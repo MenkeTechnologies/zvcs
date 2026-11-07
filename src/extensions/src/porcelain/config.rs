@@ -2181,40 +2181,61 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     }
 
     // ```c
-    // if (inc->depth > MAX_INCLUDE_DEPTH)
+    // if (++inc->depth > MAX_INCLUDE_DEPTH)
     //         die(_(include_depth_advice), MAX_INCLUDE_DEPTH, path,
-    //             !cf ? "<unknown>" : cf->name ? cf->name : "the command line");
+    //             !kvi ? "<unknown>" :
+    //             kvi->filename ? kvi->filename :
+    //             "the command line");
     // ```
     //
-    // (`handle_path_include()`, config.c.) A configuration that includes itself
-    // is fatal at 128, naming the include and the file that asked for it. gix
-    // answers a circular chain two other ways — silently capping it for the
+    // (`handle_path_include()`, config.c:177-182.) A configuration that includes
+    // itself is fatal at 128, naming the include and the file that asked for it.
+    // gix answers a circular chain two other ways — silently capping it for the
     // repository cascade, and with its own wording for an explicit
-    // `--file … --includes` — so the chain is walked here for the diagnostic.
-    if includes && reads_config {
-        let cyclic = match &scope {
-            Scope::File(path) => include_depth_overflow(path),
+    // `--file … --includes` — so the file is read here as git reads it.
+    //
+    // A `--file` is read through `git_parse_source()`, which hands each entry to
+    // `show_all_config()` as it completes (config.c:1055-1150), so `--list` has
+    // written every entry ahead of the line it refuses, or of the include it will
+    // not follow, by the time it dies; the get forms collect their matches and
+    // print nothing (builtin/config.c:538).
+    if reads_config {
+        let stop = match &scope {
+            Scope::File(path) => {
+                let typed = path.to_string_lossy().into_owned();
+                let shown = origin_path(&d, Source::Cli, &typed).into_owned();
+                let mut segments = Vec::new();
+                crate::config::read_config_file_like_git(path, &shown, includes, 0, Some(&mut segments))
+                    .err()
+                    .map(|stop| (stop, segments))
+            }
             // A circular include also stops the repository from *opening* — gix
             // gives up on the configuration and discovery fails with it — so the
             // git directory is located directly rather than through `repo`,
             // which is `None` in exactly the case this diagnostic is for.
-            Scope::Default | Scope::Local => {
+            Scope::Default | Scope::Local if includes => {
                 let git_dir = match repo.as_ref() {
                     Some(repo) => Some(repo.common_dir().to_path_buf()),
                     None => gix::discover::upwards(std::path::Path::new("."))
                         .ok()
                         .map(|(path, _trust)| path.into_repository_and_work_tree_directories().0),
                 };
-                git_dir.and_then(|dir| include_depth_overflow(&dir.join("config")))
+                git_dir
+                    .and_then(|dir| {
+                        let config = dir.join("config");
+                        crate::config::read_config_file_like_git(&config, &display_origin_path(&config), true, 0, None)
+                            .err()
+                    })
+                    .filter(|stop| matches!(stop, crate::config::ConfigReadStop::IncludeDepth { .. }))
+                    .map(|stop| (stop, Vec::new()))
             }
             _ => None,
         };
-        if let Some((path, from)) = cyclic {
-            eprintln!(
-                "fatal: exceeded maximum include depth ({MAX_INCLUDE_DEPTH}) while including\n\
-                 \t{path}\nfrom\n\t{from}\nThis might be due to circular includes."
-            );
-            return Ok(ExitCode::from(128));
+        if let Some((stop, segments)) = stop {
+            if mode == Mode::List && !segments.is_empty() {
+                list(&read_segments(&segments, &d)?, &d)?;
+            }
+            return Ok(fatal(&stop.message()));
         }
     }
 
@@ -4607,41 +4628,26 @@ fn worktree_config_file(repo: &gix::Repository) -> Result<std::path::PathBuf> {
     Ok(repo.common_dir().join("config"))
 }
 
-/// `MAX_INCLUDE_DEPTH` (config.c): how many nested `include.path` hops git will
-/// follow before it decides the chain is circular.
-const MAX_INCLUDE_DEPTH: usize = 10;
-
-/// Walk `start`'s unconditional `include.path` chain looking for the hop that
-/// would exceed [`MAX_INCLUDE_DEPTH`], and return the pair git's diagnostic names:
-/// the include it refused to follow and the file that asked for it. `None` is
-/// every chain that terminates within the limit.
+/// The `--file` entries git's reader delivered before it died, as one
+/// configuration `list()` can print: each stretch parsed under the file it came
+/// from, appended in the order the callback saw them.
 ///
-/// Only `include.path` is followed. A conditional `includeIf` hop is decided by
-/// `include_condition_is_true()` against a context this walk does not have, and
-/// a chain that is only circular through a condition would be mis-reported;
-/// leaving it out means such a chain keeps whatever answer the resolver gives it
-/// rather than getting a fabricated one.
-fn include_depth_overflow(start: &std::path::Path) -> Option<(String, String)> {
-    let mut current = start.to_path_buf();
-    for depth in 0..=MAX_INCLUDE_DEPTH {
-        let file =
-            gix::config::File::from_path_no_includes(current.clone(), Source::Local).ok()?;
-        let raw = file.string_by("include", None, "path")?.to_string();
-        // `handle_path_include()` resolves a relative include against the
-        // directory of the file that named it, not against the current directory.
-        let next = match std::path::Path::new(&raw).is_absolute() {
-            true => std::path::PathBuf::from(&raw),
-            false => match current.parent().filter(|d| !d.as_os_str().is_empty()) {
-                Some(dir) => dir.join(&raw),
-                None => std::path::PathBuf::from(&raw),
-            },
+/// A stretch's path is the `kvi->filename` the walk built, which already carries
+/// the `--file` prefix; [`origin_path`] puts that prefix on a relative `--file`
+/// path itself, so it is taken off again here.
+fn read_segments(segments: &[crate::config::ConfigSegment], d: &Display) -> Result<ConfigFile> {
+    let mut all = empty_config(std::path::Path::new(""), Source::Cli);
+    for segment in segments {
+        let shown = match d.prefix.as_deref() {
+            Some(prefix) if !std::path::Path::new(&segment.shown).is_absolute() => {
+                segment.shown.strip_prefix(prefix).unwrap_or(&segment.shown)
+            }
+            _ => segment.shown.as_str(),
         };
-        if depth == MAX_INCLUDE_DEPTH {
-            return Some((display_origin_path(&next), display_origin_path(&current)));
-        }
-        current = next;
+        let file = parse_config(&segment.text, std::path::Path::new(shown), Source::Cli)?;
+        let _ = all.append(file);
     }
-    None
+    Ok(all)
 }
 
 /// A git directory as an absolute, symlink-resolved path — what

@@ -2120,15 +2120,217 @@ pub enum ConfigScopes {
     EarlyRepository,
 }
 
-/// `fatal: bad config line <n> in file <path>` for the first file in `scopes`
-/// that git's parser would refuse, or `None` when they all parse.
+/// The `fatal:` the configuration reader dies with on the first file in `scopes`
+/// git would refuse — `bad config line <n> in file <path>`, or the
+/// `exceeded maximum include depth` advice of a circular `include.path` — or
+/// `None` when the whole sequence reads.
 ///
 /// The returned string is the message without the `fatal: ` prefix, so it can be
 /// handed to [`crate::fatal::die`] or printed by a gate that already knows it is
 /// leaving with 128.
 pub fn bad_config_line(scopes: ConfigScopes, naming: GitDirNaming) -> Option<String> {
-    let (path, line) = first_unparsable_config_file(scopes, naming)?;
-    Some(format!("bad config line {line} in file {path}"))
+    first_unparsable_config_file(scopes, naming).map(|stop| stop.message())
+}
+
+/// `MAX_INCLUDE_DEPTH` (config.c:135): how many nested `include.path` hops git
+/// follows before it decides the chain is circular.
+pub const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Where git's configuration reader died while reading one file, with what it
+/// would print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigReadStop {
+    /// `git_parse_source()`'s `bad config line %d in file %s` (config.c:1147-1150).
+    BadLine { shown: String, line: usize },
+    /// `handle_path_include()`'s `die(_(include_depth_advice), …)` (config.c:136-141,
+    /// :177-182): `path` is the include it refused to open, `from` the
+    /// `kvi->filename` of the file that named it.
+    IncludeDepth { path: String, from: String },
+}
+
+impl ConfigReadStop {
+    /// The text after `fatal: `.
+    pub fn message(&self) -> String {
+        match self {
+            ConfigReadStop::BadLine { shown, line } => format!("bad config line {line} in file {shown}"),
+            ConfigReadStop::IncludeDepth { path, from } => format!(
+                "exceeded maximum include depth ({MAX_INCLUDE_DEPTH}) while including\n\t{path}\nfrom\n\t{from}\nThis might be due to circular includes."
+            ),
+        }
+    }
+}
+
+/// One stretch of a configuration file that git's reader handed to its callback
+/// before it died: the events re-serialized as text that parses on its own, and
+/// the `kvi->filename` its entries carry.
+///
+/// A file is cut into several of these when an `include.path` splits it,
+/// because git reads the included file *at* the include, between the parent's
+/// entries (`git_config_include()`, config.c:419-440). A stretch that resumes a
+/// section after an include starts with that section's header again.
+pub struct ConfigSegment {
+    pub shown: String,
+    pub text: Vec<u8>,
+}
+
+/// git's `git_config_from_file()` over `path` under `git_config_include()`
+/// (config.c:419-460): every entry `git_parse_source()` reads before it stops is
+/// passed along, and an `include.path` is followed at the point it is read,
+/// through `handle_path_include()` (config.c:142-191). `shown` is the
+/// `kvi->filename` the file is read under, which the diagnostics quote and a
+/// relative include is resolved against.
+///
+/// `includes` is `opts->respect_includes`. `depth` is `inc->depth` as this file is
+/// entered. When `segments` is given, the stretches read are appended to it in
+/// callback order, which is what `config --list` prints ahead of the `fatal:`.
+///
+/// Only `include.path` is followed; an `includeIf.<condition>.path` needs
+/// `include_condition_is_true()` (config.c:393-417), which this walk does not
+/// port, so a chain that is only circular or malformed through a condition is not
+/// reported here.
+pub fn read_config_file_like_git(
+    path: &std::path::Path,
+    shown: &str,
+    includes: bool,
+    depth: usize,
+    mut segments: Option<&mut Vec<ConfigSegment>>,
+) -> Result<(), ConfigReadStop> {
+    use gix::bstr::ByteSlice as _;
+    use gix::config::parse::EventRef;
+
+    let Ok(bytes) = std::fs::read(path) else {
+        // `git_config_from_file_with_options()` opens with `fopen_or_warn()` and
+        // simply returns -1 when that fails, so an unreadable file is not this
+        // diagnostic.
+        return Ok(());
+    };
+    // `git_parse_source()` calls the callback for each entry as it completes, so
+    // whatever precedes the line it refuses has been delivered when it dies.
+    let (read, bad) = match gix::config::parse::Events::from_bytes(&bytes, None) {
+        Err(err) => (&bytes[..bytes.len() - err.remaining_data().len()], Some(err.line_number())),
+        Ok(events) => match unterminated_valueless_key(&events) {
+            Some(line) => {
+                let start = bytes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b == b'\n')
+                    .nth(line.saturating_sub(2))
+                    .map_or(0, |(at, _)| at + 1);
+                (&bytes[..if line > 1 { start } else { 0 }], Some(line))
+            }
+            None => (&bytes[..], None),
+        },
+    };
+    let parsed = gix::config::parse::Events::from_bytes(read, None).unwrap_or_default();
+    let mut events: Vec<EventRef<'_>> = parsed.iter().collect();
+    // A refusal that is not at the start of a line is one inside the entry that
+    // line began: `parse_value()` failing on an unterminated quote or an unknown
+    // escape returns before `get_value()` calls the callback (config.c:854-944),
+    // so that entry is not delivered, though gitoxide hands back its name.
+    // Only blanks between the last newline and the refusal mean it is the next
+    // line that failed, and the entry before it was delivered.
+    let line_start = read.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+    if !read[line_start..].iter().all(|b| matches!(b, b' ' | b'\t')) {
+        if let Some(name) = events.iter().rposition(|e| matches!(e, EventRef::SectionValueName(_))) {
+            events.truncate(name);
+        }
+    }
+
+    let mut text = Vec::new();
+    let mut header: Vec<u8> = Vec::new();
+    let mut in_include = false;
+    let mut at_path = false;
+    let mut pending: Option<Vec<u8>> = None;
+    for event in &events {
+        event.write_to(&mut text).expect("writing to a Vec cannot fail");
+        let value = match event {
+            EventRef::SectionHeader { name, subsection_name, .. } => {
+                header.clear();
+                event.write_to(&mut header).expect("writing to a Vec cannot fail");
+                in_include = subsection_name.is_none() && name.to_str_lossy().eq_ignore_ascii_case("include");
+                at_path = false;
+                None
+            }
+            EventRef::SectionValueName(name) => {
+                at_path = in_include && name.to_str_lossy().eq_ignore_ascii_case("path");
+                None
+            }
+            EventRef::Value(raw) if at_path => Some(raw.to_vec()),
+            EventRef::ValueNotDone(raw) if at_path => {
+                pending.get_or_insert_with(Vec::new).extend_from_slice(raw);
+                None
+            }
+            EventRef::ValueDone(raw) if at_path => {
+                let mut whole = pending.take().unwrap_or_default();
+                whole.extend_from_slice(raw);
+                Some(whole)
+            }
+            _ => None,
+        };
+        let Some(raw) = value.filter(|_| includes) else { continue };
+        at_path = false;
+        if let Some(out) = segments.as_deref_mut() {
+            out.push(ConfigSegment { shown: shown.to_owned(), text: std::mem::take(&mut text) });
+        }
+        text = header.clone();
+        let value = gix::config::value::normalize(raw.as_bstr()).to_str_lossy().into_owned();
+        handle_path_include(path, shown, &value, depth, segments.as_deref_mut())?;
+    }
+    if let Some(out) = segments {
+        out.push(ConfigSegment { shown: shown.to_owned(), text });
+    }
+    match bad {
+        Some(line) => Err(ConfigReadStop::BadLine { shown: shown.to_owned(), line }),
+        None => Ok(()),
+    }
+}
+
+/// `handle_path_include()` (config.c:142-191) for the `include.path` value
+/// `value` read from `from` (spelled `from_shown`) at include depth `depth`.
+fn handle_path_include(
+    from: &std::path::Path,
+    from_shown: &str,
+    value: &str,
+    depth: usize,
+    segments: Option<&mut Vec<ConfigSegment>>,
+) -> Result<(), ConfigReadStop> {
+    // An empty value names no file; `interpolate_path()` keeps it empty and the
+    // `access()` below finds nothing to read under it.
+    if value.is_empty() {
+        return Ok(());
+    }
+    let expanded = expand_tilde(value);
+    // ```c
+    // if (!is_absolute_path(path)) {
+    //         slash = find_last_dir_sep(kvi->filename);
+    //         if (slash)
+    //                 strbuf_add(&buf, kvi->filename, slash - kvi->filename + 1);
+    //         strbuf_addstr(&buf, path);
+    // ```
+    //
+    // The name is built by text, so the diagnostic spells it as the including
+    // file was spelled; the file opened is the same one, found from where this
+    // process actually reads `from`.
+    let (path, shown) = if expanded.is_absolute() {
+        (expanded.clone(), expanded.to_string_lossy().into_owned())
+    } else {
+        let dir = from_shown.rfind('/').map_or("", |slash| &from_shown[..=slash]);
+        let shown = format!("{dir}{}", expanded.to_string_lossy());
+        let path = match from.parent() {
+            Some(parent) => parent.join(&expanded),
+            None => expanded.clone(),
+        };
+        (path, shown)
+    };
+    // `if (!access_or_die(path, R_OK, 0))`: a missing include is skipped.
+    if std::fs::File::open(&path).is_err() {
+        return Ok(());
+    }
+    // `if (++inc->depth > MAX_INCLUDE_DEPTH) die(_(include_depth_advice), …)`.
+    if depth + 1 > MAX_INCLUDE_DEPTH {
+        return Err(ConfigReadStop::IncludeDepth { path: shown, from: from_shown.to_owned() });
+    }
+    read_config_file_like_git(&path, &shown, true, depth + 1, segments)
 }
 
 /// How the message spells `$GIT_DIR`, which is not a constant: git prints what
@@ -2171,22 +2373,16 @@ pub enum GitDirNaming {
 /// first refusal is the one git would have died on, because git aborts the whole
 /// sequence at that same point.
 ///
-/// `include.path` is followed depth-first after its including file parses, which
-/// is where git resolves it — an included file that will not parse is named by
-/// its own path, not the includer's. Conditional `includeIf` sections are not
-/// followed; naming no file at all is better than naming the wrong one, and the
-/// caller falls back to its own voice when this returns `None`.
-pub fn first_unparsable_config_file(
-    scopes: ConfigScopes,
-    naming: GitDirNaming,
-) -> Option<(String, usize)> {
-    let mut seen: Vec<PathBuf> = Vec::new();
-    for candidate in config_file_sequence(scopes, naming) {
-        if let Some(found) = check_config_file(&candidate, &mut seen) {
-            return Some(found);
-        }
-    }
-    None
+/// `include.path` is followed where it is read, as [`read_config_file_like_git`]
+/// does — an included file that will not parse is named by its own path, not the
+/// includer's, and a circular chain dies at `MAX_INCLUDE_DEPTH`. Conditional
+/// `includeIf` sections are not followed; naming no file at all is better than
+/// naming the wrong one, and the caller falls back to its own voice when this
+/// returns `None`.
+pub fn first_unparsable_config_file(scopes: ConfigScopes, naming: GitDirNaming) -> Option<ConfigReadStop> {
+    config_file_sequence(scopes, naming)
+        .iter()
+        .find_map(|candidate| read_config_file_like_git(&candidate.path, &candidate.shown, true, 0, None).err())
 }
 
 /// One file of the config sequence: where it lives, and how git names it.
@@ -2197,44 +2393,6 @@ struct ConfigCandidate {
     /// `git_config_from_file()`, which is absolute for the global scopes and
     /// `$GIT_DIR`-relative for a discovered repository.
     shown: String,
-}
-
-/// Parse `candidate`, and on success follow its unconditional includes. Returns
-/// the first `(shown path, line)` that will not parse.
-fn check_config_file(
-    candidate: &ConfigCandidate,
-    seen: &mut Vec<PathBuf>,
-) -> Option<(String, usize)> {
-    // git's own `include.c` guards against an include cycle with a depth limit;
-    // a visited set is the same guarantee and cheaper to state.
-    if seen.contains(&candidate.path) {
-        return None;
-    }
-    seen.push(candidate.path.clone());
-    let Ok(bytes) = std::fs::read(&candidate.path) else {
-        // `git_config_from_file_with_options()` opens with `fopen_or_warn()` and
-        // simply returns -1 when that fails, so an unreadable file is not this
-        // diagnostic.
-        return None;
-    };
-    if let Some(line) = first_bad_config_line(&bytes) {
-        return Some((candidate.shown.clone(), line));
-    }
-    // Only a file that parsed has includes to follow.
-    let Ok(events) = gix::config::parse::Events::from_bytes(&bytes, None) else {
-        return None;
-    };
-    for included in included_paths(&events, &candidate.path) {
-        let shown = included.to_string_lossy().into_owned();
-        let next = ConfigCandidate {
-            path: included,
-            shown,
-        };
-        if let Some(found) = check_config_file(&next, seen) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// The 1-based line `git_parse_source()` would refuse in `bytes`, or `None` when
@@ -2549,56 +2707,6 @@ fn unterminated_valueless_key(events: &gix::config::parse::Events) -> Option<usi
     None
 }
 
-/// The `include.path` targets of one parsed file, resolved the way
-/// `expand_include_path()` (config.c) resolves them: `~` against `$HOME`, and a
-/// relative path against the *including file's* directory.
-///
-/// `includeIf.<condition>.path` is deliberately left out — evaluating the
-/// condition here would be a second implementation of `include_condition_is_true()`
-/// and getting it wrong would name a file git never opened.
-fn included_paths(events: &gix::config::parse::Events, from: &std::path::Path) -> Vec<PathBuf> {
-    use gix::bstr::ByteSlice as _;
-    use gix::config::parse::EventRef;
-
-    let mut out = Vec::new();
-    let mut in_include = false;
-    let mut at_path = false;
-    for event in events.iter() {
-        match event {
-            EventRef::SectionHeader {
-                name,
-                subsection_name,
-                ..
-            } => {
-                in_include = subsection_name.is_none()
-                    && name.to_str_lossy().eq_ignore_ascii_case("include");
-                at_path = false;
-            }
-            EventRef::SectionValueName(name) => {
-                at_path = in_include && name.to_str_lossy().eq_ignore_ascii_case("path");
-            }
-            EventRef::Value(raw) if at_path => {
-                at_path = false;
-                let text = raw.to_str_lossy().into_owned();
-                if text.is_empty() {
-                    continue;
-                }
-                let expanded = expand_tilde(&text);
-                out.push(if expanded.is_absolute() {
-                    expanded
-                } else {
-                    match from.parent() {
-                        Some(dir) => dir.join(expanded),
-                        None => expanded,
-                    }
-                });
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// The files `do_git_config_sequence()` would open for `scopes`, in its order.
 ///
 /// The two *global* scopes are delegated to gitoxide's
@@ -2606,7 +2714,8 @@ fn included_paths(events: &gix::config::parse::Events, from: &std::path::Path) -
 /// for them — `GIT_CONFIG_GLOBAL` replacing a scope outright, `XDG_CONFIG_HOME`
 /// falling back to `$HOME/.config` — and reads nothing but the environment to do
 /// it. Duplicates are possible (`GIT_CONFIG_GLOBAL` answers for both the XDG and
-/// the user scope) and are dropped by the visited set in [`check_config_file`].
+/// the user scope); reading the same file twice reaches the same verdict, so
+/// [`first_unparsable_config_file`] answers as git, which reads it once.
 ///
 /// The *system* scope is not, and `Source::GitInstallation` is absent entirely:
 /// both can start a `git` subprocess, and this list is built on every invocation.

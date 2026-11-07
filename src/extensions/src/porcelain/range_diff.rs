@@ -3185,60 +3185,90 @@ fn endpoints(repo: &gix::Repository, spec: &str) -> Result<(Vec<ObjectId>, Vec<O
         crate::objname::Dotdot::NotARange => {}
     }
 
-    // No literal `..`/`...`: defer to rev-parse, which recognises `^!`, `^@`,
-    // `^<rev>` and plain committishes. The parents of a `^!`/`^@` spec are read
-    // straight off the named commit.
-    use gix::revision::plumbing::Spec;
-    let parents_of = |id: ObjectId| -> Result<Vec<ObjectId>> {
-        let commit = repo.find_object(id)?.try_into_commit()?;
-        Ok(commit.parent_ids().map(|p| p.detach()).collect())
-    };
-    // The single `get_oid_basic()` call this operand reaches, which is the other
-    // place the ambiguity warning is due. It is asked of
-    // [`crate::objname`] rather than of rev-parse, because rev-parse resolves
-    // through the object database and so never sees the full-hex branch that
-    // warns; the helper peels the `~<n>`/`^<n>`/`^{…}`/`:<path>` suffixes the way
-    // `get_oid_1()` does before deciding.
+    // No range: `handle_revision_arg_1()` (revision.c:2186-2216) tries its
+    // parent marks next and then resolves what is left as a single name. The
+    // marks are its own grammar, not the revision parser's, so a range that
+    // `handle_dotdot()` refused stays refused: `main..v1^@` hands
+    // `add_parents_only()` the name `main..v1`, which `repo_get_oid_committish()`
+    // cannot resolve, and `get_oid_with_context()` then fails on the whole word —
+    // `bad revision 'main..v1^@'`, where gitoxide's rev-parse read a range.
+    //
+    // The single `get_oid_basic()` call this operand reaches is the other
+    // place the ambiguity warning is due. It is asked of [`crate::objname`]
+    // rather than of the resolution below, which runs quiet: the helper peels
+    // the `~<n>`/`^<n>`/`^{…}`/`:<path>` suffixes the way `get_oid_1()` does
+    // before deciding, and git resolves an operand once.
     // The mark comes off first: `handle_revision_arg_1()` advances past a leading
     // `^` before `get_oid_with_context()` sees the name, so `get_oid_basic()`
     // measures `<40-hex>` rather than `^<40-hex>` and takes its full-hex branch.
     // `repo_get_oid()` performs no such strip, which is why
     // [`crate::objname::ambiguity_base`] does not either.
     crate::objname::warn_ambiguous_refname(repo, crate::objname::uninteresting_mark(spec).0);
-    // …and the *resolution* that branch performs, which `rev_parse` does not
-    // have: a name of exactly `hexsz` hex digits **is** the object id, decoded
-    // without the object database or the ref store being consulted. gitoxide
-    // looks the id up and, when the repository does not have it, falls back to a
-    // ref of the same name — so in a repository holding `refs/heads/<40-hex>`
-    // this walked that ref's history where git reports `bad object`. The mark is
-    // split off first because `handle_revision_arg_1()` advances past it before
-    // resolving; a `^@`/`^!`/`^-<n>` spelling is longer than `hexsz` and so falls
-    // through to `rev_parse` untouched, which is where `add_parents_only()`'s
-    // forms are handled.
-    let (bare, negative) = crate::objname::uninteresting_mark(spec);
-    if let Some(id) = crate::objname::full_hex(repo, bare) {
-        // `get_reference()`: `parse_object()` or `die("bad object %s", name)`.
-        // The caller renders that fatal through
-        // [`super::log::early_revision_fatal`], so only the failure matters here.
-        repo.find_object(id).map_err(|_| anyhow!("bad object {bare}"))?;
-        return Ok(if negative { (vec![], vec![id]) } else { (vec![id], vec![]) });
-    }
-    let parsed = repo.rev_parse(spec).map_err(|e| anyhow!("{spec}: {e}"))?;
-    match parsed.detach() {
-        Spec::Include(id) => Ok((vec![id], vec![])),
-        Spec::Exclude(id) => Ok((vec![], vec![id])),
-        Spec::Range { from, to } => Ok((vec![to], vec![from])),
-        Spec::Merge { theirs, ours } => {
-            let bases: Vec<ObjectId> = repo
-                .merge_bases_many(theirs, &[ours])?
-                .into_iter()
-                .map(|id| id.detach())
-                .collect();
-            Ok((vec![theirs, ours], bases))
+    let _quiet = crate::objname::AmbiguityWarnings::off();
+    let mut tips = Vec::new();
+    let mut hidden = Vec::new();
+    // `<rev>^@` pends the parents alone and claims the operand, while `<rev>^!`
+    // and `<rev>^-<n>` pend the selected parents with
+    // `flags ^ (UNINTERESTING | BOTTOM)` and put the truncated name back into
+    // `arg` for the single-name path below. See [`crate::objname::parents_only`]
+    // for the C.
+    let spec: &str = match crate::objname::parents_only(spec) {
+        crate::objname::ParentsOnly::Absent => spec,
+        // `strtol_i()` refused the `<n>` before `add_parents_only()` was
+        // reached: `ret = -1`, nothing resolved and nothing pended.
+        crate::objname::ParentsOnly::BadParent => return Err(anyhow!("bad revision '{spec}'")),
+        crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+            let mut queued: Vec<(ObjectId, bool)> = Vec::new();
+            let mut queue = |_name: &str, id: ObjectId, not: bool| queued.push((id, not));
+            match crate::objname::add_parents_only(repo, base, !replaces, nth, &mut queue) {
+                // `get_reference()`'s `die(_("bad object %s"), name)`; the
+                // callers render it through [`super::log::early_revision_fatal`].
+                crate::objname::Parents::BadObject => {
+                    return Err(anyhow!("bad object {}", crate::objname::uninteresting_mark(base).0));
+                }
+                // `return 0` leaves `arg` alone, so the operand keeps its mark
+                // and cannot resolve below.
+                crate::objname::Parents::None => spec,
+                crate::objname::Parents::Queued => {
+                    for (id, not) in queued {
+                        if not {
+                            hidden.push(id);
+                        } else {
+                            tips.push(id);
+                        }
+                    }
+                    // `^@` returned 0 the moment its parents were pended.
+                    if replaces {
+                        return Ok((tips, hidden));
+                    }
+                    base
+                }
+            }
         }
-        Spec::ExcludeParents(id) => Ok((vec![id], parents_of(id)?)),
-        Spec::IncludeOnlyParents(id) => Ok((parents_of(id)?, vec![])),
+    };
+    // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`, then
+    // `get_oid_with_context()` on what is left. A name of exactly `hexsz` hex
+    // digits **is** the object id, decoded by `get_oid_basic()` without the
+    // object database or the ref store being consulted, and `get_reference()`
+    // then dies `bad object` for an id the repository lacks — where a fallback
+    // to a ref of the same name would walk that ref's history.
+    let (bare, negative) = crate::objname::uninteresting_mark(spec);
+    let id = match crate::objname::full_hex(repo, bare) {
+        Some(id) => {
+            // `get_reference()`: `parse_object()` or `die("bad object %s", name)`.
+            // The caller renders that fatal through
+            // [`super::log::early_revision_fatal`], so only the failure matters here.
+            repo.find_object(id).map_err(|_| anyhow!("bad object {bare}"))?;
+            id
+        }
+        None => crate::objname::resolve(repo, bare).ok_or_else(|| anyhow!("bad revision '{spec}'"))?,
+    };
+    if negative {
+        hidden.push(id);
+    } else {
+        tips.push(id);
     }
+    Ok((tips, hidden))
 }
 
 // ---------------------------------------------------------------------------

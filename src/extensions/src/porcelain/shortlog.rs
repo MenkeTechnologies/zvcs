@@ -678,6 +678,16 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // widen the *object* walk; a commit tally reads neither, so all
                 // three are accepted and change nothing.
                 ("children" | "objects" | "unpacked", None) => {}
+                // `revs->rewrite_parents = 1; revs->print_parents = 1;`
+                // (revision.c:2491-2493): parent rewriting changes the parents a
+                // commit is shown with, not which commits are walked, so like
+                // `--children` it leaves the tally as it was.
+                ("parents", None) => {}
+                // `get_commit_format(NULL, revs)` and `get_commit_format("oneline",
+                // revs)` (revision.c:2594-2597, :2648-2652) both set a built-in
+                // format, so a `--format=<user>` before them stops applying and
+                // shortlog goes back to the subject line (builtin/shortlog.c:461).
+                ("pretty" | "oneline", None) => opts.user_format = None,
                 // `revision_opts_finish()`'s companion check in
                 // `setup_revisions()`: a reflog pattern with no reflog walk is
                 // refused before any revision is resolved, and shortlog runs the

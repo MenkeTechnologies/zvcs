@@ -1351,6 +1351,21 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             &notes_trees,
             &mut msg,
         ) {
+            // `--signoff`'s identity dies inside `show_log()`, once the record
+            // separator and `log_write_email_headers()`'s lines are out
+            // (log-tree.c:770-790, :870-872); stdio writes them on its way out.
+            if let Some(SignoffIdentDie(refusal)) = e.downcast_ref::<SignoffIdentDie>() {
+                if opts.to_stdout && idx > 0 {
+                    if let Some(p) = &opts.line_prefix {
+                        buffered.extend_from_slice(p.as_bytes());
+                    }
+                    buffered.push(b'\n');
+                }
+                emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts, false)?;
+                stdout.write_all(&buffered)?;
+                stdout.flush()?;
+                return Ok(refusal.die());
+            }
             emit_message(&mut buffered, &[], patch_filename(&commit, nr, &opts)?, &opts, false)?;
             stdout.write_all(&buffered)?;
             stdout.flush()?;
@@ -3542,6 +3557,43 @@ fn committer_ident(repo: &gix::Repository) -> Result<Ident> {
     })
 }
 
+/// `fmt_name(WANT_COMMITTER_IDENT)` (ident.c:544-562), the identity `--signoff`
+/// asks for in `show_log()` — for `need_8bit_cte` and then in `append_signoff()`
+/// (log-tree.c:870-892, sequencer.c:5814). It is `fmt_ident()` under
+/// `IDENT_STRICT | IDENT_NO_DATE`, so an identity git cannot work out dies with
+/// the `Committer identity unknown` block, after the `From <commit>` line
+/// `log_write_email_headers()` already wrote; the caller writes that much out
+/// first, see [`SignoffIdentDie`].
+fn signoff_ident(repo: &gix::Repository) -> Result<Ident> {
+    if let Some(refusal) = crate::fmt_ident_strict(repo, "Committer").filter(|r| !r.is_date()) {
+        return Err(anyhow::Error::new(SignoffIdentDie(refusal)));
+    }
+    // Past the strict checks `fmt_ident()` defaults whichever field is missing
+    // (ident.c:468-516), as [`crate::ensure_reflog_identity`] does for the copy of
+    // the repository asked here.
+    let mut repo = repo.clone();
+    crate::ensure_reflog_identity(&mut repo);
+    committer_ident(&repo)
+}
+
+/// [`signoff_ident`]'s `die()`, carried out of the message renderer so the
+/// caller can put out what git had written by then.
+struct SignoffIdentDie(crate::IdentRefusal);
+
+impl std::fmt::Debug for SignoffIdentDie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("committer identity unknown")
+    }
+}
+
+impl std::fmt::Display for SignoffIdentDie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("committer identity unknown")
+    }
+}
+
+impl std::error::Error for SignoffIdentDie {}
+
 /// Port of `parse_cover_from_description()` (builtin/log.c).
 fn parse_cover_from_description(arg: &str) -> Option<CoverFrom> {
     match arg {
@@ -5356,7 +5408,17 @@ fn render_message(
 ) -> Result<()> {
     let msg_start = out.len();
     let mut raw_spans: Vec<(usize, usize)> = Vec::new();
-    render_message_body(repo, commit, nr, total, opts, th, notes_trees, out, &mut raw_spans)?;
+    if let Err(e) = render_message_body(repo, commit, nr, total, opts, th, notes_trees, out, &mut raw_spans) {
+        // `--signoff`'s identity dies after `log_write_email_headers()` wrote its
+        // lines, each followed by `graph_show_oneline()`, which with no graph
+        // writes the `--line-prefix` of the line to come (log-tree.c:500-540).
+        if let (Some(prefix), Some(_)) = (&opts.line_prefix, e.downcast_ref::<SignoffIdentDie>()) {
+            let end = out.len();
+            prefix_lines(out, msg_start, end, prefix.as_bytes());
+            out.extend_from_slice(prefix.as_bytes());
+        }
+        return Err(e);
+    }
     // Everything a patch message is made of takes `--line-prefix`: `show_log()`
     // opens with `graph_show_commit()`, `log_write_email_headers()` follows each
     // header with `graph_show_oneline()`, `graph_show_strbuf()` writes it between
@@ -5479,7 +5541,7 @@ fn render_message_body(
     // failing that any non-ASCII byte in the re-coded message body
     // (pretty.c:2175-2192) or the in-body headers (pretty.c:2131-2139).
     let signoff_needs_8bit = opts.signoff && {
-        let c = committer_ident(repo)?;
+        let c = signoff_ident(repo)?;
         has_non_ascii(&c.name) || has_non_ascii(&c.mail)
     };
     let need_8bit = opts.mime_boundary.is_none()
@@ -5525,7 +5587,7 @@ fn render_message_body(
     // `APPEND_SIGNOFF_DEDUP`, so a trailer block that already carries this
     // `Signed-off-by:` anywhere is left alone.
     if opts.signoff {
-        let c = committer_ident(repo)?;
+        let c = signoff_ident(repo)?;
         let mut ident = c.name.clone();
         ident.extend_from_slice(b" <");
         ident.extend_from_slice(&c.mail);

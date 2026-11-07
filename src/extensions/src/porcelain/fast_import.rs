@@ -409,10 +409,21 @@ struct PackLog {
     last_blob: LastObject,
     /// `max_depth`: `pack.depth`, `--depth`, or git's 50.
     max_depth: u64,
-    /// `repo_settings_get_big_file_threshold()`: `core.bigFileThreshold`,
-    /// `--big-file-threshold`, or git's 512 MiB. A `data <n>` above it is
-    /// streamed by `stream_blob()`, which never deltifies.
+    /// `repo->settings.big_file_threshold`: what `--big-file-threshold` or
+    /// `option git big-file-threshold` set through
+    /// `repo_settings_set_big_file_threshold()`, 0 when nothing did. Read through
+    /// [`PackLog::big_file_threshold`].
     big_file_threshold: u64,
+    /// `core.bigFileThreshold`, or git's 512 MiB: what
+    /// `repo_settings_get_big_file_threshold()` reads when the setting is 0.
+    config_big_file_threshold: u64,
+    /// Whether the object database has been prepared, which is where
+    /// `prepare_multi_pack_index_one()` calls the process's first
+    /// `prepare_repo_settings()` (midx.c:741-745) and so `repo_settings_clear()`
+    /// (repo-settings.c:30-46, :160-166). Set on the first pack lookup
+    /// `store_object()` and `stream_blob()` make for an object the run has not
+    /// seen, and on every object read ([`Importer::odb`]).
+    odb_prepared: std::cell::Cell<bool>,
     /// The objects of the pack now being built, in the order they were stored.
     /// `object_count` is its length.
     ids: Vec<ObjectId>,
@@ -479,7 +490,9 @@ impl PackLog {
             delta_attempts_by_type: [0; 4],
             last_blob: LastObject::default(),
             max_depth: 50,
-            big_file_threshold: 512 * 1024 * 1024,
+            big_file_threshold: 0,
+            config_big_file_threshold: 512 * 1024 * 1024,
+            odb_prepared: std::cell::Cell::new(false),
             ids: Vec::new(),
             created: Vec::new(),
             packed,
@@ -544,7 +557,7 @@ impl PackLog {
         // `git_default_core_config()` reads `core.bigfilethreshold` with
         // `git_config_ulong()` into the repository settings the blob parser asks.
         if let Some(threshold) = crate::config::config_ulong(repo, "core.bigfilethreshold").map_err(die)? {
-            self.big_file_threshold = threshold;
+            self.config_big_file_threshold = threshold;
         }
         // `pack_compression_level`: `pack.compression` wins over `core.compression`
         // whichever comes first (`pack_compression_seen`, environment.c), and an
@@ -759,6 +772,8 @@ impl PackLog {
 
         let slot = type_slot(kind);
         let duplicate = self.table.contains_key(&id) || {
+            // `packfile_store_get_packs()` prepares the object database.
+            self.odb_prepared.set(true);
             let packed = self.packed.iter().any(|idx| idx.lookup(id).is_some());
             if packed {
                 self.table.insert(id, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0, offset: 1 });
@@ -773,6 +788,27 @@ impl PackLog {
             return Ok(None);
         }
         Ok(Some(fresh))
+    }
+
+    /// `repo_settings_get_big_file_threshold()` (repo-settings.c:167-173):
+    ///
+    /// ```c
+    /// if (!repo->settings.big_file_threshold)
+    ///         repo_cfg_ulong(repo, "core.bigfilethreshold",
+    ///                        &repo->settings.big_file_threshold, 512 * 1024 * 1024);
+    /// return repo->settings.big_file_threshold;
+    /// ```
+    ///
+    /// The value `--big-file-threshold` set holds only until the object database is
+    /// first prepared: `prepare_repo_settings()` opens with `repo_settings_clear()`,
+    /// and fast-import calls nothing that prepares the settings before that, so
+    /// from the first pack lookup on the threshold is `core.bigFileThreshold`'s.
+    fn big_file_threshold(&self) -> u64 {
+        match self.big_file_threshold {
+            0 => self.config_big_file_threshold,
+            _ if self.odb_prepared.get() => self.config_big_file_threshold,
+            set => set,
+        }
     }
 
     /// The tail of `store_object()` and `stream_blob()` once the entry's bytes
@@ -1678,6 +1714,13 @@ struct Importer {
 }
 
 impl Importer {
+    /// The object database, for a read: `odb_read_object()` and its siblings
+    /// prepare it first, see [`PackLog::odb_prepared`].
+    fn odb(&self) -> &gix::Repository {
+        self.pack.odb_prepared.set(true);
+        &self.repo
+    }
+
     /// Drive the stream; the command line is read from inside it, where git
     /// reads it.
     ///
@@ -1916,7 +1959,7 @@ impl Importer {
             // object the table does not hold yet must exist, and enters it as
             // one no pack of this run holds.
             if !self.pack.table.contains_key(&id) {
-                let Some(header) = self.repo.try_find_header(id)? else {
+                let Some(header) = self.odb().try_find_header(id)? else {
                     crate::git_fatal!("object not found: {id}");
                 };
                 self.pack.table.insert(
@@ -2303,7 +2346,7 @@ impl Importer {
         };
         // `parse_data()` returns 0 — "stream it" — only for the counted form:
         // `if (limit && limit < len)`.
-        let limit = self.pack.big_file_threshold;
+        let limit = self.pack.big_file_threshold();
         let streamed = !spec.starts_with(b"<<") && limit != 0 && (limit as u128) < strtoumax10(&spec) as u128;
         let payload = input.data(&spec)?;
         let id = match streamed {
@@ -2592,7 +2635,7 @@ impl Importer {
             }
         }
 
-        let kind = self.repo.find_header(object)?.kind();
+        let kind = self.odb().find_header(object)?.kind();
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("object {object}\ntype {kind}\ntag {name}\n").as_bytes());
         if let Some(t) = &tagger {
@@ -2925,7 +2968,7 @@ impl Importer {
         // `inline` payload is a blob by construction and git never re-reads it,
         // so the check is skipped there as it is in the C.
         if !inline_data {
-            match self.repo.try_find_header(oid)? {
+            match self.odb().try_find_header(oid)? {
                 None if mode == 0o160000 => {}
                 None => crate::git_fatal!("{want} not found: {shown}"),
                 Some(header) if header.kind() != want => crate::git_fatal!(
@@ -3040,7 +3083,7 @@ impl Importer {
                 crate::git_fatal!("invalid ref name or SHA1 expression: {text}");
             };
             // `odb_read_object_peeled(…, OBJ_COMMIT, …)`.
-            match self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
+            match self.odb().find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
                 Some(commit) => commit.id,
                 None => crate::git_fatal!("not a valid commit: {text}"),
             }
@@ -3056,7 +3099,7 @@ impl Importer {
                 }
                 Some(_) => {}
                 None if oid.is_null() => {}
-                None => match self.repo.try_find_header(oid)? {
+                None => match self.odb().try_find_header(oid)? {
                     None => crate::git_fatal!("blob not found: {}", command_buf()),
                     Some(h) if h.kind() != Kind::Blob => {
                         crate::git_fatal!("not a blob (actually a {}): {}", h.kind(), command_buf())
@@ -3109,13 +3152,13 @@ impl Importer {
     /// answers it, not as a fatal error.
     fn cat_blob(&mut self, spec: &[u8]) -> Result<()> {
         let oid = self.dataref(spec)?;
-        let Some(header) = self.repo.try_find_header(oid)? else {
+        let Some(header) = self.odb().try_find_header(oid)? else {
             return self.respond(format!("{oid} missing\n").as_bytes());
         };
         if header.kind() != Kind::Blob {
             crate::git_fatal!("object {oid} is a {} but a blob was expected.", header.kind());
         }
-        let data = self.repo.find_object(oid)?.data.clone();
+        let data = self.odb().find_object(oid)?.data.clone();
         let mut out = format!("{oid} blob {}\n", data.len()).into_bytes();
         out.extend_from_slice(&data);
         out.push(b'\n');
@@ -3208,7 +3251,7 @@ impl Importer {
                 Some(e) => e.kind,
                 None => {
                     // `dereference()`: `/* cache it! */`
-                    let Some(header) = self.repo.try_find_header(oid)? else {
+                    let Some(header) = self.odb().try_find_header(oid)? else {
                         crate::git_fatal!("object not found: {oid}");
                     };
                     let kind = header.kind();
@@ -3223,7 +3266,7 @@ impl Importer {
                 Kind::Tag => (&b"object "[..], "tag"),
                 Kind::Blob => crate::git_fatal!("not a tree-ish: {}", command_buf()),
             };
-            let Ok(object) = self.repo.find_object(oid) else {
+            let Ok(object) = self.odb().find_object(oid) else {
                 crate::git_fatal!("can't load object {oid}");
             };
             // The id is read at a fixed offset, past `tree ` or `object `, as
@@ -3391,6 +3434,7 @@ impl Importer {
             self.branches[idx].tree.versions[1].oid = null;
             return Ok(());
         };
+        self.pack.odb_prepared.set(true);
         let peeled = self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok());
         let Some(commit) = peeled else {
             crate::git_fatal!("not a valid commit: {id}");
@@ -3424,7 +3468,7 @@ impl Importer {
         let Some(id) = self.get_oid(&text) else {
             crate::git_fatal!("invalid ref name or SHA1 expression: {text}");
         };
-        match self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
+        match self.odb().find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
             Some(commit) => Ok(commit.id),
             None => crate::git_fatal!("not a valid commit: {text}"),
         }
@@ -3467,7 +3511,7 @@ impl Importer {
             // itself rather than coming through here.
             let mark = parse_mark_ref_eol(v)?;
             let id = self.find_mark(mark)?;
-            if self.repo.try_find_header(id)?.map(|h| h.kind()) != Some(Kind::Commit) {
+            if self.odb().try_find_header(id)?.map(|h| h.kind()) != Some(Kind::Commit) {
                 crate::git_fatal!("mark :{mark} not a commit");
             }
             return Ok(id);
@@ -3495,7 +3539,16 @@ impl Importer {
         if let Some(v) = spec.strip_prefix(b":") {
             return self.mark_ref(v);
         }
-        ObjectId::from_hex(spec).map_err(|_| anyhow!("invalid dataref: {}", command_buf()))
+        // `parse_cat_blob()` (builtin/fast-import.c:3456-3460): `parse_mapped_oid_hex()`
+        // reads exactly `hexsz` digits, and whatever follows them is garbage.
+        let hexsz = self.repo.object_hash().len_in_hex();
+        let Some(oid) = spec.get(..hexsz).and_then(|hex| ObjectId::from_hex(hex).ok()) else {
+            crate::git_fatal!("invalid dataref: {}", command_buf());
+        };
+        if spec.len() > hexsz {
+            crate::git_fatal!("garbage after SHA1: {}", command_buf());
+        }
+        Ok(oid)
     }
 
     /// A dataref that is followed by a space: a mark through
@@ -3869,7 +3922,7 @@ impl Importer {
     /// which is the `branch %s is missing commits.` error rather than a refusal.
     fn is_ancestor(&self, old: ObjectId, new: ObjectId) -> Option<bool> {
         let peel = |id: ObjectId| -> Option<ObjectId> {
-            Some(self.repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+            Some(self.odb().find_object(id).ok()?.peel_to_commit().ok()?.id)
         };
         let (old, new) = (peel(old)?, peel(new)?);
         Some(matches!(self.repo.merge_base(old, new), Ok(base) if base.detach() == old))
@@ -4475,10 +4528,15 @@ fn load_tree(g: &mut Ctx<'_>, root: &mut TreeEntry) -> Result<()> {
                 _ => crate::git_fatal!("can't load tree {oid}"),
             }
         }
-        _ => match g.repo.try_find_object(oid) {
-            Ok(Some(object)) if object.kind == Kind::Tree => object.data.clone(),
-            _ => crate::git_fatal!("can't load tree {oid}"),
-        },
+        // `odb_read_object()`, which prepares the object database; the arm
+        // above is `gfi_unpack_entry()` on this run's own pack.
+        _ => {
+            g.pack.odb_prepared.set(true);
+            match g.repo.try_find_object(oid) {
+                Ok(Some(object)) if object.kind == Kind::Tree => object.data.clone(),
+                _ => crate::git_fatal!("can't load tree {oid}"),
+            }
+        }
     };
 
     let rawsz = g.repo.object_hash().len_in_bytes();

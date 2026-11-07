@@ -829,6 +829,54 @@ fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()>
     Ok(())
 }
 
+/// [`check_new_object`] as `--stdin` meets it: both refusals are
+/// `REF_TRANSACTION_ERROR_INVALID_NEW_VALUE` (refs.c:1433-1448), which
+/// `handle_ref_transaction_error()` (builtin/update-ref.c:273-292) dies on only
+/// without `--batch-updates`. With it, `print_rejected_refs()` reports the
+/// update at once, while the command is parsed — so its `rejected` line comes
+/// ahead of every rejection the commit later finds — and the update is never
+/// added to the transaction:
+///
+/// ```c
+/// if (details && *details)
+///         error("%s", details);
+/// strbuf_addf(&sb, "rejected %s %s %s %s\n", refname,
+///             new_oid ? oid_to_hex(new_oid) : new_target,
+///             old_oid ? oid_to_hex(old_oid) : old_target,
+///             ref_transaction_error_msg(err));
+/// ```
+///
+/// `old` is the `<old-oid>` column: `parse_cmd_update()` passes its old value
+/// only when one was given, and `parse_cmd_create()` passes `NULL`
+/// (builtin/update-ref.c:333, :427), which `printf` renders `(null)`. True when
+/// the update was rejected and must not be staged.
+fn invalid_new_value(
+    repo: &gix::Repository,
+    name: &str,
+    new: &Val,
+    old: Option<&Val>,
+    batch_updates: bool,
+) -> Result<bool> {
+    let Err(e) = check_new_object(repo, name, new) else {
+        return Ok(false);
+    };
+    if !batch_updates {
+        return Err(e);
+    }
+    let column = |v: &Val| match v {
+        Val::Oid(id) => id.to_string(),
+        Val::Zero => repo.object_hash().null().to_string(),
+        Val::Missing => "(null)".to_string(),
+    };
+    eprintln!("error: {e:#}");
+    crate::cstdio::println!(
+        "rejected {name} {} {} invalid new value provided",
+        column(new),
+        old.map_or_else(|| "(null)".to_string(), column)
+    );
+    Ok(true)
+}
+
 /// Validate `name` as a fully-qualified ref name.
 fn refname(name: &str) -> Result<FullName> {
     name.try_into()
@@ -1581,30 +1629,58 @@ fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) 
     if let Some(message) = duplicate_update(&batch.edits) {
         crate::git_fatal!("{message}");
     }
-    if let Some(conflict) = split_conflicts(repo, &batch.edits).first() {
+    // Under `--batch-updates` a split that runs into another update is a
+    // `REF_TRANSACTION_ERROR_NAME_CONFLICT` the transaction records and `commit`
+    // reports; only `HEAD has been racily updated` dies here.
+    let splits = split_conflicts(repo, &batch.edits, batch_updates)?;
+    if let Some(conflict) = splits.first().filter(|_| !batch_updates) {
         crate::git_fatal!("{}", conflict.message);
     }
-    check_absent(repo, &batch.absent)?;
+    // Under `--batch-updates` every refusal below but a generic one is
+    // `ref_transaction_maybe_set_rejected()`'s (refs.c:1276-1312): the update is
+    // recorded as rejected, takes no part in the locks `prepare` takes, and is
+    // reported by `commit` — which runs the same checks again in [`apply`].
+    let mut rejected: std::collections::BTreeSet<usize> = splits.iter().map(|c| c.at).collect();
+    if batch_updates {
+        for entry in &batch.absent {
+            if entry.guards_edit && absent_violated(repo, entry)? {
+                rejected.insert(entry.at);
+            }
+        }
+    } else {
+        check_absent(repo, &batch.absent)?;
+    }
     if batch.edits.is_empty() {
         return Ok(());
     }
-    let mut edits = batch.edits.clone();
-    for edit in &mut edits {
-        if let Err(refused) = settle_old_value(repo, edit) {
+    let mut edits = Vec::new();
+    for (at, edit) in batch.edits.iter().enumerate() {
+        if rejected.contains(&at) {
+            continue;
+        }
+        let mut edit = edit.clone();
+        if let Err(refused) = settle_old_value(repo, &mut edit) {
+            if batch_updates && refused.kind.is_some() {
+                rejected.insert(at);
+                continue;
+            }
             crate::git_fatal!("{}", refused.message);
         }
+        edits.push((at, edit));
     }
     // `ref_transaction_prepare()` refuses a name conflict before it takes any
     // lock (refs/files-backend.c:3024-3029), so `prepare` fails here exactly as
     // `commit` would.
-    if let Some(reason) = transaction_conflicts(repo, &batch.edits)?.into_iter().flatten().next() {
+    let conflicts = transaction_conflicts(repo, &batch.edits)?;
+    if let Some(reason) = conflicts.iter().flatten().next().filter(|_| !batch_updates) {
         crate::git_fatal!("{reason}");
     }
+    edits.retain(|(at, _)| conflicts.get(*at).is_none_or(Option::is_none));
     let prepared = repo
         .refs
         .transaction()
         .prepare(
-            edits,
+            edits.into_iter().map(|(_, edit)| edit),
             gix::lock::acquire::Fail::Immediately,
             gix::lock::acquire::Fail::Immediately,
         )
@@ -1758,6 +1834,7 @@ fn run_stdin(
                     edit_deref,
                     create_reflog,
                     msg,
+                    batch_updates,
                 ) {
                     Ok(()) => {}
                     Err(e) => return fatal(e),
@@ -1816,7 +1893,7 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
     if let Some(message) = duplicate_update(&batch.edits) {
         crate::git_fatal!("{message}");
     }
-    let splits = split_conflicts(repo, &batch.edits);
+    let splits = split_conflicts(repo, &batch.edits, batch_updates)?;
     // `refs_verify_refnames_available()` runs over the whole transaction before
     // any reference is written (refs/files-backend.c:3024-3029), which is what
     // names the reference standing in the way; reaching the file system instead
@@ -2163,7 +2240,22 @@ fn duplicate_update(edits: &[RefEdit]) -> Option<String> {
 ///   refused when the referent is already in the transaction: `multiple updates
 ///   for '<referent>' (including one via symref '<ref>') are not allowed`. A
 ///   symref cycle ends there too, the second time round.
-fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Vec<SplitConflict> {
+///
+/// Under `--batch-updates` a refused update is `ref_transaction_maybe_set_rejected()`'s
+/// (refs.c:1276-1312), which takes its name back out of `transaction->refnames`,
+/// so a later update no longer meets it. `lock_ref_for_update()` keeps the lock
+/// it took before refusing, though (refs/files-backend.c:2714-2733), and a later
+/// update of the same name reuses that lock without `lock_raw_ref()` ever setting
+/// its `type`. The log-only `HEAD` update split off the checked-out branch then
+/// reads as no symref at all, which is `HEAD has been racily updated`
+/// (refs/files-backend.c:2735-2757), a `REF_TRANSACTION_ERROR_GENERIC` that
+/// dies: `update HEAD <A> <A>` refused over the branch it points at, followed by
+/// an update of that branch, ends there.
+fn split_conflicts(
+    repo: &gix::Repository,
+    edits: &[RefEdit],
+    batch_updates: bool,
+) -> Result<Vec<SplitConflict>> {
     let head_ref = match repo.try_find_reference("HEAD") {
         Ok(Some(head)) => match head.target() {
             gix::refs::TargetRef::Symbolic(target) => Some(target.as_bstr().to_string()),
@@ -2171,35 +2263,95 @@ fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Vec<SplitConfli
         },
         _ => None,
     };
-    let mut refnames: std::collections::HashSet<String> =
+    // `transaction->refnames`: `ref_transaction_add_update()` appends every update
+    // that is not `REF_LOG_ONLY` (refs.c:1356-1363), so the log-only `HEAD` update
+    // `split_head_update()` adds is not among them. `ref_transaction_prepare()`
+    // sorts it (refs.c:2708) and the splits then append to it unsorted, while
+    // every lookup and removal is the binary search of `get_entry_index()`
+    // (string-list.c:17-40) — so a name appended behind the sorted part can go
+    // unseen, which decides what the splits below run into.
+    let mut refnames: Vec<String> =
         edits.iter().filter(|e| !log_only(e)).map(|e| e.name.as_bstr().to_string()).collect();
-    // (root edit, name, deref, came through HEAD, split off)
-    let mut queue: std::collections::VecDeque<(usize, String, bool, bool, bool)> = edits
+    refnames.sort();
+    // `backend_data->ref_locks`: every name `lock_ref_for_update()` has locked.
+    let mut locked: std::collections::HashSet<String> = Default::default();
+    // One update in `transaction->updates`, as `lock_ref_for_update()` takes it.
+    struct Update {
+        /// The update the input queued, whose index the conflict is reported at.
+        at: usize,
+        name: String,
+        deref: bool,
+        /// `REF_UPDATE_VIA_HEAD`.
+        via_head: bool,
+        /// Split off the update the input queued.
+        via_split: bool,
+        /// `REF_LOG_VIA_SPLIT`: the log-only `HEAD` update `split_head_update()` adds.
+        head_split: bool,
+    }
+    let mut queue: std::collections::VecDeque<Update> = edits
         .iter()
         .enumerate()
         .filter(|(_, e)| !log_only(e))
-        .map(|(i, e)| (i, e.name.as_bstr().to_string(), e.deref, false, false))
+        .map(|(at, e)| Update {
+            at,
+            name: e.name.as_bstr().to_string(),
+            deref: e.deref,
+            via_head: false,
+            via_split: false,
+            head_split: false,
+        })
         .collect();
     let mut conflicts = Vec::new();
     let mut failed: std::collections::HashSet<usize> = Default::default();
-    while let Some((at, name, deref, via_head, via_split)) = queue.pop_front() {
+    while let Some(update) = queue.pop_front() {
+        // Without `--batch-updates` the first conflict fails `lock_ref_for_update()`
+        // and with it the whole `files_transaction_prepare()`.
+        if !batch_updates && !conflicts.is_empty() {
+            break;
+        }
+        let Update { at, name, deref, via_head, via_split, head_split } = update;
         if failed.contains(&at) {
             continue;
         }
-        let mut refuse = |message: String| {
+        let mut refuse = |message: String, refnames: &mut Vec<String>| {
             failed.insert(at);
+            // `string_list_remove()` (string-list.c:70-85).
+            if batch_updates {
+                if let Some(pos) = string_list_find(refnames, &name) {
+                    refnames.remove(pos);
+                }
+            }
             conflicts.push(SplitConflict { at, refname: name.clone(), message, on_split: via_split });
         };
+        if head_split {
+            // `lock = strmap_get(&backend_data->ref_locks, update->refname)`: a
+            // lock taken earlier is reused and `update->type` stays 0, so the
+            // `REF_ISSYMREF` test fails.
+            if !locked.insert(name.clone()) {
+                crate::git_fatal!("HEAD has been racily updated");
+            }
+            continue;
+        }
         if !via_head && head_ref.as_deref() == Some(name.as_str()) {
-            if refnames.contains("HEAD") {
-                refuse(format!(
-                    "multiple updates for 'HEAD' (including one via its referent '{name}') are not allowed"
-                ));
+            if string_list_find(&refnames, "HEAD").is_some() {
+                refuse(
+                    format!("multiple updates for 'HEAD' (including one via its referent '{name}') are not allowed"),
+                    &mut refnames,
+                );
                 continue;
             }
-            refnames.insert("HEAD".into());
+            queue.push_back(Update {
+                at,
+                name: "HEAD".into(),
+                deref: false,
+                via_head: false,
+                via_split: true,
+                head_split: true,
+            });
         }
-        if !deref {
+        // A reused lock leaves `update->type` 0, so the update is not split as a
+        // symref's would be.
+        if !locked.insert(name.clone()) || !deref {
             continue;
         }
         let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {
@@ -2209,16 +2361,39 @@ fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Vec<SplitConfli
             continue;
         };
         let referent = referent.as_bstr().to_string();
-        if refnames.contains(&referent) {
-            refuse(format!(
-                "multiple updates for '{referent}' (including one via symref '{name}') are not allowed"
-            ));
+        if string_list_find(&refnames, &referent).is_some() {
+            refuse(
+                format!("multiple updates for '{referent}' (including one via symref '{name}') are not allowed"),
+                &mut refnames,
+            );
             continue;
         }
-        refnames.insert(referent.clone());
-        queue.push_back((at, referent, true, name == "HEAD", true));
+        refnames.push(referent.clone());
+        queue.push_back(Update {
+            at,
+            name: referent,
+            deref: true,
+            via_head: name == "HEAD",
+            via_split: true,
+            head_split: false,
+        });
     }
-    conflicts
+    Ok(conflicts)
+}
+
+/// `get_entry_index()`'s exact match (string-list.c:17-40): a binary search that
+/// assumes `list` is sorted, whether it still is or not.
+fn string_list_find(list: &[String], name: &str) -> Option<usize> {
+    let (mut left, mut right) = (0, list.len());
+    while left < right {
+        let middle = left + (right - left) / 2;
+        match name.cmp(list[middle].as_str()) {
+            std::cmp::Ordering::Less => right = middle,
+            std::cmp::Ordering::Greater => left = middle + 1,
+            std::cmp::Ordering::Equal => return Some(middle),
+        }
+    }
+    None
 }
 
 /// Why `lock_ref_for_update()`'s old-value check refused an update: the message,
@@ -2426,6 +2601,7 @@ fn stage_oid_command(
     deref: bool,
     create_reflog: bool,
     msg: Option<&str>,
+    batch_updates: bool,
 ) -> Result<()> {
     let name = cur
         .parse_refname()?
@@ -2441,7 +2617,9 @@ fn stage_oid_command(
                 .parse_next_oid(repo, cmd, name, Slot::Old, false)?
                 .unwrap_or(Val::Missing);
             extra_input(cur, cmd, name)?;
-            check_new_object(repo, name, &new)?;
+            if invalid_new_value(repo, name, &new, Some(&old), batch_updates)? {
+                return Ok(());
+            }
             // A null `<old-oid>` must find no ref at all, as for `create`
             // (refs/files-backend.c:2647-2651).
             if let (Val::Zero, Val::Oid(id)) = (&old, &new) {
@@ -2459,7 +2637,9 @@ fn stage_oid_command(
                 crate::git_fatal!("create {name}: zero <new-oid>");
             };
             extra_input(cur, cmd, name)?;
-            check_new_object(repo, name, &new)?;
+            if invalid_new_value(repo, name, &new, None, batch_updates)? {
+                return Ok(());
+            }
             // git's `create` refuses outright when the ref is already there;
             // gitoxide's `MustNotExist` tolerates an existing ref that already
             // holds the value being written, so the check is made explicit.
@@ -2753,10 +2933,13 @@ fn stage_symref_command(
 /// The flush is the whole point: a caller driving `--stdin` over a pipe reads
 /// this line before it writes the next command, so leaving it in the buffer
 /// until exit hangs both ends.
+///
+/// It goes through the same stdio buffer as the `rejected` lines
+/// `print_rejected_refs()` wrote during the `commit`, so they come out ahead of
+/// `commit: ok`, as on C's single `stdout` stream.
 fn report_ok(command: &str) {
-    use std::io::Write as _;
-    println!("{command}: ok");
-    let _ = std::io::stdout().flush();
+    crate::cstdio::println!("{command}: ok");
+    crate::cstdio::flush();
 }
 
 /// git's `next` pointer walking one dispatched `--stdin` record.

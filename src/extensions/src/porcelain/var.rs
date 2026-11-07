@@ -50,10 +50,10 @@
 //!   directory of the running binary with `libexec/git-core`, `bin` or `git`
 //!   stripped off it. A compiled-in constant of *another* program is not readable,
 //!   so [`installation_prefix`] recovers it the two ways it is observable at
-//!   runtime, in order: ask the git installation where its own `etc/gitconfig`
-//!   lives (see [`installation_config`]), then fall back to `system_prefix()`'s
-//!   suffix-stripping applied to this binary's own location, which is the right
-//!   answer once zvcs is itself installed under a prefix. `gix_path::env::system_prefix()`
+//!   runtime, in order: ask the git installation for its own `GIT_ATTR_SYSTEM`,
+//!   or where its `etc/gitconfig` lives (see [`installation_etc`]), then fall
+//!   back to `system_prefix()`'s suffix-stripping applied to this binary's own
+//!   location, which is the right answer once zvcs is itself installed under a prefix. `gix_path::env::system_prefix()`
 //!   — a flat `/` off Windows — is the last resort, correct only for a git
 //!   installed under `/`. The probe deliberately ignores `GIT_CONFIG_SYSTEM` and
 //!   `GIT_CONFIG_NOSYSTEM`, which relocate or switch off the system config *scope*
@@ -346,9 +346,9 @@ impl Installation {
 ///
 /// Ordered by how directly each source observes the installation:
 ///
-/// 1. **The installation's own `gitconfig`** ([`installation_config`]). This is
-///    the only source that survives an absolute `sysconfdir`, where the config
-///    and attributes files sit outside the prefix entirely.
+/// 1. **The installation's own answer** ([`installation_etc`]). This is the only
+///    source that survives an absolute `sysconfdir`, where the config and
+///    attributes files sit outside the prefix entirely.
 /// 2. **This binary's location**, put through `system_prefix()`'s suffix chain —
 ///    `libexec/git-core`, then `bin`, then `git` (see [`strip_path_suffix`]).
 ///    That is exactly what a `RUNTIME_PREFIX` build of git computes, and it is
@@ -359,10 +359,8 @@ impl Installation {
 ///    `FALLBACK_RUNTIME_PREFIX` role, and correct only for a git installed
 ///    under `/`.
 fn installation_prefix() -> Installation {
-    if let Some(cfg) = installation_config() {
-        if let Some(etc) = cfg.parent() {
-            return Installation::Etc(etc.to_owned());
-        }
+    if let Some(etc) = installation_etc() {
+        return Installation::Etc(etc.to_owned());
     }
     if let Some(prefix) = prefix_from_executable() {
         return Installation::Prefix(prefix);
@@ -402,15 +400,28 @@ fn prefix_from_executable() -> Option<std::path::PathBuf> {
         .find_map(|suffix| strip_path_suffix(dir, suffix))
 }
 
-/// The `gitconfig` shipped with the git installation, as the installation reports it.
+/// The `sysconfdir` of the git installation, as the installation reports it.
 ///
-/// The probe is `gix_path::env::installation_config_unsuppressed()`'s, argv for
-/// argv: `git config -lz --show-origin --name-only` run from `/` with the
+/// Each `git` is asked first for `git var GIT_ATTR_SYSTEM`, which prints
+/// `git_attr_system_file()`, that is `system_path(ETC_GITATTRIBUTES)` (attr.c:874-880):
+/// the compiled-in path itself, whatever the prefix, `sysconfdir` or `RUNTIME_PREFIX`
+/// of that build. Its directory is the `sysconfdir` `ETC_GITCONFIG` shares
+/// (Makefile:651-652). A git whose `var` does not know the variable is asked where
+/// its `gitconfig` lives instead. Asking for the variable first matters twice: git's
+/// own `make install` writes no `etc/gitconfig`, so the `gitconfig` question alone
+/// passed such an installation over for the next `git` on `PATH`; and an
+/// installation whose highest-scoped file is not its system config (Xcode's git
+/// reads `share/git-core/gitconfig` ahead of `/etc/gitconfig`) answered it with the
+/// wrong directory.
+///
+/// The `gitconfig` probe is `gix_path::env::installation_config_unsuppressed()`'s,
+/// argv for argv: `git config -lz --show-origin --name-only` run from `/` with the
 /// repository- and scope-selecting variables neutralised, keeping the first
 /// `file:` origin — the highest-scoped configuration file, which is the
 /// installation's own. `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are removed
 /// because they relocate or switch off the system *scope* without moving the
-/// installation, and this asks where git is installed.
+/// installation, and this asks where git is installed; `GIT_ATTR_NOSYSTEM` is
+/// removed for the same reason.
 ///
 /// It differs in the one respect that matters for a binary that *is* `git` on this
 /// machine's `PATH`: rather than probing whichever `git` `PATH` resolves first and
@@ -422,9 +433,9 @@ fn prefix_from_executable() -> Option<std::path::PathBuf> {
 /// second installation) and what stops the probe from spawning itself.
 ///
 /// Probed once per process; `git var` is the only caller and asks at most twice.
-fn installation_config() -> Option<&'static Path> {
-    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
+fn installation_etc() -> Option<&'static Path> {
+    static ETC: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    ETC.get_or_init(|| {
         let me = crate::hosted::git_exe().and_then(|p| p.canonicalize()).ok();
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
@@ -432,21 +443,45 @@ fn installation_config() -> Option<&'static Path> {
             .map(|dir| dir.join(gix::path::env::exe_invocation()))
             .filter(|git| git.is_file())
             .filter(|git| git.canonicalize().ok() != me)
-            .find_map(|git| ask_installation_config(&git))
+            .find_map(|git| {
+                ask_attr_system(&git)
+                    .or_else(|| ask_installation_config(&git))
+                    .and_then(|file| file.parent().map(Path::to_owned))
+            })
     })
     .as_deref()
 }
 
+/// Ask one `git` binary for its `GIT_ATTR_SYSTEM`: one absolute path and a newline
+/// (builtin/var.c:63-71, :244), or nothing from a git that does not know it.
+fn ask_attr_system(git: &Path) -> Option<std::path::PathBuf> {
+    let out = probe(git, &["var", "GIT_ATTR_SYSTEM"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = gix::path::try_from_byte_slice(out.stdout.strip_suffix(b"\n")?).ok()?;
+    path.is_absolute().then(|| path.to_owned())
+}
+
 /// Ask one `git` binary for the highest-scoped configuration file it can see.
 fn ask_installation_config(git: &Path) -> Option<std::path::PathBuf> {
-    let out = std::process::Command::new(git)
-        .args(["config", "-lz", "--show-origin", "--name-only"])
+    let out = probe(git, &["config", "-lz", "--show-origin", "--name-only"]).output().ok()?;
+    let first = out.stdout.strip_prefix(b"file:")?;
+    let end = first.iter().position(|&b| b == 0)?;
+    gix::path::try_from_byte_slice(&first[..end]).ok().map(Path::to_owned)
+}
+
+/// `git <args>` in the neutral environment both installation probes run in.
+fn probe(git: &Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(git);
+    cmd.args(args)
         // Run from the root, as gitoxide does: a deleted or deeply nested cwd
         // costs the child a discovery walk for an answer that does not depend on it.
         .current_dir(Path::new("/"))
         .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_SYSTEM")
         .env_remove("GIT_CONFIG_NOSYSTEM")
+        .env_remove("GIT_ATTR_NOSYSTEM")
         .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
@@ -454,12 +489,8 @@ fn ask_installation_config(git: &Path) -> Option<std::path::PathBuf> {
         .env("GIT_DIR", "/dev/null")
         .env("GIT_WORK_TREE", "/dev/null")
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let first = out.stdout.strip_prefix(b"file:")?;
-    let end = first.iter().position(|&b| b == 0)?;
-    gix::path::try_from_byte_slice(&first[..end]).ok().map(Path::to_owned)
+        .stderr(std::process::Stdio::null());
+    cmd
 }
 
 /// `GIT_ATTR_GLOBAL` — `core.attributesFile` if set, else the XDG attributes path.

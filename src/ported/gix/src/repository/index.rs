@@ -259,7 +259,11 @@ impl crate::Repository {
         }
         index.remove_entries(|_, _, e| e.mode == Mode::DIR);
         for (dir, tree_id) in &sparse {
-            let subtree = self.index_from_tree(tree_id)?;
+            // `read_tree_at()`'s result is not looked at (sparse-index.c:438-439): a tree that
+            // cannot be read leaves its directory out, and the expansion goes on.
+            let Ok(subtree) = self.index_from_tree(tree_id) else {
+                continue;
+            };
             for e in subtree.entries() {
                 let mut path = dir.clone();
                 path.extend_from_slice(e.path(&subtree));

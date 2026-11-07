@@ -954,6 +954,32 @@ impl State {
     pub fn fs_monitor(&self) -> Option<&extension::FsMonitor> {
         self.fs_monitor.as_ref()
     }
+    /// git's `add_fsmonitor()` (fsmonitor.c:759-781) with fsmonitor disabled: when no token
+    /// is held yet, take `token` (`initialize_fsmonitor_last_update()`'s `getnanotime()`,
+    /// fsmonitor.c:751-757) and clear `CE_FSMONITOR_VALID` on every entry, so the next write
+    /// carries an `FSMN` extension marking each entry dirty. `refresh_fsmonitor()` returns at
+    /// once for a disabled mode (fsmonitor.c:527-529), and the untracked cache's
+    /// `use_fsmonitor` is in-core only. Returns whether anything changed, git's
+    /// `FSMONITOR_CHANGED`.
+    pub fn add_fsmonitor(&mut self, token: bstr::BString) -> bool {
+        if self.fsmonitor_last_update.is_some() {
+            return false;
+        }
+        self.fsmonitor_last_update = Some(token);
+        for entry in &mut self.entries {
+            entry.flags.remove(entry::Flags::FSMONITOR_VALID);
+        }
+        true
+    }
+    /// git's `remove_fsmonitor()` (fsmonitor.c:783-790): drop the token, so the next write
+    /// carries no `FSMN`. Returns whether one was held, git's `FSMONITOR_CHANGED`.
+    pub fn remove_fsmonitor(&mut self) -> bool {
+        self.fsmonitor_last_update.take().is_some()
+    }
+    /// The `FSMN` token the next write carries, git's `istate->fsmonitor_last_update`.
+    pub fn fsmonitor_last_update(&self) -> Option<&BStr> {
+        self.fsmonitor_last_update.as_ref().map(|t| t.as_bstr())
+    }
     /// Return `true` if the end-of-index extension was present when decoding this index.
     pub fn had_end_of_index_marker(&self) -> bool {
         self.end_of_index_at_decode_time

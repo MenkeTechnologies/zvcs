@@ -8559,6 +8559,11 @@ fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> 
         return None;
     }
     i += 1;
+    // Extra linear whitespace before the timestamp is allowed, a newline is not
+    // (fsck.c:918-928).
+    while matches!(ident.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
     if ident.get(i) == Some(&b'0') && ident.get(i + 1) != Some(&b' ') {
         report(out, &ZERO_PADDED_DATE, "invalid author/committer line - zero-padded date");
         return None;

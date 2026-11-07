@@ -85,10 +85,11 @@
 //!
 //! `splitIndex.maxPercentChange` is honoured (`too_many_not_shared_entries()`,
 //! read-cache.c:3281): once too much of the index lives outside the shared half, the
-//! next write folds it all back into a new one. `splitIndex.sharedIndexExpire`
-//! remains unimplemented — `clean_shared_index_files()` (read-cache.c:3212) deletes
-//! only shared indexes older than it, which is two weeks by default, so nothing this
-//! port has just superseded would qualify.
+//! next write folds it all back into a new one. Writing a new shared index deletes the
+//! other `sharedindex.*` files older than `splitIndex.sharedIndexExpire` (two weeks by
+//! default), `clean_shared_index_files()` (read-cache.c:3226-3253), and every read of a
+//! split index freshens the shared half it names (read-cache.c:2421), so one in use is
+//! never old enough.
 //!
 //! `--unresolve` restores the conflict stages recorded in the index's `REUC`
 //! extension exactly as git does — dropping the stage-0 entry, re-adding stages
@@ -97,11 +98,11 @@
 //! so a conflict resolved through this port stays recoverable by stock git's
 //! `git checkout --merge`.
 //!
-//! Accepted but not represented on disk, because the vendored `gix_index` does
-//! not write the extension. Each is invisible to `git status` / `git ls-files`,
-//! so behaviour observable through git itself is unaffected, but the index bytes
-//! differ from stock git's:
-//!   * `--fsmonitor`: the `FSMN` extension is not writable through the vendored crates.
+//! `--fsmonitor` writes the `FSMN` extension as `add_fsmonitor()` leaves it with
+//! fsmonitor disabled (fsmonitor.c:759-781): a `getnanotime()` token and every
+//! entry dirty. The fsmonitor hook and daemon are not ported, so a configured
+//! `core.fsmonitor` is not queried, and the next index write by any command
+//! drops the extension again, as `tweak_fsmonitor()` does when it is disabled.
 //!
 //! Content filters run where git runs them. `index_mem()` (read-cache.c:2295)
 //! hands every blob it is about to hash to `convert_to_git()`, so a worktree file
@@ -516,6 +517,10 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         let f = repo.missing_index();
         (f, 0)
     };
+    // `post_read_index_from()`'s `tweak_fsmonitor()` (read-cache.c:1967) drops an `FSMN` the
+    // index was read with, fsmonitor being disabled here, and `remove_fsmonitor()` marks that
+    // `FSMONITOR_CHANGED` (fsmonitor.c:783-790), so the index is written back without it.
+    let fsmonitor_dropped = index.fs_monitor().is_some();
     let stat_opts = repo.stat_options()?;
     let trust_executable_bit = repo
         .config_snapshot()
@@ -533,7 +538,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         index,
         workdir,
         prefix,
-        dirty: false,
+        dirty: fsmonitor_dropped,
         something_changed: false,
         has_errors: false,
         force_write: false,
@@ -611,7 +616,16 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
                 } else {
                     gix::index::file::split::Request::Keep
                 };
-                crate::index_racy::write_locked(&ctx.repo, &mut ctx.index, write_options, request)?;
+                if let Err(err) = crate::index_racy::write_locked(&ctx.repo, &mut ctx.index, write_options, request) {
+                    // `do_write_index()` dies on its own over a split index that is also sparse
+                    // (read-cache.c:2999-3000), after the new shared half is in place.
+                    let err = anyhow::Error::from(err);
+                    const SPARSE_SPLIT: &str = "cannot write split index for a sparse index";
+                    if err.chain().any(|cause| cause.to_string() == SPARSE_SPLIT) {
+                        crate::git_fatal!("{SPARSE_SPLIT}");
+                    }
+                    return Err(err);
+                }
                 // `core.fsync=index` (or an aggregate containing it) hardens the
                 // index git has just rewritten; the platform default does not.
                 fsync.harden_path(crate::config::FsyncComponent::Index, ctx.index.path());
@@ -909,33 +923,24 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     continue;
                 }
 
+                // `resolve_undo_clear_index()` returns early when there is no
+                // extension and only otherwise sets `RESOLVE_UNDO_CHANGED`
+                // (resolve-undo.c:113-122), so with nothing to forget no index
+                // is written — not even into a repository that has none yet.
                 "clear-resolve-undo" => {
-                    ctx.index.remove_resolve_undo();
-                    ctx.dirty = true;
+                    if ctx.index.remove_resolve_undo().is_some() {
+                        ctx.dirty = true;
+                    }
                 }
 
                 // `cmd_update_index`'s `OPT_BOOL(0, "split-index", &split_index, ...)`
                 // is a tri-state: unset leaves the index's shape alone, `1` splits
                 // it, `0` un-splits it (builtin/update-index.c:1177-1195). Reading a
                 // split index already dissolved its `link` extension into the
-                // entries, so "un-split" is simply the ordinary full write.
-                "split-index" => {
-                    ctx.split_index = Some(true);
-                    ctx.dirty = true;
-                }
-                "no-split-index" => {
-                    ctx.split_index = Some(false);
-                    // `if (the_repository->index->split_index) { ... }`
-                    // (builtin/update-index.c:1188-1194): un-splitting an index that
-                    // was never split changes nothing, and git does not rewrite it.
-                    // `remove_split_index()` is what sets `SOMETHING_CHANGED`
-                    // (split-index.c:491), so this is one of the three ways an index
-                    // comes out whole.
-                    if ctx.index.had_link() {
-                        ctx.dirty = true;
-                        ctx.something_changed = true;
-                    }
-                }
+                // entries, so "un-split" is simply the ordinary full write. The last
+                // spelling wins, and only its final value is acted on, after parsing.
+                "split-index" => ctx.split_index = Some(true),
+                "no-split-index" => ctx.split_index = Some(false),
                 // git's `fsmonitor` is a tri-state that only the tail acts on, so
                 // the warning fires once however many times the flag was given.
                 "fsmonitor" => fsmonitor = Some(true),
@@ -1038,10 +1043,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         }
     }
 
-    // `report()`: `printf` under `--verbose`, silence otherwise. The `FSMN`
-    // extension is not writable through the vendored crates (see the module
-    // documentation), but the line git prints about it is, and its absence is a
-    // stdout difference on every verbose invocation.
+    // `report()`: `printf` under `--verbose`, silence otherwise.
     let verbose = ctx.verbose;
     let report = |line: &str| {
         if verbose {
@@ -1112,6 +1114,20 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         }
         _ => {}
     }
+    match ctx.split_index {
+        // `add_split_index()` marks `SPLIT_INDEX_ORDERED` whether or not the index
+        // was split already (builtin/update-index.c:1229-1238, split-index.c:452-458).
+        Some(true) => ctx.dirty = true,
+        // `remove_split_index()` (split-index.c:460-495) acts only on an index that
+        // was split: un-splitting one that never was changes nothing, and git does
+        // not rewrite it. It is what sets `SOMETHING_CHANGED` (split-index.c:491),
+        // so this is one of the three ways an index comes out whole.
+        Some(false) if ctx.index.had_link() => {
+            ctx.dirty = true;
+            ctx.something_changed = true;
+        }
+        _ => {}
+    }
 
     match fsmonitor {
         Some(true) => {
@@ -1120,6 +1136,14 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                     "warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor"
                 );
             }
+            // `add_fsmonitor()` (fsmonitor.c:759-781): a token from `getnanotime()`
+            // (fsmonitor.c:751-757), every entry left fsmonitor-dirty, `FSMONITOR_CHANGED`.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            if ctx.index.add_fsmonitor(nanos.to_string().into()) {
+                ctx.dirty = true;
+            }
             report("fsmonitor enabled");
         }
         Some(false) => {
@@ -1127,6 +1151,9 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 eprintln!(
                     "warning: core.fsmonitor is set; remove it if you really want to disable fsmonitor"
                 );
+            }
+            if ctx.index.remove_fsmonitor() {
+                ctx.dirty = true;
             }
             report("fsmonitor disabled");
         }
@@ -1473,6 +1500,7 @@ fn index_info_add(
         e.flags = want_flags;
         ctx.dirty = true;
             ctx.invalidate(path);
+        note_sparse_dir_entry(ctx, mode);
         return Ok(true);
     }
 
@@ -1499,6 +1527,7 @@ fn index_info_add(
 
     ctx.index
         .dangerously_push_entry(stat, oid, want_flags, mode, path);
+    note_sparse_dir_entry(ctx, mode);
     ctx.index.sort_entries();
     ctx.dirty = true;
     ctx.invalidate(path);
@@ -2082,6 +2111,7 @@ fn add_index_entry(
             e.flags = want_flags;
             same
         };
+        note_sparse_dir_entry(ctx, mode);
         if !unchanged {
             ctx.dirty = true;
             ctx.invalidate(path);
@@ -2143,10 +2173,22 @@ fn add_index_entry(
 
     ctx.index
         .dangerously_push_entry(stat, id, want_flags, mode, path);
+    note_sparse_dir_entry(ctx, mode);
     ctx.index.sort_entries();
     ctx.dirty = true;
     ctx.invalidate(path);
     Ok(true)
+}
+
+/// `set_index_entry()` (read-cache.c:134-137): placing a sparse-directory entry
+/// (`S_ISSPARSEDIR`, a mode of exactly `S_IFDIR`) marks the whole index
+/// `INDEX_COLLAPSED`, so the write carries the `sdir` extension
+/// (read-cache.c:3061-3066) even outside a sparse checkout, as
+/// `--cacheinfo 040000,<tree>,<path>` or an `--index-info` tree line leaves it.
+fn note_sparse_dir_entry(ctx: &mut Ctx, mode: Mode) {
+    if mode == Mode::DIR {
+        ctx.index.set_collapsed();
+    }
 }
 
 /// `check_file_directory_conflict()` (read-cache.c:1211) for an entry `path` at
@@ -3039,11 +3081,13 @@ fn resolve_in_workdir(ctx: &Ctx, workdir: &Path, raw: &BStr) -> Result<std::resu
         return Ok(Err(Die));
     };
 
-    let mut out = rel.to_string_lossy().replace('\\', "/");
+    // `prefix_path()` keeps every byte of the name: a `\` is an ordinary path
+    // character outside Windows, and a name need not be UTF-8.
+    let mut out: BString = gix::path::to_unix_separators_on_windows(gix::path::into_bstr(rel)).into_owned();
     if raw.last() == Some(&b'/') && !out.is_empty() {
-        out.push('/');
+        out.push(b'/');
     }
-    Ok(Ok(BString::from(out.into_bytes())))
+    Ok(Ok(out))
 }
 
 /// A worktree path argument is raw bytes; convert to an `OsString` preserving

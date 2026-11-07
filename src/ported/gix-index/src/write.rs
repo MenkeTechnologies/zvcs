@@ -36,14 +36,15 @@ impl Extensions {
             } => match signature {
                 extension::tree::SIGNATURE => tree_cache,
                 extension::end_of_index_entry::SIGNATURE => end_of_index_entry,
-                // `strip_extensions` is the only gate git puts on `link`, `REUC` and
-                // `UNTR` (read-cache.c:2197, :2222 and :3022) — none has a knob of its
-                // own, and each describes state that exists nowhere else in the file.
-                // `Given` is this crate's "not stripped", so all three are always
+                // `strip_extensions` is the only gate git puts on `link`, `REUC`, `UNTR`
+                // and `FSMN` (read-cache.c:2197, :2222, :3022 and :3049) — none has a knob
+                // of its own, and each describes state that exists nowhere else in the file.
+                // `Given` is this crate's "not stripped", so all four are always
                 // written when the state carries them; only [`Extensions::None`] drops them.
                 extension::link::SIGNATURE
                 | extension::resolve_undo::SIGNATURE
-                | extension::untracked_cache::SIGNATURE => &true,
+                | extension::untracked_cache::SIGNATURE
+                | extension::fs_monitor::SIGNATURE => &true,
                 _ => &false,
             }
             .then(|| signature),
@@ -202,7 +203,14 @@ impl State {
                     .and_then(|signature| {
                         self.link()
                             .filter(|link| !link.shared_index_checksum.is_null())
-                            .map(|link| extension::link::write_to(link, write).map(|()| signature))
+                            .map(|link| {
+                                // `if (istate->sparse_index) die(_("cannot write split index for a sparse
+                                // index"));` (read-cache.c:2999-3000): the caller dies with this text.
+                                if self.is_sparse() {
+                                    return Err(std::io::Error::other("cannot write split index for a sparse index"));
+                                }
+                                extension::link::write_to(link, write).map(|()| signature)
+                            })
                     })
             },
             &|write| {
@@ -233,6 +241,40 @@ impl State {
                         self.untracked().map(|untracked| {
                             let mut body = Vec::new();
                             untracked.write_to(&mut body, self.object_hash);
+                            write.write_all(&signature)?;
+                            write.write_all(&(body.len() as u32).to_be_bytes())?;
+                            write.write_all(&body).map(|()| signature)
+                        })
+                    })
+            },
+            // `if (write_extensions & WRITE_FSMONITOR_EXTENSION && istate->fsmonitor_last_update)`
+            // (read-cache.c:3049-3059), after `UNTR` and before `sdir`: `write_fsmonitor_extension()`
+            // (fsmonitor.c:121-154) writes version 2, the NUL-terminated token, and the EWAH size
+            // and bitmap that `fill_fsmonitor_bitmap()` (fsmonitor.c:109-119, called from
+            // `write_locked_index()`, read-cache.c:3339-3340) built: one bit per written entry,
+            // `CE_REMOVE` ones skipped, set where `CE_FSMONITOR_VALID` is clear.
+            &|write| {
+                extensions
+                    .should_write(extension::fs_monitor::SIGNATURE)
+                    .and_then(|signature| {
+                        self.fsmonitor_last_update.as_ref().map(|token| {
+                            let mut dirty = gix_bitmap::ewah::Builder::new();
+                            let mut skipped = 0;
+                            for (i, entry) in self.entries().iter().enumerate() {
+                                if entry.flags.contains(entry::Flags::REMOVE) {
+                                    skipped += 1;
+                                } else if !entry.flags.contains(entry::Flags::FSMONITOR_VALID) {
+                                    dirty.set(i - skipped);
+                                }
+                            }
+                            let mut bitmap = Vec::new();
+                            dirty.write_to(&mut bitmap);
+                            let mut body = Vec::new();
+                            body.extend_from_slice(&2u32.to_be_bytes());
+                            body.extend_from_slice(token);
+                            body.push(0);
+                            body.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
+                            body.extend_from_slice(&bitmap);
                             write.write_all(&signature)?;
                             write.write_all(&(body.len() as u32).to_be_bytes())?;
                             write.write_all(&body).map(|()| signature)

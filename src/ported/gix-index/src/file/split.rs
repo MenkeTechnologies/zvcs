@@ -113,7 +113,7 @@ impl File {
         max_percent_split_change: Option<u32>,
         options: write::Options,
     ) -> Result<Option<gix_hash::ObjectId>, Error> {
-        self.write_locked_holding(None, git_dir, request, max_percent_split_change, options)
+        self.write_locked_holding(None, git_dir, request, max_percent_split_change, options, &mut |_| Ok(()))
     }
 
     /// [`write_locked()`](File::write_locked()) through `held`, the lock on this index's
@@ -121,6 +121,10 @@ impl File {
     /// `write_locked_index(istate, lock, …)` with a `lock` from `repo_hold_locked_index()`.
     /// `None` acquires the lock at write time, as [`write_locked()`](File::write_locked())
     /// does. The shared half of a split index has a lock of its own either way.
+    ///
+    /// `after_new_shared` runs with the id of a shared index the moment it is in place and
+    /// before the split half is written, where `write_shared_index()` runs
+    /// `clean_shared_index_files()` (read-cache.c:3286); an error from it abandons the write.
     pub fn write_locked_holding(
         &mut self,
         held: Option<gix_lock::File>,
@@ -128,6 +132,7 @@ impl File {
         request: Request,
         max_percent_split_change: Option<u32>,
         options: write::Options,
+        after_new_shared: &mut dyn FnMut(gix_hash::ObjectId) -> std::io::Result<()>,
     ) -> Result<Option<gix_hash::ObjectId>, Error> {
         // Against the full entry list, before `prepare_to_write_split_index()` narrows it to
         // the split half below.
@@ -151,7 +156,14 @@ impl File {
             || too_many_not_shared_entries(self, max_percent_split_change);
 
         let shared_id = if new_shared {
-            let id = write_shared(self, git_dir)?;
+            // The shared half is `si->base`, an `index_state` of its own whose `sparse_index`
+            // nothing ever sets, so it is written without `sdir` (read-cache.c:3061-3066)
+            // even when this index is collapsed.
+            let sparse = std::mem::replace(&mut self.state.is_sparse, false);
+            let written = write_shared(self, git_dir);
+            self.state.is_sparse = sparse;
+            let id = written?;
+            after_new_shared(id)?;
             // `move_cache_to_base_index()` (split-index.c:80-121).
             self.state.set_split_index(Some(SplitIndex::from_written_shared_index(
                 id,
@@ -180,6 +192,14 @@ impl File {
         let result = self.write_reconciled_holding(held, options);
         finish_writing_split_index(self, saved);
         result?;
+        // "Freshen the shared index only if the split-index was written" (read-cache.c:3394-3400):
+        // a split half written against an existing base touches that base. git warns
+        // "could not freshen shared index" when the `utime()` fails; this crate does not print.
+        if shared_id.is_none() {
+            if let Some(base) = self.state.split_index().map(|si| si.base_checksum).filter(|id| !id.is_null()) {
+                let _ = crate::extension::link::freshen(&shared_index_path(git_dir, base));
+            }
+        }
         Ok(shared_id)
     }
 
@@ -374,13 +394,12 @@ pub fn shared_index_path(git_dir: &Path, id: gix_hash::ObjectId) -> PathBuf {
 /// alone verified. `skip_hash` therefore applies only to the split half, which is the one
 /// git's own `write_shared_index()` hashes unconditionally to get a name for.
 ///
-/// ### Older shared indexes are left alone
+/// ### Older shared indexes are the caller's
 ///
-/// `clean_shared_index_files()` (read-cache.c:3212) unlinks the other `sharedindex.*`
-/// files, but only those `should_delete_shared_index()` finds older than
-/// `splitIndex.sharedIndexExpire`, which defaults to two weeks. A shared index this port
-/// has just superseded is by definition newer than that, so the loop deletes nothing and
-/// is not run.
+/// `clean_shared_index_files()` (read-cache.c:3226-3253) then unlinks the other
+/// `sharedindex.*` files that `should_delete_shared_index()` finds older than
+/// `splitIndex.sharedIndexExpire`. That needs the configuration, which this crate does not
+/// read, so the caller runs it for the id [`File::write_locked()`] returns.
 fn write_shared(file: &File, git_dir: &Path) -> Result<gix_hash::ObjectId, Error> {
     let mut buf = Vec::new();
     let (_version, id) = file.write_to(

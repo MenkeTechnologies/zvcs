@@ -127,7 +127,11 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
             "--prefix" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
-                    return Ok(usage_error("option `prefix' requires a value"));
+                    // `get_arg()`'s `error()` is a plain `PARSE_OPT_ERROR`, which
+                    // `parse_options()` turns into `exit(129)` without the usage
+                    // block (parse-options.c:60, :1210-1211).
+                    eprintln!("error: option `prefix' requires a value");
+                    return Ok(ExitCode::from(129));
                 };
                 prefix = Some(v.clone());
             }
@@ -915,7 +919,7 @@ pub(super) fn update_cache_tree_quietly(repo: &gix::Repository, index: &mut gix:
 /// the same function's second pass (cache-tree.c:240-255), with the same cap. The
 /// `invalid object` line is `update_one()`'s (cache-tree.c:450-451) and is emitted
 /// once, because git returns from the deepest level as soon as it prints it.
-pub(super) fn report_tree_build_failure(err: &cache_tree::Error) {
+pub(crate) fn report_tree_build_failure(err: &cache_tree::Error) {
     match err {
         cache_tree::Error::Unmerged(entries) => {
             for (n, (path, id)) in entries.iter().enumerate() {

@@ -101,6 +101,13 @@ fn shared_index_candidates(
     out
 }
 
+/// `check_and_freshen_file(fn, 1)`'s `utime(fn, NULL)`: set the access and modification
+/// times to now, reporting whether that worked.
+pub(crate) fn freshen(path: &std::path::Path) -> bool {
+    let now = filetime::FileTime::now();
+    filetime::set_file_times(path, now, now).is_ok()
+}
+
 impl Link {
     pub(crate) fn dissolve_into(
         self,
@@ -120,6 +127,11 @@ impl Link {
         for candidate in &candidates {
             match crate::File::at(candidate, object_hash, skip_hash, options) {
                 Ok(file) => {
+                    // `freshen_shared_index(base_path, 0)` (read-cache.c:2421): every read
+                    // touches the shared index, `check_and_freshen_file()`'s `utime(fn, NULL)`
+                    // (read-cache.c:2356-2360), so one in use never ages past
+                    // `splitIndex.sharedIndexExpire`. A failure is not reported.
+                    freshen(candidate);
                     shared_index = Some(file);
                     break;
                 }

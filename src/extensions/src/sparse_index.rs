@@ -299,26 +299,67 @@ pub fn retarget_virtual_sparse_dirs(repo: &gix::Repository, index: &mut gix::ind
 }
 
 /// `ensure_full_index()` — `expand_index(istate, NULL)` (sparse-index.c:330-474): an index
-/// that is not `INDEX_EXPANDED` gives the advice (once), has every sparse directory replaced
-/// by its entries, is marked `INDEX_EXPANDED`, and gets its cache-tree recomputed from scratch
-/// (`cache_tree_free()` + `cache_tree_update(istate, 0)`, sparse-index.c:469-470).
+/// that is not `INDEX_EXPANDED` has its cache-tree rebuilt over the collapsed entries, gives
+/// the advice (once), has every sparse directory replaced by its entries, is marked
+/// `INDEX_EXPANDED`, and gets its cache-tree recomputed from scratch (`cache_tree_free()` +
+/// `cache_tree_update(istate, 0)`, sparse-index.c:469-470).
+///
+/// Both cache-tree updates run without `WRITE_TREE_SILENT`, so each prints `verify_cache()`'s
+/// `unmerged` lines or `update_one()`'s `invalid object` line when it fails: a conflicted
+/// sparse index reports its unmerged entries twice on every expansion.
 ///
 /// Returns whether the index was sparse before.
 pub fn ensure_full_index(repo: &gix::Repository, index: &mut gix::index::State) -> bool {
     if !index.is_sparse() {
         return false;
     }
+    let odb = RepoOdb { repo };
+    // A NULL pattern list fails `if (pl && !pl->use_cone_patterns)`, so the else branch runs:
+    // `cache_tree_free()` and `cache_tree_update(istate, 0)` over the index as it is still
+    // collapsed (sparse-index.c:351-367), writing the trees it names. This port holds the
+    // directories expanded, so the update runs over a copy with each one put back as the
+    // entry it was read as: git expands before it changes anything below a sparse directory,
+    // so that entry is what it held at this point.
+    let mut collapsed = index.clone();
+    for dir in index.virtual_sparse_dirs() {
+        collapsed.remove_entries(|_, path, _| path.starts_with(dir.path.as_slice()));
+        collapsed.dangerously_push_entry(
+            gix::index::entry::Stat::default(),
+            dir.id,
+            gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
+            gix::index::entry::Mode::DIR,
+            dir.path.as_bstr(),
+        );
+    }
+    collapsed.sort_entries();
+    collapsed.remove_tree();
+    if let Err(err) = collapsed.cache_tree_update(&odb, cache_tree::Options::default()) {
+        crate::porcelain::write_tree::report_tree_build_failure(&err);
+    }
     if GIVE_ADVICE_ON_EXPANSION.swap(false, Ordering::Relaxed) {
         crate::advice::Advice::SparseIndexExpanded.advise_in(repo, ADVICE_MSG);
+    }
+    // Each sparse directory still collapsed is walked into: one that is not `CE_SKIP_WORKTREE`
+    // is warned about first (sparse-index.c:424-426), and a tree that cannot be read is
+    // `repo_parse_tree()`'s error inside `read_tree_at()` (tree.c:29-30, :195-199), its entry
+    // dropped with nothing put in its place.
+    for e in index.entries().iter().filter(|e| e.mode == gix::index::entry::Mode::DIR) {
+        if !e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+            eprintln!("warning: index entry is a directory, but not sparse ({:08x})", e.flags.bits());
+        }
+        if repo.find_tree(e.id).is_err() {
+            eprintln!("error: Could not read {}", e.id);
+        }
     }
     // Directories still collapsed (an index read before the read hook existed, or one a
     // conversion just collapsed) are expanded from their trees; ones already expanded on
     // read are simply forgotten.
     let _ = repo.ensure_full_index(index);
     index.forget_virtual_sparse_dirs();
-    let odb = RepoOdb { repo };
     index.remove_tree();
-    let _ = index.cache_tree_update(&odb, cache_tree::Options::default());
+    if let Err(err) = index.cache_tree_update(&odb, cache_tree::Options::default()) {
+        crate::porcelain::write_tree::report_tree_build_failure(&err);
+    }
     true
 }
 

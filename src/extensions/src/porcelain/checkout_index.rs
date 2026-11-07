@@ -899,7 +899,23 @@ fn create_symlink(path: &Path, target: &[u8]) -> std::io::Result<()> {
     create_file(path, false, target)
 }
 
-/// git's `git_mkstemp_mode()` on a `XXXXXX` template: replace the six trailing
+#[cfg(unix)]
+fn create_owner_only_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    create_file(path, false, data)
+}
+
+/// libc's `mkstemp()` on a `XXXXXX` template: replace the six trailing
 /// `X`s with characters from git's alphabet until an exclusive create succeeds.
 /// The file is created in `dir` and its bare name is returned.
 fn create_tempfile(dir: &Path, template: &str, data: &[u8]) -> std::io::Result<String> {
@@ -917,7 +933,9 @@ fn create_tempfile(dir: &Path, template: &str, data: &[u8]) -> std::io::Result<S
             seed ^= seed << 17;
             name.push(LETTERS[(seed % LETTERS.len() as u64) as usize] as char);
         }
-        match create_file(&dir.join(&name), false, data) {
+        // `open_output_fd()` makes the file with libc's `mkstemp()` (entry.c:109-112), which
+        // creates it `0600`: a temporary checkout is readable by its owner alone.
+        match create_owner_only_file(&dir.join(&name), data) {
             Ok(()) => return Ok(name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),

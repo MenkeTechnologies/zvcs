@@ -809,7 +809,7 @@ mod shell;
 mod shortlog;
 /// git's history simplification (`revision.c`); not a subcommand.
 mod simplify;
-mod convert_to_git;
+pub(crate) mod convert_to_git;
 mod pretty_formats;
 mod pretty_pad;
 mod show;

@@ -15,7 +15,7 @@ use anyhow::Result;
 /// This is `gix::filter::Pipeline` taken apart with `into_parts()`: the plumbing
 /// pipeline has to be driven directly because [`WorktreeFilter::convert`] needs to
 /// vary the `index_object` callback, which the facade hard-codes.
-pub(super) struct WorktreeFilter {
+pub(crate) struct WorktreeFilter {
     pipeline: gix::filter::plumbing::Pipeline,
     attrs: gix::worktree::Stack,
     index: gix::index::State,
@@ -40,7 +40,7 @@ impl WorktreeFilter {
     /// that writes them. Tying the check to "this pipeline writes objects" put it on
     /// the wrong half — the scan is the pass that stands in for `index_path()`, so
     /// the flag is the caller's to set and is deliberately independent of any write.
-    pub(super) fn new(
+    pub(crate) fn new(
         repo: &gix::Repository,
         roundtrip_check: bool,
         renormalize: bool,
@@ -110,7 +110,7 @@ impl WorktreeFilter {
     /// (`crlf_to_git()` consults `has_crlf_in_index()`). `CONV_EOL_RENORMALIZE`
     /// skips that check — it is the whole purpose of the flag — which here means
     /// telling the pipeline that no index version of the file is available.
-    pub(super) fn convert(
+    pub(crate) fn convert(
         &mut self,
         repo: &gix::Repository,
         rela_path: &std::path::Path,
@@ -165,7 +165,7 @@ pub(super) fn demote_roundtrip_die(options: &mut gix::filter::plumbing::pipeline
 /// A conversion that could not be performed — in practice `core.safecrlf=true`
 /// refusing a round trip, which git reports as a `fatal:` naming the path and
 /// exits 128 with nothing staged.
-pub(super) struct ConvertError(String);
+pub(crate) struct ConvertError(String);
 
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

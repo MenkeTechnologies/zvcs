@@ -607,9 +607,22 @@ fn convert_for_checkin<'repo>(
         return Err(Fatal::new(message));
     }
     if filters.is_none() {
-        let (mut pipeline, index) = repo
-            .filter_pipeline(None)
-            .map_err(|err| Fatal::new(format!("unable to setup filters: {err}")))?;
+        // hash-object never reads the index: `index_fd()` is handed `the_repository->index`
+        // unpopulated (builtin/hash-object.c:29), so `read_attr_from_index()` finds no
+        // `.gitattributes` in it (attr.c:791-839) and `has_crlf_in_index()` no blob to keep
+        // CRLF for (convert.c:224-245, :536-538) — the path is converted as if the index were
+        // empty. A bare repository still takes its attributes from `HEAD`'s tree.
+        let empty = gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path());
+        let setup = |err: &dyn std::fmt::Display| Fatal::new(format!("unable to setup filters: {err}"));
+        let mut pipeline = if repo.is_bare() {
+            repo.filter_pipeline(None).map_err(|err| setup(&err))?.0
+        } else {
+            let cache = repo
+                .attributes_only(&empty, gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping)
+                .map_err(|err| setup(&err))?;
+            gix::filter::Pipeline::new(repo, cache.detach()).map_err(|err| setup(&err))?
+        };
+        let index = gix::worktree::IndexPersistedOrInMemory::InMemory(empty);
         if !write {
             let options = pipeline.options_mut();
             options.crlf_roundtrip_check = gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;

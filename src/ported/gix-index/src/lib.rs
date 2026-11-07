@@ -213,6 +213,12 @@ pub struct State {
     /// git's `UNTRACKED_CHANGED` bit of `cache_changed`; see [`State::untracked_changed()`].
     untracked_changed: bool,
     fs_monitor: Option<extension::FsMonitor>,
+    /// git's `istate->fsmonitor_last_update`: the token the next write puts in the `FSMN`
+    /// extension, `None` to write none. A decoded `FSMN` is not carried into it, because
+    /// `post_read_index_from()` runs `tweak_fsmonitor()` (read-cache.c:1967), which with
+    /// fsmonitor disabled — the only mode this crate has — is `remove_fsmonitor()`
+    /// (fsmonitor.c:818-821); see [`State::add_fsmonitor()`].
+    fsmonitor_last_update: Option<bstr::BString>,
 }
 
 mod impls {

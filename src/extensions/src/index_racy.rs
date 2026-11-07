@@ -61,7 +61,8 @@ use gix::bstr::ByteSlice;
 ///
 /// `md` must come from `symlink_metadata` — this is `lstat`, and following the link is the bug.
 ///
-/// Hashing raw can still disagree with a filtered blob (`core.autocrlf`, a clean filter). Erring
+/// Hashing raw can still disagree with a filtered blob (`core.autocrlf`, a clean filter); the
+/// write-time smudge reads regular files through [`compare_data`] instead. Erring
 /// toward "modified" costs a re-read; erring the other way makes a real change invisible, so an
 /// unreadable file counts as modified, exactly as `ce_compare_data()`'s `match = -1` does.
 pub fn modified_check_fs(
@@ -197,10 +198,18 @@ pub(crate) fn ie_match_stat_unchanged(
 /// entries whose `mtime` is older than the index's own — the overwhelming majority.
 pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File) {
     let object_hash = index.object_hash();
+    let mut filter = None;
     let smudge: Vec<usize> = racy_comparisons(repo, index)
         .into_iter()
         // `ce_modified_check_fs()`: the stat agrees, so the content has to answer.
-        .filter(|(idx, full, meta)| modified_check_fs(object_hash, full, meta, &index.entries()[*idx].id))
+        .filter(|(idx, full, meta)| {
+            let entry = &index.entries()[*idx];
+            if meta.file_type().is_file() {
+                compare_data(repo, &mut filter, entry.path(index), full, &entry.id)
+            } else {
+                modified_check_fs(object_hash, full, meta, &entry.id)
+            }
+        })
         .map(|(idx, _, _)| idx)
         .collect();
 
@@ -208,6 +217,36 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
         // `ce->ce_stat_data.sd_size = 0` — the one field git touches, so nothing else about the
         // entry is disturbed.
         index.entries_mut()[idx].stat.size = 0;
+    }
+}
+
+/// `ce_compare_data()` (read-cache.c:231-245) for the regular file `full` the index records at
+/// `rela_path`: `index_fd()` is handed the entry's name, so the bytes go through
+/// `convert_to_git()` — clean filter, `ident`, EOL normalisation — before they are hashed, and a
+/// file that only differs from its blob by what checkout put back is not a change. Its flags are
+/// 0, so no `core.safecrlf` round-trip check runs. A file that cannot be read or converted is
+/// `match = -1`, a change.
+fn compare_data(
+    repo: &gix::Repository,
+    filter: &mut Option<crate::porcelain::convert_to_git::WorktreeFilter>,
+    rela_path: &gix::bstr::BStr,
+    full: &std::path::Path,
+    id: &gix::ObjectId,
+) -> bool {
+    let Ok(bytes) = std::fs::read(full) else {
+        return true;
+    };
+    let filter = match filter {
+        Some(f) => f,
+        none => match crate::porcelain::convert_to_git::WorktreeFilter::new(repo, false, false) {
+            Ok(f) => none.insert(f),
+            Err(_) => return true,
+        },
+    };
+    match filter.convert(repo, &gix::path::from_bstr(rela_path), &bytes) {
+        Ok(stored) => gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &stored)
+            .is_ok_and(|hash| hash != *id),
+        Err(_) => true,
     }
 }
 
@@ -451,11 +490,89 @@ fn write_locked_inner(
     let request = tweak_split_index(repo, request);
     let git_dir = repo.git_dir().to_owned();
     let max_percent = crate::config::split_index_max_percent_change(repo);
-    match index.write_locked_holding(held, &git_dir, request, max_percent, options) {
+    let mut bad_expiry = None;
+    let result = {
+        let mut clean = |current: gix::ObjectId| clean_shared_index_files(repo, &git_dir, current, &mut bad_expiry);
+        index.write_locked_holding(held, &git_dir, request, max_percent, options, &mut clean)
+    };
+    // `repo_config_get_expiry()`'s `git_die_config()` (config.c:2480-2492), taken once the
+    // write has been abandoned and its lock released, as git's `die()` releases it.
+    if let Some(err) = bad_expiry {
+        crate::config::die_config(Some(repo), "splitindex.sharedindexexpire", err.as_deref());
+    }
+    match result {
         Ok(_) => Ok(()),
         Err(gix::index::file::split::Error::Write(err)) => Err(err),
         Err(err) => Err(gix::index::file::write::Error::Io(std::io::Error::other(err).into())),
     }
+}
+
+/// `clean_shared_index_files()` (read-cache.c:3226-3253), which `write_shared_index()` runs
+/// once the shared index `current` is in place: every other `sharedindex.*` in `git_dir` that
+/// `should_delete_shared_index()` (read-cache.c:3209-3224) finds no newer than
+/// `splitIndex.sharedIndexExpire` is unlinked.
+///
+/// An expiry git would die over is left in `bad_expiry` — `Some(None)` for a valueless key,
+/// whose `missing value` error the config layer words — and the write is abandoned.
+fn clean_shared_index_files(
+    repo: &gix::Repository,
+    git_dir: &std::path::Path,
+    current: gix::ObjectId,
+    bad_expiry: &mut Option<Option<String>>,
+) -> std::io::Result<()> {
+    // `get_shared_index_expire_date()` (read-cache.c:3186-3207): `2.weeks.ago` unless
+    // configured, and `repo_config_get_expiry()` refuses anything but `now` that resolves to
+    // the present or later.
+    let expire = match crate::config::last_value_implicit(repo, "splitIndex.sharedIndexExpire") {
+        None => "2.weeks.ago".to_owned(),
+        Some(None) => {
+            *bad_expiry = Some(Some("missing value for 'splitindex.sharedindexexpire'".to_owned()));
+            return Err(std::io::Error::other("splitindex.sharedindexexpire"));
+        }
+        Some(Some(value)) => {
+            if value != "now" && crate::date::approxidate(&value) >= crate::date::approxidate("now") {
+                *bad_expiry = Some(Some(format!("Invalid splitindex.sharedindexexpire: '{value}'")));
+                return Err(std::io::Error::other("splitindex.sharedindexexpire"));
+            }
+            value
+        }
+    };
+    let expiration = crate::date::approxidate(&expire);
+    let dir = match std::fs::read_dir(git_dir) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: unable to open git dir: {}: {}", git_dir.display(), crate::external::strerror(&err));
+            return Ok(());
+        }
+    };
+    let current = current.to_string();
+    for de in dir.flatten() {
+        let name = de.file_name();
+        let Some(hex) = name.to_str().and_then(|n| n.strip_prefix("sharedindex.")) else {
+            continue;
+        };
+        if hex == current || expiration == 0 {
+            continue;
+        }
+        let path = git_dir.join(&name);
+        let mtime = match std::fs::metadata(&path) {
+            Ok(meta) => meta.modified().ok(),
+            Err(err) => {
+                eprintln!("error: could not stat '{}': {}", path.display(), crate::external::strerror(&err));
+                continue;
+            }
+        };
+        let seconds = mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        if seconds > expiration {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            eprintln!("warning: unable to unlink: {}: {}", path.display(), crate::external::strerror(&err));
+        }
+    }
+    Ok(())
 }
 
 /// `tweak_split_index()` (read-cache.c:1932-1946), which git runs on every index it reads:

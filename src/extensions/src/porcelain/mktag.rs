@@ -393,7 +393,8 @@ fn fsck_tag(
     let rest = &rest[eol + 1..];
 
     // Early tags carry no `tagger` line; git only warns, `mktag` promotes it.
-    let rest = match rest.strip_prefix(b"tagger ") {
+    // Every check before this one stops at its first error, so `ret` is 0 here.
+    let (rest, ident_failed) = match rest.strip_prefix(b"tagger ") {
         None => {
             if reporter.report(
                 &fsck::MISSING_TAGGER_ENTRY,
@@ -401,7 +402,7 @@ fn fsck_tag(
             ) {
                 return found;
             }
-            rest
+            (rest, false)
         }
         Some(ident) => {
             // The line is consumed whether or not it validates.
@@ -409,24 +410,44 @@ fn fsck_tag(
                 Some(nl) => &ident[nl + 1..],
                 None => &ident[ident.len()..],
             };
-            if let Some((msg, text)) = fsck_ident(ident) {
-                if reporter.report(msg, text.as_bytes()) {
-                    return found;
-                }
-            }
-            after
+            // `else ret = fsck_ident(&buffer, …);` (fsck.c:1094-1095) is not acted on
+            // there: the `gpgsig` walk and the extra-header check still run.
+            let failed = match fsck_ident(ident) {
+                Some((msg, text)) => reporter.report(msg, text.as_bytes()),
+                None => false,
+            };
+            (after, failed)
         }
     };
 
+    // A `gpgsig` / `gpgsig-sha256` header and its ` `-indented continuation lines
+    // are skipped (fsck.c:1097-1112). Their `badGpgsig` / `badHeaderContinuation`
+    // for a line with no newline cannot be reached: `verify_headers()` above has
+    // already refused a header block that does not end in one.
+    let mut rest = rest;
+    fn next_line(s: &[u8]) -> &[u8] {
+        s.iter().position(|b| *b == b'\n').map_or(&s[s.len()..], |nl| &s[nl + 1..])
+    }
+    if let Some(sig) = rest.strip_prefix(b"gpgsig ").or_else(|| rest.strip_prefix(b"gpgsig-sha256 ")) {
+        rest = next_line(sig);
+        while rest.starts_with(b" ") {
+            rest = next_line(rest);
+        }
+    }
+
     // A message, when present, is separated by a blank line. Anything else here
     // is a header git's `verify_headers` would have waved through, and `mktag`
-    // rejects it.
+    // rejects it. Its `ret = report(…)` replaces the ident's verdict
+    // (fsck.c:1114-1125), so under `--no-strict`, where the extra header is only a
+    // warning, a bad tagger line no longer fails the tag.
+    let mut failed = ident_failed;
     if !rest.is_empty() && !rest.starts_with(b"\n") {
-        reporter.report(
+        failed = reporter.report(
             &fsck::EXTRA_HEADER_ENTRY,
             b"invalid format - extra header(s) after 'tagger'",
         );
     }
+    reporter.failed = failed;
     found
 }
 
@@ -506,6 +527,9 @@ fn fsck_ident(ident: &[u8]) -> Option<(&'static Msg, &'static str)> {
         ));
     }
     let rest = &rest[1..];
+    // "we'll continue to" allow extra linear whitespace before the timestamp, but
+    // not a newline: `while (*p == ' ' || *p == '\t') p++;` (fsck.c:927-928).
+    let rest = &rest[rest.iter().take_while(|b| matches!(b, b' ' | b'\t')).count()..];
 
     if rest.first() == Some(&b'0') && rest.get(1) != Some(&b' ') {
         return Some((

@@ -598,13 +598,21 @@ fn capabilities(repo: &gix::Repository, config: &Config) -> String {
 
 /// Append one pkt-line: a four-digit hex length covering the header itself,
 /// followed by the payload.
+/// Traced as `packet_buf_write()` traces it (pkt-line.c:161).
 fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
+    crate::trace::packet_trace(payload, true);
+    frame(out, payload);
+}
+
+/// Frame a pkt-line without tracing it, as `send_sideband()` writes (sideband.c:443-470).
+fn frame(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
     out.extend_from_slice(payload);
 }
 
-/// Append a flush packet.
+/// Append a flush packet, `packet_buf_flush()` (pkt-line.c:122-126).
 fn flush_pkt(out: &mut Vec<u8>) {
+    crate::trace::packet_trace(b"0000", true);
     out.extend_from_slice(b"0000");
 }
 
@@ -1281,7 +1289,7 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool) -> 
             for chunk in report.chunks(MAX_SIDEBAND_PAYLOAD) {
                 let mut payload = vec![1u8];
                 payload.extend_from_slice(chunk);
-                pkt_line(&mut out, &payload);
+                frame(&mut out, &payload);
             }
         } else {
             out = report;
@@ -1312,6 +1320,7 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool) -> 
     // after every band-2 word the post hooks and the maintenance run produced.
     if band.sideband {
         let mut stdout = std::io::stdout().lock();
+        crate::trace::packet_trace(b"0000", true);
         stdout.write_all(b"0000")?;
         stdout.flush()?;
     }
@@ -1684,7 +1693,7 @@ impl Band {
         for chunk in text.chunks(MAX_SIDEBAND_PAYLOAD) {
             let mut payload = vec![2u8];
             payload.extend_from_slice(chunk);
-            pkt_line(&mut out, &payload);
+            frame(&mut out, &payload);
         }
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&out);
@@ -1737,12 +1746,26 @@ fn read_pkt_line(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         16,
     )
     .map_err(|_| anyhow!("protocol error: bad line length character"))?;
+    // `packet_read_with_status()` traces what it read (pkt-line.c:434-445, :502-505).
     match len {
-        0 => Ok(None),                 // flush
-        1..=4 => Ok(Some(Vec::new())), // flush/delim/response-end or empty line
+        0 => {
+            crate::trace::packet_trace(b"0000", false);
+            Ok(None)
+        }
+        1..=4 => {
+            // delim/response-end or empty line
+            match len {
+                1 => crate::trace::packet_trace(b"0001", false),
+                2 => crate::trace::packet_trace(b"0002", false),
+                4 => crate::trace::packet_trace(b"", false),
+                _ => {}
+            }
+            Ok(Some(Vec::new()))
+        }
         _ => {
             let mut buf = vec![0u8; len as usize - 4];
             read_exact(r, &mut buf)?;
+            crate::trace::packet_trace(&buf, false);
             Ok(Some(buf))
         }
     }

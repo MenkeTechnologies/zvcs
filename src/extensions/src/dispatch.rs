@@ -1674,6 +1674,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // every index this command reads is to be held (`crate::sparse_index`).
     crate::sparse_index::note_command(sub, args);
 
+    // `packet_trace_identity()`, which the transport builtins call first thing.
+    crate::trace::identity_for(sub);
+
     // Fleet-wide command policy (`git zguard`): refuse or warn on a matching
     // command before it runs. A single `stat` when no rule is set. The policy
     // management verbs are exempt so a bad rule can never lock you out of fixing it.

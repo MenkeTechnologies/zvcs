@@ -135,8 +135,15 @@ where
 {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.pos >= self.cap {
+            // With a progress handler this is `sideband_demux()`, which git runs as an
+            // async whose packets are traced as `sideband` (pkt-line.c:20-23).
+            let demux = self.handle_progress.is_some();
             let (ofs, cap) = loop {
-                let line = match self.parent.read_line() {
+                let line = match if demux {
+                    crate::trace::as_async(|| self.parent.read_line())
+                } else {
+                    self.parent.read_line()
+                } {
                     Some(line) => line?.map_err(io::Error::other)?,
                     None => break (0, 0),
                 };

@@ -8,16 +8,22 @@ use crate::{
 
 /// Write a response-end message to `out`.
 pub fn response_end_to_write(mut out: impl io::Write) -> io::Result<usize> {
+    // `packet_response_end()` (pkt-line.c:107-112).
+    crate::trace::packet_trace(b"0002", true);
     out.write_all(RESPONSE_END_LINE).map(|_| 4)
 }
 
 /// Write a delim message to `out`.
 pub fn delim_to_write(mut out: impl io::Write) -> io::Result<usize> {
+    // `packet_delim()` (pkt-line.c:100-105).
+    crate::trace::packet_trace(b"0001", true);
     out.write_all(DELIMITER_LINE).map(|_| 4)
 }
 
 /// Write a flush message to `out`.
 pub fn flush_to_write(mut out: impl io::Write) -> io::Result<usize> {
+    // `packet_flush()` (pkt-line.c:93-98).
+    crate::trace::packet_trace(b"0000", true);
     out.write_all(FLUSH_LINE).map(|_| 4)
 }
 
@@ -34,8 +40,10 @@ pub fn write_error(error: &ErrorRef<'_>, out: impl io::Write) -> io::Result<usiz
 }
 
 /// Write `data` of `kind` to `out` using sideband encoding.
+///
+/// Like `send_sideband()` (sideband.c), this is not traced.
 pub fn band_to_write(kind: Channel, data: &[u8], out: impl io::Write) -> io::Result<usize> {
-    prefixed_data_to_write(&[kind as u8], data, out)
+    write_frame(&[kind as u8], data, &[], false, out)
 }
 
 /// Serialize `band` to `out`, returning the amount of bytes written.
@@ -82,8 +90,14 @@ fn prefixed_and_suffixed_data_to_write(
     prefix: &[u8],
     data: &[u8],
     suffix: &[u8],
-    mut out: impl io::Write,
+    out: impl io::Write,
 ) -> io::Result<usize> {
+    write_frame(prefix, data, suffix, true, out)
+}
+
+/// Frame `prefix`, `data` and `suffix` as one pkt-line; `traced` is
+/// `packet_write()`'s `packet_trace(buf, size, 1)` (pkt-line.c:213, :259).
+fn write_frame(prefix: &[u8], data: &[u8], suffix: &[u8], traced: bool, mut out: impl io::Write) -> io::Result<usize> {
     let data_len = prefix.len() + data.len() + suffix.len();
     if data_len > MAX_DATA_LEN {
         return Err(io::Error::other(Error::DataLengthLimitExceeded {
@@ -94,6 +108,9 @@ fn prefixed_and_suffixed_data_to_write(
         return Err(io::Error::other(Error::DataIsEmpty));
     }
 
+    if traced && crate::trace::wanted() {
+        crate::trace::packet_trace(&[prefix, data, suffix].concat(), true);
+    }
     let data_len = data_len + 4;
     let buf = u16_to_hex(data_len as u16);
 

@@ -214,9 +214,13 @@ impl Plan {
     /// Whether a pack of `nr_objects` goes to `unpack-objects` rather than
     /// `index-pack` (fetch-pack.c:994-997, 1007, 1040-1041). `do_keep` starts as `args->keep_pack` and only the
     /// header read changes it, so with no header read (`fetch.unpackLimit=0`) every pack not kept is unpacked.
-    fn unpacks(&self, nr_objects: usize) -> bool {
-        let do_keep = self.keep_pack || (self.passes_header() && (nr_objects as u64) >= self.unpack_limit);
-        !do_keep && !self.index_pack_required
+    pub(crate) fn unpacks(&self, nr_objects: usize) -> bool {
+        !self.do_keep(nr_objects) && !self.index_pack_required
+    }
+
+    /// `do_keep` after the header read (fetch-pack.c:967, 991-998).
+    pub(crate) fn do_keep(&self, nr_objects: usize) -> bool {
+        self.keep_pack || (self.passes_header() && (nr_objects as u64) >= self.unpack_limit)
     }
 
     /// `index-pack -v` (fetch-pack.c:1013-1014).

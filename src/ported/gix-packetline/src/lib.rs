@@ -72,6 +72,9 @@ pub mod blocking_io {
     pub use write::Writer;
 }
 
+/// Packet tracing for `GIT_TRACE_PACKET`, a port of pkt-line.c's `packet_trace()`.
+pub mod trace;
+
 /// Various utilities for `io::Read` trait implementation.
 ///
 /// Only useful in conjunction with the `async-io` and `blocking-io` cargo features.

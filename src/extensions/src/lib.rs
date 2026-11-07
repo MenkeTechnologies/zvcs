@@ -79,6 +79,7 @@ pub mod threads;
 pub mod tmp_objdir;
 pub mod userdiff;
 pub mod transport_err;
+pub mod trace;
 pub mod trace2;
 pub mod unicode_width;
 pub mod untracked_cache;
@@ -98,6 +99,7 @@ use std::process::ExitCode;
 pub fn run() -> ExitCode {
     let argv: Vec<String> = rawarg::args();
     remove_lock_files_on_abort();
+    trace::install();
     trace2::start(&argv);
     let code = run_command(&argv);
     trace2::exit(exit_status(code));
@@ -153,6 +155,7 @@ pub fn run_argv(argv: &[String]) -> i32 {
                 return code;
             }
         }
+        trace::install();
         trace2::start(argv);
         let code = exit_status(run_command(argv));
         trace2::exit(code);

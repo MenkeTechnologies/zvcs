@@ -614,7 +614,7 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
         for id in &boundary.unshallow {
             write_pkt(&mut out, format!("unshallow {}\n", id.to_hex()).as_bytes())?;
         }
-        out.write_all(b"0000")?;
+        write_flush(&mut out)?;
         out.flush()?;
     }
 
@@ -817,12 +817,9 @@ fn serve_inner(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool
             .chunks(band_max)
             .chain((!tail.is_empty()).then_some(tail))
         {
-            let mut framed = Vec::with_capacity(chunk.len() + 1);
-            framed.push(1);
-            framed.extend_from_slice(chunk);
-            write_pkt(&mut out, &framed)?;
+            write_band(&mut out, 1, chunk)?;
         }
-        out.write_all(b"0000")?;
+        write_flush(&mut out)?;
     } else {
         out.write_all(&pack)?; // raw, self-delimiting
     }
@@ -1239,15 +1236,39 @@ fn cap_present(caps: &[u8], want: &[u8]) -> bool {
     caps.split(|&b| b == b' ' || b == b'\n' || b == 0).any(|tok| tok == want)
 }
 
-/// Append a pkt-line (four-hex length header covering itself, then the payload).
+/// Append a pkt-line (four-hex length header covering itself, then the payload),
+/// traced as `packet_buf_write()` traces it (pkt-line.c:161).
 fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
+    crate::trace::packet_trace(payload, true);
+    frame(out, payload);
+}
+
+/// Frame a pkt-line without tracing it, as `send_sideband()` writes (sideband.c:443-470).
+fn frame(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
     out.extend_from_slice(payload);
 }
 
-/// Append a flush packet.
+/// Append a flush packet, `packet_buf_flush()` (pkt-line.c:122-126).
 fn flush_pkt(out: &mut Vec<u8>) {
+    crate::trace::packet_trace(b"0000", true);
     out.extend_from_slice(b"0000");
+}
+
+/// `packet_flush()` (pkt-line.c:93-98).
+fn write_flush(out: &mut impl Write) -> std::io::Result<()> {
+    crate::trace::packet_trace(b"0000", true);
+    out.write_all(b"0000")
+}
+
+/// One band of a side-band stream: `send_sideband()` (sideband.c:443-470), which
+/// does not trace.
+fn write_band(out: &mut impl Write, band: u8, data: &[u8]) -> std::io::Result<()> {
+    let mut framed = Vec::with_capacity(data.len() + 5);
+    framed.extend_from_slice(format!("{:04x}", data.len() + 5).as_bytes());
+    framed.push(band);
+    framed.extend_from_slice(data);
+    out.write_all(&framed)
 }
 
 /// Write one pkt-line to a stream.
@@ -1265,10 +1286,7 @@ fn write_pkt(out: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
 fn relay_on_band_2(bytes: &[u8]) {
     let mut out = std::io::stdout().lock();
     for piece in bytes.chunks(128) {
-        let mut framed = Vec::with_capacity(piece.len() + 1);
-        framed.push(2);
-        framed.extend_from_slice(piece);
-        let _ = write_pkt(&mut out, &framed);
+        let _ = write_band(&mut out, 2, piece);
     }
     let _ = out.flush();
 }
@@ -1283,12 +1301,25 @@ fn read_pkt(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         16,
     )
     .map_err(|_| anyhow::anyhow!("protocol error: bad line length character"))?;
+    // `packet_read_with_status()` traces what it read (pkt-line.c:434-445, :502-505).
     match len {
-        0 => Ok(None),
-        1..=4 => Ok(Some(Vec::new())),
+        0 => {
+            crate::trace::packet_trace(b"0000", false);
+            Ok(None)
+        }
+        1..=4 => {
+            match len {
+                1 => crate::trace::packet_trace(b"0001", false),
+                2 => crate::trace::packet_trace(b"0002", false),
+                4 => crate::trace::packet_trace(b"", false),
+                _ => {}
+            }
+            Ok(Some(Vec::new()))
+        }
         _ => {
             let mut buf = vec![0u8; len as usize - 4];
             read_exact(r, &mut buf)?;
+            crate::trace::packet_trace(&buf, false);
             Ok(Some(buf))
         }
     }
@@ -1543,18 +1574,32 @@ impl<R: Read> PktReader<R> {
             .map_err(|_| Die("protocol error: bad line length character".into()))?;
         let len = u16::from_str_radix(text, 16)
             .map_err(|_| Die(format!("protocol error: bad line length character: {text}")))?;
+        // `packet_read_with_status()` traces what it read (pkt-line.c:434-445, :502-505).
         match len {
-            0 => Ok(Pkt::Flush),
-            1 => Ok(Pkt::Delim),
-            2 => Ok(Pkt::ResponseEnd),
+            0 => {
+                crate::trace::packet_trace(b"0000", false);
+                Ok(Pkt::Flush)
+            }
+            1 => {
+                crate::trace::packet_trace(b"0001", false);
+                Ok(Pkt::Delim)
+            }
+            2 => {
+                crate::trace::packet_trace(b"0002", false);
+                Ok(Pkt::ResponseEnd)
+            }
             3 => die!("protocol error: bad line length 3"),
-            4 => Ok(Pkt::Line(Vec::new())),
+            4 => {
+                crate::trace::packet_trace(b"", false);
+                Ok(Pkt::Line(Vec::new()))
+            }
             _ => {
                 let mut buf = vec![0u8; len as usize - 4];
                 read_exact(&mut self.inner, &mut buf)?;
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
                 }
+                crate::trace::packet_trace(&buf, false);
                 Ok(Pkt::Line(buf))
             }
         }
@@ -1601,20 +1646,19 @@ impl<W: Write> PktWriter<W> {
     /// pack is always multiplexed, `sideband-all` or not
     /// (`data.use_sideband = LARGE_PACKET_MAX`, upload-pack.c:1778).
     fn band(&mut self, band: u8, data: &[u8]) -> Result<(), Die> {
-        let mut framed = Vec::with_capacity(data.len() + 1);
-        framed.push(band);
-        framed.extend_from_slice(data);
-        write_pkt(&mut self.out, &framed)?;
+        write_band(&mut self.out, band, data)?;
         Ok(())
     }
 
+    /// `packet_delim()` (pkt-line.c:100-105).
     fn delim(&mut self) -> Result<(), Die> {
+        crate::trace::packet_trace(b"0001", true);
         self.out.write_all(b"0001")?;
         Ok(())
     }
 
     fn flush_pkt(&mut self) -> Result<(), Die> {
-        self.out.write_all(b"0000")?;
+        write_flush(&mut self.out)?;
         self.out.flush()?;
         Ok(())
     }

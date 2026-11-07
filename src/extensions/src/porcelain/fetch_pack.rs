@@ -35,15 +35,21 @@
 //!     still fetching the ones that were) and when nothing at all was asked for
 //!     or advertised; 128 outside a repository or when the remote is unreachable;
 //!     129 for `-h` (usage on stdout) and for a usage error (usage on stderr).
-//!   * end state: the received objects are exploded into loose objects and the
-//!     intermediate pack is removed, which is what git does below
-//!     `fetch.unpackLimit`. No ref, reflog or `FETCH_HEAD` is touched.
+//!   * end state: `get_pack()`'s choice of child (fetch-pack.c:991-1057). A pack
+//!     below `fetch.unpackLimit` (then `transfer.unpackLimit`, then 100) is
+//!     exploded into loose objects and the intermediate pack removed, as
+//!     `unpack-objects` leaves it; a limit of 0 reads no header, so every pack
+//!     not kept is exploded; a pack at or above the limit is kept as
+//!     `index-pack --stdin --keep` keeps it, with the `keep <hash>` line. No ref,
+//!     reflog or `FETCH_HEAD` is touched. See [`dispose`].
 //!   * `-k`/`--keep` — the received pack stays in `objects/pack` under a
 //!     `.keep`, with the `.rev` git's `index-pack` writes beside it, and the
 //!     `keep <hash>` line goes out before the ref listing. `<hash>` is the
 //!     pack's trailer checksum, which is what both git and `gix-pack` name a
 //!     pack after, so the two agree byte-for-byte as long as the received pack
-//!     bytes do. See [`keep_pack`].
+//!     bytes do. Without `fetch.unpackLimit`, `--lock-pack` or a second `-k`,
+//!     `index-pack` is not told `--keep` (fetch-pack.c:1019-1020): no `.keep`
+//!     is written and the line is `pack <hash>`.
 //!   * `--lock-pack` — the kept pack's `.keep` is *reported* as
 //!     `lock <path>` in place of the `keep <hash>` line, which is what git does
 //!     with it; without `--keep` there is no lock to report and it prints
@@ -55,12 +61,6 @@
 //!     indexes regardless.
 //!
 //! Not covered — each bails rather than silently diverging:
-//!   * a fetch large enough that git would keep the pack on its own
-//!     (`fetch.unpackLimit`, default 100) without `--keep` having been asked
-//!     for. That is the same kept-pack end state, but reached by a rule this
-//!     port has no way to observe from the outside: git decides it from the pack
-//!     *header* before reading the body, while the vendored bundle writer only
-//!     reports the object count once the pack is already written and indexed.
 //!   * `--include-tag`, **unless the want set already covers every advertised
 //!     tag** (which `--all` guarantees). The capability only ever *adds* tags
 //!     the server would otherwise have held back, so once all of them are
@@ -110,10 +110,6 @@ const PORTED: &str = "ported: --all, --stdin, -q/--quiet, -v, --no-progress, --t
                       --depth, --shallow-since, --shallow-exclude, --deepen-relative, --diag-url, \
                       -k/--keep, --lock-pack, --check-self-contained-and-connected";
 
-/// git's built-in `unpack_limit`, overridable via `fetch.unpackLimit` and then
-/// `transfer.unpackLimit`.
-const DEFAULT_UNPACK_LIMIT: i64 = 100;
-
 /// `git fetch-pack` — download the objects needed for the named remote refs.
 ///
 /// See the module docs for the supported flag set and the deliberate gaps.
@@ -143,6 +139,8 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     let mut diag_url = false;
     let mut include_tag = false;
     let mut keep = false;
+    // `args.lock_pack`: set by `--lock-pack` and by a second `-k`/`--keep`.
+    let mut keep_lock = false;
     let mut lock_pack = false;
     let mut dest: Option<&str> = None;
     let mut sought: Vec<String> = Vec::new();
@@ -183,7 +181,13 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // nothing else — there is no `--no-thin` entry (builtin/fetch-pack.c:100),
             // so that spelling falls through to `usage(fetch_pack_usage)`.
             "--thin" => {}
-            "-k" | "--keep" => keep = true,
+            // `args.lock_pack = args.keep_pack; args.keep_pack = 1;`
+            // (builtin/fetch-pack.c:95-98): a repeated `-k` asks for the `--keep`
+            // message without capturing `index-pack`'s output.
+            "-k" | "--keep" => {
+                keep_lock = keep;
+                keep = true;
+            }
 
             // `--lock-pack` asks for the `.keep` the kept pack already carries to
             // be *reported* rather than silently released:
@@ -207,7 +211,10 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             // `lock .git/objects/pack/pack-<hash>.keep` in place of the
             // `keep\t<hash>` line the bare `--keep` prints, because the lock path
             // is parsed *out of* that line rather than printed alongside it.
-            "--lock-pack" => lock_pack = true,
+            "--lock-pack" => {
+                keep_lock = true;
+                lock_pack = true;
+            }
 
             // `--check-self-contained-and-connected` forwards the flag of the
             // same name to `index-pack`, and `cmd_fetch_pack()` reports the
@@ -330,6 +337,14 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     // write commands; a no-op guard when no daemon is running.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `git_connect()` runs `parse_connect_url()` first (connect.c:1467), whose
+    // `die()`s end the command before any transport is tried: `fetch-pack` speaks
+    // no smart HTTP of its own, so `http://` is "protocol 'http' is not supported".
+    if let Err(message) = parse_connect_url(dest) {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
+    }
+
     // --- phase 1: read the whole advertisement ----------------------------
     // `fetch-pack` takes a URL, never a configured remote name, so build the
     // remote from the URL alone: that also guarantees it carries no configured
@@ -426,7 +441,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         unpack_limit: super::fetch_progress::unpack_limit(&repo),
         index_pack_required: super::fetch::fetch_pack_fsck_objects(&repo),
     };
-    if let Err(e) = receive(&repo, dest, &selected, shallow, lock_pack, plan) {
+    if let Err(e) = receive(&repo, dest, &selected, shallow, Locks { keep_lock, lock_pack }, plan) {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -942,8 +957,8 @@ fn build_shallow(
     Ok(Shallow::NoChange)
 }
 
-/// Want exactly `selected`, receive the pack, and either keep it (`--keep`) or
-/// explode it into loose objects.
+/// Want exactly `selected`, receive the pack, and keep it or explode it into
+/// loose objects as [`dispose`] decides.
 ///
 /// Each ref is turned into a one-sided fetch refspec (`refs/heads/main` with no
 /// destination), which makes it a `want` without producing any ref edit — the
@@ -953,7 +968,7 @@ fn receive(
     dest: &str,
     selected: &[(String, ObjectId)],
     shallow: Shallow,
-    lock_pack: bool,
+    locks: Locks,
     plan: super::fetch_progress::Plan,
 ) -> Result<()> {
     let keep = plan.keep_pack;
@@ -988,15 +1003,71 @@ fn receive(
         Status::NoPackReceived { .. } => Ok(()),
         Status::Change {
             write_pack_bundle, ..
-        } if keep => keep_pack(repo, write_pack_bundle, lock_pack),
-        Status::Change {
-            write_pack_bundle, ..
-        } => explode(repo, write_pack_bundle),
+        } => dispose(repo, write_pack_bundle, locks, plan),
     }
 }
 
-/// `--keep`: leave the received pack in `objects/pack` under a `.keep`, and
-/// print the `keep <hash>` line `index-pack --stdin --keep` prints.
+/// The two ways `cmd_fetch_pack()` asks for the kept pack's lock.
+#[derive(Clone, Copy)]
+struct Locks {
+    /// `args.lock_pack`: `--lock-pack`, or `-k` given twice
+    /// (builtin/fetch-pack.c:95-98, :148-150).
+    keep_lock: bool,
+    /// `pack_lockfiles_ptr`, set only by `--lock-pack`: `index-pack`'s stdout is
+    /// captured and its `.keep` reported as `lock <path>`
+    /// (builtin/fetch-pack.c:148-150, :261-264).
+    lock_pack: bool,
+}
+
+/// `get_pack()`'s choice of child for the received pack (fetch-pack.c:991-1057).
+///
+/// `do_keep` starts at `args->keep_pack`; only the header read, which happens
+/// when `unpack_limit` is non-zero and `--keep` was not given, changes it, so
+/// with `fetch.unpackLimit=0` every pack not kept goes to `unpack-objects` (see
+/// [`super::fetch_progress::Plan::do_keep`]). A kept pack, or one
+/// `fetch.fsckObjects` sends to `index-pack`, stays in `objects/pack`.
+fn dispose(
+    repo: &gix::Repository,
+    bundle: gix::odb::pack::bundle::write::Outcome,
+    locks: Locks,
+    plan: super::fetch_progress::Plan,
+) -> Result<()> {
+    let nr_objects = bundle.index.num_objects as usize;
+    if plan.unpacks(nr_objects) {
+        return explode(repo, bundle);
+    }
+    let do_keep = plan.do_keep(nr_objects);
+    // ```c
+    // if ((do_keep || index_pack_args) && (args->lock_pack || unpack_limit))
+    //         add_index_pack_keep_option(&cmd.args);
+    // ```
+    // (fetch-pack.c:1019-1020.)
+    let keep_option = do_keep && (locks.keep_lock || plan.unpack_limit != 0);
+    // `if (pack_lockfiles || fsck_objects) cmd.out = -1;` (fetch-pack.c:1010-1011):
+    // a captured `index-pack` prints nothing, and only `--lock-pack` turns its
+    // `keep` line into a lock (:1076-1087).
+    let output = if locks.lock_pack || plan.index_pack_required {
+        Output::Captured { lock: do_keep && locks.lock_pack }
+    } else {
+        Output::Inherited
+    };
+    keep_pack(repo, bundle, keep_option, output)
+}
+
+/// Where `index-pack`'s `<report>\t<hash>` line goes (fetch-pack.c:1010-1011).
+#[derive(Clone, Copy)]
+enum Output {
+    /// The child inherits stdout and prints the line itself.
+    Inherited,
+    /// `cmd.out = -1`: the line is read by `index_pack_lockfile()`, and printed as
+    /// `lock <path>` by `cmd_fetch_pack()` when `lock` and it began `keep\t`.
+    Captured { lock: bool },
+}
+
+/// The `index-pack` side of `get_pack()`: leave the received pack in
+/// `objects/pack`, under a `.keep` when `keep_option` (`--keep=<msg>`), and print
+/// the `keep <hash>` or `pack <hash>` line `index-pack --stdin` prints
+/// (`final()`, builtin/index-pack.c:1612-1651) unless `output` captured it.
 ///
 /// git reaches this by running `index-pack --stdin --keep=<msg>` instead of
 /// `unpack-objects` (`get_pack()`, fetch-pack.c:1007-1018); the child inherits
@@ -1016,7 +1087,8 @@ fn receive(
 fn keep_pack(
     repo: &gix::Repository,
     bundle: gix::odb::pack::bundle::write::Outcome,
-    lock_pack: bool,
+    keep_option: bool,
+    output: Output,
 ) -> Result<()> {
     let (Some(index_path), Some(data_path)) = (bundle.index_path.clone(), bundle.data_path.clone())
     else {
@@ -1024,7 +1096,11 @@ fn keep_pack(
         // so there is nothing to keep and nothing new to name.
         return Ok(());
     };
-    if let Some(keep_path) = bundle.keep_path.clone() {
+    // Without `--keep`, `final()` writes no `.keep` (builtin/index-pack.c:1626-1628),
+    // so the guard the vendored writer left is removed.
+    if let Some(keep_path) = bundle.keep_path.clone().filter(|_| !keep_option) {
+        std::fs::remove_file(keep_path)?;
+    } else if let Some(keep_path) = bundle.keep_path.clone() {
         std::fs::write(
             &keep_path,
             format!(
@@ -1059,8 +1135,9 @@ fn keep_pack(
     // than echoed from the bundle, because gitoxide spells the same file
     // `./.git/objects/…` where git spells it `.git/objects/…`; both name one
     // file, only one of them is the string git prints.
-    match (lock_pack, bundle.keep_path.is_some()) {
-        (true, true) => {
+    let report = if keep_option { "keep" } else { "pack" };
+    match output {
+        Output::Captured { lock: true } if keep_option && bundle.keep_path.is_some() => {
             // gitoxide records the object directory with the leading `./` its
             // discovery walked in with; git's `setup_git_directory()` never keeps
             // one, so it is dropped rather than printed.
@@ -1072,13 +1149,14 @@ fn keep_pack(
                 bundle.index.data_hash.to_hex()
             );
         }
-        _ => println!("keep\t{}", bundle.index.data_hash.to_hex()),
+        Output::Captured { .. } => {}
+        Output::Inherited => println!("{report}\t{}", bundle.index.data_hash.to_hex()),
     }
     Ok(())
 }
 
 /// Turn the freshly written pack into loose objects and remove it, which is what
-/// git does whenever the pack stays below `fetch.unpackLimit`.
+/// `unpack-objects` leaves whenever [`dispose`] picks it.
 fn explode(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcome) -> Result<()> {
     // `keep_path` is `None` only when a pack with this content was already on
     // disk, in which case gitoxide reused it and every object is already
@@ -1090,20 +1168,6 @@ fn explode(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcom
     ) else {
         return Ok(());
     };
-
-    let num_objects = i64::from(bundle.index.num_objects);
-    let limit = unpack_limit(repo);
-    if limit > 0 && num_objects >= limit {
-        return Err(Refusal(format!(
-            "received pack holds {num_objects} objects, at or above the unpack limit of {limit} \
-             (fetch.unpackLimit/transfer.unpackLimit), so git would keep it as a `.keep` pack; \
-             that end state cannot be reproduced, as git names a kept pack after the hash of its \
-             sorted object names and adds a `.rev` file while gix-pack names it after the pack \
-             trailer checksum and writes none. The pack is left at {}",
-            data_path.display()
-        ))
-        .into());
-    }
 
     // Move the pack out of `objects/pack` before reading it, so the object
     // database we consult for "do we already have this?" below cannot see it —
@@ -1143,16 +1207,6 @@ fn explode(repo: &gix::Repository, bundle: gix::odb::pack::bundle::write::Outcom
     }
 
     Ok(())
-}
-
-/// git's unpack limit: `fetch.unpackLimit`, then `transfer.unpackLimit`, then
-/// the built-in 100. A value of zero or less disables the check entirely.
-fn unpack_limit(repo: &gix::Repository) -> i64 {
-    let config = repo.config_snapshot();
-    config
-        .integer("fetch.unpackLimit")
-        .or_else(|| config.integer("transfer.unpackLimit"))
-        .unwrap_or(DEFAULT_UNPACK_LIMIT)
 }
 
 /// Whether `name` is a full object id rather than a ref name, using the same

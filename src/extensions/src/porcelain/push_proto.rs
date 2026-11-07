@@ -1486,6 +1486,10 @@ pub fn send_pack(
         Vec::new()
     };
 
+    // `git_transport_push()` closes both ends without the flush `disconnect_git()`
+    // would send, and clears `finished_handshake` (transport.c:999-1003, :1024-1025).
+    connection.skip_end_of_interaction();
+
     // POST the request: command list + flush + pack, written verbatim (the pack is
     // not pkt-line framed). `into_parts` hands back the raw writer and the response
     // reader; the writer must be dropped before the response is read.
@@ -1906,12 +1910,18 @@ fn pkt_lines(buf: &[u8]) -> Vec<String> {
         let Ok(hex) = std::str::from_utf8(&buf[i..i + 4]) else { break };
         let Ok(len) = usize::from_str_radix(hex, 16) else { break };
         // 0000/0001/0002 are flush, delim and response-end; all end the report.
+        // `receive_status()` reads them through `packet_reader_read()`, which
+        // traces each one (pkt-line.c:434-445, :502-505).
         if len < 4 {
+            if len < 3 {
+                crate::trace::packet_trace(&buf[i..i + 4], false);
+            }
             break;
         }
         if i + len > buf.len() {
             break;
         }
+        crate::trace::packet_trace(&buf[i + 4..i + len], false);
         lines.push(String::from_utf8_lossy(&buf[i + 4..i + len]).into_owned());
         i += len;
     }
@@ -1933,7 +1943,9 @@ fn demultiplex_sideband(
     let mut sideband = Sideband::new(repo);
     let mut primary: Vec<u8> = Vec::new();
     loop {
-        match reader.readline() {
+        // `sideband_demux()` runs as an async, so its packets are traced as
+        // `sideband` (send-pack.c:284, pkt-line.c:20-23).
+        match crate::trace::as_async(|| reader.readline()) {
             // EOF without a flush: `PACKET_READ_EOF` — git reports the disconnect
             // and stops.
             None => {

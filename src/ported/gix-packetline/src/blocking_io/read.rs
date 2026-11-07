@@ -75,6 +75,14 @@ where
             None,
             Some(match Self::read_line_inner(reader, buf) {
                 Ok(Ok(line)) => {
+                    // `packet_read_with_status()` traces every packet it reads
+                    // (pkt-line.c:434-445, :502-505).
+                    match line {
+                        PacketLineRef::Data(d) => crate::trace::packet_trace(d, false),
+                        PacketLineRef::Flush => crate::trace::packet_trace(b"0000", false),
+                        PacketLineRef::Delimiter => crate::trace::packet_trace(b"0001", false),
+                        PacketLineRef::ResponseEnd => crate::trace::packet_trace(b"0002", false),
+                    }
                     if trace {
                         match line {
                             #[allow(unused_variables, reason = "Used when tracing is enabled at compile time.")]

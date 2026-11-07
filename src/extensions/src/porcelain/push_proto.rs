@@ -109,6 +109,20 @@ pub struct Request {
     /// stock git sends only the flush packet and reports
     /// `error: unable to delete '<name>': remote ref does not exist`.
     pub explicit_delete: bool,
+    /// An explicit `<src>:<dst>` whose `<dst>` is not `refs/`-qualified. Such a
+    /// destination is resolved against the advertisement by `match_explicit()`
+    /// (remote.c:1302-1331), which only the wire layer has, so [`name`][Self::name]
+    /// is a placeholder until then.
+    pub unqualified_dst: Option<UnqualifiedDst>,
+}
+
+/// The two halves of a refspec `match_explicit()` needs to place an unqualified
+/// destination: `dst_value` as written, and `matched_src->name`, the name of the
+/// local ref `match_explicit_lhs()` matched, or the source text as written when it
+/// fell back to `try_explicit_object_name()` (remote.c:1130-1149).
+pub struct UnqualifiedDst {
+    pub dst: String,
+    pub src_name: String,
 }
 
 /// Which advertised refs a push may DELETE beyond the caller's explicit
@@ -329,7 +343,10 @@ pub struct SendOptions {
     /// cleanup` that closes the connection without writing anything more, where `git push`
     /// ends a failed match through `transport_disconnect()`, whose `disconnect_git()`
     /// writes a flush first (transport.c:1024-1025).
-    pub send_pack_match: Option<Vec<String>>,
+    /// Each error carries the number of requests built before its refspec, which
+    /// places it among the destination errors in `match_explicit_refs()`'s one walk
+    /// over the refspecs (remote.c:1351-1358).
+    pub send_pack_match: Option<Vec<(usize, String)>>,
 }
 
 /// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
@@ -395,6 +412,9 @@ pub struct RefStatus {
     /// refusal: `print_ref_status('!', "[remote failure]", …, "remote failed to
     /// report status")` (transport.c:793-798), not `[rejected]`.
     pub missing_report: bool,
+    /// The `advise()` block a [`pre_transport`][Self::pre_transport] refusal
+    /// prints under its `error:` line, already gated on its advice slot.
+    pub hint: Option<String>,
 }
 
 impl RefStatus {
@@ -836,6 +856,9 @@ pub fn send_pack(
     // does not advertise them, in the order they were matched — the tail of the
     // list every report walks. See [`remote_refs_order`].
     let mut created: Vec<String> = Vec::new();
+    // Every refusal `match_explicit()` raised, with the index of its request, in the
+    // order the refspecs were walked (remote.c:1351-1358).
+    let mut match_errors: Vec<(usize, String, Option<String>)> = Vec::new();
     // ```c
     // if (!ref->peer_ref)
     //         continue;
@@ -861,10 +884,11 @@ pub fn send_pack(
                 only_if_absent: false,
                 check_reachable: None,
                 explicit_delete: false,
+                unqualified_dst: None,
             })
             .collect(),
     };
-    for req in requests.iter().chain(matched.iter()) {
+    for (req_idx, req) in requests.iter().chain(matched.iter()).enumerate() {
         // A followed tag (`--follow-tags`) the remote already carries is dropped
         // outright — not reported, not sent — exactly as git omits it from the
         // ref list it builds after reading the advertisement.
@@ -889,8 +913,33 @@ pub fn send_pack(
         // `refs/tags/outermost`, which is the only way deleting a remote tag by
         // its short name has ever worked; guessing `refs/heads/outermost` made
         // every such delete report `remote ref does not exist`.
+        let name = match match_explicit_dst(repo, req, &advertised_order) {
+            Ok(name) => name,
+            Err((reason, hint)) => {
+                match_errors.push((req_idx, reason.clone(), hint.clone()));
+                let name = req.unqualified_dst.as_ref().map_or(&req.name, |u| &u.dst).clone();
+                if !advertised.contains_key(&name) && !created.contains(&name) {
+                    created.push(name.clone());
+                }
+                statuses.push(RefStatus {
+                    name,
+                    src: req.src.clone(),
+                    report_name: None,
+                    old: null,
+                    new: req.new,
+                    result: Err(reason),
+                    forced: false,
+                    up_to_date: false,
+                    pre_transport: true,
+                    remote_rejected: false,
+                    missing_report: false,
+                    hint,
+                });
+                continue;
+            }
+        };
         let req = &Request {
-            name: dwim_delete_target(req, &advertised_order),
+            name,
             src: req.src.clone(),
             new: req.new,
             force: req.force,
@@ -898,6 +947,7 @@ pub fn send_pack(
             only_if_absent: req.only_if_absent,
             check_reachable: req.check_reachable.clone(),
             explicit_delete: req.explicit_delete,
+            unqualified_dst: None,
         };
         if !advertised.contains_key(&req.name) && !created.contains(&req.name) {
             created.push(req.name.clone());
@@ -931,6 +981,7 @@ pub fn send_pack(
             pre_transport: false,
             remote_rejected: false,
             missing_report: false,
+            hint: None,
         };
 
         if deletion && !allow_deleting_refs {
@@ -944,11 +995,13 @@ pub fn send_pack(
         // becomes a new linked ref and its null→null command goes out on the wire,
         // which the branch below lets through.
         if deletion && req.explicit_delete && remote_current == null {
+            let reason = format!(
+                "unable to delete '{}': remote ref does not exist",
+                req.name.strip_prefix("refs/heads/").unwrap_or(&req.name)
+            );
+            match_errors.push((req_idx, reason.clone(), None));
             statuses.push(RefStatus {
-                result: Err(format!(
-                    "unable to delete '{}': remote ref does not exist",
-                    req.name.strip_prefix("refs/heads/").unwrap_or(&req.name)
-                )),
+                result: Err(reason),
                 pre_transport: true,
                 ..reject("")
             });
@@ -973,6 +1026,7 @@ pub fn send_pack(
                 pre_transport: false,
                 remote_rejected: false,
                 missing_report: false,
+                hint: None,
             });
             continue;
         }
@@ -1100,6 +1154,7 @@ pub fn send_pack(
             pre_transport: false,
             remote_rejected: false,
             missing_report: false,
+            hint: None,
         });
                 continue;
             }
@@ -1138,9 +1193,27 @@ pub fn send_pack(
     let send_pack_errors = opts.send_pack_match.as_deref();
     if send_pack_errors.is_some_and(|e| !e.is_empty()) || statuses.iter().any(|s| s.pre_transport) {
         statuses.retain(|s| s.pre_transport);
+        // Back into refspec order for the caller's `error:` lines; the report order
+        // above is `remote_refs`', which the match never printed in.
+        statuses.sort_by_key(|s| {
+            match_errors.iter().position(|(_, reason, _)| s.result.as_ref().err() == Some(reason))
+        });
         if let Some(errors) = send_pack_errors {
-            let refused = statuses.iter().filter_map(|s| s.result.as_ref().err());
-            for reason in errors.iter().chain(refused) {
+            // `match_explicit_refs()` walks the refspecs once and `match_explicit()`
+            // raises a source refusal and a destination refusal from the same call,
+            // so they come out in refspec order (remote.c:1351-1358). A source error
+            // recorded before request `i` was built precedes that request's own.
+            let mut sources = errors.iter().peekable();
+            for (req_idx, reason, hint) in &match_errors {
+                while let Some((_, reason)) = sources.next_if(|(before, _)| before <= req_idx) {
+                    eprintln!("error: {reason}");
+                }
+                eprintln!("error: {reason}");
+                if let Some(hint) = hint {
+                    crate::advice::print_hint(hint);
+                }
+            }
+            for (_, reason) in sources {
                 eprintln!("error: {reason}");
             }
             statuses.clear();
@@ -1427,6 +1500,7 @@ pub fn send_pack(
                     pre_transport: false,
                     remote_rejected: false,
                     missing_report: false,
+                    hint: None,
                 });
             }
             remote_refs_order(&mut statuses, &advertised_order, &created);
@@ -1461,6 +1535,7 @@ pub fn send_pack(
             pre_transport: false,
             remote_rejected: false,
             missing_report: false,
+            hint: None,
         });
         }
         remote_refs_order(&mut statuses, &advertised_order, &created);
@@ -1738,6 +1813,7 @@ pub fn send_pack(
                 pre_transport: false,
                 remote_rejected: !missing_report,
                 missing_report,
+                hint: None,
             });
             continue;
         }
@@ -1754,6 +1830,7 @@ pub fn send_pack(
                 pre_transport: false,
                 remote_rejected: true,
                 missing_report: false,
+                hint: None,
             });
         }
     }
@@ -2601,67 +2678,167 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
     None
 }
 
-/// `count_refspec_match()` (remote.c:1084-1136) reduced to what a deletion needs:
-/// the single advertised ref an unqualified destination names, if there is
-/// exactly one strong match.
+/// The destination half of `match_explicit()` (remote.c:1302-1331), for the two
+/// requests whose destination the porcelain could not place without the
+/// advertisement: an explicit deletion, and an explicit `<src>:<dst>` with an
+/// unqualified `<dst>`. Every other request keeps the name it already carries.
 ///
 /// ```c
-/// if (namelen != patlen &&
-///     patlen != namelen - 5 &&
-///     !starts_with(name, "refs/heads/") &&
-///     !starts_with(name, "refs/tags/")) {
-///         matched_weak = refs;
-///         weak_match++;
-/// }
-/// else {
-///         matched = refs;
-///         match++;
+/// switch (count_refspec_match(dst_value, dst, &matched_dst)) {
+/// case 1:
+///         break;
+/// case 0:
+///         if (starts_with(dst_value, "refs/")) {
+///                 matched_dst = make_linked_ref(dst_value, dst_tail);
+///         } else if (is_null_oid(&matched_src->new_oid)) {
+///                 error(_("unable to delete '%s': remote ref does not exist"),
+///                       dst_value);
+///         } else if ((dst_guess = guess_ref(dst_value, matched_src))) {
+///                 matched_dst = make_linked_ref(dst_guess, dst_tail);
+///                 free(dst_guess);
+///         } else {
+///                 show_push_unqualified_ref_name_error(dst_value,
+///                                                      matched_src->name);
+///         }
+///         break;
+/// default:
+///         matched_dst = NULL;
+///         error(_("dst refspec %s matches more than one"),
+///               dst_value);
+///         break;
 /// }
 /// ```
 ///
-/// A match outside `refs/heads/` and `refs/tags/` that was not spelled in full
-/// (`namelen == patlen`) or from the top level (`patlen == namelen - 5`, i.e.
-/// without the leading `refs/`) is only *weak*: it loses to any strong match, so
-/// `push $URL main` is not ambiguous between `refs/heads/main` and
-/// `refs/remotes/origin/main`. Several strong matches, or only several weak
-/// ones, are ambiguous and match nothing here.
-fn count_refspec_match<'a>(pattern: &str, advertised: &'a [String]) -> Option<&'a str> {
-    let (mut strong, mut weak): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-    for name in advertised {
-        if !refname_match(pattern, name) {
-            continue;
+/// `count_refspec_match()` runs over the *advertised* refs, so `main:side` lands
+/// on whatever `side` the remote has, a tag included, and only a name the remote
+/// lacks is guessed from the source. The unadvertised deletion is left to the
+/// caller, which reports it with the same `pre_transport` shape. The `Err` is the
+/// `error()` text and, when `advice.pushUnqualifiedRefName` allows it, the
+/// `advise()` block that follows it.
+fn match_explicit_dst(
+    repo: &gix::Repository,
+    req: &Request,
+    advertised: &[String],
+) -> std::result::Result<String, (String, Option<String>)> {
+    let (dst, src_name) = match &req.unqualified_dst {
+        Some(u) => (u.dst.as_str(), Some(u.src_name.as_str())),
+        // The porcelain has already applied its `refs/heads/` fallback, so the name
+        // the user wrote is what is left after stripping it back off —
+        // `explicit_delete` is set only for a destination that was not
+        // `refs/`-qualified.
+        None if req.explicit_delete => {
+            (req.name.strip_prefix("refs/heads/").unwrap_or(&req.name), None)
         }
-        let (namelen, patlen) = (name.len(), pattern.len());
-        if namelen != patlen
-            && patlen + 5 != namelen
-            && !name.starts_with("refs/heads/")
-            && !name.starts_with("refs/tags/")
-        {
-            weak.push(name);
-        } else {
-            strong.push(name);
-        }
-    }
-    let chosen = if strong.is_empty() { &weak } else { &strong };
-    match chosen.as_slice() {
-        [only] => Some(only),
-        _ => None,
+        None => return Ok(req.name.clone()),
+    };
+    match crate::refname::count_refspec_match(dst, advertised) {
+        (1, Some(matched)) => Ok(matched.clone()),
+        (0, _) => match src_name {
+            None => Ok(req.name.clone()),
+            Some(src_name) => guess_ref(repo, dst, src_name)
+                .ok_or_else(|| show_push_unqualified_ref_name_error(repo, dst, src_name, req.new)),
+        },
+        _ => Err((format!("dst refspec {dst} matches more than one"), None)),
     }
 }
 
-/// The remote ref an explicit deletion targets. Only an unqualified name is
-/// resolved against the advertisement; a `refs/`-qualified one is `make_linked_ref`
-/// territory and is left exactly as written, and every non-deletion keeps the
-/// destination the refspec already computed.
-fn dwim_delete_target(req: &Request, advertised: &[String]) -> String {
-    if !req.explicit_delete {
-        return req.name.clone();
+/// `guess_ref()` (remote.c:1158-1179): the namespace of the ref the source
+/// resolves to, put in front of the destination as written.
+///
+/// ```c
+/// const char *r = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+///                                         peer->name,
+///                                         RESOLVE_REF_READING,
+///                                         NULL, NULL);
+/// if (!r)
+///         return NULL;
+///
+/// if (starts_with(r, "refs/heads/")) {
+///         strbuf_addstr(&buf, "refs/heads/");
+/// } else if (starts_with(r, "refs/tags/")) {
+///         strbuf_addstr(&buf, "refs/tags/");
+/// } else {
+///         return NULL;
+/// }
+/// ```
+///
+/// `peer->name` is resolved through symrefs, so `HEAD:<dst>` on a branch is a
+/// branch; a detached `HEAD`, a remote-tracking ref and an object name such as
+/// `main~1` resolve to nothing under either prefix.
+fn guess_ref(repo: &gix::Repository, name: &str, peer: &str) -> Option<String> {
+    use gix::bstr::ByteSlice;
+    let mut reference = repo.find_reference(peer).ok()?;
+    // `refs_resolve_ref_unsafe()` gives up past `SYMREF_MAXDEPTH` (5) levels.
+    for _ in 0..5 {
+        let next = match reference.target() {
+            gix::refs::TargetRef::Symbolic(next) => next.as_bstr().to_str().ok()?.to_owned(),
+            gix::refs::TargetRef::Object(_) => break,
+        };
+        reference = repo.find_reference(next.as_str()).ok()?;
     }
-    // The porcelain has already applied its `refs/heads/` fallback, so the name
-    // the user wrote is what is left after stripping it back off — `explicit_delete`
-    // is set only for a destination that was not `refs/`-qualified.
-    let pattern = req.name.strip_prefix("refs/heads/").unwrap_or(&req.name);
-    count_refspec_match(pattern, advertised).map_or_else(|| req.name.clone(), str::to_owned)
+    if matches!(reference.target(), gix::refs::TargetRef::Symbolic(_)) {
+        return None;
+    }
+    let resolved = reference.name().as_bstr().to_str().ok()?;
+    ["refs/heads/", "refs/tags/"]
+        .into_iter()
+        .find(|prefix| resolved.starts_with(prefix))
+        .map(|prefix| format!("{prefix}{name}"))
+}
+
+/// `show_push_unqualified_ref_name_error()` (remote.c:1206-1266): the `error()`,
+/// and the `advise()` that names the refspec it should have been, chosen by the
+/// type of the object `repo_get_oid(matched_src_name)` reads, which is the
+/// object the request pushes.
+fn show_push_unqualified_ref_name_error(
+    repo: &gix::Repository,
+    dst_value: &str,
+    matched_src_name: &str,
+    oid: ObjectId,
+) -> (String, Option<String>) {
+    let error = format!(
+        "The destination you provided is not a full refname (i.e.,\n\
+         starting with \"refs/\"). We tried to guess what you meant by:\n\
+         \n\
+         - Looking for a ref that matches '{dst_value}' on the remote side.\n\
+         - Checking if the <src> being pushed ('{matched_src_name}')\n  \
+         is a ref in \"refs/{{heads,tags}}/\". If so we add a corresponding\n  \
+         refs/{{heads,tags}}/ prefix on the remote side.\n\
+         \n\
+         Neither worked, so we gave up. You must fully qualify the ref."
+    );
+    // `if (!advice_enabled(ADVICE_PUSH_UNQUALIFIED_REF_NAME)) return;`
+    if !crate::advice::Advice::PushUnqualifiedRefName.enabled_in(repo) {
+        return (error, None);
+    }
+    use gix::object::Kind;
+    let hint = match repo.find_header(oid).ok().map(|h| h.kind()) {
+        Some(Kind::Commit) => format!(
+            "The <src> part of the refspec is a commit object.\n\
+             Did you mean to create a new branch by pushing to\n\
+             '{matched_src_name}:refs/heads/{dst_value}'?"
+        ),
+        Some(Kind::Tag) => format!(
+            "The <src> part of the refspec is a tag object.\n\
+             Did you mean to create a new tag by pushing to\n\
+             '{matched_src_name}:refs/tags/{dst_value}'?"
+        ),
+        Some(Kind::Tree) => format!(
+            "The <src> part of the refspec is a tree object.\n\
+             Did you mean to tag a new tree by pushing to\n\
+             '{matched_src_name}:refs/tags/{dst_value}'?"
+        ),
+        Some(Kind::Blob) => format!(
+            "The <src> part of the refspec is a blob object.\n\
+             Did you mean to tag a new blob by pushing to\n\
+             '{matched_src_name}:refs/tags/{dst_value}'?"
+        ),
+        None => format!(
+            "The <src> part of the refspec ('{matched_src_name}') \
+             is an object ID that doesn't exist.\n"
+        ),
+    };
+    (error, Some(hint))
 }
 
 fn is_reachable_in_reflog(

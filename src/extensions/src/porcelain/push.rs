@@ -1084,6 +1084,9 @@ git push <groupname>\n"
         for s in &outcome.statuses {
             if let Err(reason) = &s.result {
                 eprintln!("error: {reason}");
+                if let Some(hint) = &s.hint {
+                    crate::advice::print_hint(hint);
+                }
             }
         }
         eprintln!("error: failed to push some refs to '{transport_url}'");
@@ -1454,7 +1457,7 @@ fn build_requests(
                     new: id,
                     force: true,
                     expected: None,
-                    only_if_absent: false, check_reachable: None, explicit_delete: false,
+                    only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
                 });
             }
         }
@@ -1467,7 +1470,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false });
+                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None });
                 upstreams.push((short, name));
             }
         }
@@ -1491,7 +1494,7 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false });
+                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None });
             }
         }
         // Only `--tags` on its own is complete here; with refspecs alongside, the
@@ -1536,6 +1539,7 @@ fn build_requests(
                 // error only when it is not, because there is nothing to qualify
                 // it with (remote.c:1152-1163).
                 explicit_delete: !spec.starts_with("refs/"),
+                unqualified_dst: None,
             });
         }
         return Ok((requests, upstreams));
@@ -1660,7 +1664,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None, explicit_delete: false });
+            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None, explicit_delete: false, unqualified_dst: None });
         }
     }
     Ok(())
@@ -1827,6 +1831,19 @@ fn parse_refspec(
             // blind delete when it is `refs/`-qualified.
             explicit_delete: src.is_empty()
                 && !dst_spec.is_some_and(|d| d.starts_with("refs/")),
+            // `match_explicit()` places an explicit destination outside `refs/` against
+            // the advertisement, and `guess_ref()` reads `matched_src->name` when it
+            // finds nothing there (remote.c:1302-1331); `dst_full` above is only the
+            // name a destination-less caller sees.
+            unqualified_dst: match dst_spec {
+                Some(d) if !src.is_empty() && !d.is_empty() && !d.starts_with("refs/") => {
+                    Some(push_proto::UnqualifiedDst {
+                        dst: d.to_owned(),
+                        src_name: matched_src.clone().unwrap_or_else(|| src.to_owned()),
+                    })
+                }
+                _ => None,
+            },
         },
         upstream,
     ))
@@ -2308,7 +2325,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
             new,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
         },
         (branch, name),
     ))
@@ -3281,7 +3298,7 @@ pub(super) fn expand_pattern_refspec(
             new: id,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
         });
     }
     Ok(out)
@@ -3396,7 +3413,7 @@ mod tests {
             new: tip,
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         requests.into_iter().skip(1).map(|r| r.name).collect()
@@ -3425,7 +3442,7 @@ mod tests {
             // Even under `--force`, a followed tag must not inherit the force bit.
             force: true,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
 
@@ -3451,7 +3468,7 @@ mod tests {
             new: gix::hash::ObjectId::null(repo.object_hash()),
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");

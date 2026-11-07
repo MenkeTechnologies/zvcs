@@ -66,6 +66,10 @@ pub enum Advice {
     /// `git push <remote>/<branch>`: the repository argument is no remote but
     /// its text before the first slash names one (builtin/push.c:668-689).
     PushRepoLooksLikeRef,
+    /// An unqualified push destination that neither the advertisement nor the
+    /// source's namespace could place (`show_push_unqualified_ref_name_error()`,
+    /// remote.c:1206-1266).
+    PushUnqualifiedRefName,
     /// Git is blocked on an editor the user may not have noticed.
     WaitingForEditor,
     /// A ref name was rejected by `check-ref-format`'s rules.
@@ -165,6 +169,7 @@ impl Advice {
             Advice::PushNeedsForce => "advice.pushNeedsForce",
             Advice::PushRefNeedsUpdate => "advice.pushRefNeedsUpdate",
             Advice::PushRepoLooksLikeRef => "advice.pushRepoLooksLikeRef",
+            Advice::PushUnqualifiedRefName => "advice.pushUnqualifiedRefName",
             Advice::WaitingForEditor => "advice.waitingForEditor",
             Advice::RefSyntax => "advice.refSyntax",
             Advice::SetUpstreamFailure => "advice.setUpstreamFailure",

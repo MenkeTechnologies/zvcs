@@ -544,9 +544,10 @@ fn build_requests(
     repo: &gix::Repository,
     st: &State,
     matching: &mut Option<push_proto::Matching>,
-) -> Result<(Vec<Request>, Vec<String>)> {
+) -> Result<(Vec<Request>, Vec<(usize, String)>)> {
     let mut requests = Vec::new();
-    // The `error()` of every source `match_explicit_lhs()` refused, in argv order.
+    // The `error()` of every source `match_explicit_lhs()` refused, in argv order,
+    // each with the number of requests built before it: its place in the refspec walk.
     // `match_explicit_refs()` reports every one of them rather than stopping at the
     // first (remote.c:1351-1358).
     let mut missing = Vec::new();
@@ -573,6 +574,7 @@ fn build_requests(
                     only_if_absent: false,
                     check_reachable: None,
                 explicit_delete: false,
+                unqualified_dst: None,
                 });
             }
         }
@@ -621,6 +623,7 @@ fn build_requests(
                 only_if_absent: false,
                 check_reachable: None,
                 explicit_delete: !dst.starts_with("refs/"),
+                unqualified_dst: None,
             });
             continue;
         }
@@ -638,24 +641,30 @@ fn build_requests(
             (0, _) => match repo.rev_parse_single(src) {
                 Ok(id) => (src.to_owned(), id.detach()),
                 Err(_) => {
-                    missing.push(format!("src refspec {src} does not match any"));
+                    missing.push((requests.len(), format!("src refspec {src} does not match any")));
                     continue;
                 }
             },
             _ => {
-                missing.push(format!("src refspec {src} matches more than one"));
+                missing.push((requests.len(), format!("src refspec {src} matches more than one")));
                 continue;
             }
         };
+        // An explicit `<dst>` outside `refs/` is placed against the advertisement by
+        // `match_explicit()` (remote.c:1302-1331), which the wire layer does; a bare
+        // `<src>` takes its destination from the source and is never matched.
+        let unqualified_dst = (body.contains(':') && !dst.is_empty() && !dst.starts_with("refs/"))
+            .then(|| push_proto::UnqualifiedDst { dst: dst.to_owned(), src_name: src_name.clone() });
         requests.push(Request {
             name: full_ref_name(repo, dst),
-            src: Some(src_name),
+            src: Some(src_name.clone()),
             new,
             force,
             expected: None,
             only_if_absent: false,
             check_reachable: None,
             explicit_delete: false,
+            unqualified_dst,
         });
     }
     Ok((requests, missing))

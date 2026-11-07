@@ -6050,10 +6050,6 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     if no_commit_id && graph {
         bail!("`--no-commit-id` with `--graph` is not ported");
     }
-    if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
-        bail!("`-m` with `--graph` is not ported: git lays out one graph row per
-               per-parent record");
-    }
     // The parents each commit's diff is taken against: the walked ones, or the
     // `--full-diff` saved ones where the display list was rewritten.
     let diff_nodes: std::borrow::Cow<'_, [Node]> = match saved_parents.is_empty() {
@@ -6201,7 +6197,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // in [`render_graph`] marks. Only `--graph` gets here: every other path
         // dropped the commit from the list outright.
         if pickaxe_shown.as_ref().is_some_and(|hits| !hits.contains(&node.id)) {
-            blocks.push(None);
+            push_graph_block(&mut blocks, ni, None, &line_prefix);
             continue;
         }
         // Whether this record produced a diff queue; `whatchanged` prints nothing for
@@ -6229,7 +6225,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 block.push(rec_term);
             }
             if graph {
-                blocks.push(Some(GraphBlock::message_only(block)));
+                push_graph_block(&mut blocks, ni, Some(GraphBlock::message_only(block)), &line_prefix);
                 continue;
             }
             let mut piece: Vec<u8> = Vec::new();
@@ -7234,7 +7230,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // Under `--graph` the commit was still walked and graphed, so it
                 // keeps its slot and prints no row (see [`render_graph`]).
                 if graph {
-                    blocks.push(None);
+                    push_graph_block(&mut blocks, ni, None, &line_prefix);
                 }
                 continue;
             }
@@ -7251,7 +7247,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         }
         if graph {
             // Buffer for the column layout, which spans all commits at once.
-            blocks.push(Some(GraphBlock { text: block, msg_len }));
+            let block = GraphBlock { text: block, msg_len, more: Vec::new(), lead: Vec::new() };
+            push_graph_block(&mut blocks, ni, Some(block), &line_prefix);
             continue;
         }
 
@@ -15707,97 +15704,107 @@ pub(super) fn render_graph(
             &interest.lookahead(nodes, i),
         );
 
-        let Some(record) = blocks[i].as_ref() else {
+        let Some(first) = blocks[i].as_ref() else {
             continue;
         };
-        let current: &[u8] = &record.text;
+        // `log_tree_diff()`'s `for (;;)` loop under `-m` (log-tree.c:1146-1172) runs
+        // `show_log()` once per parent with no `graph_update()` in between, so the
+        // records after the first find the graph already padded, and
+        // `graph_show_commit()` draws them a padding row instead of the commit row
+        // (graph.c:1864-1872); the separator in front of each is `show_log()`'s own.
+        for record in std::iter::once(first).chain(first.more.iter()) {
+            let current: &[u8] = &record.text;
 
-        // `show_log()` prints the record separator *after* the next commit has been
-        // through `graph_update()`, and puts that commit's padding row in front of
-        // it whenever the previous record ended in a newline — otherwise the gap
-        // would read as a hole in the graph. The row is git's `graph_padding_line()`,
-        // which also marks the state as padded so the commit row below it does not
-        // mistake the collapse it interrupted for its own.
-        if let (Some(prev), Some(sep)) = (prev_message, separator) {
-            if sep == b'\n' && prev.ends_with(b"\n") {
-                out.extend_from_slice(&graph.padding_line_before_record());
+            // `show_log()` prints the record separator *after* the next commit has been
+            // through `graph_update()`, and puts that commit's padding row in front of
+            // it whenever the previous record ended in a newline — otherwise the gap
+            // would read as a hole in the graph. The row is git's `graph_padding_line()`,
+            // which also marks the state as padded so the commit row below it does not
+            // mistake the collapse it interrupted for its own.
+            if let (Some(prev), Some(sep)) = (prev_message, separator) {
+                if sep == b'\n' && prev.ends_with(b"\n") {
+                    out.extend_from_slice(&graph.padding_line_before_record());
+                }
+                out.push(sep);
             }
-            out.push(sep);
-        }
-        prev_message = Some(&record.text[..record.msg_len.min(record.text.len())]);
+            prev_message = Some(&record.text[..record.msg_len.min(record.text.len())]);
 
-        // `graph_show_commit()` drains every row that comes *before* the commit
-        // row onto lines of its own — the `...` skip row, and the expansion rows
-        // an octopus merge needs — so that the commit's text lands on the row
-        // carrying its `*`.
-        while matches!(graph.state, GraphState::Skip | GraphState::PreCommit | GraphState::PreRoot) {
-            out.extend_from_slice(&graph.next_line());
-            out.push(b'\n');
-        }
-
-        // A terminator format's byte is carried at the end of the block, but git
-        // prints it *after* the commit's remaining graph rows (log-tree.c:915-919),
-        // so it is taken off here and put back below.
-        let block: &[u8] = match terminator {
-            Some(t) if current.last() == Some(&t) => &current[..current.len() - 1],
-            _ => current,
-        };
-        // `show_log()` hands only the commit *message* to `graph_show_commit_msg()`;
-        // everything after it — the blank line fencing the diff off, and the diff
-        // itself — is written by `log_tree_diff_flush()` through the diff prefix
-        // callback, which is `graph_padding_line()` (graph.c:329-342). The graph's
-        // remaining rows are therefore drained *between* the two, not after the
-        // whole record: a commit under a collapse prints `|/` on a row of its own
-        // and its diff on the padded rows below it.
-        let split = record.msg_len.min(block.len());
-        let (msg, diff) = block.split_at(split);
-
-        let msg_nl = msg.ends_with(b"\n");
-        graph_write_lines(&mut out, &mut graph, msg);
-
-        // Rows the commit's message did not consume: the `|\` of a merge and the
-        // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
-        // opens a line for them when the message did not end in one, then
-        // `graph_show_remainder()` puts a newline *between* the rows only — the
-        // trailing one comes back at the end, and only for a message that was newline
-        // terminated. A collapse needs at most one row per column, so the bound below
-        // can only trip on a bug here — failing beats hanging the caller.
-        if graph.state != GraphState::Padding {
-            if !msg_nl {
-                out.push(b'\n');
-            }
-            let mut guard = graph.columns.len() + graph.new_columns.len() + graph.num_parents + 8;
-            loop {
+            // `graph_show_commit()` drains every row that comes *before* the commit
+            // row onto lines of its own — the `...` skip row, and the expansion rows
+            // an octopus merge needs — so that the commit's text lands on the row
+            // carrying its `*`.
+            while matches!(graph.state, GraphState::Skip | GraphState::PreCommit | GraphState::PreRoot) {
                 out.extend_from_slice(&graph.next_line());
-                if graph.state == GraphState::Padding {
-                    break;
-                }
-                out.push(b'\n');
-                guard -= 1;
-                if guard == 0 {
-                    crate::git_fatal!("--graph failed to settle the commit graph");
-                }
-            }
-            if msg_nl {
                 out.push(b'\n');
             }
-        }
 
-        if !diff.is_empty() {
-            graph_write_lines(&mut out, &mut graph, diff);
-        }
+            // A terminator format's byte is carried at the end of the block, but git
+            // prints it *after* the commit's remaining graph rows (log-tree.c:915-919),
+            // so it is taken off here and put back below.
+            let block: &[u8] = match terminator {
+                Some(t) if current.last() == Some(&t) => &current[..current.len() - 1],
+                _ => current,
+            };
+            // `show_log()` hands only the commit *message* to `graph_show_commit_msg()`;
+            // everything after it — the blank line fencing the diff off, and the diff
+            // itself — is written by `log_tree_diff_flush()` through the diff prefix
+            // callback, which is `graph_padding_line()` (graph.c:329-342). The graph's
+            // remaining rows are therefore drained *between* the two, not after the
+            // whole record: a commit under a collapse prints `|/` on a row of its own
+            // and its diff on the padded rows below it.
+            let split = record.msg_len.min(block.len());
+            let (msg, diff) = block.split_at(split);
 
-        // `show_log()` closes a terminator format's record last of all, and puts a
-        // padding row in front of the terminator when the record's own text ended
-        // in a newline (log-tree.c:915-919) — the same reason the separator carries
-        // one: an empty line would read as a hole in the graph.
-        if let Some(term) = terminator {
-            if current.last() == Some(&term) {
-                let tail_nl = if diff.is_empty() { msg_nl } else { diff.ends_with(b"\n") };
-                if tail_nl {
+            let msg_nl = msg.ends_with(b"\n");
+            if !msg.is_empty() {
+                out.extend_from_slice(&record.lead);
+            }
+            graph_write_lines(&mut out, &mut graph, msg);
+
+            // Rows the commit's message did not consume: the `|\` of a merge and the
+            // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
+            // opens a line for them when the message did not end in one, then
+            // `graph_show_remainder()` puts a newline *between* the rows only — the
+            // trailing one comes back at the end, and only for a message that was newline
+            // terminated. A collapse needs at most one row per column, so the bound below
+            // can only trip on a bug here — failing beats hanging the caller.
+            if graph.state != GraphState::Padding {
+                if !msg_nl {
+                    out.push(b'\n');
+                }
+                let mut guard = graph.columns.len() + graph.new_columns.len() + graph.num_parents + 8;
+                loop {
                     out.extend_from_slice(&graph.next_line());
+                    if graph.state == GraphState::Padding {
+                        break;
+                    }
+                    out.push(b'\n');
+                    guard -= 1;
+                    if guard == 0 {
+                        crate::git_fatal!("--graph failed to settle the commit graph");
+                    }
                 }
-                out.push(term);
+                if msg_nl {
+                    out.push(b'\n');
+                }
+            }
+
+            if !diff.is_empty() {
+                graph_write_lines(&mut out, &mut graph, diff);
+            }
+
+            // `show_log()` closes a terminator format's record last of all, and puts a
+            // padding row in front of the terminator when the record's own text ended
+            // in a newline (log-tree.c:915-919) — the same reason the separator carries
+            // one: an empty line would read as a hole in the graph.
+            if let Some(term) = terminator {
+                if current.last() == Some(&term) {
+                    let tail_nl = if diff.is_empty() { msg_nl } else { diff.ends_with(b"\n") };
+                    if tail_nl {
+                        out.extend_from_slice(&graph.next_line());
+                    }
+                    out.push(term);
+                }
             }
         }
     }
@@ -15812,12 +15819,45 @@ pub(super) struct GraphBlock {
     /// receives, and after which the graph's remaining rows are drained. The rest
     /// is diff output, which git prefixes with `graph_padding_line()` instead.
     msg_len: usize,
+    /// The per-parent records `-m` prints after this one for the same merge
+    /// (log-tree.c:1146-1172), drawn under the one `graph_update()` the commit got.
+    more: Vec<GraphBlock>,
+    /// What a `-m` record after the first prints ahead of its padding row: the
+    /// `--line-prefix` `graph_show_commit()` writes before it calls
+    /// `graph_show_padding()`, which writes its own (graph.c:1859, 1869-1871).
+    lead: Vec<u8>,
 }
 
 impl GraphBlock {
     /// A record with no diff, so nothing follows the message.
     pub(super) fn message_only(text: Vec<u8>) -> Self {
-        GraphBlock { msg_len: text.len(), text }
+        GraphBlock { msg_len: text.len(), text, more: Vec::new(), lead: Vec::new() }
+    }
+}
+
+/// File `block`, a record of `nodes[ni]` or `None` for one that printed nothing,
+/// in that node's slot of `blocks`. A per-parent `-m` record after the merge's
+/// first printed one joins it as [`GraphBlock::more`], and a node that reached no
+/// record at all (every parent rejected by `-S`/`-G`) is a slot that printed nothing.
+fn push_graph_block(
+    blocks: &mut Vec<Option<GraphBlock>>,
+    ni: usize,
+    block: Option<GraphBlock>,
+    line_prefix: &[u8],
+) {
+    while blocks.len() < ni {
+        blocks.push(None);
+    }
+    match blocks.get_mut(ni) {
+        None => blocks.push(block),
+        Some(slot) => match (slot.as_mut(), block) {
+            (Some(shown), Some(mut block)) => {
+                block.lead = line_prefix.to_vec();
+                shown.more.push(block);
+            }
+            (None, block @ Some(_)) => *slot = block,
+            (_, None) => {}
+        },
     }
 }
 

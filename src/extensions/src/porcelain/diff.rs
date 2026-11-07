@@ -10186,7 +10186,7 @@ fn quote_two(pa: &[u8], a: &BString, pb: &[u8], b: &BString) -> Vec<u8> {
 struct LostLine {
     line: Vec<u8>,
     /// Bit `n` set means parent `n` lost this line.
-    parent_map: u32,
+    parent_map: u64,
 }
 
 /// One line of the merge result, plus everything the parents lost in front of it.
@@ -10200,20 +10200,23 @@ struct SLine {
     plost: Vec<Vec<u8>>,
     /// Bits `0..num_parent` mark parents that lack this line; bit `num_parent`
     /// is `mark` and bit `num_parent + 1` is `no_pre_delete`.
-    flag: u32,
+    flag: u64,
     /// Per-parent line number this sline starts at, filled by `combine_diff()`.
-    p_lno: [u32; NUM_PARENT],
+    p_lno: Vec<u32>,
 }
 
+/// The two stages, `:2:` and `:3:`, an unmerged worktree path is diffed against
+/// (diff-lib.c:211-215).
 const NUM_PARENT: usize = 2;
 
-/// Build the two-parent combined-diff `sline` table: the merge result plus, for
-/// each parent, the lines that parent lost — coalesced and numbered exactly as
-/// `combine_diff()` / `make_hunks()` do. Returns the table and the result line
-/// count. Shared by the unmerged-worktree (`--cc`) and multi-revision paths.
+/// Build the combined-diff `sline` table for any number of parents: the merge
+/// result plus, for each parent, the lines that parent lost — coalesced and
+/// numbered exactly as `show_patch_diff()`'s parent loop, `combine_diff()` and
+/// `make_hunks()` do (combine-diff.c:1184-1204). Returns the table and the result
+/// line count. Shared by the unmerged-worktree (`--cc`) and multi-revision paths.
 fn build_combined_sline(
     result: &[u8],
-    parents: &[Vec<u8>],
+    parents: &[CombinedSide],
     ctx: u32,
     dense: bool,
 ) -> (Vec<SLine>, usize) {
@@ -10222,16 +10225,29 @@ fn build_combined_sline(
     if !result.is_empty() && *result.last().expect("non-empty") != b'\n' {
         cnt += 1;
     }
-    let mut sline: Vec<SLine> = (0..cnt + 2).map(|_| SLine::default()).collect();
+    let m = Marks::new(parents.len());
+    let mut sline: Vec<SLine> = (0..cnt + 2)
+        .map(|_| SLine {
+            p_lno: vec![0; parents.len()],
+            ..SLine::default()
+        })
+        .collect();
     for (i, line) in byte_lines(result).into_iter().enumerate() {
         let end = line.len() - usize::from(line.last() == Some(&b'\n'));
         sline[i].bol = line[..end].to_vec();
     }
 
     let result_lines = byte_lines(result);
-    for (n, parent) in parents.iter().enumerate() {
-        let nmask = 1u32 << n;
-        let before = byte_lines(parent);
+    for (n, side) in parents.iter().enumerate() {
+        // A parent whose blob an earlier parent already had takes that parent's
+        // result through `reuse_combine_diff()` (combine-diff.c:1186-1193, 878-903)
+        // instead of a diff of its own.
+        if let Some(j) = parents[..n].iter().position(|p| p.id == side.id) {
+            reuse_combine_diff(&mut sline, cnt, n, j);
+            continue;
+        }
+        let nmask = 1u64 << n;
+        let before = byte_lines(&side.bytes);
         let mut input: InternedInput<Vec<u8>> = InternedInput::default();
         input.update_before(before.iter().map(|l| l.to_vec()));
         input.update_after(result_lines.iter().map(|l| l.to_vec()));
@@ -10260,7 +10276,7 @@ fn build_combined_sline(
         for lno in 0..=cnt {
             sline[lno].p_lno[n] = p_lno;
             let fresh = std::mem::take(&mut sline[lno].plost);
-            coalesce_lines(&mut sline[lno].lost, fresh, n as u32);
+            coalesce_lines(&mut sline[lno].lost, fresh, n);
             for ll in &sline[lno].lost {
                 if ll.parent_map & nmask != 0 {
                     p_lno += 1;
@@ -10273,14 +10289,34 @@ fn build_combined_sline(
         sline[cnt + 1].p_lno[n] = p_lno;
     }
 
-    make_hunks(&mut sline, cnt, ctx, dense);
+    make_hunks(m, &mut sline, cnt, ctx, dense);
     (sline, cnt)
+}
+
+/// `reuse_combine_diff()` (combine-diff.c:878-903): parent `i` holds the same blob
+/// as parent `j`, already examined, so every line parent `j` lacks or lost parent
+/// `i` lacks or lost too, at the same per-parent line numbers.
+fn reuse_combine_diff(sline: &mut [SLine], cnt: usize, i: usize, j: usize) {
+    let (imask, jmask) = (1u64 << i, 1u64 << j);
+    for sl in sline.iter_mut().take(cnt + 1) {
+        sl.p_lno[i] = sl.p_lno[j];
+        for ll in sl.lost.iter_mut() {
+            if ll.parent_map & jmask != 0 {
+                ll.parent_map |= imask;
+            }
+        }
+        if sl.flag & jmask != 0 {
+            sl.flag |= imask;
+        }
+    }
+    // "the overall size of the file (sline[cnt])".
+    sline[cnt + 1].p_lno[i] = sline[cnt + 1].p_lno[j];
 }
 
 /// `true` if any result line survived dense filtering, i.e. the combined diff has
 /// at least one hunk to emit for this path.
-fn sline_has_marks(sline: &[SLine], cnt: usize) -> bool {
-    sline.iter().take(cnt + 1).any(|s| s.flag & MARK != 0)
+fn sline_has_marks(m: Marks, sline: &[SLine], cnt: usize) -> bool {
+    sline.iter().take(cnt + 1).any(|s| s.flag & m.mark != 0)
 }
 
 /// The file path a tree-to-tree change touches, or `None` for a directory-level
@@ -11324,9 +11360,8 @@ fn combined_patch(
 ) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     for cp in set {
-        if cp.parents.len() != NUM_PARENT {
-            bail!("combined diff of more than two parents is not supported");
-        }
+        // `show_patch_diff()` handles every `num_parent` alike (combine-diff.c:1015).
+        let m = Marks::new(cp.parents.len());
         // `buffer_is_binary()` over the result and every parent (combine-diff.c:
         // 1132-1147): a binary path gets the header without its `---`/`+++` pair and
         // `Binary files differ`, and no line diff is run for it.
@@ -11341,11 +11376,10 @@ fn combined_patch(
         let (sline, cnt) = match binary || result_deleted {
             true => (Vec::new(), 0),
             false => {
-                let parent_bytes: Vec<Vec<u8>> = cp.parents.iter().map(|p| p.bytes.clone()).collect();
-                build_combined_sline(&cp.bytes, &parent_bytes, ctx, dense)
+                build_combined_sline(&cp.bytes, &cp.parents, ctx, dense)
             }
         };
-        let show_hunks = !binary && !result_deleted && sline_has_marks(&sline, cnt);
+        let show_hunks = !binary && !result_deleted && sline_has_marks(m, &sline, cnt);
         // `for (i = 0; i < num_parent; i++) if (elem->parent[i].mode != elem->mode)`
         // (combine-diff.c:1123-1128).
         let mode_differs = cp.parents.iter().any(|p| p.kind != cp.patch_kind);
@@ -11442,11 +11476,13 @@ fn combined_patch(
         // 853), which a whole-buffer pass over its output reproduces.
         let mut hunks: Vec<u8> = Vec::new();
         if !result_deleted {
-            dump_sline(&mut hunks, &sline, cnt, ctx);
+            dump_sline(m, &mut hunks, &sline, cnt, ctx);
         }
         out.extend_from_slice(&apply_line_prefix(hunks, line_prefix));
     }
-    Ok(colorize_combined(out, colors, line_prefix, NUM_PARENT))
+    // Every path of one set has the same parents, so one count paints them all.
+    let num_parent = set.first().map_or(0, |cp| cp.parents.len());
+    Ok(colorize_combined(out, colors, line_prefix, num_parent))
 }
 
 /// The palette `show_patch_diff()` and `dump_sline()` paint a combined section
@@ -11592,7 +11628,7 @@ fn grab_blob(repo: &gix::Repository, kind: EntryKind, id: ObjectId) -> Result<Ve
 
 /// `coalesce_lines()`: LCS-merge `fresh` (the lines parent `parent` lost) into the
 /// already-merged `base`, so a line lost by several parents is shown once.
-fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
+fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: usize) {
     if fresh.is_empty() {
         return;
     }
@@ -11601,7 +11637,7 @@ fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
             .into_iter()
             .map(|line| LostLine {
                 line,
-                parent_map: 1 << parent,
+                parent_map: 1u64 << parent,
             })
             .collect();
         return;
@@ -11642,7 +11678,7 @@ fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
                         parent_map: 0,
                     },
                 );
-                ll.parent_map |= 1 << parent;
+                ll.parent_map |= 1u64 << parent;
                 merged.push(ll);
                 i -= 1;
                 j -= 1;
@@ -11650,7 +11686,7 @@ fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
             1 => {
                 merged.push(LostLine {
                     line: fresh[j - 1].clone(),
-                    parent_map: 1 << parent,
+                    parent_map: 1u64 << parent,
                 });
                 j -= 1;
             }
@@ -11670,17 +11706,40 @@ fn coalesce_lines(base: &mut Vec<LostLine>, fresh: Vec<Vec<u8>>, parent: u32) {
     *base = merged;
 }
 
-const ALL_MASK: u32 = (1 << NUM_PARENT) - 1;
-const MARK: u32 = 1 << NUM_PARENT;
-const NO_PRE_DELETE: u32 = 2 << NUM_PARENT;
+/// The bits `make_hunks()`, `give_context()` and `dump_sline()` read off an
+/// `sline` flag for `num_parent` parents (combine-diff.c:544-546, 610-611,
+/// 756-757): bit `n` below `num_parent` is "parent `n` lacks this line", and the
+/// two bits above them are `mark` and `no_pre_delete`. `unsigned long` in git, so
+/// a 64-bit word here.
+#[derive(Clone, Copy)]
+struct Marks {
+    num_parent: usize,
+    /// `all_mask = (1UL<<num_parent) - 1`.
+    all: u64,
+    /// `mark = (1UL<<num_parent)`.
+    mark: u64,
+    /// `no_pre_delete = (2UL<<num_parent)`.
+    no_pre_delete: u64,
+}
 
-fn interesting(sl: &SLine) -> bool {
-    sl.flag & ALL_MASK != 0 || !sl.lost.is_empty()
+impl Marks {
+    fn new(num_parent: usize) -> Self {
+        Self {
+            num_parent,
+            all: (1u64 << num_parent) - 1,
+            mark: 1u64 << num_parent,
+            no_pre_delete: 2u64 << num_parent,
+        }
+    }
+}
+
+fn interesting(sl: &SLine, m: Marks) -> bool {
+    sl.flag & m.all != 0 || !sl.lost.is_empty()
 }
 
 /// `adjust_hunk_tail()`.
-fn adjust_hunk_tail(sline: &[SLine], hunk_begin: usize, i: usize) -> usize {
-    if hunk_begin < i && sline[i - 1].flag & ALL_MASK == 0 {
+fn adjust_hunk_tail(m: Marks, sline: &[SLine], hunk_begin: usize, i: usize) -> usize {
+    if hunk_begin < i && sline[i - 1].flag & m.all == 0 {
         i - 1
     } else {
         i
@@ -11688,10 +11747,10 @@ fn adjust_hunk_tail(sline: &[SLine], hunk_begin: usize, i: usize) -> usize {
 }
 
 /// `find_next()`.
-fn find_next(sline: &[SLine], i: usize, cnt: usize, look_for_uninteresting: bool) -> usize {
+fn find_next(m: Marks, sline: &[SLine], i: usize, cnt: usize, look_for_uninteresting: bool) -> usize {
     let mut i = i;
     while i <= cnt {
-        let marked = sline[i].flag & MARK != 0;
+        let marked = sline[i].flag & m.mark != 0;
         if look_for_uninteresting != marked {
             return i;
         }
@@ -11701,30 +11760,30 @@ fn find_next(sline: &[SLine], i: usize, cnt: usize, look_for_uninteresting: bool
 }
 
 /// `give_context()`.
-fn give_context(sline: &mut [SLine], cnt: usize, context: usize) {
-    let mut i = find_next(sline, 0, cnt, false);
+fn give_context(m: Marks, sline: &mut [SLine], cnt: usize, context: usize) {
+    let mut i = find_next(m, sline, 0, cnt, false);
     if cnt < i {
         return;
     }
     while i <= cnt {
         let mut j = i.saturating_sub(context);
         while j < i {
-            if sline[j].flag & MARK == 0 {
-                sline[j].flag |= NO_PRE_DELETE;
+            if sline[j].flag & m.mark == 0 {
+                sline[j].flag |= m.no_pre_delete;
             }
-            sline[j].flag |= MARK;
+            sline[j].flag |= m.mark;
             j += 1;
         }
         loop {
-            let mut j = find_next(sline, i, cnt, true);
+            let mut j = find_next(m, sline, i, cnt, true);
             if cnt < j {
                 return;
             }
-            let k = find_next(sline, j, cnt, false);
-            j = adjust_hunk_tail(sline, i, j);
+            let k = find_next(m, sline, j, cnt, false);
+            j = adjust_hunk_tail(m, sline, i, j);
             if k < j + context {
                 while j < k {
-                    sline[j].flag |= MARK;
+                    sline[j].flag |= m.mark;
                     j += 1;
                 }
                 i = k;
@@ -11734,7 +11793,7 @@ fn give_context(sline: &mut [SLine], cnt: usize, context: usize) {
             let mut j2 = j;
             let end = (j + context).min(cnt + 1);
             while j2 < end {
-                sline[j2].flag |= MARK;
+                sline[j2].flag |= m.mark;
                 j2 += 1;
             }
             break;
@@ -11744,13 +11803,13 @@ fn give_context(sline: &mut [SLine], cnt: usize, context: usize) {
 
 /// `make_hunks()` (combine-diff.c:607-745). `dense` is `rev->dense_combined_merges`
 /// (combine-diff.c:1204): `--cc` sets it and `-c` does not.
-fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
+fn make_hunks(m: Marks, sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
     let context = context as usize;
     for sl in sline.iter_mut().take(cnt + 1) {
-        if interesting(sl) {
-            sl.flag |= MARK;
+        if interesting(sl, m) {
+            sl.flag |= m.mark;
         } else {
-            sl.flag &= !MARK;
+            sl.flag &= !m.mark;
         }
     }
 
@@ -11758,7 +11817,7 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
     // A bare `-c` stops here: every interesting line keeps its mark, so a hunk only
     // one parent changed still shows.
     if !dense {
-        give_context(sline, cnt, context);
+        give_context(m, sline, cnt, context);
         return;
     }
 
@@ -11766,7 +11825,7 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
     // those are changes only one side made, which `--cc` elides.
     let mut i = 0usize;
     while i <= cnt {
-        while i <= cnt && sline[i].flag & MARK == 0 {
+        while i <= cnt && sline[i].flag & m.mark == 0 {
             i += 1;
         }
         if cnt < i {
@@ -11775,14 +11834,14 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
         let hunk_begin = i;
         let mut j = i + 1;
         while j <= cnt {
-            if sline[j].flag & MARK == 0 {
+            if sline[j].flag & m.mark == 0 {
                 // Look past the gap: another marked line within `context` continues it.
-                let mut la = adjust_hunk_tail(sline, hunk_begin, j);
+                let mut la = adjust_hunk_tail(m, sline, hunk_begin, j);
                 la = (la + context).min(cnt + 1);
                 let mut contin = false;
                 while la > 0 && j < la {
                     la -= 1;
-                    if sline[la].flag & MARK != 0 {
+                    if sline[la].flag & m.mark != 0 {
                         contin = true;
                         break;
                     }
@@ -11796,13 +11855,13 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
         }
         let hunk_end = j;
 
-        let mut same_diff: u32 = 0;
+        let mut same_diff: u64 = 0;
         let mut has_interesting = false;
         for sl in sline.iter().take(hunk_end).skip(i) {
             if has_interesting {
                 break;
             }
-            let this_diff = sl.flag & ALL_MASK;
+            let this_diff = sl.flag & m.all;
             if this_diff != 0 {
                 if same_diff == 0 {
                     same_diff = this_diff;
@@ -11823,15 +11882,15 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
             }
         }
 
-        if !has_interesting && same_diff != ALL_MASK {
+        if !has_interesting && same_diff != m.all {
             for sl in sline.iter_mut().take(hunk_end).skip(hunk_begin) {
-                sl.flag &= !MARK;
+                sl.flag &= !m.mark;
             }
         }
         i = hunk_end;
     }
 
-    give_context(sline, cnt, context);
+    give_context(m, sline, cnt, context);
 }
 
 /// `hunk_comment_line()` (combine-diff.c:730-738): a result line opening with an
@@ -11861,13 +11920,13 @@ pub(crate) fn combined_hunk_comment(bol: &[u8]) -> &[u8] {
 }
 
 /// `dump_sline()`.
-fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
+fn dump_sline(m: Marks, out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
     let mut lno = 0usize;
     loop {
         // `hunk_comment` starts over for every hunk and follows the unmarked lines
         // scanned on the way to it (combine-diff.c:772-778).
         let mut hunk_comment: Option<&[u8]> = None;
-        while lno <= cnt && sline[lno].flag & MARK == 0 {
+        while lno <= cnt && sline[lno].flag & m.mark == 0 {
             if is_hunk_comment_line(&sline[lno].bol) {
                 hunk_comment = Some(&sline[lno].bol);
             }
@@ -11877,7 +11936,7 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
             break;
         }
         let mut hunk_end = lno + 1;
-        while hunk_end <= cnt && sline[hunk_end].flag & MARK != 0 {
+        while hunk_end <= cnt && sline[hunk_end].flag & m.mark != 0 {
             hunk_end += 1;
         }
         let mut rlines = hunk_end - lno;
@@ -11887,15 +11946,15 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
         let mut null_context = 0usize;
         if context == 0 {
             for sl in sline.iter().take(hunk_end).skip(lno) {
-                if sl.flag & (MARK - 1) == 0 {
+                if sl.flag & (m.mark - 1) == 0 {
                     null_context += 1;
                 }
             }
             rlines = rlines.saturating_sub(null_context);
         }
 
-        out.extend_from_slice(&b"@".repeat(NUM_PARENT + 1));
-        for n in 0..NUM_PARENT {
+        out.extend_from_slice(&b"@".repeat(m.num_parent + 1));
+        for n in 0..m.num_parent {
             let l0 = sline[lno].p_lno[n];
             let l1 = sline[hunk_end].p_lno[n];
             push_str(
@@ -11904,7 +11963,7 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
             );
         }
         push_str(out, &format!(" +{},{rlines} ", lno + 1));
-        out.extend_from_slice(&b"@".repeat(NUM_PARENT + 1));
+        out.extend_from_slice(&b"@".repeat(m.num_parent + 1));
         // `printf("%s%s %s%s", c_reset, c_context, c_reset, c_func)` ahead of the
         // comment (combine-diff.c:825-827); [`colorize_combined`] paints it.
         let comment = hunk_comment.map(combined_hunk_comment).unwrap_or_default();
@@ -11917,10 +11976,10 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
         while lno < hunk_end {
             let sl = &sline[lno];
             lno += 1;
-            if sl.flag & NO_PRE_DELETE == 0 {
+            if sl.flag & m.no_pre_delete == 0 {
                 for ll in &sl.lost {
-                    for n in 0..NUM_PARENT {
-                        out.push(if ll.parent_map & (1 << n) != 0 { b'-' } else { b' ' });
+                    for n in 0..m.num_parent {
+                        out.push(if ll.parent_map & (1u64 << n) != 0 { b'-' } else { b' ' });
                     }
                     out.extend_from_slice(&ll.line);
                     out.push(b'\n');
@@ -11929,12 +11988,12 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
             if cnt < lno {
                 break;
             }
-            if sl.flag & (MARK - 1) == 0 && context == 0 {
+            if sl.flag & (m.mark - 1) == 0 && context == 0 {
                 // Only there to hang lost lines in front of; not shown at -U0.
                 continue;
             }
-            for n in 0..NUM_PARENT {
-                out.push(if sl.flag & (1 << n) != 0 { b'+' } else { b' ' });
+            for n in 0..m.num_parent {
+                out.push(if sl.flag & (1u64 << n) != 0 { b'+' } else { b' ' });
             }
             out.extend_from_slice(&sl.bol);
             out.push(b'\n');

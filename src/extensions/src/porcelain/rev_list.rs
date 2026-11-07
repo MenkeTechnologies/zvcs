@@ -600,8 +600,9 @@ pub(super) enum Origin {
 ///
 /// The message is the `die()` text without its `fatal: ` prefix. `--cherry` sets
 /// `right_only` and `cherry_mark`, so it conflicts with a later `--left-only` or
-/// `--cherry-pick` through those. Shared by `rev-list` and `log`.
-pub(super) fn side_option_conflict(
+/// `--cherry-pick` through those. Shared by `rev-list` and `log`, and by the
+/// sequencer's `cherry-pick`/`revert` walk.
+pub(crate) fn side_option_conflict(
     arg: &str,
     left_only: bool,
     right_only: bool,

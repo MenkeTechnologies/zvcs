@@ -797,7 +797,7 @@ mod request_pull;
 mod rerere;
 mod reset;
 mod restore;
-mod rev_list;
+pub(crate) mod rev_list;
 pub(crate) mod rev_parse;
 mod revert;
 mod rm;

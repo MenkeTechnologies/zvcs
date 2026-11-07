@@ -565,7 +565,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::Revs::BadRevision(_)
         | crate::sequencer::Revs::BadObject(_)
         | crate::sequencer::Revs::InvalidRange { .. }
-        | crate::sequencer::Revs::Fatal(_) => {
+        | crate::sequencer::Revs::Fatal(_)
+        | crate::sequencer::Revs::Died(_) => {
             unreachable!("reported by setup_revisions_fatal above")
         }
     };

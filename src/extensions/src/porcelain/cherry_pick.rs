@@ -915,6 +915,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         | crate::sequencer::Revs::BadObject(_)
         | crate::sequencer::Revs::InvalidRange { .. }
         | crate::sequencer::Revs::Fatal(_)
+        | crate::sequencer::Revs::Died(_)
         | crate::sequencer::Revs::UnknownOption => {
             unreachable!("stage 4 and stage 5 return on these")
         }

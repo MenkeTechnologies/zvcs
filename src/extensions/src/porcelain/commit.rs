@@ -1036,32 +1036,125 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Err(code) = patch_opts.finish() {
         return Ok(code);
     }
+
+    // `cmd_commit()` runs under `RUN_SETUP | NEED_WORK_TREE` (git.c:560), so the
+    // repository is found before a single option is judged, and every refusal
+    // below — `parse_and_validate_options()` (builtin/commit.c:1309-1425), then
+    // `get_cleanup_mode()` and `prepare_index()` — comes out in git's order
+    // behind the "not a git repository" one.
+    let mut repo = crate::setup::discover()?;
+    // `fmt_ident(…, IDENT_STRICT)` for the author in `determine_author_info()`
+    // (builtin/commit.c:683-684) and `git_committer_info(IDENT_STRICT)` in
+    // `prepare_to_commit()` (builtin/commit.c:941) judge the configured identity, so
+    // both verdicts are taken before the identity the commit is written with is
+    // injected, and each is reported where git asks — a `git commit` a pick runs
+    // in-process keeps the verdict its parent took.
+    crate::settle_commit_identity(&mut repo);
+    let (author_refusal, committer_refusal) = crate::commit_ident_verdicts();
+
+    // `status_init_config(&s, git_commit_config)` (builtin/commit.c:1808) chains
+    // into `git_status_config`, so `git commit` validates `status.showUntrackedFiles`
+    // exactly as `git status` does — and dies on a bad value even when no report
+    // will be rendered, as a plain `-m <msg>` commit does not.
+    if let Some(code) = super::status::validate_show_untracked_files(&repo) {
+        return Ok(code);
+    }
+
+    // --- `determine_whence()` --------------------------------------------
+    // The last act of `status_init_config()` (builtin/commit.c:213). A merge,
+    // cherry-pick, revert or rebase left in the index is what this commit
+    // concludes; everything downstream (parents, default message, which options
+    // are legal, what state is torn down) keys off this.
+    let whence = determine_whence(&repo);
+
     // ```c
+    // if (repo_get_oid(the_repository, "HEAD", &oid))
+    //         current_head = NULL;
+    // else {
+    //         current_head = lookup_commit_or_die(&oid, "HEAD");
+    // ```
+    //
+    // (builtin/commit.c:1813-1816.) Before `parse_and_validate_options()`.
+    // `repo_get_oid()` only turns the name into an oid, so an unborn `HEAD` is
+    // the ordinary root-commit case; anything else has to be a commit, and
+    // `lookup_commit_reference()` says so in two separate voices when it is not
+    // (commit.c:61-67, :84-85):
+    //
+    //   * the object exists but is a blob/tree — `error("object %s is a %s, not
+    //     a %s")` first, then `die("could not parse HEAD")`;
+    //   * the object is missing entirely — `peel_object_ext()` fails before the
+    //     type test, so only the `die()` is printed.
+    //
+    // Both exit 128, and both happen here rather than at the first use, which is
+    // why a `--dry-run` of a repository in this state never reaches the report.
+    if let Some(code) = die_unless_head_is_a_commit(&repo)? {
+        return Ok(code);
+    }
+    let current_head = repo.head()?.try_peel_to_id()?.is_some();
+
+    // `-z` promotes an unset format to porcelain and refuses an explicitly long
+    // one — git's `finalize_deferred_config()`, the first call after
+    // `parse_options()` in `parse_and_validate_options()`:
+    //
+    // ```c
+    // if (s->null_termination) {
+    //         if (status_format == STATUS_FORMAT_NONE ||
+    //             status_format == STATUS_FORMAT_UNSPECIFIED)
+    //                 status_format = STATUS_FORMAT_PORCELAIN;
+    //         else if (status_format == STATUS_FORMAT_LONG)
+    //                 die(_("options '%s' and '%s' cannot be used together"), "--long", "-z");
+    // }
+    // ```
+    //
+    // (builtin/commit.c:1262-1268.) `--short` and `--porcelain` pass through, so
+    // only the long format — which has no NUL-delimited spelling — is fatal.
+    if null_term {
+        match status_format {
+            StatusFormat::Long => {
+                crate::git_fatal!("options '--long' and '-z' cannot be used together")
+            }
+            StatusFormat::None => status_format = StatusFormat::Porcelain,
+            _ => {}
+        }
+    }
+
+    // ```c
+    // if (force_author && !strchr(force_author, '>'))
+    //         force_author = find_author_by_nickname(force_author);
+    //
     // if (force_author && renew_authorship)
     //         die(_("options '%s' and '%s' cannot be used together"), "--reset-author", "--author");
     // ```
     //
-    // (builtin/commit.c:1322-1323.) It comes first because `--author` has already been
-    // through `find_author_by_nickname()` by this point:
-    //
-    // ```c
-    // if (force_author && !strchr(force_author, '>'))
-    //         force_author = find_author_by_nickname(force_author);
-    // ```
-    //
-    // which is the very first statement of `parse_and_validate_options()`, ahead
-    // of every other refusal in this block. The repository is opened here rather
-    // than at the usual place below because the lookup is a revision walk — and
-    // only when a nickname is actually present, so a value that already names an
-    // ident still reaches the option checks without needing a repository.
+    // (builtin/commit.c:1317-1323.) The nickname lookup is a revision walk, and
+    // it runs ahead of every other refusal in this block.
     if let Some(a) = &author_arg {
         if !a.contains('>') {
-            let repo = crate::setup::discover()?;
             author_arg = Some(find_author_by_nickname(&repo, a)?);
         }
     }
     if author_arg.is_some() && reset_author {
         crate::git_fatal!("options '--reset-author' and '--author' cannot be used together");
+    }
+
+    // ```c
+    // if (amend && !current_head)
+    //         die(_("You have nothing to amend."));
+    // ```
+    //
+    // (builtin/commit.c:1329-1330.)
+    if amend && !current_head {
+        crate::git_fatal!("You have nothing to amend.");
+    }
+    // An in-progress operation forbids `--amend`, because the commit being
+    // replaced is not the one the operation is building (builtin/commit.c:1331-1338).
+    if amend && whence != Whence::Commit {
+        crate::git_fatal!("You are in the middle of a {} -- cannot amend.", whence.noun());
+    }
+    // `if (fixup_message && squash_message) die(…, "--squash", "--fixup");`
+    // (builtin/commit.c:1339-1340).
+    if squash_arg.is_some() && fixup_arg.is_some() {
+        crate::git_fatal!("options '--squash' and '--fixup' cannot be used together");
     }
     // ```c
     // die_for_incompatible_opt4(!!use_message, "-C", !!edit_message, "-c",
@@ -1113,6 +1206,56 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let reedit = edit_message_arg.is_some();
     let reuse_arg: Option<String> = edit_message_arg.or(use_message_arg);
 
+    // ```c
+    // if (amend && !use_message && !fixup_message)
+    //         use_message = "HEAD";
+    // if (!use_message && !is_from_cherry_pick(whence) &&
+    //     !is_from_rebase(whence) && renew_authorship)
+    //         die(_("--reset-author can be used only with -C, -c or --amend."));
+    // ```
+    //
+    // (builtin/commit.c:1353-1357.) There has to be an authorship to reset: `-C`/`-c`
+    // name one, `--amend` reuses HEAD's, and a stopped cherry-pick or rebase carries the
+    // picked commit's. Note the trailing full stop, which the surrounding `die()`s do not
+    // have.
+    if reset_author
+        && reuse_arg.is_none()
+        && !(amend && fixup_arg.is_none())
+        && !whence.is_cherry_pick()
+        && !whence.is_rebase()
+    {
+        crate::git_fatal!("--reset-author can be used only with -C, -c or --amend.");
+    }
+    // `-C`/`-c <commit>`: resolve the commit whose message and author are reused.
+    // ```c
+    // commit = lookup_commit_reference_by_name(name);
+    // if (!commit)
+    //         die(_("could not lookup commit '%s'"), name);
+    // ```
+    //
+    // (`read_commit_message()`, builtin/commit.c:1358-1362.) An object that is not a commit has
+    // already been reported by `object_as_type()`'s `error: object %s is a %s, not a %s`,
+    // so the death is the *second* line of two.
+    // `lookup_commit_reference_by_name()` *peels* — so `-C <annotated tag>` reuses
+    // the tagged commit's message and author rather than dying, and only what the
+    // chain ends at has to be a commit.
+    let reuse_commit = match &reuse_arg {
+        Some(spec) => match lookup_commit_reference_by_name(&repo, spec.as_str()) {
+            Some(commit) => Some(commit),
+            None => crate::git_fatal!("could not lookup commit '{spec}'"),
+        },
+        None => None,
+    };
+    // `determine_author_info()` asks for the default author only when neither
+    // `author_message` — the `-C`/`-c`/`--amend` commit, or `CHERRY_PICK_HEAD` for a
+    // pick being concluded, unless `--reset-author` (builtin/commit.c:1353-1368) — nor
+    // `--author` named one (builtin/commit.c:643-674).
+    let author_message = !reset_author
+        && (reuse_arg.is_some()
+            || (amend && fixup_arg.is_none())
+            || whence.is_cherry_pick()
+            || whence.is_rebase());
+
     // `-p` implies `--interactive`, and the four ways of choosing what to stage
     // are mutually exclusive (git's `die_for_incompatible_opt4(also, only, all,
     // interactive)`, which names them in that order).
@@ -1140,18 +1283,115 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("options '-a/--all' and '--interactive/-p/--patch' cannot be used together");
     }
 
-    // git's `prepare_index()` opens with the two `cannot be negative` fatals.
+    // ```c
+    // char *p = fixup_message;
+    // while (isalpha(*p))
+    //         p++;
+    // if (p > fixup_message && *p == ':') {
+    //         …
+    //         if (!strcmp("amend", fixup_message) ||
+    //             !strcmp("reword", fixup_message)) {
+    //                 fixup_prefix = "amend";
+    //                 allow_empty = 1;
+    //                 if (*fixup_message == 'r') {
+    //                         check_fixup_reword_options(argc, argv);
+    //                         only = 1;
+    //                 }
+    //         } else {
+    //                 die(_("unknown option: --fixup=%s:%s"), fixup_message, fixup_commit);
+    //         }
+    // }
+    // ```
+    //
+    // (builtin/commit.c:1376-1408.) `reword:` is `amend:` with two extra flags,
+    // and both are in force for every check below, including the "No paths with
+    // --include/--only" one in `prepare_index()`. The message itself is shaped
+    // further down, where the `amend` prefix it shares is handled.
+    let fixup_reword = fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("reword:"));
+    let fixup_amend = fixup_reword || fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("amend:"));
+    if fixup_amend {
+        allow_empty = true;
+    }
+    // `check_fixup_reword_options()` (builtin/commit.c:1295-1307): a reword
+    // records no content, so an operation in progress, a pathspec on the command
+    // line (`argv[0]`, the first one — `--pathspec-from-file` is only read later,
+    // in `prepare_index()`) and every staging mode are refused.
+    if fixup_reword {
+        match whence {
+            Whence::Merge => crate::git_fatal!("You are in the middle of a merge -- cannot reword."),
+            Whence::CherryPick => {
+                crate::git_fatal!("You are in the middle of a cherry-pick -- cannot reword.")
+            }
+            _ => {}
+        }
+        if let Some(path) = pathspecs.first() {
+            crate::git_fatal!("reword option of '--fixup' and path '{path}' cannot be used together");
+        }
+        if interactive || all || include_flag || only_flag {
+            crate::git_fatal!(
+                "reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together"
+            );
+        }
+    }
+    if let Some(raw) = &fixup_arg {
+        let alpha = raw.bytes().take_while(u8::is_ascii_alphabetic).count();
+        if alpha > 0 && raw.as_bytes().get(alpha) == Some(&b':') {
+            let (sub, commit) = (&raw[..alpha], &raw[alpha + 1..]);
+            if !matches!(sub, "amend" | "reword") {
+                crate::git_fatal!("unknown option: --fixup={sub}:{commit}");
+            }
+        }
+    }
+    // `handle_untracked_files_arg()` (builtin/commit.c:1413) rejects a malformed
+    // `-u<mode>`; the named modes, or anything `git_parse_maybe_bool` reads
+    // (`1`, `true`, `0x10`), pass.
+    if let Some(u) = &untracked_arg {
+        if super::status::parse_untracked_mode(u).is_none() {
+            crate::git_fatal!("Invalid untracked files mode '{u}'");
+        }
+    }
+    // `if (all && argc > 0) die(_("paths '%s ...' with -a does not make sense"), argv[0]);`
+    // (builtin/commit.c:1415-1417): the command-line paths only, since
+    // `--pathspec-from-file` has not been read yet.
+    if all && !pathspecs.is_empty() {
+        crate::git_fatal!("paths '{} ...' with -a does not make sense", pathspecs[0]);
+    }
+    // `if (status_format != STATUS_FORMAT_NONE) dry_run = 1;` (builtin/commit.c:1419-1420).
+    if status_format != StatusFormat::None {
+        dry_run = true;
+    }
+
+    // `cleanup_mode = get_cleanup_mode(cleanup_config, use_editor);`
+    // (builtin/commit.c:1830-1834), right after `parse_and_validate_options()`:
+    // `--cleanup` replaces the `commit.cleanup` value, and the one that is left is
+    // validated before the index is read, so a typo in either is not reported as a
+    // clean tree.
+    let cleanup_config = match &cleanup_arg {
+        Some(c) => Some(c.clone()),
+        None => repo.config_snapshot().string("commit.cleanup").map(|c| c.to_string()),
+    };
+    if let Some(c) = &cleanup_config {
+        if !matches!(c.as_str(), "default" | "verbatim" | "whitespace" | "strip" | "scissors") {
+            crate::git_fatal!("Invalid cleanup mode {c}");
+        }
+    }
+
+    // --- `prepare_index()` (builtin/commit.c:351-…) ---------------------
+    // `dry_run_commit()` runs it too, so every refusal below reaches `--dry-run`.
+    // It opens with the two `cannot be negative` fatals.
     if let Some(code) = patch_opts.reject_negative() {
         return Ok(code);
     }
+    // `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL, prefix, argv)`
+    // (builtin/commit.c:367-369), so every element is read before the index is
+    // touched and a malformed one is `fatal:` at 128. Reaching the matcher first
+    // reported gitoxide's own wording at exit 1.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
     // `--pathspec-from-file` supplies the pathspec list instead of the command
-    // line, so it is resolved before every pathspec-dependent check below.
-    if pathspec_from_file.is_some() && !pathspecs.is_empty() {
-        crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
-    }
-    if pathspec_file_nul && pathspec_from_file.is_none() {
-        crate::git_fatal!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-    }
+    // line (builtin/commit.c:371-386).
     if let Some(src) = &pathspec_from_file {
         if interactive {
             crate::git_fatal!(
@@ -1161,55 +1401,34 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         if all {
             crate::git_fatal!("options '--pathspec-from-file' and '-a' cannot be used together");
         }
+        if !pathspecs.is_empty() {
+            crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
+        }
         pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
+    } else if pathspec_file_nul {
+        crate::git_fatal!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
     }
-    // ```c
-    // } else if (skip_prefix(fixup_message, "reword:", &fixup_commit)) {
-    //         fixup_prefix = "amend";
-    //         allow_empty = 1;
-    //         only = 1;
-    // }
-    // ```
+    // `prepare_index()` (builtin/commit.c:387-390), after every option check:
+    //     if (!pathspec.nr && (also || (only && !allow_empty &&
+    //         (!amend || (fixup_message && strcmp(fixup_prefix, "amend"))))))
+    //             die(_("No paths with --include/--only does not make sense."));
+    // `--only` with no paths is how a caller says "commit exactly what is staged
+    // and nothing the worktree has since changed", which is meaningful the moment
+    // there is something to commit without a pathspec — an amend, or an explicitly
+    // allowed empty commit. `--include` has no such reading and always needs paths.
     //
-    // (builtin/commit.c's `--fixup` parsing.) `reword:` is `amend:` with two
-    // extra flags, and git sets them while parsing options — so they are in force
-    // for every check below, including the "No paths with --include/--only" one
-    // further down. The message itself is shaped further down, where the
-    // `amend` prefix it shares is handled.
-    let fixup_reword = fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("reword:"));
-    // `amend:` sets the same `allow_empty = 1` while it is parsed
-    // (builtin/commit.c:1395-1398), ahead of the `--only` check below.
-    let fixup_amend = fixup_reword || fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("amend:"));
-    if fixup_amend {
-        allow_empty = true;
-    }
-    // `parse_and_validate_options()` rejects a malformed `-u<mode>` and
-    // `--cleanup=<mode>` before the index is read, so the answer does not depend
-    // on whether there was anything to commit. Validating them where they are
-    // *used* put both behind the "nothing to commit" exit, which meant a typo in
-    // either was reported as a clean tree.
-    if let Some(u) = &untracked_arg {
-        // The named modes, or anything `git_parse_maybe_bool` reads (`1`, `true`, `0x10`).
-        if super::status::parse_untracked_mode(u).is_none() {
-            crate::git_fatal!("Invalid untracked files mode '{u}'");
-        }
-    }
-    if let Some(c) = &cleanup_arg {
-        if !matches!(
-            c.as_str(),
-            "default" | "verbatim" | "whitespace" | "strip" | "scissors"
-        ) {
-            crate::git_fatal!("Invalid cleanup mode {c}");
-        }
+    // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
+    // how the JetBrains client rewords a commit message.
+    if pathspecs.is_empty()
+        && (include_flag
+            || (only_flag && !allow_empty && (!amend || (fixup_arg.is_some() && !fixup_amend))))
+    {
+        crate::git_fatal!("No paths with --include/--only does not make sense.");
     }
     // Outside patch mode the two diff-shaping options have nothing to feed, and
-    // git refuses the whole command rather than ignore them.
+    // git refuses the whole command rather than ignore them (builtin/commit.c:435-440).
     if let Some(code) = patch_opts.require_patch_only(interactive, "--interactive/--patch") {
         return Ok(code);
-    }
-    // `git commit -a <paths>` is rejected outright, exactly as git does.
-    if all && !pathspecs.is_empty() {
-        crate::git_fatal!("paths '{} ...' with -a does not make sense", pathspecs[0]);
     }
     // Pathspec-limited ("only") mode: build the commit tree from HEAD's tree with
     // only the listed paths taken from the worktree. `-i`/`--include` instead adds
@@ -1232,63 +1451,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let only_mode =
         (only_flag || !pathspecs.is_empty() || fixup_reword) && !include_flag && !interactive;
 
-    // `-z` promotes an unset format to porcelain and refuses an explicitly long
-    // one, and any format at all implies a dry run — git's
-    // `finalize_deferred_config()` plus the `status_format != STATUS_FORMAT_NONE`
-    // rule in cmd_commit:
-    //
-    // ```c
-    // if (s->null_termination) {
-    //         if (status_format == STATUS_FORMAT_NONE ||
-    //             status_format == STATUS_FORMAT_UNSPECIFIED)
-    //                 status_format = STATUS_FORMAT_PORCELAIN;
-    //         else if (status_format == STATUS_FORMAT_LONG)
-    //                 die(_("options '%s' and '%s' cannot be used together"), "--long", "-z");
-    // }
-    // ```
-    //
-    // (builtin/commit.c:1262-1268.) `--short` and `--porcelain` pass through, so
-    // only the long format — which has no NUL-delimited spelling — is fatal.
-    if null_term {
-        match status_format {
-            StatusFormat::Long => {
-                crate::git_fatal!("options '--long' and '-z' cannot be used together")
-            }
-            StatusFormat::None => status_format = StatusFormat::Porcelain,
-            _ => {}
-        }
-    }
-    if status_format != StatusFormat::None {
-        dry_run = true;
+    // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the
+    // rest of the index, which would silently drop the operation's other paths.
+    if only_mode && whence != Whence::Commit {
+        crate::git_fatal!("cannot do a partial commit during a {}.", whence.noun());
     }
 
-    // --- repository + serialized read-modify-write -----------------------
-    let mut repo = crate::setup::discover()?;
-    // `get_cleanup_mode()` reads `commit.cleanup` as well when no `--cleanup` was given, still inside
-    // `parse_and_validate_options()`, so a bad configured mode dies before any hook or staging.
-    if cleanup_arg.is_none() {
-        if let Some(c) = repo.config_snapshot().string("commit.cleanup") {
-            if !matches!(c.to_string().as_str(), "default" | "verbatim" | "whitespace" | "strip" | "scissors") {
-                crate::git_fatal!("Invalid cleanup mode {c}");
-            }
-        }
-    }
-    // `fmt_ident(…, IDENT_STRICT)` for the author in `determine_author_info()`
-    // (builtin/commit.c:683-684) and `git_committer_info(IDENT_STRICT)` in
-    // `prepare_to_commit()` (builtin/commit.c:941) judge the configured identity, so
-    // both verdicts are taken before the identity the commit is written with is
-    // injected, and each is reported where git asks — a `git commit` a pick runs
-    // in-process keeps the verdict its parent took.
-    crate::settle_commit_identity(&mut repo);
-    let (author_refusal, committer_refusal) = crate::commit_ident_verdicts();
-    // `prepare_index()` opens with `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL,
-    // prefix, argv)` (builtin/commit.c:367-369), so every element is read before the
-    // index is touched and a malformed one is `fatal:` at 128. Reaching the matcher
-    // first reported gitoxide's own wording at exit 1.
-    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
-        eprintln!("fatal: {msg}");
-        return Ok(ExitCode::from(128));
-    }
     // Serialize tree build + commit + HEAD update through the repo coordinator so
     // concurrent zvcs writers queue instead of racing. Held across the whole op —
     // except that `-p`/`--interactive` must run the selector *outside* the lane,
@@ -1299,126 +1467,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // exit, and the whole selection would be silently dropped. It is re-taken the
     // moment the selector returns.
     let mut _lock = (!interactive).then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
-
-    // ```c
-    // if (repo_get_oid(the_repository, "HEAD", &oid))
-    //         current_head = NULL;
-    // else {
-    //         current_head = lookup_commit_or_die(&oid, "HEAD");
-    // ```
-    //
-    // (builtin/commit.c:1813-1816.) `cmd_commit()`'s very first act, before it
-    // has even parsed its options. `repo_get_oid()` only turns the name into an
-    // oid, so an unborn `HEAD` is the ordinary root-commit case; anything else
-    // has to be a commit, and `lookup_commit_reference()` says so in two
-    // separate voices when it is not (commit.c:61-67, :84-85):
-    //
-    //   * the object exists but is a blob/tree — `error("object %s is a %s, not
-    //     a %s")` first, then `die("could not parse HEAD")`;
-    //   * the object is missing entirely — `peel_object_ext()` fails before the
-    //     type test, so only the `die()` is printed.
-    //
-    // Both exit 128, and both happen here rather than at the first use, which is
-    // why a `--dry-run` of a repository in this state never reaches the report.
-    if let Some(code) = die_unless_head_is_a_commit(&repo)? {
-        return Ok(code);
-    }
-
-    // `status_init_config(&s, git_commit_config)` (builtin/commit.c:1808) chains
-    // into `git_status_config`, so `git commit` validates `status.showUntrackedFiles`
-    // exactly as `git status` does — and dies on a bad value even when no report
-    // will be rendered, as a plain `-m <msg>` commit does not.
-    if let Some(code) = super::status::validate_show_untracked_files(&repo) {
-        return Ok(code);
-    }
-
-    // --- `determine_whence()` --------------------------------------------
-    // A merge, cherry-pick, revert or rebase left in the index is what this
-    // commit concludes; everything downstream (parents, default message, which
-    // options are legal, what state is torn down) keys off this.
-    let whence = determine_whence(&repo);
-
-    // `parse_and_validate_options()`: an in-progress operation forbids `--amend`,
-    // because the commit being replaced is not the one the operation is building.
-    if amend && whence != Whence::Commit {
-        crate::git_fatal!("You are in the middle of a {} -- cannot amend.", whence.noun());
-    }
-
-    // ```c
-    // if (amend && !use_message && !fixup_message)
-    //         use_message = "HEAD";
-    // if (!use_message && !is_from_cherry_pick(whence) &&
-    //     !is_from_rebase(whence) && renew_authorship)
-    //         die(_("--reset-author can be used only with -C, -c or --amend."));
-    // ```
-    //
-    // (builtin/commit.c:1353-1357.) There has to be an authorship to reset: `-C`/`-c`
-    // name one, `--amend` reuses HEAD's, and a stopped cherry-pick or rebase carries the
-    // picked commit's. Note the trailing full stop, which the surrounding `die()`s do not
-    // have.
-    if reset_author
-        && reuse_arg.is_none()
-        && !(amend && fixup_arg.is_none())
-        && !whence.is_cherry_pick()
-        && !whence.is_rebase()
-    {
-        crate::git_fatal!("--reset-author can be used only with -C, -c or --amend.");
-    }
-    // `determine_author_info()` asks for the default author only when neither
-    // `author_message` — the `-C`/`-c`/`--amend` commit, or `CHERRY_PICK_HEAD` for a
-    // pick being concluded, unless `--reset-author` (builtin/commit.c:1353-1368) — nor
-    // `--author` named one (builtin/commit.c:643-674).
-    let author_message = !reset_author
-        && (reuse_arg.is_some()
-            || (amend && fixup_arg.is_none())
-            || whence.is_cherry_pick()
-            || whence.is_rebase());
-
-    // `check_fixup_reword_options()` (builtin/commit.c:1295-1307), called while
-    // `--fixup=reword:` is parsed (:1399-1401): a reword records no content, so
-    // an operation in progress, a pathspec on the command line (`argv[0]`, the
-    // first one — `--pathspec-from-file` is only read later, in
-    // `prepare_index()`) and every staging mode are refused.
-    if fixup_reword {
-        match whence {
-            Whence::Merge => crate::git_fatal!("You are in the middle of a merge -- cannot reword."),
-            Whence::CherryPick => {
-                crate::git_fatal!("You are in the middle of a cherry-pick -- cannot reword.")
-            }
-            _ => {}
-        }
-        if let Some(path) = pathspecs.first().filter(|_| pathspec_from_file.is_none()) {
-            crate::git_fatal!("reword option of '--fixup' and path '{path}' cannot be used together");
-        }
-        if interactive || all || include_flag || only_flag {
-            crate::git_fatal!(
-                "reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together"
-            );
-        }
-    }
-    // `prepare_index()` (builtin/commit.c:387-390), after every option check:
-    //     if (!pathspec.nr && (also || (only && !allow_empty &&
-    //         (!amend || (fixup_message && strcmp(fixup_prefix, "amend"))))))
-    //             die(_("No paths with --include/--only does not make sense."));
-    // `--only` with no paths is how a caller says "commit exactly what is staged
-    // and nothing the worktree has since changed", which is meaningful the moment
-    // there is something to commit without a pathspec — an amend, or an explicitly
-    // allowed empty commit. `--include` has no such reading and always needs paths.
-    //
-    // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
-    // how the JetBrains client rewords a commit message.
-    if pathspecs.is_empty()
-        && (include_flag
-            || (only_flag && !allow_empty && (!amend || (fixup_arg.is_some() && !fixup_amend))))
-    {
-        crate::git_fatal!("No paths with --include/--only does not make sense.");
-    }
-
-    // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the
-    // rest of the index, which would silently drop the operation's other paths.
-    if only_mode && whence != Whence::Commit {
-        crate::git_fatal!("cannot do a partial commit during a {}.", whence.noun());
-    }
 
     // --- `-p`/`--interactive`: hand staging to the hunk selector ----------
     // git's `prepare_index()` runs `interactive_add()` before anything reads the
@@ -1553,27 +1601,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `-C`/`-c <commit>`: resolve the commit whose message and author are reused.
-    // ```c
-    // commit = lookup_commit_reference_by_name(name);
-    // if (!commit)
-    //         die(_("could not lookup commit '%s'"), name);
-    // ```
-    //
-    // (`read_commit_message()`, builtin/commit.c.) An object that is not a commit has
-    // already been reported by `object_as_type()`'s `error: object %s is a %s, not a %s`,
-    // so the death is the *second* line of two.
-    // `lookup_commit_reference_by_name()` *peels* — so `-C <annotated tag>` reuses
-    // the tagged commit's message and author rather than dying, and only what the
-    // chain ends at has to be a commit.
-    let reuse_commit = match &reuse_arg {
-        Some(spec) => match lookup_commit_reference_by_name(&repo, spec.as_str()) {
-            Some(commit) => Some(commit),
-            None => crate::git_fatal!("could not lookup commit '{spec}'"),
-        },
-        None => None,
-    };
-    // `-C` (unlike `-c`) supplies the message directly, with no editor.
+    // `-C` (unlike `-c`), resolved by `read_commit_message()` above, supplies the
+    // message directly, with no editor.
     if let Some(rc) = &reuse_commit {
         if !reedit && !from_flags {
             message = crate::rawarg::from_bytes(rc.message_raw()?).into_owned();
@@ -1593,9 +1622,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // by the whole original message and allows an empty change so a later
     // rebase can reword. `squash_fixup_seed`, when set, seeds the editor path.
     let mut squash_fixup_seed: Option<String> = None;
-    if squash_arg.is_some() && fixup_arg.is_some() {
-        crate::git_fatal!("options '--squash' and '--fixup' cannot be used together");
-    }
     if let Some(spec) = &squash_arg {
         // `prepare_to_commit()` does the lookup, after `prepare_index()` has reported
         // unmatched pathspecs, so its death is deferred like an unreadable `-F`.

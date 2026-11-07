@@ -157,6 +157,11 @@ pub enum Revs {
     /// `parse_count()` refuses, a second `--stdin`, an option line in `--stdin`
     /// mode. The text is the message without its `fatal: ` prefix.
     Fatal(String),
+    /// Everything a refusal that is not a bare `die()` wrote, ready to print, at
+    /// status 128: the `error()` + `exit(128)` of an `--ancestry-path=` argument
+    /// that names no commit, and whatever the `rev-list` walk of
+    /// [`WalkOpts::run_rev_list`] died with.
+    Died(String),
 }
 
 impl Revs {
@@ -172,6 +177,7 @@ impl Revs {
             Revs::BadRevision(spec) => Some(format!("fatal: bad revision '{spec}'\n")),
             Revs::BadObject(name) => Some(format!("fatal: bad object {name}\n")),
             Revs::Fatal(message) => Some(format!("fatal: {message}\n")),
+            Revs::Died(text) => Some(text.clone()),
             Revs::InvalidRange { spec, symmetric, notes } => {
                 let mut out = String::new();
                 for note in notes {
@@ -226,10 +232,12 @@ impl Revs {
 /// A dash-prefixed operand is offered to [`pseudo_opt`] first, as
 /// `setup_revisions()` offers it to `handle_revision_pseudo_opt()`; whatever
 /// that does not claim goes on to `--stdin`, `--end-of-options` and the part of
-/// `handle_revision_opt()` served here — `--reverse`, `--max-count`, `-<n>`,
-/// `-n<n>` and `--skip`. The rest of that function — `--max-count-oldest`, the
-/// grep, date and ordering options — is still unserved, so those stay
-/// unrecognized options for `run_sequencer()` where stock walks them.
+/// `handle_revision_opt()` served here — `--reverse`, the count and date arm and
+/// the limiting, ordering, grep and side options [`WalkOpts::revision_opt`]
+/// lists. A selection one of those shapes is walked by this binary's `rev-list`
+/// ([`WalkOpts::run_rev_list`]); the rest of that function (the diff and pretty
+/// options, `--boundary`, `--objects`, ...) stays an unrecognized option for
+/// `run_sequencer()`.
 pub fn prepare_revs<S: AsRef<str>>(
     repo: &gix::Repository,
     specs: &[S],
@@ -240,10 +248,7 @@ pub fn prepare_revs<S: AsRef<str>>(
     let mut unknown_option = false;
     let mut seen_end_of_options = false;
     let mut read_from_stdin = false;
-    let mut walk = WalkOpts {
-        reverse: false,
-        counts: crate::revopt::Counts::default(),
-    };
+    let mut walk = WalkOpts::default();
 
     let mut n = 0usize;
     while n < specs.len() {
@@ -270,8 +275,11 @@ pub fn prepare_revs<S: AsRef<str>>(
                     return Ok(Revs::Fatal("--stdin given twice?".into()));
                 }
                 read_from_stdin = true;
-                if let Some(stop) = read_revisions_from_stdin(repo, &mut state, &mut pending)? {
+                if let Some(stop) = read_revisions_from_stdin(repo, &mut state, &mut pending, &mut walk.pathspecs)? {
                     return Ok(stop);
+                }
+                if !walk.pathspecs.is_empty() {
+                    walk.needs_rev_list = true;
                 }
                 continue;
             }
@@ -281,33 +289,48 @@ pub fn prepare_revs<S: AsRef<str>>(
             }
             // `handle_revision_opt()`'s `--reverse` (revision.c:2746-2747) and its
             // count arm (revision.c:2373-2410). `--max-count`, `-<n>` and `-n<n>`
-            // clear `revs->no_walk`; `--skip` does not. The rest of the arm — the
-            // `--max-count-oldest` limit and the date bounds — and the rest of
-            // the function stay unknown options here.
+            // clear `revs->no_walk`; `--skip` does not.
             if spec == "--reverse" {
                 walk.reverse = !walk.reverse;
                 continue;
             }
-            if let Some(Ok(crate::revopt::Hit {
-                what: crate::revopt::Count::MaxCount(_) | crate::revopt::Count::Skip(_),
-                ..
-            })) = crate::revopt::parse(specs, n - 1)
-            {
-                match walk.counts.parse(specs, n - 1) {
-                    Some(Ok(hit)) => {
-                        n += hit.consumed - 1;
-                        if matches!(hit.what, crate::revopt::Count::MaxCount(_)) {
+            //
+            // `walk.counts.parse()` runs the `die_for_incompatible_opt2()` tests
+            // ahead of `parse_count()`, as the arm does (revision.c:2373-2431).
+            // `--max-count-oldest` and the date bounds are served by the walk
+            // `rev-list` runs for the sequencer (see [`WalkOpts::run_rev_list`]),
+            // so their words are kept for it; `--max-count`, `-<n>`, `-n<n>` and
+            // `--skip` are applied here unless that walk runs, which then takes
+            // them as well.
+            match walk.counts.parse(specs, n - 1) {
+                Some(Ok(hit)) => {
+                    walk.forward.extend(specs[n - 1..n - 1 + hit.consumed].iter().map(|s| s.as_ref().to_owned()));
+                    n += hit.consumed - 1;
+                    match hit.what {
+                        crate::revopt::Count::MaxCount(_) | crate::revopt::Count::MaxCountOldest(_) => {
                             pending.walked = true;
                         }
+                        crate::revopt::Count::Skip(_) => {}
+                        crate::revopt::Count::MaxAge(_)
+                        | crate::revopt::Count::MinAge(_)
+                        | crate::revopt::Count::MaxAgeAsFilter(_) => walk.needs_rev_list = true,
                     }
-                    Some(Err(message)) => return Ok(Revs::Fatal(message)),
-                    None => {}
+                    if walk.counts.max_count_oldest {
+                        walk.needs_rev_list = true;
+                    }
+                    continue;
                 }
-                continue;
+                // A count spelling `parse_count()` refuses dies on the spot.
+                Some(Err(message)) => return Ok(Revs::Fatal(message)),
+                None => {}
             }
-            // A count spelling `parse_count()` refuses dies on the spot.
-            if let Some(Err(message)) = crate::revopt::parse(specs, n - 1) {
-                return Ok(Revs::Fatal(message));
+            match walk.revision_opt(repo, specs, n - 1) {
+                Some(Ok(consumed)) => {
+                    n += consumed - 1;
+                    continue;
+                }
+                Some(Err(stop)) => return Ok(stop),
+                None => {}
             }
             unknown_option = true;
             continue;
@@ -318,17 +341,35 @@ pub fn prepare_revs<S: AsRef<str>>(
         }
     }
 
+    // `parse_pathspec(&revs->prune_data, …)` at the end of `setup_revisions()`
+    // (revision.c:3135-3150), ahead of `run_sequencer()`'s `argc > 1` usage.
+    if let Some(message) = crate::pathspec::parse_pathspec_fatal(repo, &walk.pathspecs) {
+        return Ok(Revs::Fatal(message));
+    }
     if unknown_option {
         return Ok(Revs::UnknownOption);
     }
-
-    let Pending { mut include, exclude, walked, cmdline, plain, names } = pending;
 
     // `setup_revisions()` has returned, `builtin/revert.c`'s `argc > 1` usage
     // check (129, above) has passed, and `run_sequencer()` is now in
     // `sequencer_pick_revisions()` — whose first act is to resolve every queued
     // name a second time.
-    warn_pending_names(repo, &names);
+    warn_pending_names(repo, &pending.names);
+
+    // `single_pick()` (sequencer.c:5577-5600) takes one plain `<commit>` without
+    // a walk at all, so nothing that shapes the walk reaches it.
+    let single = !pending.walked && pending.cmdline == 1 && pending.plain == 1;
+    if walk.needs_rev_list && !single {
+        // `prepare_revs()`'s `revs->reverse ^= 1` for a walking pick, on top of
+        // the user's own `--reverse` (sequencer.c:2603-2604).
+        let reverse = walk.reverse ^ (action == Action::Pick && pending.walked);
+        return Ok(match walk.run_rev_list(&pending, pending.walked, state.sorted_input, reverse)? {
+            Ok(commits) => Revs::Picks { commits, sequencer: true },
+            Err(died) => died,
+        });
+    }
+
+    let Pending { mut include, exclude, walked, cmdline, plain, .. } = pending;
 
     if !walked {
         // `add_pending_object()` sets `SEEN`, so an operand named twice is
@@ -374,14 +415,176 @@ pub fn prepare_revs<S: AsRef<str>>(
 
 /// The `rev_info` fields `handle_revision_opt()` and the `--no-walk` pseudo
 /// option set for the sequencer, beyond the pending list itself.
+#[derive(Default)]
 struct WalkOpts {
     /// `revs->reverse`.
     reverse: bool,
-    /// `revs->max_count` and `revs->skip_count`.
+    /// `revs->max_count`, `revs->skip_count`, `revs->max_count_type` and the
+    /// three age bounds.
     counts: crate::revopt::Counts,
+    /// The words of every `handle_revision_opt()` option taken other than
+    /// `--reverse`, as typed, for the `rev-list` walk [`Self::run_rev_list`] runs.
+    forward: Vec<String>,
+    /// Set by an option only that walk serves: the commit-limiting, ordering,
+    /// grep, parent-count, side-selecting and date options, `--max-count-oldest`,
+    /// and a pathspec read by `--stdin`.
+    needs_rev_list: bool,
+    /// `revs->left_only`, `revs->right_only`, `revs->cherry_mark` and
+    /// `revs->cherry_pick`, which the side options test against each other while
+    /// they are parsed (revision.c:2518-2547).
+    left_only: bool,
+    right_only: bool,
+    cherry_mark: bool,
+    cherry_pick: bool,
+    /// The pathspecs `read_pathspec_from_stdin()` collected after a `--` line
+    /// (revision.c:2267-2272, :3018-3019): `revs->prune_data`.
+    pathspecs: Vec<String>,
 }
 
 impl WalkOpts {
+    /// The part of `handle_revision_opt()` (revision.c:2341-2760) the sequencer's
+    /// walk is limited and ordered by, beyond `--reverse` and the count arm:
+    /// `--first-parent`, `--ancestry-path[=<commit>]`, `--topo-order`,
+    /// `--date-order`, `--author-date-order`, `--merges`, `--no-merges`,
+    /// `--[no-]min-parents[=<n>]`, `--[no-]max-parents[=<n>]`, `--left-right`,
+    /// `--left-only`, `--right-only`, `--cherry`, `--cherry-mark`,
+    /// `--cherry-pick`, `--author`, `--committer`, `--grep`, `--basic-regexp`,
+    /// `-E`/`--extended-regexp`, `-i`/`--regexp-ignore-case`,
+    /// `-F`/`--fixed-strings`, `-P`/`--perl-regexp`, `--all-match` and
+    /// `--invert-grep`.
+    ///
+    /// `None` leaves the word an unknown option. `Some(Ok(n))` took `n` words.
+    /// `Some(Err(..))` is a `die()` the arm raises while it parses: the side
+    /// options' conflicts, `parse_count()` of a parent count, `parse_long_opt()`'s
+    /// missing value, and the `error()` + `exit(128)` of an `--ancestry-path=`
+    /// argument that names no commit (revision.c:2443-2457, :3111-3112).
+    fn revision_opt<S: AsRef<str>>(
+        &mut self,
+        repo: &gix::Repository,
+        specs: &[S],
+        i: usize,
+    ) -> Option<std::result::Result<usize, Revs>> {
+        let arg = specs[i].as_ref();
+        let consumed = match arg {
+            "--first-parent" | "--ancestry-path" | "--topo-order" | "--date-order"
+            | "--author-date-order" | "--merges" | "--no-merges" | "--no-min-parents"
+            | "--no-max-parents" | "--left-right" | "--basic-regexp" | "--extended-regexp" | "-E"
+            | "--regexp-ignore-case" | "-i" | "--fixed-strings" | "-F" | "--perl-regexp" | "-P"
+            | "--all-match" | "--invert-grep" => 1,
+            "--left-only" | "--right-only" | "--cherry" | "--cherry-mark" | "--cherry-pick" => {
+                if let Some(message) = crate::porcelain::rev_list::side_option_conflict(
+                    arg,
+                    self.left_only,
+                    self.right_only,
+                    self.cherry_mark,
+                    self.cherry_pick,
+                ) {
+                    return Some(Err(Revs::Fatal(message)));
+                }
+                match arg {
+                    "--left-only" => self.left_only = true,
+                    "--right-only" => self.right_only = true,
+                    // `--cherry`: `cherry_mark = 1; right_only = 1; max_parents = 1`.
+                    "--cherry" => {
+                        self.cherry_mark = true;
+                        self.right_only = true;
+                    }
+                    "--cherry-mark" => self.cherry_mark = true,
+                    _ => self.cherry_pick = true,
+                }
+                1
+            }
+            _ => {
+                if let Some(count) = arg.strip_prefix("--min-parents=").or_else(|| arg.strip_prefix("--max-parents=")) {
+                    if let Err(message) = crate::revopt::parse_count(count) {
+                        return Some(Err(Revs::Fatal(message)));
+                    }
+                    1
+                } else if let Some(name) = arg.strip_prefix("--ancestry-path=") {
+                    // `repo_get_oid_committish()` and `lookup_commit_reference()`.
+                    let commit = repo
+                        .rev_parse_single(name)
+                        .ok()
+                        .and_then(|id| id.object().ok()?.peel_to_commit().ok());
+                    if commit.is_none() {
+                        return Some(Err(Revs::Died(format!(
+                            "error: could not get commit for --ancestry-path argument {name}\n"
+                        ))));
+                    }
+                    1
+                } else {
+                    let mut hit = None;
+                    for name in ["author", "committer", "grep"] {
+                        if let Some(found) = crate::revopt::long_opt(name, specs, i) {
+                            hit = Some(found);
+                            break;
+                        }
+                    }
+                    match hit? {
+                        Ok((_, consumed)) => consumed,
+                        Err(message) => return Some(Err(Revs::Fatal(message))),
+                    }
+                }
+            }
+        };
+        self.forward.extend(specs[i..i + consumed].iter().map(|s| s.as_ref().to_owned()));
+        self.needs_rev_list = true;
+        Some(Ok(consumed))
+    }
+
+    /// `prepare_revs()` and the `get_revision()` loop of
+    /// `walk_revs_populate_todo()` (sequencer.c:2597-2610, :5404-5440) for a
+    /// selection an option above shapes: the walk this binary's own `rev-list`
+    /// runs, handed the same options, the pending objects in queue order and the
+    /// `--stdin` pathspecs, so the limiting, ordering, grep and side-selection
+    /// code is the one `rev-list` and `log` use rather than a second copy of it.
+    ///
+    /// `no_walk` is passed as the `--no-walk[=unsorted]` `run_sequencer()` set
+    /// (builtin/revert.c:233-234), and the `revs->reverse ^= 1` `prepare_revs()`
+    /// applies to a walking pick as one more `--reverse`. A walk that dies —
+    /// `limit_list()`'s "--ancestry-path given but there are no bottom commits",
+    /// a pattern `compile_grep_patterns()` refuses — is passed through as it
+    /// stands, at its status.
+    fn run_rev_list(
+        &self,
+        pending: &Pending,
+        walked: bool,
+        sorted_input: bool,
+        reverse: bool,
+    ) -> Result<std::result::Result<Vec<ObjectId>, Revs>> {
+        // Nothing pending walks to nothing, the "empty commit set passed" of
+        // `walk_revs_populate_todo()`; `rev-list`'s own `usage()` for a command
+        // line without revisions (builtin/rev-list.c) is not the sequencer's.
+        if pending.tokens.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+        cmd.arg("rev-list");
+        if !walked {
+            cmd.arg(if sorted_input { "--no-walk=sorted" } else { "--no-walk=unsorted" });
+        }
+        cmd.args(&self.forward);
+        if reverse {
+            cmd.arg("--reverse");
+        }
+        cmd.args(&pending.tokens).arg("--").args(&self.pathspecs);
+        let out = cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).output()?;
+        if !out.status.success() {
+            return Ok(Err(Revs::Died(String::from_utf8_lossy(&out.stderr).into_owned())));
+        }
+        let mut commits = Vec::new();
+        for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            // `--left-right` and `--cherry-mark` put a mark in front of the id;
+            // the commit is the same one `get_revision()` hands the sequencer.
+            let hex = match line.first() {
+                Some(b'<' | b'>' | b'+' | b'=') => &line[1..],
+                _ => line,
+            };
+            commits.push(ObjectId::from_hex(hex)?);
+        }
+        Ok(Ok(commits))
+    }
+
     /// `get_revision()` over the selection: `get_revision_internal()` drops the
     /// first `skip_count` commits and stops after `max_count`, and `reverse`
     /// then hands the survivors back in the opposite order (revision.c:4528-4590).
@@ -401,24 +604,36 @@ impl WalkOpts {
 /// reach the command line. A dash line other than a pseudo option or
 /// `--end-of-options` dies, and so does a revision that does not resolve.
 ///
-/// The pathspecs `read_pathspec_from_stdin()` takes after a `--` line are not
-/// read: a cherry-pick or revert walk limited by paths is not served.
+/// A `--` line ends the revisions and makes every line after it a pathspec
+/// (`read_pathspec_from_stdin()`, revision.c:2267-2272, :3018-3019), collected
+/// into `pathspecs`, `revs->prune_data`.
+///
+/// The whole read runs with `warn_on_object_refname_ambiguity` cleared
+/// (revision.c:2984-2985, :3022), so a full-length hex that is also a ref name
+/// is not warned about while the lines are resolved.
 fn read_revisions_from_stdin(
     repo: &gix::Repository,
     state: &mut RevState,
     pending: &mut Pending,
+    pathspecs: &mut Vec<String>,
 ) -> Result<Option<Revs>> {
+    let _quiet = crate::objname::AmbiguityWarnings::off();
     let outer = std::mem::replace(&mut state.uninteresting, false);
     let mut seen_end_of_options = false;
     let mut input = Vec::new();
     std::io::Read::read_to_end(&mut std::io::stdin(), &mut input)?;
     let mut stop = None;
-    for line in input.split_inclusive(|&b| b == b'\n') {
-        // `strbuf_getline()`: the newline and a carriage return before it go.
+    // `strbuf_getline()`: the newline and a carriage return before it go.
+    let mut lines = input.split_inclusive(|&b| b == b'\n').map(|line| {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let line = String::from_utf8_lossy(line);
-        if line.is_empty() || line == "--" {
+        String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line)).into_owned()
+    });
+    while let Some(line) = lines.next() {
+        if line.is_empty() {
+            break;
+        }
+        if line == "--" {
+            pathspecs.extend(lines);
             break;
         }
         if !seen_end_of_options && line.starts_with('-') {
@@ -473,6 +688,7 @@ fn handle_operand(
             // `<a>...<b>`: both tips, with their merge bases excluded. The
             // merge bases take `flags_exclude`, both tips take `flags`.
             crate::objname::Dotdot::Ok { a, b } if range.symmetric => {
+                let first_token = pending.tokens.len();
                 for base in repo.merge_bases_many(a, &[b])? {
                     // `add_pending_commit_list()` names a merge base by its
                     // own `oid_to_hex()`, so it is always a full-length hex
@@ -483,6 +699,15 @@ fn handle_operand(
                 }
                 pending.add(a, range.a, state.uninteresting);
                 pending.add(b, range.b, state.uninteresting);
+                // One `<a>...<b>` word, so `rev-list` marks `<a>`'s side
+                // `SYMMETRIC_LEFT` for `--left-only`, `--right-only` and the
+                // cherry options; under `--not` it is negated the same way.
+                pending.tokens.truncate(first_token);
+                let range = format!("{a}...{b}");
+                match state.uninteresting {
+                    true => pending.tokens.extend(["--not".to_owned(), range, "--not".to_owned()]),
+                    false => pending.tokens.push(range),
+                }
             }
             // `<a>..<b>`: everything `<b>` reaches that `<a>` does not. This
             // form only `parse_object()`s its endpoints, so a non-commit one
@@ -682,6 +907,12 @@ struct Pending {
     /// `add_pending_commit_list()` — the merge bases of `<a>...<b>` — queues them
     /// under `oid_to_hex()`, a full-length hex every time.
     names: Vec<String>,
+    /// The pending list as `rev-list` arguments, in queue order: a full-length
+    /// hex for each object, `^`-prefixed when it is `UNINTERESTING`, and
+    /// `<a>...<b>` for a symmetric range, whose `SYMMETRIC_LEFT` side and merge
+    /// bases `rev-list` derives again exactly as `handle_dotdot_1()` did. Only
+    /// [`WalkOpts::run_rev_list`] reads it.
+    tokens: Vec<String>,
 }
 
 impl Pending {
@@ -695,6 +926,7 @@ impl Pending {
     fn add(&mut self, id: ObjectId, name: &str, uninteresting: bool) {
         self.cmdline += 1;
         self.names.push(name.to_owned());
+        self.tokens.push(if uninteresting { format!("^{id}") } else { id.to_string() });
         if uninteresting {
             self.exclude.push(id);
             self.walked = true;

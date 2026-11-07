@@ -292,7 +292,7 @@ impl crate::Bundle {
             compression: _,
         }: Options,
         data_file: SharedTempFile,
-        mut pack_entries_iter: Box<dyn Iterator<Item = Result<data::input::Entry, data::input::Error>> + 'a>,
+        pack_entries_iter: Box<dyn Iterator<Item = Result<data::input::Entry, data::input::Error>> + 'a>,
         should_interrupt: &AtomicBool,
         pack_version: data::Version,
     ) -> Result<WriteOutcome, Error> {
@@ -300,6 +300,15 @@ impl crate::Bundle {
             "create index file".into(),
             ProgressId::IndexingSteps(Default::default()).into(),
         );
+        // Where the last entry ends: the pack's trailer follows it, and nothing else does. `index-pack` writes only
+        // what it `use()`s (`flush()`, builtin/index-pack.c:299-308), but the pass-through copies every byte the reader
+        // took, so whatever input followed the trailer in its last read is cut off again below.
+        let entries_end = std::cell::Cell::new(None::<u64>);
+        let mut pack_entries_iter = pack_entries_iter.inspect(|entry| {
+            if let Ok(entry) = entry {
+                entries_end.set(Some(entry.pack_offset + u64::from(entry.header_size) + entry.compressed_size));
+            }
+        });
         Ok(match directory {
             Some(directory) => {
                 let directory = directory.as_ref();
@@ -321,6 +330,18 @@ impl crate::Bundle {
                     pack_version,
                 )?;
                 drop(pack_entries_iter);
+                if let Some(entries_end) = entries_end.get() {
+                    let pack_end = entries_end + object_hash.len_in_bytes() as u64;
+                    let mut file = data_file.lock();
+                    file.flush()?;
+                    file.get_mut().with_mut(|f| {
+                        let f = f.as_file_mut();
+                        match f.metadata()?.len() > pack_end {
+                            true => f.set_len(pack_end),
+                            false => Ok(()),
+                        }
+                    })??;
+                }
 
                 if outcome.num_objects == 0 {
                     WriteOutcome {

@@ -163,7 +163,6 @@
 
 use anyhow::{bail, Result};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -412,9 +411,6 @@ struct Opts {
     /// makes `show_log()` print a formatted commit header where the bare object name
     /// would otherwise go. Behind an `Rc` so `Opts` stays `Clone`, like `specs`.
     pretty: Option<std::rc::Rc<super::log::Pretty>>,
-    /// The object flags the command-line operands left (see [`pend_marked_operand`]),
-    /// read by `get_revision_mark()` when a commit header is shown.
-    rev_flags: std::rc::Rc<HashMap<ObjectId, u32>>,
 }
 
 /// One file-level change, in the form the raw/name output needs.
@@ -487,7 +483,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         diff_args: std::rc::Rc::new(Vec::new()),
         line_prefix: Vec::new(),
         pretty: None,
-        rev_flags: std::rc::Rc::new(HashMap::new()),
     };
 
     // The first option git accepts but this port cannot honour. Kept until we know
@@ -517,10 +512,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // commits and dies fatally (not a usage error) otherwise, even with zero revs.
     let mut merge_base = false;
     let mut revs: Vec<String> = Vec::new();
-    // The flags `handle_revision_arg()` left on each pended object (revision.h's
-    // `UNINTERESTING`, `SYMMETRIC_LEFT`, `BOTTOM`). They live on the object, not on
-    // the pending entry, which is what `tree2->flags` and `obj->flags` read.
-    let mut rev_flags: HashMap<ObjectId, u32> = HashMap::new();
     let mut raw_paths: Vec<String> = Vec::new();
     // `--stdin`: read `<oid>` lines and diff each one, instead of (or as well as) the
     // revisions on the command line.
@@ -549,8 +540,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
     // git scans the whole argument list for a literal `--` up front; when one is
     // present every argument before it must be a revision.
     let seen_dashdash = args.iter().any(|a| a == "--");
-    // `setup_revisions()`'s `seen_end_of_options` (revision.c:3049).
-    let mut seen_end_of_options = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -558,13 +547,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         if a == "--" {
             raw_paths.extend(args[i + 1..].iter().cloned());
             break;
-        }
-        // `if (!seen_end_of_options && *arg == '-')` (revision.c:3077, :3100-3103):
-        // past `--end-of-options` every word but `--` is a revision operand.
-        if !seen_end_of_options && a == "--end-of-options" {
-            seen_end_of_options = true;
-            i += 1;
-            continue;
         }
         // `--ws-error-highlight <kind>`, `--color-moved-ws <modes>` and
         // `--word-diff-regex <re>` take their value as the next argument when it is
@@ -586,11 +568,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         // short options: `OPT_PICKAXE_S`/`OPT_PICKAXE_G` (diff.c:6270-6275) and
         // `OPT_CALLBACK_F('I', …)` all take a required argument, so a bare one takes
         // the next argv entry. Their value re-glues without an `=`.
-        if !seen_end_of_options
-            && (a == "--ws-error-highlight"
+        if a == "--ws-error-highlight"
             || a == "--diff-algorithm"
             || SHORT_GLUED_WHEN_SEPARATED.contains(&a)
-            || super::diff_color::needs_separate_value(a))
+            || super::diff_color::needs_separate_value(a)
         {
             let Some(v) = args.get(i + 1).map(String::as_str) else {
                 eprintln!("error: {}", super::diff_color::missing_value(a));
@@ -611,7 +592,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         // The same three spelled with `=`, validated by the same callback.
-        if let Some((flag, v)) = a.split_once('=').filter(|_| !seen_end_of_options) {
+        if let Some((flag, v)) = a.split_once('=') {
             if flag == "--ws-error-highlight" || super::diff_color::needs_separate_value(flag) {
                 if let Some(code) = validate_render_value(flag, v) {
                     return Ok(code);
@@ -621,7 +602,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         }
-        if !seen_end_of_options && a.starts_with('-') && a != "-" {
+        if a.starts_with('-') && a != "-" {
             // The value checks `diff_opt_parse`'s callbacks run as each option is
             // seen — before any revision is resolved, and before this module gets
             // to decide whether it can render the option at all.
@@ -967,17 +948,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         // because the two disagree on an absent full-length hex — git decodes it
         // and then reports `bad object` a few lines below, which is the branch
         // under `revs.push()`.
-        match pend_marked_operand(&repo, a, seen_dashdash, &mut revs, &mut rev_flags)? {
-            Marked::Pended => {
-                i += 1;
-                continue;
-            }
-            Marked::Fatal(text) => {
-                eprint!("{text}");
-                return Ok(ExitCode::from(FATAL));
-            }
-            Marked::Plain => {}
-        }
         crate::objname::resolve(&repo, a);
         if repo.rev_parse_single(a).is_ok() {
             revs.push(a.to_string());
@@ -1193,26 +1163,6 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(USAGE_ERROR));
     }
-
-    // The flags on the object a pending entry names, as `obj->flags` reads them.
-    let flags_of = |spec: &str| {
-        repo.rev_parse_single(spec)
-            .ok()
-            .and_then(|id| rev_flags.get(&id.detach()).copied())
-            .unwrap_or(0)
-    };
-    // `diff_get_merge_base()`: `if (obj->flags) die(_("--merge-base does not work
-    // with ranges"));` over every pending object (diff-lib.c:597-601).
-    if merge_base && revs.iter().any(|r| flags_of(r) != 0) {
-        eprintln!("fatal: --merge-base does not work with ranges");
-        return Ok(ExitCode::from(FATAL));
-    }
-    // `else if (tree2->flags & UNINTERESTING) SWAP(tree2, tree1);`
-    // (builtin/diff-tree.c:196-198): `B ^A` diffs `A` against `B`, as `^A B` does.
-    if revs.len() == 2 && !merge_base && flags_of(&revs[1]) & UNINTERESTING != 0 {
-        revs.swap(0, 1);
-    }
-    opts.rev_flags = std::rc::Rc::new(rev_flags.clone());
 
     let mut out: Vec<u8> = Vec::new();
     let mut differed = false;
@@ -1461,15 +1411,7 @@ fn emit_commit_header(
 ) -> Result<()> {
     let term = if opts.nul { b'\0' } else { b'\n' };
     out.extend_from_slice(&opts.line_prefix);
-    // `put_revision_mark()` (revision.c:4803-4830): a commit an operand excluded
-    // is shown as `^ <oid>`, in front of the name in both header shapes
-    // (log-tree.c:754-755, :816-817).
-    let mark: &[u8] = match opts.rev_flags.get(&commit_id).is_some_and(|f| f & UNINTERESTING != 0) {
-        true => b"^ ",
-        false => b"",
-    };
     let Some(pretty) = opts.pretty.as_deref() else {
-        out.extend_from_slice(mark);
         out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
         out.push(term);
         return Ok(());
@@ -1498,7 +1440,6 @@ fn emit_commit_header(
         if !oneline {
             out.extend_from_slice(b"commit ");
         }
-        out.extend_from_slice(mark);
         out.extend_from_slice(commit_id.to_hex().to_string().as_bytes());
         // git separates the object name from a oneline body with a space and from
         // every other body with the line terminator.
@@ -2177,143 +2118,6 @@ fn is_known_unsupported(a: &str) -> bool {
 ///
 /// `Ok(None)` means git would have died here; the message is already on stderr and
 /// the caller exits 128.
-/// `UNINTERESTING` (revision.h): the object-flag bit `builtin/diff-tree.c` reads
-/// back off the second pending tree, and `get_revision_mark()` off a shown commit.
-const UNINTERESTING: u32 = 1 << 1;
-/// `SYMMETRIC_LEFT` (revision.h), which `handle_dotdot_1()` gives the left end of
-/// `A...B`. Only `diff_get_merge_base()`'s "any flag at all" test sees it here.
-const SYMMETRIC_LEFT: u32 = 1 << 8;
-/// `BOTTOM` (revision.h), raised together with `UNINTERESTING` everywhere an
-/// operand is excluded (`flags ^ (UNINTERESTING | BOTTOM)`).
-const BOTTOM: u32 = 1 << 10;
-
-/// What [`pend_marked_operand`] made of one positional.
-enum Marked {
-    /// The operand pended its objects; go on to the next argument.
-    Pended,
-    /// `handle_revision_arg()` or `setup_revisions()` died with this text.
-    Fatal(String),
-    /// A plain name: no range, no parent mark and no `^`, left to the caller.
-    Plain,
-}
-
-/// The parts of `handle_revision_arg_1()` (revision.c:2186-2266) that make a
-/// positional more than one tree-ish: a range (`handle_dotdot()`), a parent mark
-/// (`^@`, `^!`, `^-<n>`, via `add_parents_only()`) and the `^` exclusion mark.
-///
-/// `cmd_diff_tree()` reads nothing but `revs->pending` afterwards
-/// (builtin/diff-tree.c:177-206), so each operand is reduced to the objects it
-/// pends, in pending order, with the flags it left on each object recorded in
-/// `flags` — `A..B` pends `^A B`, `A...B` pends its merge bases UNINTERESTING
-/// followed by `A` and `B` (revision.c:2092-2124), and `<c>^!` pends the parents
-/// of `<c>` UNINTERESTING and then `<c>`.
-fn pend_marked_operand(
-    repo: &gix::Repository,
-    arg: &str,
-    cant_be_filename: bool,
-    revs: &mut Vec<String>,
-    flags: &mut HashMap<ObjectId, u32>,
-) -> Result<Marked> {
-    // `if (!cant_be_filename && !strcmp(arg, ".."))`: the parent directory, not
-    // `HEAD..HEAD` (revision.c:2207-2214).
-    if crate::objname::is_parent_directory_pathspec(arg, cant_be_filename) {
-        return Ok(Marked::Plain);
-    }
-    // `handle_dotdot()` (revision.c:2216-2219); one whose endpoints do not both
-    // resolve returns -1 and the token is read as a single name below.
-    let dotdot = crate::objname::dotdot(repo, arg);
-    if !matches!(dotdot, crate::objname::Dotdot::NotARange) {
-        let range = crate::objname::split_range(arg).expect("dotdot() split the token");
-        // `get_oid_with_context()` on both endpoints, then `verify_non_filename()`
-        // on the whole token, then `parse_object()` (revision.c:2080-2091).
-        crate::objname::warn_ambiguous_refname(repo, range.a);
-        crate::objname::warn_ambiguous_refname(repo, range.b);
-        if !cant_be_filename {
-            if let Some(message) = crate::setup::verify_non_filename(repo, arg) {
-                return Ok(Marked::Fatal(format!("fatal: {message}\n")));
-            }
-        }
-        let crate::objname::Dotdot::Ok { a, b } = dotdot else {
-            return Ok(Marked::Fatal(crate::objname::dotdot_fatal(repo, arg).unwrap_or_default()));
-        };
-        let a_flags = if range.symmetric {
-            // `add_pending_commit_list(revs, exclude, flags_exclude)` for every merge
-            // base, ahead of both endpoints.
-            for base in repo.merge_bases_many(a, &[b]).unwrap_or_default() {
-                let base = base.detach();
-                *flags.entry(base).or_default() |= UNINTERESTING | BOTTOM;
-                revs.push(base.to_hex().to_string());
-            }
-            SYMMETRIC_LEFT
-        } else {
-            UNINTERESTING | BOTTOM
-        };
-        *flags.entry(a).or_default() |= a_flags;
-        revs.push(a.to_hex().to_string());
-        flags.entry(b).or_default();
-        revs.push(b.to_hex().to_string());
-        return Ok(Marked::Pended);
-    }
-    // `<c>^@` pends the parents of `<c>` in its place; `<c>^!` and `<c>^-<n>` pend
-    // them UNINTERESTING and go on with `<c>` (revision.c:2221-2252). A mark
-    // `add_parents_only()` declines leaves the operand whole, to fail as a name.
-    let operand = arg;
-    let mut arg = arg;
-    let mut parents_pended = false;
-    if let crate::objname::ParentsOnly::Mark { base, nth, replaces } = crate::objname::parents_only(arg) {
-        let mut queued: Vec<(ObjectId, bool)> = Vec::new();
-        match crate::objname::add_parents_only(repo, base, !replaces, nth, &mut |_, id, not| {
-            queued.push((id, not))
-        }) {
-            crate::objname::Parents::BadObject => {
-                let name = crate::objname::uninteresting_mark(base).0;
-                return Ok(Marked::Fatal(format!("fatal: bad object {name}\n")));
-            }
-            crate::objname::Parents::None => {}
-            crate::objname::Parents::Queued => {
-                for (id, not) in queued {
-                    let bits = flags.entry(id).or_default();
-                    if not {
-                        *bits |= UNINTERESTING | BOTTOM;
-                    }
-                    revs.push(id.to_hex().to_string());
-                }
-                if replaces {
-                    return Ok(Marked::Pended);
-                }
-                arg = base;
-                parents_pended = true;
-            }
-        }
-    }
-    // `if (*arg == '^') { flags ^= UNINTERESTING | BOTTOM; arg++; }`
-    // (revision.c:2254-2257), then `get_oid_with_context()` on what is left.
-    let (bare, marked) = crate::objname::uninteresting_mark(arg);
-    if !marked && !parents_pended {
-        return Ok(Marked::Plain);
-    }
-    let Some(id) = crate::objname::resolve(repo, bare) else {
-        // `if (seen_dashdash || *arg == '^') die("bad revision '%s'", arg)`
-        // (revision.c:3118-3119), naming the operand as written.
-        return Ok(Marked::Fatal(super::log::bad_revision_message_in_gated(repo, operand, cant_be_filename)));
-    };
-    if !cant_be_filename {
-        if let Some(message) = crate::setup::verify_non_filename(repo, bare) {
-            return Ok(Marked::Fatal(format!("fatal: {message}\n")));
-        }
-    }
-    // `get_reference()`'s `die("bad object %s", name)`.
-    if repo.find_object(id).is_err() {
-        return Ok(Marked::Fatal(format!("fatal: bad object {bare}\n")));
-    }
-    let bits = flags.entry(id).or_default();
-    if marked {
-        *bits |= UNINTERESTING | BOTTOM;
-    }
-    revs.push(bare.to_string());
-    Ok(Marked::Pended)
-}
-
 fn resolve_tree(repo: &gix::Repository, spec: &str) -> Result<Option<ObjectId>> {
     let Ok(id) = repo.rev_parse_single(spec) else {
         eprintln!("fatal: ambiguous argument '{spec}': {AMBIGUOUS_TAIL}");

@@ -641,14 +641,6 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
 
         match name {
             "--" => only_specs = true,
-            // parse_options_step() stops at `--end-of-options` and, under
-            // PARSE_OPT_KEEP_UNKNOWN_OPT (builtin/revert.c:173-174), leaves it in argv
-            // (parse-options.c:1119-1124), so setup_revisions() reads every later
-            // word as an operand.
-            "--end-of-options" if inline.is_none() => {
-                o.specs.push(arg);
-                only_specs = true;
-            }
 
             "--quit" => set_verb(&mut o.verb, Verb::Quit)?,
             "--continue" => set_verb(&mut o.verb, Verb::Continue)?,

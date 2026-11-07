@@ -139,9 +139,7 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
             }
         };
         match a {
-            // parse_options_step() stops at `--end-of-options` as at `--` and
-            // consumes it (parse-options.c:1119-1124; builtin/log.c:2756 passes no flags).
-            "--" | "--end-of-options" => end_of_options = true,
+            "--" => end_of_options = true,
             "-v" | "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
             "--abbrev" => abbrev = Abbrev::Configured,

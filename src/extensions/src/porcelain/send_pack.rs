@@ -56,6 +56,11 @@ use std::process::ExitCode;
 
 use super::push_proto::{self, Request};
 
+/// git's `DEFAULT_ABBREV` floor for `find_unique_abbrev` and the
+/// `FALLBACK_DEFAULT_ABBREV` `transport_summary_width()` uses when a push
+/// carries no object ids at all.
+const DEFAULT_ABBREV: usize = 7;
+
 /// Stock git's `send-pack` usage block, byte-for-byte (1472 bytes, git 2.55.0),
 /// including the trailing blank line. Printed on `-h` (stdout), after the
 /// `unknown option` / `unknown switch` diagnostics (stderr), on stdout after the
@@ -270,15 +275,6 @@ fn push(st: &State) -> Result<ExitCode> {
     let dest = st.dest.as_deref().unwrap_or_default();
     let repo = crate::setup::discover()?;
 
-    // `refspec_appendn(&rs, argv + 1, argc - 1)` and the `--stdin` `refspec_append()`s
-    // (builtin/send-pack.c:222, :245, :249) parse every refspec before the remote is
-    // looked up or connected to, and `refspec_item_init_or_die()` dies on the first
-    // one `parse_refspec()` refuses (refspec.c:205-209).
-    let hex_len = repo.object_hash().len_in_hex();
-    if let Some(bad) = st.refspecs.iter().find(|s| !super::push::push_refspec_is_valid(s, hex_len)) {
-        crate::git_fatal!("invalid refspec '{bad}'");
-    }
-
     // `if (remote_name) { remote = remote_get(...); if (!remote_has_url(...)) die(...) }`
     // (send-pack.c:259-265). Only a named remote gets its tracking refs updated
     // afterwards, which is why the destination has to be one of its URLs.
@@ -329,13 +325,18 @@ fn push(st: &State) -> Result<ExitCode> {
         };
     }
 
-    // `if (match_push_refs(...)) { ret = -1; goto cleanup; }` (builtin/send-pack.c:309-312):
+    // `if (match_push_refs(...)) { ret = -1; goto cleanup; }` (send-pack.c:309-312):
     // every refspec whose source names nothing is an `error()` of its own and the
-    // whole push is abandoned, even when other refspecs were fine. The match runs
-    // after `git_connect()` and the advertisement, so the wire layer connects first
-    // and fails the match there ([`push_proto::SendOptions::send_pack_match`]).
+    // whole push is abandoned, even when other refspecs were fine. `cmd_send_pack`
+    // returns -1 for it, which `run_builtin()` masks to 255.
     let mut matching = None;
     let (mut requests, missing) = build_requests(&repo, st, &mut matching)?;
+    if !missing.is_empty() {
+        for src in &missing {
+            eprintln!("error: src refspec {src} does not match any");
+        }
+        return Ok(ExitCode::from(255));
+    }
 
     // ```c
     // if (!is_empty_cas(&cas))
@@ -389,7 +390,6 @@ fn push(st: &State) -> Result<ExitCode> {
         // (builtin/send-pack.c:27), so `push.negotiate` restricts to the pushed tips alone.
         negotiation_include: Vec::new(),
         negotiation_restrict: Vec::new(),
-        send_pack_match: Some(missing),
     };
 
     // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,
@@ -407,8 +407,6 @@ fn push(st: &State) -> Result<ExitCode> {
     // status is 128 rather than the dispatcher's 1.
     let outcome = match push_proto::send_pack(&repo, &remote, &requests, st.dry_run, &opts, None) {
         Ok(outcome) => outcome,
-        // A `die()` whose only line is already out.
-        Err(err) if err.downcast_ref::<crate::fatal::Silent>().is_some() => return Err(err),
         Err(err) => {
             eprintln!("fatal: {err}");
             return Ok(ExitCode::from(128));
@@ -546,12 +544,9 @@ fn build_requests(
     matching: &mut Option<push_proto::Matching>,
 ) -> Result<(Vec<Request>, Vec<String>)> {
     let mut requests = Vec::new();
-    // The `error()` of every source `match_explicit_lhs()` refused, in argv order.
-    // `match_explicit_refs()` reports every one of them rather than stopping at the
-    // first (remote.c:1351-1358).
+    // Sources that resolved to nothing, in argv order. `match_explicit()` reports
+    // every one of them (remote.c:1179) rather than stopping at the first.
     let mut missing = Vec::new();
-    // `get_local_heads()` (remote.c), the candidates `count_refspec_match()` walks.
-    let local_refs = super::push::local_head_names(repo);
 
     if st.send_all || st.send_mirror {
         for r in repo.references()?.all()? {
@@ -607,10 +602,7 @@ fn build_requests(
         };
         let force = forced || st.force;
 
-        // An empty source is a deletion: `:refs/heads/gone`. `match_explicit()` makes
-        // an unadvertised `refs/`-qualified destination a linked ref and refuses an
-        // unqualified one with `unable to delete '<dst>': remote ref does not exist`
-        // (remote.c:1302-1310).
+        // An empty source is a deletion: `:refs/heads/gone`.
         if src.is_empty() {
             requests.push(Request {
                 name: full_ref_name(repo, dst),
@@ -620,42 +612,25 @@ fn build_requests(
                 expected: None,
                 only_if_absent: false,
                 check_reachable: None,
-                explicit_delete: !dst.starts_with("refs/"),
+                explicit_delete: false,
             });
             continue;
         }
 
-        // `parse_refspec()` reads a lone `@` as `HEAD` (refspec.c:70-71).
-        let src = if src == "@" { "HEAD" } else { src };
-        // `match_explicit_lhs()` (remote.c:1181-1204): one local ref matching by
-        // `count_refspec_match()` is the source; none falls back to
-        // `try_explicit_object_name()` (remote.c:1130-1149), where anything
-        // `repo_get_oid()` resolves is pushed under the name the user wrote; more
-        // than one is refused. The matched ref carries the oid `one_local_ref()`
-        // stored for it, unpeeled, so an annotated tag is pushed as the tag.
-        let (src_name, new) = match crate::refname::count_refspec_match(src, &local_refs) {
-            (1, Some(name)) => (name.clone(), repo.rev_parse_single(name.as_str())?.detach()),
-            (0, _) => match repo.rev_parse_single(src) {
-                Ok(id) => (src.to_owned(), id.detach()),
-                Err(_) => {
-                    missing.push(format!("src refspec {src} does not match any"));
-                    continue;
-                }
-            },
-            _ => {
-                missing.push(format!("src refspec {src} matches more than one"));
-                continue;
-            }
+        let Ok(src_ref) = repo.find_reference(src) else {
+            missing.push(src.to_owned());
+            continue;
         };
+        let new = src_ref.clone().into_fully_peeled_id()?.detach();
         requests.push(Request {
             name: full_ref_name(repo, dst),
-            src: Some(src_name),
+            src: Some(src_ref.name().as_bstr().to_string()),
             new,
             force,
             expected: None,
             only_if_absent: false,
             check_reachable: None,
-            explicit_delete: false,
+                explicit_delete: false,
         });
     }
     Ok((requests, missing))
@@ -680,8 +655,10 @@ fn full_ref_name(repo: &gix::Repository, dst: &str) -> String {
 /// form: `To <dest>` once, then the up-to-date refs under `-v`, then the ones
 /// that moved, then the ones that did not.
 fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verbose: bool) {
-    // `int summary_width = transport_summary_width(refs);` (transport.c:900).
-    let width = push_proto::summary_width(repo, outcome);
+    // `transport_summary_width()`: `2 * <widest abbreviation> + 3`, measured
+    // over every old and new oid in the push, with `FALLBACK_DEFAULT_ABBREV`
+    // when there are none (transport.c:837-848).
+    let width = summary_width(repo, outcome);
     let mut printed = 0usize;
 
     let mut emit = |flag: char, summary: String, from: Option<&str>, to: &str, msg: Option<&str>| {
@@ -697,7 +674,10 @@ fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verb
         eprintln!(" {flag} {summary:<width$} {refs}{msg}");
     };
 
-    let short = |oid: &ObjectId| push_proto::quickref_abbrev(repo, oid);
+    // `strbuf_add_unique_abbrev(&quickref, oid, DEFAULT_ABBREV)`: the quickref
+    // uses the same abbreviation length the width was measured from.
+    let abbrev = (width - 3) / 2;
+    let short = |oid: &ObjectId| oid.to_hex_with_len(abbrev).to_string();
 
     for pass in 0..3 {
         for s in &outcome.statuses {
@@ -752,6 +732,53 @@ fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verb
             }
         }
     }
+}
+
+/// `transport_summary_width()`. `measure_abbrev` takes the *unique* abbreviation
+/// of each oid but never below `DEFAULT_ABBREV`; with no refs at all the width
+/// falls back to that same constant.
+fn summary_width(repo: &gix::Repository, outcome: &push_proto::Outcome) -> usize {
+    let floor = default_abbrev(repo);
+    let mut maxw = None;
+    for s in &outcome.statuses {
+        for oid in [&s.old, &s.new] {
+            if oid.is_null() {
+                continue;
+            }
+            maxw = Some(maxw.unwrap_or(0).max(unique_abbrev_len(repo, oid, floor)));
+        }
+    }
+    2 * maxw.unwrap_or(floor) + 3
+}
+
+/// git's `DEFAULT_ABBREV`: `core.abbrev` when set, else the fallback. A repo
+/// that spells it `no` gets the full hash, which is git's `40`/`64` case.
+fn default_abbrev(repo: &gix::Repository) -> usize {
+    let full = repo.object_hash().len_in_hex();
+    let config = repo.config_snapshot();
+    match config.string("core.abbrev") {
+        None => DEFAULT_ABBREV,
+        Some(v) if v.as_slice() == b"no" => full,
+        Some(v) => std::str::from_utf8(v.as_slice())
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(4, full))
+            .unwrap_or(DEFAULT_ABBREV),
+    }
+}
+
+/// `repo_find_unique_abbrev_r(..., DEFAULT_ABBREV)`: the shortest prefix that
+/// still names exactly one object, never shorter than `floor`.
+fn unique_abbrev_len(repo: &gix::Repository, oid: &ObjectId, floor: usize) -> usize {
+    let full = repo.object_hash().len_in_hex();
+    (floor..=full)
+        .find(|&len| {
+            gix::hash::Prefix::new(oid.as_ref(), len)
+                .ok()
+                .and_then(|p| repo.objects.lookup_prefix(p, None).ok())
+                .is_some_and(|found| matches!(found, Some(Ok(_))))
+        })
+        .unwrap_or(full)
 }
 
 /// `prettify_refname()`: drop the namespace prefix from a full ref name.

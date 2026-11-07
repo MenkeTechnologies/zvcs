@@ -550,101 +550,6 @@ impl<R: io::BufRead> io::BufRead for EofWatch<'_, R> {
     }
 }
 
-/// The bytes of the input the pack parser has used, git's `consumed_bytes` (builtin/index-pack.c:340-345):
-/// what `use()` has taken, as against what `fill()` has merely read into the buffer.
-struct Consumed<'a, R> {
-    inner: R,
-    count: &'a std::cell::Cell<u64>,
-}
-
-impl<R: io::BufRead> Read for Consumed<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = io::BufRead::fill_buf(self)?;
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        io::BufRead::consume(self, n);
-        Ok(n)
-    }
-}
-
-impl<R: io::BufRead> io::BufRead for Consumed<'_, R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.inner.fill_buf()
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.count.set(self.count.get() + amt as u64);
-        self.inner.consume(amt);
-    }
-}
-
-/// What `index-pack --stdin` handed the vendored pack writer: how many bytes, and the most
-/// recent of them. The writer reads ahead through a buffer of its own, so whatever followed
-/// the trailer in the last read it made is in `recent`, and `final()`'s copy of the rest of
-/// the input buffer to stdout takes it from there.
-#[derive(Default)]
-struct Taken {
-    count: u64,
-    recent: std::collections::VecDeque<u8>,
-}
-
-/// How much of [`Taken::recent`] is kept: more than one read-ahead of the writer's buffer.
-const RECENTLY_TAKEN: usize = 256 * 1024;
-
-impl Taken {
-    fn record(&mut self, bytes: &[u8]) {
-        self.count += bytes.len() as u64;
-        self.recent.extend(bytes);
-        let excess = self.recent.len().saturating_sub(RECENTLY_TAKEN);
-        self.recent.drain(..excess);
-    }
-}
-
-/// A reader that records in [`Taken`] every byte that passes through it.
-struct Taking<'a, R> {
-    inner: R,
-    taken: &'a std::cell::RefCell<Taken>,
-}
-
-impl<R: io::BufRead> Read for Taking<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = io::BufRead::fill_buf(self)?;
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        io::BufRead::consume(self, n);
-        Ok(n)
-    }
-}
-
-impl<R: io::BufRead> io::BufRead for Taking<'_, R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.inner.fill_buf()
-    }
-
-    fn consume(&mut self, amt: usize) {
-        if let Ok(available) = self.inner.fill_buf() {
-            self.taken.borrow_mut().record(&available[..amt.min(available.len())]);
-        }
-        self.inner.consume(amt);
-    }
-}
-
-/// ```c
-/// /* If input_fd is a file, we should have reached its end now. */
-/// if (fstat(input_fd, &st))
-///         die_errno(_("cannot fstat packfile"));
-/// if (S_ISREG(st.st_mode) &&
-///                 lseek(input_fd, 0, SEEK_CUR) - input_len != st.st_size)
-///         die(_("pack has junk at the end"));
-/// ```
-///
-/// (`parse_pack_objects()`, builtin/index-pack.c:1301-1306.) The descriptor's offset less what
-/// is still buffered is where it started plus what the parser consumed, so a regular file
-/// holding anything after the trailer is refused; a pipe is never checked.
-fn junk_at_end(meta: Option<&fs::Metadata>, start: u64, consumed: u64) -> bool {
-    meta.is_some_and(|m| m.file_type().is_file() && start + consumed != m.len())
-}
-
 /// `early EOF` for a stream error that ran the input dry — see [`EofWatch`].
 fn early_eof(e: &anyhow::Error, saw_eof: bool) -> bool {
     saw_eof
@@ -876,11 +781,8 @@ fn write_index_for_pack(
 ) -> Result<ObjectId> {
     let hash = opts.object_hash();
     let saw_eof = std::cell::Cell::new(false);
-    let consumed = std::cell::Cell::new(0u64);
-    let pack_file = fs::File::open(pack_path)?;
-    let pack_meta = pack_file.metadata().ok();
     let file = EofWatch {
-        inner: Consumed { inner: io::BufReader::new(pack_file), count: &consumed },
+        inner: io::BufReader::new(fs::File::open(pack_path)?),
         saw_eof: &saw_eof,
     };
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
@@ -890,9 +792,6 @@ fn write_index_for_pack(
         hash,
     )?;
     let pack_version = entries.version();
-    // The vendored iterator reads the trailer along with the last object, so a pack of no
-    // objects leaves it unread where `parse_pack_objects()` still `use()`s it.
-    let unread_trailer = if entries.len() == 0 { hash.len_in_bytes() as u64 } else { 0 };
 
     let tmp = with_suffix(index_path, ".tmp");
     let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
@@ -930,13 +829,6 @@ fn write_index_for_pack(
     };
     out.flush()?;
     drop(out);
-
-    // The trailer check is the last step of `parse_pack_objects()`, ahead of everything that
-    // writes; see [`junk_at_end`].
-    if junk_at_end(pack_meta.as_ref(), 0, consumed.get() + unread_trailer) {
-        let _ = fs::remove_file(&tmp);
-        crate::git_fatal!("pack has junk at the end");
-    }
 
     // The fsck passes run against the finished index while it is still the
     // temporary, so a failure leaves the repository exactly as git leaves it:
@@ -1176,22 +1068,13 @@ fn index_from_stdin(
     // Bound the input to `--max-input-size` by reading at most one byte past the
     // limit: being able to read that extra byte proves the pack is too big,
     // exactly as git's `consumed_bytes > max_input_size` check does.
-    //
-    // stdin is read through a buffer the size of git's
-    // `input_buffer[DEFAULT_IO_BUFFER_SIZE]`, 128 KiB (builtin/index-pack.c:147,
-    // git-compat-util.h:741), so what is left in it once the pack has ended is
-    // what `final()` copies to stdout. Its offset before the first read and its
-    // `fstat()` are what the junk check compares against.
-    let stdin_file = fs::File::from(std::os::fd::AsFd::as_fd(&io::stdin()).try_clone_to_owned()?);
-    let stdin_meta = stdin_file.metadata().ok();
-    let stdin_start = io::Seek::stream_position(&mut &stdin_file).unwrap_or(0);
-    let mut buffered = io::BufReader::with_capacity(128 * 1024, stdin_file);
-    let mut cursor = io::Cursor::new(Vec::new());
-    let taken = std::cell::RefCell::new(Taken::default());
+    let stdin = io::stdin();
+    let mut cursor;
+    let mut locked;
     let input: &mut dyn io::BufRead = match opts.max_input_size {
         Some(limit) => {
             let mut buf = Vec::new();
-            (&mut buffered).take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+            stdin.lock().take(limit.saturating_add(1)).read_to_end(&mut buf)?;
             if buf.len() as u64 > limit {
                 return Ok(fatal(format!(
                     "pack exceeds maximum allowed size ({})",
@@ -1201,10 +1084,11 @@ fn index_from_stdin(
             cursor = io::Cursor::new(buf);
             &mut cursor
         }
-        None => &mut buffered,
+        None => {
+            locked = stdin.lock();
+            &mut locked
+        }
     };
-    let mut counted = Taking { inner: input, taken: &taken };
-    let input: &mut dyn io::BufRead = &mut counted;
 
     // `parse_pack_header()` runs before any of the pack body is decoded, so an
     // input too short to hold a header is `early EOF` rather than whatever the
@@ -1235,7 +1119,7 @@ fn index_from_stdin(
     // written like any other pack. gix's `write_to_directory` instead discards
     // both files when it indexed nothing, so the empty pack is staged and indexed
     // here through the same index writer the named-pack path uses.
-    let (hash, data_path, index_path, gix_keep, pack_len) = if object_count == 0 {
+    let (hash, data_path, index_path, gix_keep) = if object_count == 0 {
         let (hash, data_path, index_path) =
             index_empty_from_stdin(
                 opts,
@@ -1246,9 +1130,7 @@ fn index_from_stdin(
                 &write_dir,
                 &mut foreign_nr,
             )?;
-        // The header and the trailer: [`index_empty_from_stdin`] reads nothing more.
-        let pack_len = 12 + opts.object_hash().len_in_bytes() as u64;
-        (hash, data_path, index_path, None, pack_len)
+        (hash, data_path, index_path, None)
     } else {
         // With `--fix-thin` the object database resolves REF_DELTA bases missing
         // from the pack, completing a thin pack in place; without it the pack is
@@ -1282,22 +1164,6 @@ fn index_from_stdin(
         let hash = outcome.index.data_hash;
         let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {
             bail!("gitoxide indexed no objects from a pack whose header declared {object_count}");
-        };
-        // How much of the input was the pack: the file the writer left, or, when `--fix-thin`
-        // appended bases where the trailer was, everything ahead of the first of them plus
-        // the trailer it replaced.
-        let pack_len = match outcome.thin_pack_bases.is_empty() {
-            true => fs::metadata(gix_data)?.len(),
-            false => {
-                let index = pack::index::File::at(gix_index, opts.object_hash())?;
-                let first_base = outcome
-                    .thin_pack_bases
-                    .iter()
-                    .filter_map(|id| index.lookup(id).map(|i| index.pack_offset_at_index(i)))
-                    .min()
-                    .unwrap_or(0);
-                first_base + opts.object_hash().len_in_bytes() as u64
-            }
         };
 
         // Before the pack is moved anywhere, so a failing check leaves nothing
@@ -1336,37 +1202,8 @@ fn index_from_stdin(
             }
             (None, None) => (gix_data.clone(), gix_index.clone()),
         };
-        (hash, data_path, index_path, outcome.keep_path.clone(), pack_len)
+        (hash, data_path, index_path, outcome.keep_path.clone())
     };
-
-    // [`junk_at_end`]: git dies in `parse_pack_objects()`, before an index is written,
-    // with the pack it streamed still in its output file — `tmp_pack_XXXXXX`, or the
-    // named `<pack-file>` — and nothing else beside it.
-    if junk_at_end(stdin_meta.as_ref(), stdin_start, pack_len) {
-        for path in std::iter::once(&index_path).chain(gix_keep.as_ref()) {
-            let _ = fs::remove_file(path);
-        }
-        // `flush()` has written everything up to the trailer (builtin/index-pack.c:1293),
-        // and the trailer's own `use()` is not flushed before the check.
-        if let Some(output) = target_pack.or(temp_pack.as_deref()) {
-            fs::rename(&data_path, output)?;
-            let trailer = opts.object_hash().len_in_bytes() as u64;
-            fs::OpenOptions::new().write(true).open(output)?.set_len(pack_len - trailer)?;
-            // `odb_mkstemp(&tmp_file, "pack/tmp_pack_XXXXXX")` creates the temporary
-            // 0444 and lets the umask do the rest (builtin/index-pack.c:365-366,
-            // odb.c:72-84); a named `<pack-file>` is opened 0600 (:369) and keeps that.
-            if target_pack.is_none() {
-                // SAFETY: `umask()` cannot fail, and the mask is put straight back.
-                let umask = unsafe {
-                    let mask = libc::umask(0);
-                    libc::umask(mask);
-                    mask as u32
-                };
-                fs::set_permissions(output, fs::Permissions::from_mode(0o444 & !umask))?;
-            }
-        }
-        return Ok(fatal("pack has junk at the end"));
-    }
 
     // `write_to_directory` always drops a `.keep` beside the pack it wrote; git
     // only leaves one when asked, so drop gix's and, under `--keep`, write our
@@ -1405,29 +1242,6 @@ fn index_from_stdin(
     }
 
     println!("{report}\t{hash}");
-    // ```c
-    // /* Write the last part of the buffer to stdout */
-    // write_in_full(1, input_buffer + input_offset, input_len);
-    // ```
-    //
-    // (`final()`, builtin/index-pack.c:1656-1657.) Whatever followed the pack into the
-    // buffer goes on to stdout after the report line; nothing more is read for it. The
-    // vendored writer reads ahead through a buffer of its own, so that is what it took
-    // past the trailer, then what is still in this side's buffer.
-    let still_buffered = match opts.max_input_size {
-        Some(_) => &cursor.get_ref()[(cursor.position() as usize).min(cursor.get_ref().len())..],
-        None => buffered.buffer(),
-    };
-    {
-        let taken = taken.borrow();
-        let past_pack = usize::try_from(taken.count.saturating_sub(pack_len)).unwrap_or(usize::MAX);
-        let skip = taken.recent.len().saturating_sub(past_pack);
-        let read_ahead: Vec<u8> = taken.recent.iter().skip(skip).copied().collect();
-        let mut out = io::stdout().lock();
-        out.write_all(&read_ahead)?;
-        out.write_all(still_buffered)?;
-        out.flush()?;
-    }
     Ok(self_contained_exit(opts, foreign_nr))
 }
 
@@ -1453,10 +1267,7 @@ fn index_empty_from_stdin(
         (None, None) => write_dir.join(format!("tmp_pack_{}", mkstemp_suffix())),
     };
     let mut bytes = Vec::new();
-    // The header and the trailing checksum, and nothing after it: `parse_pack_objects()` stops
-    // at `fill(the_hash_algo->rawsz)` (builtin/index-pack.c:1297-1299).
-    let pack_len = 12 + opts.object_hash().len_in_bytes() as u64;
-    input.take(pack_len).read_to_end(&mut bytes)?;
+    input.read_to_end(&mut bytes)?;
     fs::write(&staged, &bytes)?;
 
     // The pack's own checksum names it, so the index is written beside the

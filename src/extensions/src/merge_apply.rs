@@ -900,6 +900,7 @@ fn update_worktree_to_tree(
                 .map(|e| e.path_in(backing).to_owned())
                 .collect()
         };
+        let sparse = crate::merge_guard::sparse_patterns(repo).is_some();
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
@@ -907,8 +908,10 @@ fn update_worktree_to_tree(
             if kept && verified.contains(&path) {
                 e.flags.insert(Flags::UPTODATE);
             }
-            // `keep_entry()` keeps the entry's `CE_SKIP_WORKTREE` too.
-            if kept && skipped.contains(&path) {
+            // `keep_entry()` keeps the entry's `CE_SKIP_WORKTREE` too, and outside a sparse
+            // checkout so does `merged_entry()`, which migrates it from the entry it replaces
+            // (unpack-trees.c:2616-2617) with no `apply_sparse_checkout()` after it (:1931-1932).
+            if skipped.contains(&path) && (kept || !sparse) {
                 e.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
             }
         }

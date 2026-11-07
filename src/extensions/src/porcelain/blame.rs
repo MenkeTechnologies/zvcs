@@ -4302,28 +4302,7 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
         // `--` was present: everything after it is a pathspec. blame accepts
         // exactly one path; a trailing second token is DWIM'd as a revision.
         Some(post) => {
-            let mut pre = std::mem::take(&mut opts.pre);
-            // The word `--end-of-options` left in front of the path reaches
-            // setup_revisions() with no `--` in argv, so one that is neither an
-            // option, a `^<rev>`, a revision nor a range is a filename:
-            // verify_filename() dies on it unless it exists, and an existing one
-            // becomes prune data blame never reads (revision.c:3113-3131).
-            if opts.pre_ends_in_unseparated_word {
-                let word = pre.last().expect("the flag marks a pushed word").as_str();
-                let operand = word.starts_with('-')
-                    || word.starts_with('^')
-                    || is_a_rev(repo, word)
-                    || !matches!(crate::objname::dotdot(repo, word), crate::objname::Dotdot::NotARange);
-                if !operand {
-                    if let Some(message) = crate::objpath::verify_filename_fatal(repo, word, true) {
-                        let mut err = std::io::stderr().lock();
-                        writeln!(err, "fatal: {message}")?;
-                        err.flush()?;
-                        return Ok(Targets::Fatal(ExitCode::from(128)));
-                    }
-                    pre.pop();
-                }
-            }
+            let pre = std::mem::take(&mut opts.pre);
             match post.len() {
                 0 => return Ok(Targets::Usage),
                 1 => (pre, post.into_iter().next().unwrap()),
@@ -4754,9 +4733,6 @@ struct Options {
     pre: Vec<String>,
     /// Positionals after `--`; `None` when no `--` was given.
     post: Option<Vec<String>>,
-    /// The last of `pre` is the word `--end-of-options` left at `dashdash_pos`,
-    /// which setup_revisions() reads with no `--` behind it — so it may be a path.
-    pre_ends_in_unseparated_word: bool,
     /// The raw `-L` arguments in command-line order. git keeps them as an
     /// `OPT_STRING_LIST` and only interprets them once the final image is in
     /// hand, because every form but the plain numeric one needs the file's text.
@@ -5164,9 +5140,6 @@ impl Options {
         // `post.is_some()` means a `--` separator was seen.
         let mut pre: Vec<String> = Vec::new();
         let mut post: Option<Vec<String>> = None;
-        // `post` was opened by `--end-of-options` rather than by `--`.
-        let mut end_of_options = false;
-        let mut pre_ends_in_unseparated_word = false;
 
         // `parse_short_opt()`'s character loop (parse-options.c:426-461), so
         // `-ln` is `-l -n`. `-L` and `-S` require a value; `-C` and `-M` are
@@ -5203,15 +5176,6 @@ impl Options {
                 // The first `--` ends option parsing; everything after it is a
                 // pathspec, including a further `--`.
                 "--" => post = Some(Vec::new()),
-                // parse_options_step() consumes `--end-of-options` and returns
-                // PARSE_OPT_DONE with `ctx.argv[0]` on the word after it, which
-                // `cmd_blame()` records as `dashdash_pos` (parse-options.c:1119-1124,
-                // builtin/blame.c:1048-1051): that word then stands where a `--`
-                // would, and is sorted out below.
-                "--end-of-options" => {
-                    end_of_options = true;
-                    post = Some(Vec::new());
-                }
                 "-l" | "--long" => long = true,
                 "-s" => suppress = true,
                 "-e" | "--show-email" => show_email = true,
@@ -5618,21 +5582,6 @@ impl Options {
             }
             i += 1;
         }
-        // With `--end-of-options` there is no `--` in argv: the word at
-        // `dashdash_pos` is the first one after it. `case 1` (builtin/blame.c:1167-1170)
-        // takes the last word as the path and leaves that word in front of it for
-        // setup_revisions(); `case 2` overwrites it while reordering to
-        // `<rev> -- <path>` (:1159-1166). No word at all is `argc - dashdash_pos - 1`
-        // of -1, the usage error an empty `post` already answers.
-        if end_of_options {
-            if let Some(words) = post.as_mut().filter(|w| !w.is_empty()) {
-                let separator = words.remove(0);
-                if words.len() == 1 {
-                    pre.push(separator);
-                    pre_ends_in_unseparated_word = true;
-                }
-            }
-        }
 
         // `blame_copy_callback`: the first `-C` turns on copy detection *and* `-M`, the second
         // adds COPY_HARDER and the third COPY_HARDEST. `sb->copy_score` is only overridden by a
@@ -5654,7 +5603,6 @@ impl Options {
             suspect_id: None,
             pre,
             post,
-            pre_ends_in_unseparated_word,
             line_specs,
             ranges: Vec::new(),
             first_parent,

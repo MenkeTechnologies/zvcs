@@ -3656,6 +3656,15 @@ pub(super) fn switch_gate(
     if repo.head_id().is_err() {
         return refuse(&clobber);
     }
+    // `create_autostash_internal()` stashes only `if (has_unstaged_changes(r, 1) ||
+    // has_uncommitted_changes(r, 1))` (sequencer.c:4742-4743); with nothing either diff can
+    // see — a change only `verify_uptodate()` looks at, under a `CE_SKIP_WORKTREE` entry —
+    // there is no stash, and the second `merge_working_tree()` (builtin/checkout.c:1230-1231)
+    // refuses again with the porcelain messages the first run kept quiet.
+    let (unstaged, staged, _) = super::rebase::dirty_state(repo)?;
+    if !unstaged && !staged {
+        return refuse(&clobber);
+    }
     let stash = super::stash::create_autostash_msg(
         repo,
         &format!("autostash while switching to '{}'", opt.name),
@@ -3718,8 +3727,16 @@ pub(super) fn move_worktree(
             Ok(Moved::Clean)
         }
         Gate::Autostashed(stash) => {
-            update_worktree_to_tree(repo, cur_tree, target_tree)?;
             let opt = merge.expect("only `-m` ever stashes");
+            // The retry is a full `merge_working_tree(..., false, ...)` (builtin/checkout.c:1230-1231):
+            // a change the stash could not see — a modified `CE_SKIP_WORKTREE` file, which
+            // `verify_uptodate()` still checks — refuses it again, with the porcelain messages,
+            // and the autostash goes back onto the unmoved worktree before the switch fails.
+            if let Gate::Refused(code) = switch_gate(repo, cur_tree, target_tree, None)? {
+                apply_switch_autostash(repo, stash, cur_tree, opt, base_label.as_deref())?;
+                return Ok(Moved::Refused(code));
+            }
+            update_worktree_to_tree(repo, cur_tree, target_tree)?;
             let conflicted = apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
             Ok(Moved::Autostashed { conflicted })
         }
@@ -4010,10 +4027,14 @@ pub(super) fn update_worktree_to_tree(
             .map(|e| e.path_in(backing).to_owned())
             .collect()
     };
+    // `o->skip_sparse_checkout` (unpack-trees.c:1931-1932): without a sparse checkout no
+    // `apply_sparse_checkout()` runs, and `do_add_entry()` turns `deleted_entry()`'s
+    // `CE_REMOVE` into `CE_WT_REMOVE` (:222-223) for a `CE_SKIP_WORKTREE` entry too.
+    let sparse_patterns = crate::merge_guard::sparse_patterns(repo);
     let updating = unpack_progress(touched.len())?;
     for path in touched
         .iter()
-        .filter(|p| !new_flat.contains_key(*p) && !skipped_before.contains(*p))
+        .filter(|p| !new_flat.contains_key(*p) && (sparse_patterns.is_none() || !skipped_before.contains(*p)))
     {
         updating.tick();
         unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
@@ -4035,17 +4056,27 @@ pub(super) fn update_worktree_to_tree(
     // takes `CE_SKIP_WORKTREE` from the patterns — `mark_new_skip_worktree()` — and
     // `apply_sparse_checkout()` keeps such an entry's file out of the worktree. Without them a
     // switch wrote every changed path outside the cone, and the index lost the bit for it.
-    let sparse_patterns = if repo.config_snapshot().boolean("core.sparseCheckout").unwrap_or(false) {
-        let cone = repo.config_snapshot().boolean("core.sparseCheckoutCone").unwrap_or(false);
-        super::sparse_checkout::UnpackPatterns::load(repo, cone)
-    } else {
-        None
+    //
+    // Outside a sparse checkout neither loop runs: an entry keeps the `CE_SKIP_WORKTREE`
+    // `merged_entry()` migrates from the index entry it replaces (unpack-trees.c:2616-2617, or
+    // `copy_cache_entry()` when `same()`), and `check_updates()` writes every `CE_UPDATE`
+    // entry whatever it carries (:483-498), so the file is checked out and the bit stays.
+    let mut written = match &sparse_patterns {
+        Some(patterns) => {
+            patterns.mark_new_skip_worktree(&mut subset, &|_| true, false)?;
+            let mut written = subset.clone();
+            written.remove_entries(|_, _, e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE));
+            written
+        }
+        None => {
+            super::reset::carry_skip_worktree(&old, &mut subset);
+            let mut written = subset.clone();
+            for e in written.entries_mut() {
+                e.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+            }
+            written
+        }
     };
-    if let Some(patterns) = &sparse_patterns {
-        patterns.mark_new_skip_worktree(&mut subset, &|_| true, false)?;
-    }
-    let mut written = subset.clone();
-    written.remove_entries(|_, _, e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE));
     checkout_subset(repo, &mut written, &result_attrs, &should_interrupt, &updating)?;
     updating.stop();
 
@@ -4146,12 +4177,28 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
 
     let mut new_index = repo.index_from_tree(&new_tree)?;
 
+    // `merged_entry()` and `deleted_entry()` run `verify_uptodate()` on the entry they
+    // replace even under `o->reset`, which only lets an entry without `CE_SKIP_WORKTREE`
+    // through unchecked (unpack-trees.c:2235-2239). `reset_tree()` installs no porcelain
+    // messages and no `show_all_errors`, so the first refusal is reported as it is met and
+    // `unpack_trees()` fails, which `reset_tree()` turns into 128 (builtin/checkout.c:777-789).
+    if let Some(path) = super::reset::skip_worktree_refusal(repo, &old, &new_index)? {
+        eprintln!("error: Entry '{path}' not uptodate. Cannot merge.");
+        return Err(anyhow::Error::new(crate::fatal::Silent(128)));
+    }
+    let sparse = crate::merge_guard::sparse_patterns(repo).is_some();
+
     // What actually gets written: everything the tree changes, plus every
-    // carried-forward entry whose worktree file is missing or stat-dirty.
+    // carried-forward entry whose worktree file is missing or stat-dirty. A kept entry
+    // with `CE_SKIP_WORKTREE` is never rewritten: `oneway_merge()` asks `!ce_skip_worktree(old)`
+    // before it looks at the file (unpack-trees.c:3036-3042).
     let mut subset = repo.index_from_tree(&new_tree)?;
     subset.remove_entries(|_, path, entry| match old_map.get(&path.to_owned()) {
         Some((oid, mode, _, probe)) => {
-            *oid == entry.id && *mode == entry.mode && *probe == super::read_tree::Probe::Uptodate
+            *oid == entry.id
+                && *mode == entry.mode
+                && (*probe == super::read_tree::Probe::Uptodate
+                    || old.entry_by_path(path).is_some_and(|e| e.flags.contains(Flags::SKIP_WORKTREE)))
         }
         None => false,
     });
@@ -4190,9 +4237,13 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     // on the result — the same carry `reset --hard` makes. Carried before the
     // checkout, because the worktree writer skips a `SKIP_WORKTREE` entry: without
     // it `checkout -f` materialised every path outside the cone and dropped the
-    // bits from the index.
+    // bits from the index. Outside a sparse checkout `o->skip_sparse_checkout` is set
+    // (unpack-trees.c:1931-1932) and `check_updates()` writes every `CE_UPDATE` entry the
+    // merge left, `CE_SKIP_WORKTREE` or not (:483-498), so the bit rides on the index only.
     super::reset::carry_skip_worktree(&old, &mut new_index);
-    super::reset::carry_skip_worktree(&old, &mut subset);
+    if sparse {
+        super::reset::carry_skip_worktree(&old, &mut subset);
+    }
 
     // `oneway_merge()` builds `o->result` out of the tree alone, so the index
     // `check_updates()` reads attributes from is the new tree's (unpack-trees.c:399).

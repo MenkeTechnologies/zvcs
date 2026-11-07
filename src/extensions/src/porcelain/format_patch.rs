@@ -2210,8 +2210,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
 
     let mut i = 0;
     let mut pathspec_mode = false;
-    // `setup_revisions()`'s `seen_end_of_options` (revision.c:3049).
-    let mut end_of_options = false;
     // `handle_revision_pseudo_opt()`'s `*flags ^= UNINTERESTING | BOTTOM`: `--not`
     // reverses the sense of everything after it and toggles again at the next one.
     let mut negate = false;
@@ -2262,27 +2260,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         let a = args[i].as_str();
         if pathspec_mode {
             o.paths.push(a.to_owned());
-            i += 1;
-            continue;
-        }
-        // `cmd_format_patch()`'s parse_options() keeps `--end-of-options` under
-        // PARSE_OPT_KEEP_UNKNOWN_OPT and stops there (parse-options.c:1119-1124);
-        // setup_revisions() then reads every later word but `--` as a revision
-        // (revision.c:3077, :3100-3103).
-        if end_of_options && a != "--" {
-            if super::log::argument_excludes(a, negate) {
-                o.no_walk = false;
-            }
-            o.revs.push(RevWord::Rev {
-                spec: a.to_owned(),
-                pos: i,
-                negate,
-            });
-            i += 1;
-            continue;
-        }
-        if a == "--end-of-options" {
-            end_of_options = true;
             i += 1;
             continue;
         }

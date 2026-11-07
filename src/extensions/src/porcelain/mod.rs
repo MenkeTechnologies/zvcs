@@ -773,7 +773,7 @@ pub(crate) mod diff_no_index;
 pub(crate) mod push_proto;
 mod quiltimport;
 mod range_diff;
-mod read_tree;
+pub(crate) mod read_tree;
 mod rebase;
 mod rebase_todo;
 mod receive_pack;

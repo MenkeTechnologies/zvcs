@@ -845,6 +845,9 @@ fn finish(o: Opts) -> Result<ExitCode> {
                 if *id == e.id && *mode == e.mode {
                     e.stat = *stat;
                     e.flags |= *flags & STICKY;
+                } else {
+                    // `merged_entry()`: "Migrate old flags over" (unpack-trees.c:2616-2617).
+                    e.flags |= *flags & MIGRATED;
                 }
             }
         }
@@ -875,7 +878,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // Needed for the checks, and for `--reset -u` to know which files to restore.
     // Both are decided from `stat` data against the OLD index, which is what
     // `verify_uptodate_1`/`oneway_merge` compare against (`o->src_index`).
-    let (dirty, absent) = if o.checked() || (o.reset && o.update) {
+    let (dirty, absent) = if o.checked() || o.reset {
         let stat_ctx = StatCtx::new(&repo, &old)?;
         let dirty = worktree_dirty(&repo, &old, &stat_ctx);
         let absent = if o.reset && o.update {
@@ -888,11 +891,36 @@ fn finish(o: Opts) -> Result<ExitCode> {
         (HashSet::new(), HashSet::new())
     };
 
+    // `verify_uptodate()` on an entry `merged_entry()`/`deleted_entry()` replaces: a
+    // `CE_SKIP_WORKTREE` one is looked at even under `--reset`, unless the sparse checkout keeps
+    // it out, and so is a `CE_VALID` one (unpack-trees.c:2233-2239, :2275-2278).
+    let skip_check = match o.index_only {
+        true => None,
+        false => Some(crate::merge_guard::SkipWorktreeUptodate::new(&repo, &old, sparse_patterns(&repo, &o)?)?),
+    };
+    let not_uptodate = |path: &BString| {
+        let Some(check) = &skip_check else {
+            return false;
+        };
+        match old.entry_by_path_and_stage(path.as_bstr(), gix::index::entry::Stage::Unconflicted) {
+            Some(e) if e.flags.contains(Flags::SKIP_WORKTREE) => check.rejects(&repo, e, path.as_bstr()),
+            Some(e) if o.reset && !e.flags.contains(Flags::ASSUME_VALID) => false,
+            _ => dirty.contains(path),
+        }
+    };
+    if o.reset && !o.index_only {
+        for path in old_paths.union(&new_paths) {
+            let loses_content = removed.contains(path) || changed.contains(path);
+            if loses_content && old_map.contains_key(path) && not_uptodate(path) {
+                return rejected(format!("Entry '{}' not uptodate. Cannot merge.", path.to_str_lossy()));
+            }
+        }
+    }
     if o.checked() {
         for path in old_paths.union(&new_paths) {
             let loses_content = removed.contains(path)
                 || (changed.contains(path) && old_map.contains_key(path));
-            if loses_content && dirty.contains(path) {
+            if loses_content && not_uptodate(path) {
                 return rejected(format!(
                     "Entry '{}' not uptodate. Cannot merge.",
                     path.to_str_lossy()
@@ -956,10 +984,16 @@ fn finish(o: Opts) -> Result<ExitCode> {
             // still writes the file when `lstat()` fails *or* `ie_match_stat()`
             // reports a change — so a deleted worktree file comes back even
             // though its index entry never moved.
+            // A `CE_SKIP_WORKTREE` entry never is: `oneway_merge()` asks
+            // `!ce_skip_worktree(old)` first (unpack-trees.c:3036-3037).
             wanted.extend(
                 new_paths
                     .iter()
                     .filter(|p| dirty.contains(*p) || absent.contains(*p))
+                    .filter(|p| {
+                        changed.contains(*p)
+                            || !old_map.get(*p).is_some_and(|(.., flags)| flags.contains(Flags::SKIP_WORKTREE))
+                    })
                     .cloned(),
             );
         }
@@ -1317,10 +1351,12 @@ fn multi_tree_read(
         .collect();
 
     let stat_ctx = StatCtx::new(repo, old)?;
+    let skip = crate::merge_guard::SkipWorktreeUptodate::new(repo, old, sparse_patterns(repo, o)?)?;
     let ctx = MergeCtx {
         repo,
         old,
         stat: &stat_ctx,
+        skip: &skip,
         update: o.update,
         index_only: o.index_only,
         reset: o.reset,
@@ -1555,6 +1591,8 @@ struct MergeCtx<'a> {
     repo: &'a gix::Repository,
     old: &'a gix::index::File,
     stat: &'a StatCtx,
+    /// `verify_uptodate()` for a `CE_SKIP_WORKTREE` entry.
+    skip: &'a crate::merge_guard::SkipWorktreeUptodate,
     update: bool,
     index_only: bool,
     reset: bool,
@@ -1565,12 +1603,25 @@ impl MergeCtx<'_> {
     /// git's `verify_uptodate()`: refuse to overwrite a worktree file that has
     /// drifted from the index entry naming it.
     fn verify_uptodate(&self, path: &gix::bstr::BStr) -> std::result::Result<(), String> {
-        if self.index_only || self.reset {
+        if self.index_only {
             return Ok(());
         }
         let Some(entry) = self.old.entry_by_path(path) else {
             return Ok(());
         };
+        // "CE_VALID and CE_SKIP_WORKTREE cheat, we better check again": only an entry
+        // carrying neither lets `o->reset` through unchecked (unpack-trees.c:2233-2239), and
+        // a skip-worktree one the sparse checkout keeps out is `verify_uptodate()`'s own exit
+        // (:2275-2278).
+        if entry.flags.contains(Flags::SKIP_WORKTREE) {
+            return match self.skip.rejects(self.repo, entry, path) {
+                false => Ok(()),
+                true => Err(format!("Entry '{}' not uptodate. Cannot merge.", path.to_str_lossy())),
+            };
+        }
+        if self.reset && !entry.flags.contains(Flags::ASSUME_VALID) {
+            return Ok(());
+        }
         match self.stat.probe(self.repo, entry, path) {
             // `errno == ENOENT` is up to date: there is nothing to lose.
             Probe::Absent | Probe::Uptodate => Ok(()),
@@ -1882,7 +1933,7 @@ fn stage0_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Sta
 /// while `oneway_merge`'s `--reset -u` arm restores the file for **either**
 /// (`if (lstat(...) || ie_match_stat(...)) update |= CE_UPDATE`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Probe {
+pub(crate) enum Probe {
     /// `lstat()` failed — the file is gone from the worktree.
     Absent,
     /// Present, and `ie_match_stat()` reports no change.
@@ -1917,7 +1968,7 @@ impl RefreshDeath {
     }
 }
 
-pub(super) struct StatCtx {
+pub(crate) struct StatCtx {
     workdir: Option<PathBuf>,
     /// `core.trustCtime` / `core.checkStat`, as `Stat::matches` consumes them.
     opts: gix::index::entry::stat::Options,
@@ -1928,7 +1979,7 @@ pub(super) struct StatCtx {
 }
 
 impl StatCtx {
-    pub(super) fn new(repo: &gix::Repository, index: &gix::index::File) -> Result<Self> {
+    pub(crate) fn new(repo: &gix::Repository, index: &gix::index::State) -> Result<Self> {
         Ok(Self {
             workdir: repo.workdir().map(Path::to_owned),
             opts: repo.stat_options()?,
@@ -1941,7 +1992,7 @@ impl StatCtx {
     }
 
     /// `lstat()` + `ie_match_stat()` for one entry, named by its index path.
-    pub(super) fn probe(
+    pub(crate) fn probe(
         &self,
         repo: &gix::Repository,
         entry: &gix::index::Entry,
@@ -2319,6 +2370,13 @@ fn checkout_subset(
     let mut subset = gix::index::File::clone(index);
     subset.remove_entries(|_, path, _| !wanted.contains(&path.to_owned()));
     subset.remove_tree();
+    // `check_updates()` writes every `CE_UPDATE` entry, `CE_SKIP_WORKTREE` or not
+    // (unpack-trees.c:483-498); in a sparse checkout `apply_sparse_checkout()` has already
+    // taken `CE_UPDATE` off the ones it keeps out, which `wanted` leaves out. What remains
+    // here with the bit is an entry outside any sparse checkout, whose file is written.
+    for e in subset.entries_mut() {
+        e.flags.remove(Flags::SKIP_WORKTREE);
+    }
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;

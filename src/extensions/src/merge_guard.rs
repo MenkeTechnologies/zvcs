@@ -310,8 +310,26 @@ pub fn verify_two_way_initial(
 
     // `verify_uptodate()`: the file must still match the index. A directory
     // where the index has a file is not `ENOENT` and fails `ie_match_stat()`;
-    // a gitlink is never in the way (see [`scan`]).
+    // a gitlink is never in the way (see [`scan`]). The status pass passes over a
+    // `CE_SKIP_WORKTREE` entry, whose file `verify_uptodate_1()` looks at all the same
+    // (see [`SkipWorktreeUptodate`]).
+    let skipped: HashMap<BString, &gix::index::Entry> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0 && e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            .map(|e| (e.path_in(backing).to_owned(), e))
+            .collect()
+    };
+    let skip_check = match skipped.is_empty() {
+        true => None,
+        false => Some(SkipWorktreeUptodate::new(repo, index, sparse_patterns(repo))?),
+    };
     let uptodate = |path: &BString, mode: Mode| {
+        if let (Some(entry), Some(check)) = (skipped.get(path), &skip_check) {
+            return !check.rejects(repo, entry, path.as_bstr());
+        }
         mode == Mode::COMMIT || !(is_dir(path) || worktree.modified.contains(path))
     };
     // `verify_clean_subdirectory()` (unpack-trees.c:2320-2393) for `path`, which
@@ -398,6 +416,67 @@ pub fn verify_two_way_initial(
         }
     }
     Ok(clobber)
+}
+
+/// `verify_uptodate()` for an entry carrying `CE_SKIP_WORKTREE` (unpack-trees.c:2224-2280).
+///
+/// The status pass a gate otherwise relies on takes such an entry for clean, the way
+/// `refresh_index()` does, but `verify_uptodate_1()` does not trust the bit: "CE_VALID and
+/// CE_SKIP_WORKTREE cheat, we better check again", so the entry is `lstat()`ed and run
+/// through `ie_match_stat(..., CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE)` even
+/// under `o->reset`. The only way out is `verify_uptodate()`'s own:
+///
+/// ```c
+/// if (!o->skip_sparse_checkout &&
+///     (ce->ce_flags & CE_SKIP_WORKTREE) &&
+///     (ce->ce_flags & CE_NEW_SKIP_WORKTREE))
+///         return 0;
+/// ```
+///
+/// `o->skip_sparse_checkout` is set whenever `core.sparseCheckout` is off or the run does
+/// not update the worktree (unpack-trees.c:1931-1932), or no pattern file can be read
+/// (:1836); otherwise `CE_NEW_SKIP_WORKTREE` is the pattern list's verdict on the path
+/// (`mark_new_skip_worktree()`, :1977-1979). In a repository that is not a sparse
+/// checkout, a file `update-index --skip-worktree` hides is therefore checked like any other.
+pub(crate) struct SkipWorktreeUptodate {
+    stat: crate::porcelain::read_tree::StatCtx,
+    /// The pattern list when `o->skip_sparse_checkout` is clear.
+    patterns: Option<crate::porcelain::sparse_checkout::UnpackPatterns>,
+}
+
+impl SkipWorktreeUptodate {
+    /// `patterns` is the list `unpack_trees()` read, `None` when it left
+    /// `o->skip_sparse_checkout` set ([`sparse_patterns`] for a run that updates the worktree).
+    pub(crate) fn new(
+        repo: &gix::Repository,
+        index: &gix::index::State,
+        patterns: Option<crate::porcelain::sparse_checkout::UnpackPatterns>,
+    ) -> Result<Self> {
+        Ok(Self {
+            stat: crate::porcelain::read_tree::StatCtx::new(repo, index)?,
+            patterns,
+        })
+    }
+
+    /// Whether `verify_uptodate()` rejects `entry`, a `CE_SKIP_WORKTREE` one named `path`.
+    /// `lstat()` failing is `ENOENT`, which is never a rejection.
+    pub(crate) fn rejects(&self, repo: &gix::Repository, entry: &gix::index::Entry, path: &gix::bstr::BStr) -> bool {
+        if self.patterns.as_ref().is_some_and(|p| !p.path_in_sparse_checkout(path)) {
+            return false;
+        }
+        self.stat.probe(repo, entry, path) == crate::porcelain::read_tree::Probe::Changed
+    }
+}
+
+/// The pattern list `unpack_trees()` reads when `core.sparseCheckout` is on
+/// (unpack-trees.c:1931-1936), `None` when it leaves `o->skip_sparse_checkout` set.
+pub(crate) fn sparse_patterns(repo: &gix::Repository) -> Option<crate::porcelain::sparse_checkout::UnpackPatterns> {
+    let config = repo.config_snapshot();
+    if !config.boolean("core.sparseCheckout").unwrap_or(false) {
+        return None;
+    }
+    let cone = config.boolean("core.sparseCheckoutCone").unwrap_or(false);
+    crate::porcelain::sparse_checkout::UnpackPatterns::load(repo, cone)
 }
 
 /// What `twoway_merge()` asks of the disk for one path of the footprint.

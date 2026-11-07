@@ -1048,6 +1048,18 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
     }
+    // `reset_index()` runs before `reset_refs()` (builtin/reset.c:503-532), and its
+    // `oneway_merge()` checks a `CE_SKIP_WORKTREE` entry the reset replaces even under
+    // `o->reset` ([`skip_worktree_refusal`]); the plumbing message is reported as it is met,
+    // then `die(_("Could not reset index file to revision '%s'."), rev)`, HEAD unmoved.
+    if mode == ResetMode::Hard {
+        let target = repo.index_from_tree(&target_tree)?;
+        if let Some(path) = skip_worktree_refusal(&repo, &old_index, &target)? {
+            eprintln!("error: Entry '{path}' not uptodate. Cannot merge.");
+            eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
+            return Ok(ExitCode::from(128));
+        }
+    }
     let mut head_moved = true;
     if let Some(commit) = &head_commit {
         if let Ok(prev) = repo.head_id() {
@@ -1503,6 +1515,39 @@ pub(super) fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::i
     }
 }
 
+/// The first entry a `oneway_merge()` run with `o->reset` and `o->update` refuses, in index
+/// order: `CE_SKIP_WORKTREE` makes `verify_uptodate_1()` look at the file even under
+/// `o->reset` (unpack-trees.c:2235-2239), and `merged_entry()` / `deleted_entry()` ask it of
+/// every entry the tree changes or drops (:2611-2614, :2693). An entry the tree keeps is
+/// `same()` and never checked (:3036-3047). See [`crate::merge_guard::SkipWorktreeUptodate`]
+/// for when the bit is honoured instead.
+pub(super) fn skip_worktree_refusal(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    new_index: &gix::index::File,
+) -> Result<Option<BString>> {
+    let backing = old.path_backing();
+    let mut skipped = old
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() == 0 && e.flags.contains(Flags::SKIP_WORKTREE))
+        .peekable();
+    if skipped.peek().is_none() {
+        return Ok(None);
+    }
+    let check = crate::merge_guard::SkipWorktreeUptodate::new(repo, old, crate::merge_guard::sparse_patterns(repo))?;
+    for e in skipped {
+        let path = e.path_in(backing);
+        let kept = new_index
+            .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+            .is_some_and(|n| n.id == e.id && n.mode == e.mode);
+        if !kept && check.rejects(repo, e, path) {
+            return Ok(Some(path.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 /// `oneway_merge()`'s `if (old && same(old, a))` arm (unpack-trees.c): a path whose mode
 /// and object id the reset does not change keeps the entry it already had — stat cache and
 /// all — rather than being rebuilt from the tree with a zeroed one.
@@ -1767,6 +1812,34 @@ fn reset_worktree_hard(
     // paths the sparse checkout deliberately left out.
     carry_skip_worktree(old, &mut new_index);
     carry_stat_of_unchanged(old, &mut new_index);
+    // Outside a sparse checkout `o->skip_sparse_checkout` is set (unpack-trees.c:1931-1932),
+    // so no `apply_sparse_checkout()` clears the `CE_UPDATE` `merged_entry()` gives an entry
+    // the reset changes, and `check_updates()` writes it with its migrated `CE_SKIP_WORKTREE`
+    // (:483-498, :2616-2617). Only a kept one stays unwritten (`oneway_merge()`, :3036-3042).
+    let materialised: Vec<usize> = match crate::merge_guard::sparse_patterns(repo) {
+        Some(_) => Vec::new(),
+        None => {
+            let kept: HashSet<(BString, ObjectId, u32)> = {
+                let backing = old.path_backing();
+                old.entries()
+                    .iter()
+                    .filter(|e| e.stage_raw() == 0)
+                    .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode.bits()))
+                    .collect()
+            };
+            let backing = new_index.path_backing().to_owned();
+            new_index
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e.flags.contains(Flags::SKIP_WORKTREE)
+                        && !kept.contains(&(e.path_in(&backing).to_owned(), e.id, e.mode.bits()))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
+    };
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
@@ -1840,6 +1913,9 @@ fn reset_worktree_hard(
     for &i in &hidden {
         new_index.entries_mut()[i].flags.insert(Flags::SKIP_WORKTREE);
     }
+    for &i in &materialised {
+        new_index.entries_mut()[i].flags.remove(Flags::SKIP_WORKTREE);
+    }
     let odb = repo.objects.clone().into_arc()?;
     let discard_files = gix::progress::Discard;
     let discard_bytes = gix::progress::Discard;
@@ -1854,6 +1930,9 @@ fn reset_worktree_hard(
     );
     for &i in &hidden {
         new_index.entries_mut()[i].flags.remove(Flags::SKIP_WORKTREE);
+    }
+    for &i in &materialised {
+        new_index.entries_mut()[i].flags.insert(Flags::SKIP_WORKTREE);
     }
     written?;
 
@@ -2165,6 +2244,14 @@ fn reset_two_tree(
         let upd: HashSet<BString> = updates.iter().map(|(p, _, _)| p.clone()).collect();
         let mut wt = new_index.clone();
         wt.remove_entries(|_, path, _| !upd.contains(path));
+        // Outside a sparse checkout no `apply_sparse_checkout()` clears the `CE_UPDATE` of an
+        // entry whose migrated `CE_SKIP_WORKTREE` stays (unpack-trees.c:1931-1932, :2616-2617),
+        // so `check_updates()` writes it like any other (:483-498).
+        if crate::merge_guard::sparse_patterns(repo).is_none() {
+            for e in wt.entries_mut() {
+                e.flags.remove(Flags::SKIP_WORKTREE);
+            }
+        }
         let mut opts =
             repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
         opts.destination_is_initially_empty = false;

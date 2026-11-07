@@ -349,7 +349,9 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     if opts.advertise_only {
         return Ok(ExitCode::SUCCESS);
     }
-    receive(&mut repo, &config, opts.stateless_rpc, opts.quiet)
+    let _ = opts.quiet; // suppresses progress only; the report-status is unaffected.
+
+    receive(&mut repo, &config, opts.stateless_rpc)
 }
 
 /// Either a fully parsed command line, or a terminal exit code for the
@@ -1095,7 +1097,7 @@ To squelch this message, you can set it to 'refuse'.
 /// `send-pack` speaks: pkt-line commands, then a flush, then a raw (non-pkt) pack,
 /// then a plain pkt-line `report-status`. An empty command list (immediate flush) is
 /// a no-op success, matching a client that connects and hangs up.
-fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, quiet: bool) -> Result<ExitCode> {
+fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool) -> Result<ExitCode> {
     // Each accepted ref update writes a reflog; a bare remote often has no configured
     // identity, so seed a synthesized system default (as git does) to keep the reflog
     // write from failing the push.
@@ -1216,10 +1218,7 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
     if cmds.iter().any(|c| c.new != zero) {
         // git reports the *child*'s failure rather than the reason; the reason
         // itself has already gone back on band 2, printed by that child.
-        // `-q`, or the `quiet` capability the client asked for (builtin/receive-pack.c:2225-2226),
-        // keeps `index-pack` from drawing its delta meter.
-        let quiet = quiet || cap_present(&caps, b"quiet");
-        if let Err(status) = ingest_pack(repo, &mut stdin, config, &mut band, quiet) {
+        if let Err(status) = ingest_pack(repo, &mut stdin, config, &mut band) {
             unpack = Err(status);
         }
     }
@@ -1804,7 +1803,6 @@ fn ingest_pack(
     input: &mut impl BufRead,
     config: &Config,
     band: &mut Band,
-    quiet: bool,
 ) -> Result<(), String> {
     // `unpack()` reads the 12-byte header first to learn the object count, and
     // that count alone decides which child runs. A short read never reaches a
@@ -1854,28 +1852,10 @@ fn ingest_pack(
         band.fatal("cannot create pack directory");
         return Err(child);
     }
-    // ```c
-    // if (!opts->quiet && err_fd)
-    //         strvec_push(&child.args, "--show-resolving-progress");
-    // ```
-    //
-    // (object-file.c:1401-1402, the `index-pack` branch only.) `err_fd` is the
-    // `copy_to_sideband()` muxer, set up only when the client asked for a sideband
-    // (builtin/receive-pack.c:2312-2324), so the meter reaches the pusher on band 2.
-    // `unpack-objects` gets no such flag, and with a pipe for a stderr its own
-    // `quiet = !isatty(2)` (builtin/unpack-objects.c:630) keeps it silent.
-    let mut progress: Box<dyn prodash::DynNestedProgress> = if !quiet && band.sideband && !to_loose {
-        let keep_alive = band.keep_alive;
-        Box::new(super::fetch_progress::Meters::resolving_only(std::sync::Arc::new(move |bytes: &[u8]| {
-            Band { sideband: true, keep_alive }.write_bytes(bytes)
-        })))
-    } else {
-        Box::new(gix::progress::Discard)
-    };
     let outcome = gix::odb::pack::Bundle::write_to_directory(
         &mut counted,
         Some(&pack_dir),
-        &mut *progress,
+        &mut gix::progress::Discard,
         &AtomicBool::new(false),
         Some(repo.objects.clone()),
         gix::odb::pack::bundle::write::Options {
@@ -1883,7 +1863,6 @@ fn ingest_pack(
             ..Default::default()
         },
     );
-    drop(progress);
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(e) => {

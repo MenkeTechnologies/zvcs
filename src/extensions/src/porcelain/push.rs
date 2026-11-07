@@ -976,7 +976,6 @@ git push <groupname>\n"
         verbosity: f.verbosity,
         negotiation_include,
         negotiation_restrict,
-        send_pack_match: None,
     };
     // `transport_push()`'s steps between the match and `push_refs()`
     // (transport.c:1479-1531), which `push_proto::send_pack` calls back into once
@@ -1107,9 +1106,9 @@ git push <groupname>\n"
     // it: `pretend` makes it report what it *would* configure, while the
     // tracking-ref update is skipped outright.
     let (code, trailer, failure) = if f.porcelain {
-        report_porcelain(&repo, &outcome, f.quiet)?
+        report_porcelain(&outcome, f.quiet)?
     } else {
-        report(&repo, &outcome, f.verbose, f.quiet)?
+        report(&outcome, f.verbose, f.quiet)?
     };
     // send-pack died under remote-curl ([`push_proto::Outcome::helper_ended`]). A dead remote-curl never answers
     // the `push` command, so `push_update_refs_status()` returns 1 (transport-helper.c:946-958), and with
@@ -1963,7 +1962,7 @@ impl std::error::Error for DstRefspecCollision {}
 ///
 /// `hex_len` is `the_hash_algo->hexsz`, which only a negative refspec reads: an
 /// exact object name cannot be excluded.
-pub(super) fn push_refspec_is_valid(spec: &str, hex_len: usize) -> bool {
+fn push_refspec_is_valid(spec: &str, hex_len: usize) -> bool {
     use super::check_ref_format::{check_refname_format, ALLOW_ONELEVEL, REFSPEC_PATTERN};
 
     let (lhs, negative) = match spec.as_bytes().first() {
@@ -2050,7 +2049,7 @@ fn check_push_refs(repo: &gix::Repository, specs: &[String]) -> bool {
     all_matched
 }
 
-pub(super) fn local_head_names(repo: &gix::Repository) -> Vec<String> {
+fn local_head_names(repo: &gix::Repository) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(platform) = repo.references() else {
         return out;
@@ -2576,7 +2575,6 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
 /// Print the human `To <url>` status block (git prints it on stderr) and return
 /// the exit code: failure if the unpack failed or any ref was rejected.
 fn report<'a>(
-    repo: &gix::Repository,
     outcome: &'a push_proto::Outcome,
     verbose: bool,
     quiet: bool,
@@ -2662,14 +2660,11 @@ fn report<'a>(
         true => outcome.statuses.as_slice(),
         false => &[][..],
     };
-    // `int summary_width = transport_summary_width(refs);` (transport.c:900): every
-    // summary below is padded to it.
-    let width = push_proto::summary_width(repo, outcome);
     // `transport_print_push_status()` walks `remote_refs` three times — up to
     // date, then moved, then everything else (transport.c:864-897).
     let in_passes = (0..3).flat_map(|pass| listed.iter().filter(move |s| s.print_pass() == pass));
     for s in in_passes.filter(|s| !s.pre_transport) {
-        let short = |oid: &ObjectId| push_proto::quickref_abbrev(repo, oid);
+        let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `print_ref_status` (transport.c:620): the left side is the LOCAL ref
         // (`ref->peer_ref`) and the right side is `report->ref_name` when the
         // server named one — a `proc-receive` hook turns `refs/for/main` into
@@ -2686,14 +2681,14 @@ fn report<'a>(
             // just what moved.
             Ok(()) if s.up_to_date => {
                 if verbose {
-                    eprintln!(" = {:<width$} {src_dst}", "[up to date]");
+                    eprintln!(" = [up to date]      {src_dst}");
                 }
             }
             // `print_ok_ref_status()` tests `ref->deletion` first, which is what
             // keeps a delete of a ref the remote never had — old and new both
             // null — from being announced as a new branch.
             Ok(()) if s.new.is_null() => {
-                eprintln!(" - {:<width$} {}", "[deleted]", short_ref(dst));
+                eprintln!(" - [deleted]         {}", short_ref(dst));
             }
             Ok(()) if s.old.is_null() => {
                 // git names the created ref by its namespace: a branch, a tag, or
@@ -2706,24 +2701,27 @@ fn report<'a>(
                 } else {
                     "[new reference]"
                 };
-                // `%-*s` at `transport_summary_width()`, then one space
-                // (transport.c:681-682).
-                eprintln!(" * {kind:<width$} {src_dst}");
+                // `%-*s` at `transport_summary_width()`, which is
+                // `2 * FALLBACK_DEFAULT_ABBREV + 3` = 17, then one space
+                // (transport.c:647). `[new reference]` is the one summary long
+                // enough for the difference between padding and a fixed run of
+                // spaces to show.
+                eprintln!(" * {kind:<17} {src_dst}");
             }
             Ok(()) => {
                 // `print_ok_ref_status`: a forced update is `+` with `...` between
                 // the abbreviations and a trailing `(forced update)`; a plain one
                 // is a blank flag with `..` and no trailer. `print_ref_status`
-                // prints the summary as ` %c %-*s ` at `transport_summary_width()`,
-                // which is why the shorter `..` form ends up one space wider than
-                // the `...` one.
+                // prints the summary as ` %c %-*s ` at `TRANSPORT_SUMMARY_WIDTH`
+                // (`2 * DEFAULT_ABBREV + 3` = 17), which is why the shorter `..`
+                // form ends up one space wider than the `...` one.
                 let (flag, sep, msg) = if s.forced {
                     ('+', "...", " (forced update)")
                 } else {
                     (' ', "..", "")
                 };
                 let summary = format!("{}{sep}{}", short(&s.old), short(&s.new));
-                eprintln!(" {flag} {summary:<width$} {src_dst}{msg}");
+                eprintln!(" {flag} {summary:<17} {src_dst}{msg}");
             }
             Err(reason) => {
                 any_failed = true;
@@ -2738,15 +2736,12 @@ fn report<'a>(
                 // `REF_STATUS_EXPECTING_REPORT`: `print_ref_status('!',
                 // "[remote failure]", …)` (transport.c:793-798).
                 let label = if s.missing_report {
-                    "[remote failure]"
+                    "! [remote failure] "
                 } else if s.remote_rejected {
-                    "[remote rejected]"
+                    "! [remote rejected]"
                 } else {
-                    "[rejected]"
+                    "! [rejected]       "
                 };
-                // `" %s%c %-*s%s "` (transport.c:635-636): the color span holds the
-                // flag and the padded summary.
-                let label = format!("! {label:<width$}");
                 // ```c
                 // case REF_STATUS_REMOTE_REJECT:
                 //         print_ref_status('!', "[remote rejected]", ref,
@@ -2767,7 +2762,7 @@ fn report<'a>(
                     Some(from) => format!("{} -> {}", short_ref(from), short_ref(dst)),
                     None => short_ref(dst).to_string(),
                 };
-                let summary = super::color::PushColors::paint(&colors.rejected, &label);
+                let summary = super::color::PushColors::paint(&colors.rejected, label);
                 eprintln!(" {summary} {shown} ({reason})");
             }
         }
@@ -2905,7 +2900,6 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
 /// `--porcelain`: machine-readable output — `<flag>\t<ref>\t<summary>` per ref,
 /// framed by `To <url>` and a trailing `Done`, on stdout.
 fn report_porcelain<'a>(
-    repo: &gix::Repository,
     outcome: &'a push_proto::Outcome,
     quiet: bool,
 ) -> Result<(ExitCode, bool, Option<PushFailure<'a>>)> {
@@ -2933,7 +2927,7 @@ fn report_porcelain<'a>(
     // The same three walks over `remote_refs` as the human block
     // (transport.c:864-897); `--porcelain` passes `verbose`, so the first runs.
     for s in (0..3).flat_map(|pass| listed.iter().filter(move |s| s.print_pass() == pass)) {
-        let short = |oid: &ObjectId| push_proto::quickref_abbrev(repo, oid);
+        let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `fprintf(stdout, "%c\t%s:%s\t", flag, from->name, to_name)` — the local
         // ref and the ref the server says it updated, both unshortened.
         let dst = s.report_name.as_deref().unwrap_or(&s.name);

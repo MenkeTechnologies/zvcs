@@ -92,6 +92,11 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // `commit` starts a detached `maintenance run --auto` (builtin/commit.c:1858),
+            // whose `objects/maintenance.lock` would land in [`Fixture::loose`]'s listing.
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_0", "false")
             .env("GIT_AUTHOR_NAME", "zvcs test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "zvcs test")

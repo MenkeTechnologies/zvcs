@@ -927,6 +927,10 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
     }
     if o.checked() {
+        // `merged_entry()` gives a new entry `CE_NEW_SKIP_WORKTREE` before its `verify_absent()`,
+        // which returns at once for it unless `o->skip_sparse_checkout` (unpack-trees.c:2540-2541,
+        // :2582-2588): in a sparse checkout the check waits for the sparse loops.
+        let sparse = sparse_patterns(&repo, &o)?.is_some();
         for path in old_paths.union(&new_paths) {
             let loses_content = removed.contains(path)
                 || (changed.contains(path) && old_map.contains_key(path));
@@ -938,7 +942,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
             }
             // A file we are about to create must not already exist untracked, but
             // only when we would actually write it (`-u`).
-            if o.update && changed.contains(path) && !old_map.contains_key(path) {
+            if o.update && !sparse && changed.contains(path) && !old_map.contains_key(path) {
                 let exists = repo
                     .workdir_path(path.as_bstr())
                     .is_some_and(|p| p.symlink_metadata().is_ok());
@@ -1341,7 +1345,9 @@ fn multi_tree_read(
         .collect();
 
     let stat_ctx = StatCtx::new(repo, old)?;
-    let skip = crate::merge_guard::SkipWorktreeUptodate::new(repo, old, sparse_patterns(repo, o)?)?;
+    let patterns = sparse_patterns(repo, o)?;
+    let sparse = patterns.is_some();
+    let skip = crate::merge_guard::SkipWorktreeUptodate::new(repo, old, patterns)?;
     let ctx = MergeCtx {
         repo,
         old,
@@ -1351,6 +1357,7 @@ fn multi_tree_read(
         index_only: o.index_only,
         reset: o.reset,
         aggressive: o.aggressive,
+        sparse,
     };
     // `is_index_unborn()`: an index that was never written has nothing to carry.
     let initial_checkout = old.entries().is_empty();
@@ -1414,10 +1421,6 @@ fn multi_tree_read(
         }
     }
 
-    if o.dry_run {
-        return Ok(ExitCode::SUCCESS);
-    }
-
     // ---- Assemble the result index. ----
     let mut new_index =
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path());
@@ -1476,6 +1479,12 @@ fn multi_tree_read(
         },
     ) {
         sparse.apply(repo, old, &mut new_index, &mut wanted, &mut removed)?;
+    }
+    // `-n` stops at `check_updates()`, which returns before touching the worktree
+    // (unpack-trees.c:442-446), and `cmd_read_tree()` writes no index (builtin/read-tree.c:
+    // 278-279): what it prints is the sparse loops' warnings above.
+    if o.dry_run {
+        return Ok(ExitCode::SUCCESS);
     }
 
     if o.update {
@@ -1588,6 +1597,8 @@ struct MergeCtx<'a> {
     index_only: bool,
     reset: bool,
     aggressive: bool,
+    /// `!o->skip_sparse_checkout`: a sparse checkout the run updates.
+    sparse: bool,
 }
 
 impl MergeCtx<'_> {
@@ -1659,7 +1670,11 @@ impl MergeCtx<'_> {
     ) -> std::result::Result<Verdict, String> {
         match old {
             None => {
-                self.verify_absent(path, true)?;
+                // `CE_NEW_SKIP_WORKTREE` is set before `verify_absent()`, which then returns at once
+                // in a sparse checkout: the sparse loops check it again (unpack-trees.c:2569-2588).
+                if !self.sparse {
+                    self.verify_absent(path, true)?;
+                }
                 Ok(Verdict::Merge { ce, update: true })
             }
             // "See if we can re-use the old CE directly? That way we get the

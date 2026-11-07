@@ -587,6 +587,10 @@ struct IdxInfo {
     /// why `git diff-index HEAD` is silent in a cone checkout instead of reporting
     /// every excluded path as deleted.
     cached_entry: bool,
+    /// `ce_uptodate(ce)`: the entry was verified against its file by this process, so
+    /// `get_stat_data()` takes it as it is without `lstat()`ing the file (diff-lib.c:324).
+    /// Only an in-memory index ([`diff_index_in_memory`]) carries it; a read never sets it.
+    uptodate: bool,
 }
 
 
@@ -807,6 +811,53 @@ fn set_earliest(slot: &mut Option<(usize, u8, Vec<u8>)>, cand: (usize, u8, Vec<u
     if slot.as_ref().is_none_or(|(i, _, _)| cand.0 < *i) {
         *slot = Some(cand);
     }
+}
+
+thread_local! {
+    /// The index [`diff_index_in_memory`] hands the run in place of the one on disk.
+    static IN_MEMORY: std::cell::RefCell<Option<std::rc::Rc<gix::index::File>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The index a run compares against: the caller's in-memory one when it handed one over,
+/// else the index on disk — an empty one when there is no file, as `do_read_index()` reads
+/// it with `must_exist == 0` (read-cache.c:2232).
+enum RunIndex {
+    Disk(gix::worktree::Index),
+    InMemory(std::rc::Rc<gix::index::File>),
+}
+
+impl std::ops::Deref for RunIndex {
+    type Target = gix::index::File;
+    fn deref(&self) -> &gix::index::File {
+        match self {
+            RunIndex::Disk(index) => index,
+            RunIndex::InMemory(index) => index,
+        }
+    }
+}
+
+fn run_index(repo: &gix::Repository) -> Result<RunIndex> {
+    match IN_MEMORY.with(|slot| slot.borrow().clone()) {
+        Some(index) => Ok(RunIndex::InMemory(index)),
+        None => Ok(RunIndex::Disk(repo.index_or_empty()?)),
+    }
+}
+
+/// `run_diff_index()` on `index`, the caller's `the_repository->index`, rather than on the
+/// index read back from disk.
+///
+/// `show_local_changes()` (builtin/checkout.c:721-734) diffs the index `unpack_trees()` just
+/// built and `write_locked_index()` wrote, without reading it again: the entries
+/// `refresh_index()` and `check_updates()` marked `CE_UPTODATE` are not `lstat()`ed by
+/// `get_stat_data()` (diff-lib.c:324), and a present file outside the sparse patterns keeps
+/// the bit the sparse loops left it, where a read would have cleared it
+/// (`clear_skip_worktree_from_present_files()`, repository.c:467).
+pub(crate) fn diff_index_in_memory(args: &[String], index: gix::index::File) -> Result<ExitCode> {
+    IN_MEMORY.with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::new(index)));
+    let result = diff_index(args);
+    IN_MEMORY.with(|slot| slot.borrow_mut().take());
+    result
 }
 
 pub fn diff_index(args: &[String]) -> Result<ExitCode> {
@@ -2093,7 +2144,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // turns away is never stat'ed, never hands a gitlink to `is_submodule_modified()`
     // and never stops a `--quiet` walk.
     let ps_index = match needs_gix && !paths.is_empty() {
-        true => Some(repo.index_or_empty()?),
+        true => Some(run_index(&repo)?),
         false => None,
     };
     let mut ps = match &ps_index {
@@ -2179,7 +2230,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // stay `diff_change()` pairs.
     let mut walk_combined: Vec<super::diff::CombinedPath> = Vec::new();
     if walk_combine.is_some() {
-        let index = repo.index_or_empty()?;
+        let index = run_index(&repo)?;
         let mut kept: Vec<Delta> = Vec::with_capacity(deltas.len());
         for d in deltas.drain(..) {
             let candidate = d.src_mode != 0 && d.dst_mode != 0 && d.src_id != d.dst_id;
@@ -2784,7 +2835,7 @@ fn collect(
     let mut tree: BTreeMap<BString, (u32, ObjectId)> = BTreeMap::new();
     flatten_tree(repo, tree_id, &BString::default(), &mut tree)?;
 
-    let index = repo.index_or_empty()?;
+    let index = run_index(repo)?;
     let index_state: &gix::index::State = &index;
 
     let mut idx: BTreeMap<BString, IdxInfo> = BTreeMap::new();
@@ -2811,6 +2862,7 @@ fn collect(
                             gix::index::entry::Flags::ASSUME_VALID
                                 | gix::index::entry::Flags::SKIP_WORKTREE,
                         ),
+                        uptodate: e.flags.contains(gix::index::entry::Flags::UPTODATE),
                     },
                 );
             }
@@ -2915,7 +2967,8 @@ fn collect(
         let mut dst_mode = info.mode;
         let mut dst_id = info.id;
         let mut dirty_submodule = false;
-        if !opts.cached && !info.cached_entry {
+        // `if (!cached && !ce_uptodate(ce))` (diff-lib.c:324).
+        if !opts.cached && !info.cached_entry && !info.uptodate {
             let workdir = workdir.as_deref().expect("checked above");
             let full = worktree_path(workdir, path);
             match std::fs::symlink_metadata(&full) {

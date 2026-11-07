@@ -3737,6 +3737,9 @@ pub(super) fn move_worktree(
                 return Ok(Moved::Refused(code));
             }
             update_worktree_to_tree(repo, cur_tree, target_tree, false)?;
+            // The re-applied autostash writes the index again, and the headed listing reads it
+            // back: `discard_index()` + `repo_read_index()` (builtin/checkout.c:1263-1266).
+            crate::held_index::forget_written();
             let conflicted = apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
             Ok(Moved::Autostashed { conflicted })
         }
@@ -4173,6 +4176,9 @@ pub(super) fn update_worktree_to_tree(
     super::write_tree::invalidate_untracked_changes(untracked_before.as_ref(), &mut index);
     super::write_tree::rebuild_cache_tree(repo, &mut index);
     crate::index_racy::write(repo, &mut index)?;
+    // `*o->dst_index = o->internal.result` (unpack-trees.c:2097-2098): the index just written
+    // stays `the_repository->index` for `show_local_changes()`.
+    crate::held_index::keep_written(index);
     Ok(())
 }
 
@@ -4243,6 +4249,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         true,
         crate::unpack_sparse::Opts {
             overwrite_untracked: FORCE.load(std::sync::atomic::Ordering::Relaxed),
+            reset: true,
             ..Default::default()
         },
     );
@@ -4403,8 +4410,9 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
 /// changes it is meant to list.
 pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
     // It runs at the tail of `merge_working_tree()`, after the index is written; a switch
-    // that moved nothing still writes the index its refresh changed.
-    crate::held_index::flush()?;
+    // that moved nothing still writes the index its refresh changed. `run_diff_index()`
+    // then diffs that in-memory index, not one read back from disk (builtin/checkout.c:930-931).
+    let in_memory = crate::held_index::flush_and_take_in_memory()?;
     if quiet {
         return Ok(());
     }
@@ -4415,7 +4423,10 @@ pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
     // `get_oid()` on the same operand and repeat its ambiguity warning, which
     // stock prints exactly once per operand.
     let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-    super::diff_index::diff_index(&args)?;
+    match in_memory {
+        Some(index) => super::diff_index::diff_index_in_memory(&args, index)?,
+        None => super::diff_index::diff_index(&args)?,
+    };
     Ok(())
 }
 

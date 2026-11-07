@@ -44,6 +44,37 @@ pub fn flush() -> anyhow::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    static WRITTEN: RefCell<Option<gix::index::File>> = const { RefCell::new(None) };
+}
+
+/// Keep `index`, which the command has just written, as the in-memory index it goes on
+/// working with: `write_locked_index()` leaves `the_repository->index` in place, with the
+/// `CE_UPTODATE` marks and `CE_SKIP_WORKTREE` bits it was written with.
+pub fn keep_written(index: gix::index::File) {
+    WRITTEN.with(|written| *written.borrow_mut() = Some(index));
+}
+
+/// Forget the index [`keep_written`] kept: the command wrote the index again since, and
+/// reads that one back (`discard_index()` + `repo_read_index()`).
+pub fn forget_written() {
+    WRITTEN.with(|written| written.borrow_mut().take());
+}
+
+/// Write the held index, if nothing took it, and hand over the in-memory index the command
+/// now has: the one [`keep_written`] kept, else the held one just written; `None` when the
+/// command holds neither and the index on disk is all there is.
+pub fn flush_and_take_in_memory() -> anyhow::Result<Option<gix::index::File>> {
+    let held = match HELD.with(|held| held.borrow_mut().take()) {
+        Some((repo, mut index)) => {
+            crate::index_racy::write(&repo, &mut index)?;
+            Some(index)
+        }
+        None => None,
+    };
+    Ok(WRITTEN.with(|written| written.borrow_mut().take()).or(held))
+}
+
 /// Forget the held index without writing it — git rolled its lock back, or discarded the
 /// in-memory index before handing the work to a child process.
 pub fn discard() {

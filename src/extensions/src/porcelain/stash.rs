@@ -2417,7 +2417,12 @@ fn apply_cached_index_tree(
     if !ok {
         return Ok(Err(format!("could not generate diff {w_commit}^!.")));
     }
-    let index_file = repo.git_dir().join(format!("index.stash.{}", std::process::id()));
+    // git's `apply` child starts in the top-level directory setup_git_directory_gently() moved the
+    // parent to (setup.c:1957-1959), so the paths it gets are taken from there; this port's
+    // process stays in the cwd, where `git_dir()` may be relative (`../.git` from a
+    // subdirectory), so the `GIT_INDEX_FILE` the child resolves from the worktree must be
+    // absolute.
+    let index_file = std::path::absolute(repo.git_dir().join(format!("index.stash.{}", std::process::id())))?;
     let result = (|| -> Result<std::result::Result<ObjectId, String>> {
         std::fs::copy(repo.index_path(), &index_file)?;
         let exe = crate::hosted::git_exe()?;

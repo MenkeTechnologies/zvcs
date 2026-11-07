@@ -1871,11 +1871,36 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         }
     }
 
-    // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
+    // `update_sparsity()` (unpack-trees.c:2132-2196) is not `unpack_trees()`: it marks the
+    // source index in place and never calls `cache_tree_update()`, and
+    // `update_working_directory()` writes that index as it stands
+    // (builtin/sparse-checkout.c:246-247). The cache-tree read with the index is what gets
+    // written, nodes an earlier `update-index` invalidated included. A collapsed index had its
+    // cache-tree recomputed when `expand_index()` expanded it (sparse-index.c:463-464), which
+    // `ensure_full_index_with_advice()` above did.
+    //
+    // `check_updates()` (unpack-trees.c:2185) writes the files `apply_sparse_checkout()`
+    // marked `CE_UPDATE` before `update_working_directory()` writes the index
+    // (builtin/sparse-checkout.c:246-247), and `update_ce_after_write()` fills each entry's
+    // stat data from the file it wrote (entry.c:269-279), so the index records the materialized
+    // files as they are on disk rather than the stat data of the entry it was before.
+    if !to_materialize.is_empty() {
+        let mut subset = index.clone();
+        subset.remove_entries(|_, path, _| !to_materialize.iter().any(|k| k.as_bstr() == path));
+        checkout_subset(repo, &mut subset)?;
+        let fresh: std::collections::HashMap<BString, gix::index::entry::Stat> = {
+            let backing = subset.path_backing();
+            subset.entries().iter().map(|e| (e.path_in(backing).to_owned(), e.stat)).collect()
+        };
+        let backing = index.path_backing().to_owned();
+        for e in index.entries_mut() {
+            if let Some(stat) = fresh.get(e.path_in(&backing)) {
+                e.stat = *stat;
+            }
+        }
+    }
 
-    // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-
-    super::write_tree::rebuild_cache_tree(repo, &mut index);
+    super::write_tree::prepare_offset_table(repo, &mut index);
     crate::index_racy::write(repo, &mut index)?;
 
     // Cone mode alone refreshes the cache tree: git finishes
@@ -1886,14 +1911,6 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     // installs a non-cone `/*` list precisely so it does not reach this.
     if matches!(sparsity, Sparsity::Cone(_)) {
         write_cache_tree(repo, &index)?;
-    }
-
-    if !to_materialize.is_empty() {
-        // Re-open so the checkout sees the freshly cleared skip bits (entries
-        // carrying SKIP_WORKTREE are ignored by the worktree writer).
-        let mut subset = repo.open_index()?;
-        subset.remove_entries(|_, path, _| !to_materialize.iter().any(|k| k.as_bstr() == path));
-        checkout_subset(repo, &mut subset)?;
     }
 
     for path in &to_remove {

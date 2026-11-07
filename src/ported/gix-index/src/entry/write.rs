@@ -84,8 +84,13 @@ impl Entry {
                 .try_into()
                 .expect("we just checked that the length is smaller than 0xfff")
         };
-        out.write_all(&(self.flags.to_storage().bits() | path_len).to_be_bytes())?;
-        if self.flags.contains(entry::Flags::EXTENDED) {
+        // `CE_EXTENDED` as `do_write_index()` recomputes it (read-cache.c:2851-2856) and
+        // `ce_write_entry()` then stores it (read-cache.c:2647-2650).
+        let extended = self.flags.needs_extended();
+        let mut flags = self.flags;
+        flags.set(entry::Flags::EXTENDED, extended);
+        out.write_all(&(flags.to_storage().bits() | path_len).to_be_bytes())?;
+        if extended {
             out.write_all(
                 &entry::at_rest::FlagsExtended::from_flags(self.flags)
                     .bits()

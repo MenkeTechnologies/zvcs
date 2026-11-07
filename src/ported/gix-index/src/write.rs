@@ -260,10 +260,13 @@ impl State {
 }
 
 impl State {
+    /// `extended ? 3 : 2` (read-cache.c:2871-2872), where `extended` counts every entry
+    /// carrying `CE_EXTENDED_FLAGS` — a `CE_REMOVE` one included, since the counting loop
+    /// (:2847-2857) runs over the whole cache before removed entries are skipped.
     fn detect_required_version(&self) -> Version {
         self.entries
             .iter()
-            .find_map(|e| e.flags.contains(entry::Flags::EXTENDED).then_some(Version::V3))
+            .find_map(|e| e.flags.needs_extended().then_some(Version::V3))
             .unwrap_or(Version::V2)
     }
 }

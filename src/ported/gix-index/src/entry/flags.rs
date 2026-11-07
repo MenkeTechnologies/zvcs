@@ -87,6 +87,29 @@ impl Flags {
         (*self & Flags::STAGE_MASK).bits() >> 12
     }
 
+    /// git's `CE_EXTENDED_FLAGS` (cache.h: `CE_INTENT_TO_ADD | CE_SKIP_WORKTREE`), the bits
+    /// that only an extended flags word can store.
+    pub const EXTENDED_FLAGS: Flags = Flags::INTENT_TO_ADD.union(Flags::SKIP_WORKTREE);
+
+    /// Whether this entry needs the extended flags word on disk, which `do_write_index()`
+    /// decides afresh for every entry before it writes one (read-cache.c:2851-2856):
+    ///
+    /// ```c
+    /// /* reduce extended entries if possible */
+    /// cache[i]->ce_flags &= ~CE_EXTENDED;
+    /// if (cache[i]->ce_flags & CE_EXTENDED_FLAGS) {
+    ///         extended++;
+    ///         cache[i]->ce_flags |= CE_EXTENDED;
+    /// }
+    /// ```
+    ///
+    /// The in-memory `EXTENDED` bit is not consulted: an entry read with the word keeps the
+    /// bit after `clear_skip_worktree_from_present_files()` (sparse-index.c:650-678) drops its
+    /// last extended flag, and git writes that entry without the word.
+    pub fn needs_extended(&self) -> bool {
+        self.intersects(Self::EXTENDED_FLAGS)
+    }
+
     /// Transform ourselves to a storage representation to keep all flags which are to be persisted,
     /// skipping all extended flags. Note that the caller has to check for the `EXTENDED` bit to be present
     /// and write extended flags as well if so.

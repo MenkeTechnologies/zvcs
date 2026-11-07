@@ -264,6 +264,11 @@ pub fn verify_two_way_initial(
         return Ok(clobber);
     }
 
+    // `merged_entry()` gives an entry with no index entry behind it `CE_NEW_SKIP_WORKTREE`
+    // before it calls `verify_absent()` (unpack-trees.c:2569-2581), and in a sparse checkout
+    // `verify_absent()` returns at once for such an entry (:2540-2541): the check waits for
+    // the sparse loops, where a file in the way is a warning (`crate::unpack_sparse`).
+    let sparse = sparse_patterns(repo).is_some();
     // What each path in the footprint asks of the disk, in traversal order.
     let mut checks: Vec<(&BString, Check)> = Vec::new();
     for path in touched {
@@ -284,6 +289,7 @@ pub fn verify_two_way_initial(
             // rejects rather than resurrect it.
             None if o.is_some() && n.is_some() && !initial_checkout => Check::Reject,
             None => match n {
+                Some(_) if sparse => continue,
                 Some(entry) => Check::Absent(entry.1, AbsentError::Overwritten),
                 None => Check::Absent(o.expect("in the footprint").1, AbsentError::Removed),
             },

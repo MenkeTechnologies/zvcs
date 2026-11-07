@@ -982,41 +982,7 @@ impl UnpackPatterns {
         select: &dyn Fn(usize) -> bool,
         show_progress: bool,
     ) -> std::result::Result<(), crate::progress::DelayError> {
-        let paths: Vec<BString> = {
-            let backing = index.path_backing();
-            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
-        };
-        let selected: Vec<bool> = (0..paths.len()).map(select).collect();
-        let dirs: Vec<bool> = index.entries().iter().map(|e| e.mode == Mode::COMMIT).collect();
-
-        // 1. Pretend the narrowest worktree: only unmerged entries are checked out.
-        let mut skip: Vec<bool> = index
-            .entries()
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                if selected[i] {
-                    e.stage_raw() == 0
-                } else {
-                    e.flags.contains(Flags::SKIP_WORKTREE)
-                }
-            })
-            .collect();
-
-        // 2. Widen worktree according to sparse-checkout file.
-        let meter = crate::progress::Meter::delayed("Updating index flags", paths.len(), show_progress)?;
-        let mut walk = ClearFlags {
-            pl: self,
-            paths: &paths,
-            dirs: &dirs,
-            selected: &selected,
-            skip: &mut skip,
-            meter,
-        };
-        let mut prefix = Vec::new();
-        walk.clear_1(0, paths.len(), &mut prefix, PatternMatch::Undecided, 0);
-        walk.meter.stop("done");
-
+        let skip = self.new_skip_worktree(index, select, show_progress)?;
         for (entry, skip) in index.entries_mut().iter_mut().zip(skip) {
             if skip {
                 entry.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
@@ -1029,6 +995,66 @@ impl UnpackPatterns {
         }
         Ok(())
     }
+
+    /// The bit [`Self::mark_new_skip_worktree`] would leave on each entry of `index`, for a
+    /// caller that keeps it apart from `CE_SKIP_WORKTREE` the way `unpack_trees()` keeps
+    /// `CE_NEW_SKIP_WORKTREE` (unpack-trees.c:1974-1976, :2041-2043). An entry `select`
+    /// leaves out answers with its current `CE_SKIP_WORKTREE`, unless the walk cleared it.
+    pub(crate) fn new_skip_worktree(
+        &self,
+        index: &gix::index::State,
+        select: &dyn Fn(usize) -> bool,
+        show_progress: bool,
+    ) -> std::result::Result<Vec<bool>, crate::progress::DelayError> {
+        let cleared = self.clear_ce_flags(index, select, show_progress)?;
+        Ok(index
+            .entries()
+            .iter()
+            .zip(cleared)
+            .enumerate()
+            .map(|(i, (e, cleared))| {
+                // 1. Pretend the narrowest worktree: only unmerged entries are checked out.
+                let set = if select(i) { e.stage_raw() == 0 } else { e.flags.contains(Flags::SKIP_WORKTREE) };
+                // 2. Widen worktree according to sparse-checkout file.
+                set && !cleared
+            })
+            .collect())
+    }
+
+    /// `clear_ce_flags()` (unpack-trees.c:1765-1797): which entries of `index` the walk clears
+    /// the flags of. That is every matched entry `select` admits — and, in cone mode, every
+    /// entry under a directory the patterns take in whole, selected or not: the
+    /// `MATCHED_RECURSIVE` arm of `clear_ce_flags_dir()` clears the whole range without asking
+    /// `select_mask` (:1645-1652).
+    pub(crate) fn clear_ce_flags(
+        &self,
+        index: &gix::index::State,
+        select: &dyn Fn(usize) -> bool,
+        show_progress: bool,
+    ) -> std::result::Result<Vec<bool>, crate::progress::DelayError> {
+        let paths: Vec<BString> = {
+            let backing = index.path_backing();
+            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        let selected: Vec<bool> = (0..paths.len()).map(select).collect();
+        let dirs: Vec<bool> = index.entries().iter().map(|e| e.mode == Mode::COMMIT).collect();
+
+        let mut cleared = vec![false; paths.len()];
+        let meter = crate::progress::Meter::delayed("Updating index flags", paths.len(), show_progress)?;
+        let mut walk = ClearFlags {
+            pl: self,
+            paths: &paths,
+            dirs: &dirs,
+            selected: &selected,
+            cleared: &mut cleared,
+            meter,
+        };
+        let mut prefix = Vec::new();
+        walk.clear_1(0, paths.len(), &mut prefix, PatternMatch::Undecided, 0);
+        walk.meter.stop("done");
+
+        Ok(cleared)
+    }
 }
 
 /// The state `clear_ce_flags_1()` and `clear_ce_flags_dir()` share through
@@ -1038,7 +1064,7 @@ struct ClearFlags<'a> {
     paths: &'a [BString],
     dirs: &'a [bool],
     selected: &'a [bool],
-    skip: &'a mut [bool],
+    cleared: &'a mut [bool],
     meter: crate::progress::Meter,
 }
 
@@ -1087,7 +1113,7 @@ impl ClearFlags<'_> {
                 ret = default_match;
             }
             if matches!(ret, PatternMatch::Matched | PatternMatch::MatchedRecursive) {
-                self.skip[i] = false;
+                self.cleared[i] = true;
             }
             i += 1;
             progress_nr += 1;
@@ -1112,7 +1138,7 @@ impl ClearFlags<'_> {
             .count();
 
         let rc = if self.pl.use_cone_patterns() && orig_ret == PatternMatch::MatchedRecursive {
-            self.skip[start..start + count].iter_mut().for_each(|s| *s = false);
+            self.cleared[start..start + count].iter_mut().for_each(|c| *c = true);
             count
         } else if self.pl.use_cone_patterns() && orig_ret == PatternMatch::NotMatched {
             count

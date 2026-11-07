@@ -795,7 +795,7 @@ mod replay_commit;
 mod repo;
 mod request_pull;
 mod rerere;
-mod reset;
+pub(crate) mod reset;
 mod restore;
 pub(crate) mod rev_list;
 pub(crate) mod rev_parse;

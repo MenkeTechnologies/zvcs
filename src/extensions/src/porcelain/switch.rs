@@ -562,6 +562,8 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
     super::checkout::set_show_progress(
         p.progress.unwrap_or_else(|| !p.quiet && std::io::IsTerminal::is_terminal(&std::io::stderr())),
     );
+    // `opts->force` apart from `--discard-changes`, for `reset_tree()`.
+    super::checkout::set_force(p.force);
 
     if let Some(name) = p.orphan {
         if p.track.is_some() {

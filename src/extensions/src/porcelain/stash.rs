@@ -4208,46 +4208,26 @@ fn restore_stash_commit(
     // stash's own staged tree. Worktree stats come from the merge's own index so
     // a following `status` does not re-hash every file.
     if let Some(mut applied) = applied.filter(|_| merged_cleanly) {
-        // `write_locked_index(o.repo->index, &lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)`
-        // (builtin/stash.c:729-731): the merge's index reaches disk on its own before the
-        // unstaging below rewrites it, and in a split index that write settles its own
-        // split half and shared index.
-        crate::index_racy::write(repo, &mut applied.index)?;
-        let fresh: HashMap<BString, (ObjectId, Mode, Stat)> = {
-            let backing = applied.index.path_backing();
-            applied
-                .index
-                .entries()
-                .iter()
-                .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
-                .collect()
-        };
     //
     // `--index` restores the stash's staged state, but `do_apply_stash` first
     // checks whether the stash *had* one: with `i_tree` equal to the base (the
     // stash staged nothing) or already equal to ours, it sets `has_index = 0`
     // and leaves the index alone — which is what keeps the caller's own staged
     // work staged.
-        let (index_tree, cache_tree) = if has_index {
+        if has_index {
+            // `write_locked_index(o.repo->index, &lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)`
+            // (builtin/stash.c:729-731): the merge's index reaches disk on its own before the
+            // reset below rewrites it, and in a split index that write settles its own
+            // split half and shared index.
+            crate::index_racy::write(repo, &mut applied.index)?;
+            let fresh = stats_by_path(&applied.index);
             // `reset_tree(&index_tree, 0, 0)` (builtin/stash.c:741) — `unpack_trees()`
             // with `oneway_merge`, whose parting repair proves every node of an index
             // that is an exact expansion of a tree the repository already has.
-            (index_tree, CacheTree::LikeUnpackTrees)
+            write_target_index(repo, index_tree, &old_index, &fresh, CacheTree::LikeUnpackTrees)?;
         } else {
-            // `unstage_changes_unless_new(&c_tree)` (builtin/stash.c:744) is not a
-            // `read-tree`: it mutates the *merge's* index one `add_index_entry()` at a
-            // time and then writes it with a plain `write_locked_index()`
-            // (builtin/stash.c:637-640). Nothing repairs afterwards, and each of those
-            // calls invalidates the path it touches (read-cache.c:1273-1274) — so what
-            // stock leaves behind is the merge's cache-tree with the unstaged paths and
-            // the directories above them marked `-1`, while a directory the stash never
-            // reached still names its tree.
-            (
-                unstage_changes_unless_new(repo, c_tree, applied.tree_id)?,
-                CacheTree::LikeUnstagedOverMerge { merged: &applied.index },
-            )
-        };
-        write_target_index(repo, index_tree, &old_index, &fresh, cache_tree)?;
+            unstage_after_clean_apply(repo, c_tree, &old_index, &mut applied, &should_interrupt)?;
+        }
     }
 
     // Untracked files come back last and stay untracked — their stats are
@@ -4813,6 +4793,138 @@ fn unstage_changes_unless_new(
     Ok(editor.write()?.detach())
 }
 
+/// `do_apply_stash()`'s tail after a clean merge without a restored index (builtin/stash.c:
+/// 729-745): the merge's index is written, then `unstage_changes_unless_new(&c_tree)` puts
+/// every path the merge changed that `c_tree` has back to `c_tree`'s entry, unstaged, with
+/// no stat data. Shared with the autostash `checkout -m` re-applies through a
+/// `git stash apply` child (builtin/checkout.c:1240-1246).
+pub(super) fn unstage_after_clean_apply(
+    repo: &gix::Repository,
+    c_tree: ObjectId,
+    old_index: &gix::index::File,
+    applied: &mut crate::merge_apply::Applied,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
+    // `write_locked_index(o.repo->index, &lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)`
+    // (builtin/stash.c:729-731): the merge's index reaches disk on its own before the
+    // unstaging below rewrites it, and in a split index that write settles its own
+    // split half and shared index.
+    crate::index_racy::write(repo, &mut applied.index)?;
+    place_skipped_changes(repo, c_tree, &mut applied.index, should_interrupt)?;
+    let fresh = stats_by_path(&applied.index);
+    // `unstage_changes_unless_new(&c_tree)` (builtin/stash.c:744) is not a
+    // `read-tree`: it mutates the *merge's* index one `add_index_entry()` at a
+    // time and then writes it with a plain `write_locked_index()`
+    // (builtin/stash.c:637-640). Nothing repairs afterwards, and each of those
+    // calls invalidates the path it touches (read-cache.c:1273-1274) — so what
+    // stock leaves behind is the merge's cache-tree with the unstaged paths and
+    // the directories above them marked `-1`, while a directory the stash never
+    // reached still names its tree.
+    write_target_index(
+        repo,
+        unstage_changes_unless_new(repo, c_tree, applied.tree_id)?,
+        old_index,
+        &fresh,
+        CacheTree::LikeUnstagedOverMerge { merged: &applied.index },
+    )
+}
+
+/// Each entry's id, mode and stat, by path.
+fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, Stat)> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
+        .collect()
+}
+
+/// Step 2 of `unstage_changes_unless_new()` (builtin/stash.c:567-612): "if the merge
+/// successfully got a new version of some path, but left it out of the working tree, then
+/// clear the SKIP_WORKTREE bit and write it to the working tree" — for every path the
+/// `orig_tree`→index diff names whose index entry carries `CE_SKIP_WORKTREE`. A file already
+/// at that path is renamed out of the way first, with the warning on stdout.
+fn place_skipped_changes(
+    repo: &gix::Repository,
+    orig_tree: ObjectId,
+    index: &mut gix::index::File,
+    should_interrupt: &AtomicBool,
+) -> Result<()> {
+    use gix::index::entry::Flags;
+    let orig = tree_map(repo, orig_tree)?;
+    let skipped: HashSet<BString> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0 && e.flags.contains(Flags::SKIP_WORKTREE))
+            .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode))
+            .filter(|(path, id, mode)| orig.get(path) != Some(&(*id, *mode)))
+            .map(|(path, _, _)| path)
+            .collect()
+    };
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    let Some(workdir) = repo.workdir().map(std::path::Path::to_owned) else {
+        return Ok(());
+    };
+    let mut in_order: Vec<&BString> = skipped.iter().collect();
+    in_order.sort();
+    for path in in_order {
+        let full = workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
+        if full.symlink_metadata().is_err() {
+            continue;
+        }
+        // "Conflicting path present; relocate it".
+        let mut template = full.clone().into_os_string();
+        template.push(".stash.XXXXXX");
+        let (new_path, file) = crate::tmp_objdir::git_mkstemp_mode(&template, 0o600)
+            .map_err(|e| anyhow!("unable to create '{}': {e}", std::path::Path::new(&template).display()))?;
+        drop(file);
+        let shown = new_path.strip_prefix(&workdir).unwrap_or(&new_path);
+        crate::cstdio::print!(
+            "WARNING: Untracked file in way of tracked file!  Renaming\n            {} -> {}\n         to make room.\n",
+            path,
+            shown.display()
+        );
+        if std::fs::rename(&full, &new_path).is_err() {
+            return Err(crate::fatal::die(format!("Failed to move {} to {}", path, shown.display())));
+        }
+    }
+    // `checkout_entry(ce, &state, NULL, NULL)` with `state.refresh_cache`: the file is written
+    // and its stat recorded on the entry, which then loses `CE_SKIP_WORKTREE`.
+    let mut subset = index.clone();
+    subset.remove_entries(|_, path, e| e.stage_raw() != 0 || !skipped.contains(path));
+    for e in subset.entries_mut() {
+        e.flags.remove(Flags::SKIP_WORKTREE);
+    }
+    let mut opts = repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    opts.destination_is_initially_empty = false;
+    opts.overwrite_existing = true;
+    let odb = repo.objects.clone().into_arc()?;
+    crate::worktree::checkout_subset(
+        &mut subset,
+        workdir.as_path(),
+        odb,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        should_interrupt,
+        opts,
+    )?;
+    crate::worktree::carry_written_stat(&subset, index);
+    let backing = index.path_backing().to_owned();
+    for e in index.entries_mut() {
+        if e.stage_raw() == 0 && skipped.contains(e.path_in(&backing)) {
+            e.flags.remove(Flags::SKIP_WORKTREE);
+            if !e.flags.contains(Flags::INTENT_TO_ADD) {
+                e.flags.remove(Flags::EXTENDED);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `base` with `paths` taken from `source` instead — the tree the index should
 /// end up at when only some paths are being reset.
 ///
@@ -5044,9 +5156,19 @@ fn write_target_index(
                     e.flags.insert(gix::index::entry::Flags::UPTODATE);
                 }
                 // `make_cache_entry(..., 0, 0)` (builtin/stash.c:622-626): the entry an unstage
-                // puts back carries no stat data at all.
+                // puts back carries no stat data at all, and no flags. An entry left alone is
+                // the merge's own, `CE_SKIP_WORKTREE` as the merge's sparse loops and step 2
+                // left it.
                 if !same {
                     e.stat = Stat::default();
+                    e.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+                } else if merged
+                    .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+                    .is_some_and(|m| m.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+                {
+                    e.flags.insert(gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED);
+                } else {
+                    e.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
                 }
             }
         }

@@ -1123,7 +1123,7 @@ fn update_worktree(
         return Ok(false);
     }
     if !dry_run {
-        super::checkout::update_worktree_to_tree(repo, old_tree, new_tree)?;
+        super::checkout::update_worktree_to_tree(repo, old_tree, new_tree, false)?;
     }
     Ok(true)
 }

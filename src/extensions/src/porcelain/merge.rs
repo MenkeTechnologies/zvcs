@@ -5859,68 +5859,6 @@ pub(super) fn update_worktree(
         }
     });
 
-    // Write the changed files into the worktree, overwriting in place.
-    let mut opts =
-        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
-    opts.destination_is_initially_empty = false;
-    opts.overwrite_existing = true;
-    let odb = repo.objects.clone().into_arc()?;
-    let discard_files = gix::progress::Discard;
-    let discard_bytes = gix::progress::Discard;
-    crate::worktree::checkout_subset(
-        &mut subset,
-        workdir.as_path(),
-        odb,
-        &discard_files,
-        &discard_bytes,
-        should_interrupt,
-        opts,
-    )?;
-
-    // Remove the files the move drops. With the footprint known that is only a
-    // path the new tree lost; without it, anything the index held and the new
-    // tree does not.
-    let new_paths: HashSet<BString> = {
-        let backing = new_index.path_backing();
-        new_index
-            .entries()
-            .iter()
-            .map(|e| e.path_in(backing).to_owned())
-            .collect()
-    };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            let owned = path.to_owned();
-            if new_paths.contains(&owned) {
-                continue;
-            }
-            if touched.as_ref().is_some_and(|t| !t.contains(&owned)) {
-                continue;
-            }
-            if let Some(full) = repo.workdir_path(path) {
-                let _ = std::fs::remove_file(&full);
-                // `unlink_entry()` ends with `schedule_dir_for_removal()`, and
-                // `remove_scheduled_dirs()` then deletes every directory the
-                // removals emptied, innermost first (unpack-trees.c). Without it
-                // a merge that moves `mm/old/*` into `mm/new/` leaves an empty
-                // `mm/old/` behind — untracked, invisible to `status`, and
-                // present in nothing stock leaves on disk.
-                let mut dir = full.parent().map(std::path::Path::to_path_buf);
-                while let Some(d) = dir {
-                    if d == workdir || !d.starts_with(&workdir) {
-                        break;
-                    }
-                    if std::fs::remove_dir(&d).is_err() {
-                        break;
-                    }
-                    dir = d.parent().map(std::path::Path::to_path_buf);
-                }
-            }
-        }
-    }
-
     // Unchanged entries reuse the old stat; the changed ones the checkout wrote then take
     // the fresh stat (and up-to-date mark) it recorded for the content it wrote.
     {
@@ -5934,7 +5872,6 @@ pub(super) fn update_worktree(
             }
         }
     }
-    crate::worktree::carry_written_stat(&subset, &mut new_index);
 
     // `keep_entry()`: outside the footprint the index entry survives as it was —
     // a staged modification keeps its blob, a staged deletion stays deleted, and
@@ -5980,6 +5917,93 @@ pub(super) fn update_worktree(
         }
         new_index.sort_entries();
     }
+
+    // Remove the files the move drops. With the footprint known that is only a
+    // path the new tree lost; without it, anything the index held and the new
+    // tree does not.
+    let new_paths: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    let mut removals: Vec<BString> = {
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .filter(|p| !new_paths.contains(p) && !touched.as_ref().is_some_and(|t| !t.contains(p)))
+            .collect()
+    };
+
+    // In a sparse checkout the sparse loops settle the result before `check_updates()` writes
+    // or removes anything (unpack-trees.c:2035-2075), over every entry — the ones the move
+    // keeps as well as the ones it touches. `checkout_fast_forward()` installs the porcelain
+    // messages (merge.c:101).
+    let sparse = crate::unpack_sparse::SparseCheckout::begin(
+        repo,
+        true,
+        crate::unpack_sparse::Opts {
+            porcelain: true,
+            ..Default::default()
+        },
+    );
+    if let Some(sparse) = &sparse {
+        let mut update: std::collections::BTreeSet<BString> = {
+            let backing = subset.path_backing();
+            subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        let mut remove: std::collections::BTreeSet<BString> = removals.iter().cloned().collect();
+        sparse.apply(repo, old, &mut new_index, &mut update, &mut remove)?;
+        subset = new_index.clone();
+        subset.remove_entries(|_, path, _| !update.contains(path));
+        removals = remove.into_iter().collect();
+    }
+
+    // Write the changed files into the worktree, overwriting in place.
+    let mut opts =
+        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    opts.destination_is_initially_empty = false;
+    opts.overwrite_existing = true;
+    let odb = repo.objects.clone().into_arc()?;
+    let discard_files = gix::progress::Discard;
+    let discard_bytes = gix::progress::Discard;
+    crate::worktree::checkout_subset(
+        &mut subset,
+        workdir.as_path(),
+        odb,
+        &discard_files,
+        &discard_bytes,
+        should_interrupt,
+        opts,
+    )?;
+
+    for owned in &removals {
+        let path: &BStr = owned.as_ref();
+        if let Some(full) = repo.workdir_path(path) {
+            let _ = std::fs::remove_file(&full);
+            // `unlink_entry()` ends with `schedule_dir_for_removal()`, and
+            // `remove_scheduled_dirs()` then deletes every directory the
+            // removals emptied, innermost first (unpack-trees.c). Without it
+            // a merge that moves `mm/old/*` into `mm/new/` leaves an empty
+            // `mm/old/` behind — untracked, invisible to `status`, and
+            // present in nothing stock leaves on disk.
+            let mut dir = full.parent().map(std::path::Path::to_path_buf);
+            while let Some(d) = dir {
+                if d == workdir || !d.starts_with(&workdir) {
+                    break;
+                }
+                if std::fs::remove_dir(&d).is_err() {
+                    break;
+                }
+                dir = d.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+    }
+
+    crate::worktree::carry_written_stat(&subset, &mut new_index);
 
     // Drop any stale cache-tree extension before persisting.
     // `unpack_trees()`'s result: the source index's timestamp and shared half

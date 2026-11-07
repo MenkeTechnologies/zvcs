@@ -1867,11 +1867,6 @@ fn reset_worktree_hard(
             .collect()
     };
 
-    // Remove files tracked before the reset but absent from the target tree —
-    // first, as `check_updates()` (unpack-trees.c:455-469) unlinks every
-    // `CE_WT_REMOVE` entry before it checks a single `CE_UPDATE` one out. On a
-    // case-insensitive file system the order is what undoes `mv a A`: removing
-    // `A` after writing `a` removes the file just written.
     let new_paths: HashSet<BString> = {
         let backing = new_index.path_backing();
         new_index
@@ -1880,33 +1875,116 @@ fn reset_worktree_hard(
             .map(|e| e.path_in(backing).to_owned())
             .collect()
     };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
+
+    // In a sparse checkout the sparse loops settle the result before `check_updates()`
+    // (unpack-trees.c:2035-2075). Going in, `CE_UPDATE` is on every entry the reset changes
+    // and on every kept one `oneway_merge()` found missing or stat-dirty — never on a kept
+    // `CE_SKIP_WORKTREE` one (:3036-3042) — and `CE_WT_REMOVE` on every entry it drops.
+    // `--hard` is `UNPACK_RESET_OVERWRITE_UNTRACKED` with no porcelain messages
+    // (builtin/reset.c:84-88).
+    let sparse = crate::unpack_sparse::SparseCheckout::begin(
+        repo,
+        true,
+        crate::unpack_sparse::Opts {
+            overwrite_untracked: true,
+            ..Default::default()
+        },
+    );
+    let sparse_sets = match &sparse {
+        Some(sparse) => {
+            let old_kept: HashMap<BString, (ObjectId, u32, bool)> = {
+                let backing = old.path_backing();
+                old.entries()
+                    .iter()
+                    .filter(|e| e.stage_raw() == 0)
+                    .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode.bits(), e.flags.contains(Flags::SKIP_WORKTREE))))
+                    .collect()
+            };
+            let mut update: BTreeSet<BString> = {
+                let backing = new_index.path_backing();
+                new_index
+                    .entries()
+                    .iter()
+                    .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode.bits()))
+                    .filter(|(path, id, mode)| match old_kept.get(path) {
+                        Some((old_id, old_mode, skipped)) if old_id == id && old_mode == mode => {
+                            !skipped && !settled.contains(path)
+                        }
+                        _ => true,
+                    })
+                    .map(|(path, _, _)| path)
+                    .collect()
+            };
+            let mut remove: BTreeSet<BString> = {
+                let backing = old.path_backing();
+                old.entries()
+                    .iter()
+                    .map(|e| e.path_in(backing).to_owned())
+                    .filter(|p| !new_paths.contains(p))
+                    .collect()
+            };
+            let mut result: gix::index::State = (*new_index).clone();
+            sparse.apply(repo, old, &mut result, &mut update, &mut remove)?;
+            crate::unpack_sparse::carry_skip_worktree_bits(&result, &mut new_index);
+            Some((update, remove))
+        }
+        None => None,
+    };
+
+    // Remove files tracked before the reset but absent from the target tree —
+    // first, as `check_updates()` (unpack-trees.c:455-469) unlinks every
+    // `CE_WT_REMOVE` entry before it checks a single `CE_UPDATE` one out. On a
+    // case-insensitive file system the order is what undoes `mv a A`: removing
+    // `A` after writing `a` removes the file just written.
+    match &sparse_sets {
+        Some((_, remove)) => {
+            for path in remove {
                 unlink_entry(
                     repo,
                     &workdir,
-                    path,
-                    Some(e.mode),
+                    path.as_ref(),
+                    old.entry_by_path(path.as_ref()).map(|e| e.mode),
                     recurse_submodules,
                     &active_submodules,
                 );
+            }
+        }
+        None => {
+            let backing = old.path_backing();
+            for e in old.entries() {
+                let path = e.path_in(backing);
+                if !new_paths.contains(&path.to_owned()) {
+                    unlink_entry(
+                        repo,
+                        &workdir,
+                        path,
+                        Some(e.mode),
+                        recurse_submodules,
+                        &active_submodules,
+                    );
+                }
             }
         }
     }
 
     // The settled entries ride through the checkout as `SKIP_WORKTREE`, which the
     // writer passes over while still reading their attributes, and get their flag
-    // back afterwards.
+    // back afterwards. In a sparse checkout that is every entry the loops left without
+    // `CE_UPDATE`.
     let hidden: Vec<usize> = {
         let backing = new_index.path_backing().to_owned();
         new_index
             .entries()
             .iter()
             .enumerate()
-            .filter(|(_, e)| !e.flags.contains(Flags::SKIP_WORKTREE) && settled.contains(e.path_in(&backing)))
+            .filter(|(_, e)| {
+                let path = e.path_in(&backing);
+                !e.flags.contains(Flags::SKIP_WORKTREE)
+                    && match &sparse_sets {
+                        Some((update, _)) => !update.contains(path),
+                        None => settled.contains(path),
+                    }
+            })
             .map(|(i, _)| i)
             .collect()
     };
@@ -2102,6 +2180,7 @@ fn reset_two_tree(
     all.extend(target.keys().cloned());
     all.extend(head.keys().cloned());
 
+    let sparse = crate::merge_guard::sparse_patterns(repo).is_some();
     let mut updates: Vec<(BString, Mode, ObjectId)> = Vec::new();
     // Paths to remove, with the index mode `remove_or_warn()` (entry.c:200-203) picks
     // the removal syscall from: `S_ISGITLINK(mode) ? rmdir_or_warn() : unlink_or_warn()`.
@@ -2147,6 +2226,10 @@ fn reset_two_tree(
                         worktree_uptodate(repo, old, BStr::new(path), i.map(|(m, _)| *m), Some(*io)),
                         Refusal::NotUptodate,
                     ),
+                    // In a sparse checkout `merged_entry()` has already set
+                    // `CE_NEW_SKIP_WORKTREE` on the entry, and `verify_absent()` returns at
+                    // once (unpack-trees.c:2540-2541, :2583): the sparse loops check it later.
+                    None if sparse => (true, Refusal::WouldLoseUntracked),
                     None => (
                         worktree_absent_or_ignored(repo, old, &mut excludes, BStr::new(path)),
                         Refusal::WouldLoseUntracked,
@@ -2224,6 +2307,25 @@ fn reset_two_tree(
     // does not have (measured: stock 0 records, this port 3).
     new_index.remove_resolve_undo();
 
+    // In a sparse checkout the sparse loops settle the result before `check_updates()`
+    // (unpack-trees.c:2035-2075): `CE_UPDATE` on the updated entries, `CE_WT_REMOVE` on the
+    // deleted ones, and `reset_index()` installs no porcelain messages (builtin/reset.c:62-125).
+    let mut upd: HashSet<BString> = updates.iter().map(|(p, _, _)| p.clone()).collect();
+    let mut deletes = deletes;
+    if let Some(sparse) = crate::unpack_sparse::SparseCheckout::begin(repo, true, Default::default()) {
+        let mut update: BTreeSet<BString> = upd.iter().cloned().collect();
+        let mut remove: BTreeSet<BString> = deletes.iter().map(|(p, _)| p.clone()).collect();
+        sparse.apply(repo, old, &mut new_index, &mut update, &mut remove)?;
+        upd = update.into_iter().collect();
+        deletes = remove
+            .into_iter()
+            .map(|p| {
+                let mode = old.entry_by_path(p.as_ref()).map(|e| e.mode);
+                (p, mode)
+            })
+            .collect();
+    }
+
     // `check_updates()` unlinks every `CE_WT_REMOVE` entry before it checks out a
     // single `CE_UPDATE` one (unpack-trees.c:455-469).
     for (p, mode) in &deletes {
@@ -2240,8 +2342,7 @@ fn reset_two_tree(
     // Write the changed files to the worktree by checking out a filtered copy that
     // holds only the updated entries — kept files (with their local changes) are
     // never touched.
-    if !updates.is_empty() {
-        let upd: HashSet<BString> = updates.iter().map(|(p, _, _)| p.clone()).collect();
+    if !upd.is_empty() {
         let mut wt = new_index.clone();
         wt.remove_entries(|_, path, _| !upd.contains(path));
         // Outside a sparse checkout no `apply_sparse_checkout()` clears the `CE_UPDATE` of an
@@ -2436,7 +2537,7 @@ fn worktree_absent_or_ignored(
 /// `ie_match_stat()` is `ce_match_stat_basic()`'s type and stat comparison and, for
 /// a racily clean entry (`is_racy_timestamp()`, whole seconds), the content check
 /// `ce_modified_check_fs()`.
-fn icase_exists(
+pub(crate) fn icase_exists(
     repo: &gix::Repository,
     old: &gix::index::File,
     path: &BStr,

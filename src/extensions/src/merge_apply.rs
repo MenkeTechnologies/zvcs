@@ -727,7 +727,7 @@ fn merge_and_apply(
         crate::cstdio::flush();
     }
 
-    let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;
+    let mut index = update_worktree_to_tree(repo, old_index, tree_id, &conflicts, should_interrupt)?;
     // Every merge-shaped verb — `merge` and its strategies, `pull`, `am`, `rebase`,
     // `cherry-pick`, `revert`, `stash apply`, `checkout`'s autostash — reaches its
     // finished index through this one function and then writes it, so this is where
@@ -784,10 +784,13 @@ fn merge_and_apply(
 /// Check out `new_tree_id` over the worktree, touching only entries that differ
 /// from `old`, deleting worktree files the new tree drops, and returning the
 /// target index (with fresh stats, **unwritten**).
+///
+/// `conflicts` are the paths `record_conflicted_index_entries()` turns into stages afterwards.
 fn update_worktree_to_tree(
     repo: &gix::Repository,
     old: &gix::index::File,
     new_tree_id: ObjectId,
+    conflicts: &[BString],
     should_interrupt: &AtomicBool,
 ) -> Result<gix::index::File> {
     let workdir = repo
@@ -812,6 +815,78 @@ fn update_worktree_to_tree(
         None => false,
     });
 
+    let new_paths: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        new_index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
+    let mut removals: Vec<BString> = {
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .filter(|p| !new_paths.contains(p))
+            .collect()
+    };
+
+    // merge-ort's `checkout()` is an `unpack_trees()` with the porcelain messages installed
+    // (merge-ort.c:4611-4645), so in a sparse checkout its sparse loops settle the result
+    // before anything is written or removed (unpack-trees.c:2035-2075). The entries the
+    // merge keeps carry the source entry's stat into them, which `verify_uptodate_sparse()`
+    // compares against the file.
+    let sparse = crate::unpack_sparse::SparseCheckout::begin(
+        repo,
+        true,
+        crate::unpack_sparse::Opts {
+            porcelain: true,
+            ..Default::default()
+        },
+    );
+    let sparse_result = match &sparse {
+        Some(sparse) => {
+            let mut result: gix::index::State = (*new_index).clone();
+            {
+                let backing = result.path_backing().to_owned();
+                for e in result.entries_mut() {
+                    if let Some((oid, mode, stat)) = old_map.get(e.path_in(&backing)) {
+                        if *oid == e.id && *mode == e.mode {
+                            e.stat = *stat;
+                        }
+                    }
+                }
+            }
+            let mut update: std::collections::BTreeSet<BString> = {
+                let backing = subset.path_backing();
+                subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+            };
+            let mut remove: std::collections::BTreeSet<BString> = removals.iter().cloned().collect();
+            sparse.apply(repo, old, &mut result, &mut update, &mut remove)?;
+            // `record_conflicted_index_entries()` (merge-ort.c:4714-4726): "Clean paths with
+            // CE_SKIP_WORKTREE set will not be written to the working tree by the
+            // unpack_trees() call in checkout() [...] Thus, we need override the
+            // CE_SKIP_WORKTREE bit and manually write those files to the working disk here."
+            {
+                let backing = result.path_backing();
+                for e in result.entries() {
+                    let path = e.path_in(backing);
+                    if e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE)
+                        && conflicts.iter().any(|c| c.as_slice() == path.as_bytes())
+                    {
+                        update.insert(path.to_owned());
+                    }
+                }
+            }
+            subset = repo.index_from_tree(&new_tree_id)?;
+            subset.remove_entries(|_, path, _| !update.contains(path));
+            removals = remove.into_iter().collect();
+            Some(result)
+        }
+        None => None,
+    };
+
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     opts.destination_is_initially_empty = false;
@@ -830,22 +905,8 @@ fn update_worktree_to_tree(
     )?;
 
     // Remove files tracked before the merge but absent from the new tree.
-    let new_paths: HashSet<BString> = {
-        let backing = new_index.path_backing();
-        new_index
-            .entries()
-            .iter()
-            .map(|e| e.path_in(backing).to_owned())
-            .collect()
-    };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
-                remove_worktree_entry(repo, path);
-            }
-        }
+    for path in &removals {
+        remove_worktree_entry(repo, path.as_ref());
     }
 
     // Backfill stats: from the just-checked-out subset for changed paths, or from
@@ -915,6 +976,10 @@ fn update_worktree_to_tree(
                 e.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
             }
         }
+    }
+    // In a sparse checkout every entry's bit is the sparse loops' verdict.
+    if let Some(result) = &sparse_result {
+        crate::unpack_sparse::carry_skip_worktree_bits(result, &mut new_index);
     }
     crate::worktree::carry_written_stat(&subset, &mut new_index);
 

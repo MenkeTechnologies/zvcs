@@ -2445,7 +2445,7 @@ fn orphan_checkout(
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
-        update_worktree_to_tree(repo, cur_tree, target_tree)?;
+        update_worktree_to_tree(repo, cur_tree, target_tree, false)?;
     }
 
     // The tail of `merge_working_tree()`, which `--orphan` runs like every other
@@ -3723,7 +3723,7 @@ pub(super) fn move_worktree(
     match switch_gate(repo, cur_tree, target_tree, merge)? {
         Gate::Refused(code) => Ok(Moved::Refused(code)),
         Gate::Clean => {
-            update_worktree_to_tree(repo, cur_tree, target_tree)?;
+            update_worktree_to_tree(repo, cur_tree, target_tree, merge.is_some())?;
             Ok(Moved::Clean)
         }
         Gate::Autostashed(stash) => {
@@ -3736,7 +3736,7 @@ pub(super) fn move_worktree(
                 apply_switch_autostash(repo, stash, cur_tree, opt, base_label.as_deref())?;
                 return Ok(Moved::Refused(code));
             }
-            update_worktree_to_tree(repo, cur_tree, target_tree)?;
+            update_worktree_to_tree(repo, cur_tree, target_tree, false)?;
             let conflicted = apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
             Ok(Moved::Autostashed { conflicted })
         }
@@ -3841,12 +3841,13 @@ pub(super) fn apply_switch_autostash(
 
     let conflicted = !applied.conflicts.is_empty();
     if !conflicted {
-        // `stash apply` without `--index`: the restored changes come back
-        // unstaged, so the index stays the target tree — which is exactly what
-        // the checkout just wrote, stat data and all. Rebuilding it from the
-        // tree here instead would drop that stat data and make the next
-        // `diff-index` call it modified: `show_local_changes()` runs right after
-        // this and would list every file in the tree.
+        // `stash apply` without `--index`: the merge's index is written and
+        // `unstage_changes_unless_new()` puts every path the re-apply changed back to the
+        // target tree's entry — unstaged, and with no stat data, so the next `diff-index`
+        // compares those files by content — while every other entry keeps the stat the
+        // checkout recorded (builtin/stash.c:729-745).
+        let mut applied = applied;
+        super::stash::unstage_after_clean_apply(repo, ours_tree, &old_index, &mut applied, &should_interrupt)?;
         eprintln!("Applied autostash.");
     } else {
         let mut index = applied.index;
@@ -3927,6 +3928,17 @@ pub(super) fn set_show_progress(on: bool) {
     SHOW_PROGRESS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `opts->force` (builtin/checkout.c:1815), which `reset_tree()` turns into
+/// `UNPACK_RESET_OVERWRITE_UNTRACKED` where `--discard-changes` alone is
+/// `UNPACK_RESET_PROTECT_UNTRACKED` (:763-764). Every `checkout` caller of
+/// [`reset_worktree_to_tree`] is a `-f`; `switch` records its own `-f` here.
+static FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Record this `switch` invocation's `opts->force`.
+pub(super) fn set_force(on: bool) {
+    FORCE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `get_progress()` for the unpack a branch switch runs: `total` entries removed
 /// or written, reported when this command's `show_progress` is on.
 fn unpack_progress(total: usize) -> Result<crate::worktree::UpdatingFiles> {
@@ -3934,10 +3946,17 @@ fn unpack_progress(total: usize) -> Result<crate::worktree::UpdatingFiles> {
     crate::worktree::UpdatingFiles::start(total, on).map_err(|e| crate::fatal::die(e.to_string()))
 }
 
+/// `merge_working_tree()`'s two-way `unpack_trees()` (builtin/checkout.c:878-917).
+///
+/// `quiet` is `merge_working_tree()`'s own argument, which `init_topts()` makes
+/// `topts->quiet` (builtin/checkout.c:831): `checkout -m`'s first attempt passes
+/// `opts->merge`, so the sparse warnings of a switch that needs no autostash are not shown
+/// (`add_rejected_path()`, unpack-trees.c:246-247).
 pub(super) fn update_worktree_to_tree(
     repo: &gix::Repository,
     old_tree: ObjectId,
     new_tree: ObjectId,
+    quiet: bool,
 ) -> Result<()> {
     let should_interrupt = AtomicBool::new(false);
 
@@ -4019,30 +4038,56 @@ pub(super) fn update_worktree_to_tree(
     // A path the sparse checkout leaves out of the worktree has no file to remove:
     // `apply_sparse_checkout()` clears `CE_WT_REMOVE` along with `CE_UPDATE` for every entry
     // that stays `CE_SKIP_WORKTREE` (unpack-trees.c:596-620).
-    let skipped_before: HashSet<BString> = {
-        let backing = old.path_backing();
-        old.entries()
-            .iter()
-            .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
-            .map(|e| e.path_in(backing).to_owned())
-            .collect()
-    };
     // `o->skip_sparse_checkout` (unpack-trees.c:1931-1932): without a sparse checkout no
     // `apply_sparse_checkout()` runs, and `do_add_entry()` turns `deleted_entry()`'s
     // `CE_REMOVE` into `CE_WT_REMOVE` (:222-223) for a `CE_SKIP_WORKTREE` entry too.
-    let sparse_patterns = crate::merge_guard::sparse_patterns(repo);
-    let updating = unpack_progress(touched.len())?;
-    for path in touched
-        .iter()
-        .filter(|p| !new_flat.contains_key(*p) && (sparse_patterns.is_none() || !skipped_before.contains(*p)))
-    {
-        updating.tick();
-        unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
-    }
+    // `merge_working_tree()` installs the porcelain messages (builtin/checkout.c:827), so
+    // the sparse warnings are collected and shown together.
+    let sparse = crate::unpack_sparse::SparseCheckout::begin(
+        repo,
+        true,
+        crate::unpack_sparse::Opts {
+            porcelain: true,
+            quiet,
+            ..Default::default()
+        },
+    );
 
     // `merged_entry()`: the touched paths the new tree has are written out.
     let mut subset = repo.index_from_tree(&new_tree)?;
     subset.remove_entries(|_, path, _| !touched.contains(&path.to_owned()));
+
+    // The sparse loops run over the whole result — `keep_entry()`'s index entries as well
+    // as the touched ones — after the merge and before `check_updates()` writes or removes
+    // anything (unpack-trees.c:2035-2075), so an untouched file the patterns leave out is
+    // taken from the worktree too, and one they take in is written.
+    let mut remove: std::collections::BTreeSet<BString> =
+        touched.iter().filter(|p| !new_flat.contains_key(*p)).cloned().collect();
+    let sparse_result = match &sparse {
+        Some(sparse) => {
+            let mut result = old.clone();
+            result.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
+            {
+                let backing = subset.path_backing();
+                for e in subset.entries() {
+                    result.dangerously_push_entry(e.stat, e.id, e.flags, e.mode, e.path_in(backing));
+                }
+            }
+            result.sort_entries();
+            let mut update: std::collections::BTreeSet<BString> = {
+                let backing = subset.path_backing();
+                subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+            };
+            sparse.apply(repo, &old, &mut result, &mut update, &mut remove)?;
+            Some((result, update))
+        }
+        None => None,
+    };
+    let updating = unpack_progress(touched.len())?;
+    for path in &remove {
+        updating.tick();
+        unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
+    }
     // `check_updates()` sets `state.istate = index` — `&o->result`, the index the
     // two-way merge just produced (unpack-trees.c:399), not the paths it is about to
     // write. `o->result` holds `merged_entry()`'s new-tree entry for a path the two
@@ -4061,11 +4106,10 @@ pub(super) fn update_worktree_to_tree(
     // `merged_entry()` migrates from the index entry it replaces (unpack-trees.c:2616-2617, or
     // `copy_cache_entry()` when `same()`), and `check_updates()` writes every `CE_UPDATE`
     // entry whatever it carries (:483-498), so the file is checked out and the bit stays.
-    let mut written = match &sparse_patterns {
-        Some(patterns) => {
-            patterns.mark_new_skip_worktree(&mut subset, &|_| true, false)?;
-            let mut written = subset.clone();
-            written.remove_entries(|_, _, e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE));
+    let mut written = match &sparse_result {
+        Some((result, update)) => {
+            let mut written = result.clone();
+            written.remove_entries(|_, path, _| !update.contains(path));
             written
         }
         None => {
@@ -4112,6 +4156,12 @@ pub(super) fn update_worktree_to_tree(
         }
     }
     index.sort_entries();
+    // `apply_sparse_checkout()`'s verdict on every entry, and the stat of each file it wrote
+    // outside the touched paths.
+    if let Some((result, _)) = &sparse_result {
+        crate::unpack_sparse::carry_skip_worktree_bits(result, &mut index);
+        crate::worktree::carry_written_stat(&written, &mut index);
+    }
     // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
     if let Some(src) = &src {
         index.unshare_entries_built_from_trees(src);
@@ -4186,7 +4236,16 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         eprintln!("error: Entry '{path}' not uptodate. Cannot merge.");
         return Err(anyhow::Error::new(crate::fatal::Silent(128)));
     }
-    let sparse = crate::merge_guard::sparse_patterns(repo).is_some();
+    // `reset_tree()` installs no porcelain messages, and `-f` is `UNPACK_RESET_OVERWRITE_UNTRACKED`
+    // with `preserve_ignored` clear (builtin/checkout.c:763-767).
+    let sparse = crate::unpack_sparse::SparseCheckout::begin(
+        repo,
+        true,
+        crate::unpack_sparse::Opts {
+            overwrite_untracked: FORCE.load(std::sync::atomic::Ordering::Relaxed),
+            ..Default::default()
+        },
+    );
 
     // What actually gets written: everything the tree changes, plus every
     // carried-forward entry whose worktree file is missing or stat-dirty. A kept entry
@@ -4220,14 +4279,60 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         let backing = old.path_backing();
         old.entries().iter().filter(|e| !new_paths.contains(&e.path_in(backing).to_owned())).count()
     };
-    let updating = unpack_progress(subset.entries().len() + dropped)?;
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
+    // The sparse loops run over the whole result before `check_updates()` (unpack-trees.c:
+    // 2035-2075): `keep_entry()`'s entries carry the source entry's stat into them, and what
+    // they leave in `update` and `remove` is what is written and unlinked.
+    let sparse_result = match &sparse {
+        Some(sparse) => {
+            let mut result = repo.index_from_tree(&new_tree)?;
+            {
+                let backing = result.path_backing().to_owned();
+                for e in result.entries_mut() {
+                    if let Some((oid, mode, stat, _)) = old_map.get(e.path_in(&backing)) {
+                        if *oid == e.id && *mode == e.mode {
+                            e.stat = *stat;
+                        }
+                    }
+                }
+            }
+            let mut update: std::collections::BTreeSet<BString> = {
+                let backing = subset.path_backing();
+                subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+            };
+            let mut remove: std::collections::BTreeSet<BString> = {
+                let backing = old.path_backing();
+                old.entries()
+                    .iter()
+                    .map(|e| e.path_in(backing).to_owned())
+                    .filter(|p| !new_paths.contains(p))
+                    .collect()
+            };
+            sparse.apply(repo, &old, &mut result, &mut update, &mut remove)?;
+            subset = result.clone();
+            subset.remove_entries(|_, path, _| !update.contains(path));
+            Some((result, remove))
+        }
+        None => None,
+    };
+    let updating = match &sparse_result {
+        Some((_, remove)) => unpack_progress(subset.entries().len() + remove.len())?,
+        None => unpack_progress(subset.entries().len() + dropped)?,
+    };
+    match &sparse_result {
+        Some((_, remove)) => {
+            for path in remove {
                 updating.tick();
-                unlink_entry(repo, path, Some(e.mode));
+                unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
+            }
+        }
+        None => {
+            let backing = old.path_backing();
+            for e in old.entries() {
+                let path = e.path_in(backing);
+                if !new_paths.contains(&path.to_owned()) {
+                    updating.tick();
+                    unlink_entry(repo, path, Some(e.mode));
+                }
             }
         }
     }
@@ -4241,8 +4346,8 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     // (unpack-trees.c:1931-1932) and `check_updates()` writes every `CE_UPDATE` entry the
     // merge left, `CE_SKIP_WORKTREE` or not (:483-498), so the bit rides on the index only.
     super::reset::carry_skip_worktree(&old, &mut new_index);
-    if sparse {
-        super::reset::carry_skip_worktree(&old, &mut subset);
+    if let Some((result, _)) = &sparse_result {
+        crate::unpack_sparse::carry_skip_worktree_bits(result, &mut new_index);
     }
 
     // `oneway_merge()` builds `o->result` out of the tree alone, so the index

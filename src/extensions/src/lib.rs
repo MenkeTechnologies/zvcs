@@ -82,6 +82,7 @@ pub mod transport_err;
 pub mod trace;
 pub mod trace2;
 pub mod unicode_width;
+pub mod unpack_sparse;
 pub mod untracked_cache;
 pub mod unix_socket;
 pub mod utf8;

@@ -17,6 +17,13 @@ pub(crate) struct HeaderData {
     /// quotes to have perfect reconstruction.
     pub(crate) separator: Option<Span>,
     pub(crate) subsection_name: Option<MaybeDecoded>,
+    /// True for the section that holds the entries written before the first `[...]` line.
+    ///
+    /// git has no such section: `git_parse_source()` starts with an empty stem and only a
+    /// `[...]` line sets one (config.c:1124-1135), so a key read before any header reaches the
+    /// callback as the bare name, `a` for a file holding `a`. This header stands for that empty
+    /// stem. It has an empty name, no subsection, and writes nothing.
+    pub(crate) headerless: bool,
 }
 
 mod types {

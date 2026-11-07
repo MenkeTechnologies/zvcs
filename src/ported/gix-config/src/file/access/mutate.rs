@@ -286,6 +286,9 @@ impl File {
         let section = self.sections.remove(&id)?;
         let position = self.section_order_position(id);
         self.section_order.remove(position);
+        if section.header.headerless {
+            return Some(file::Section::from_data(&section, &self.backing));
+        }
         let lookup_name = section::Name(section.header.name.to_bstring_in(&self.backing));
         file::util::remove_section_id_from_lookup(
             &mut self.section_lookup_tree,

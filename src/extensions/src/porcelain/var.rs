@@ -525,6 +525,12 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
 fn list_config(cfg: &ConfigFile, out: &mut impl Write, limit: Option<usize>) -> Result<()> {
     let mut left = limit.unwrap_or(usize::MAX);
     super::config::for_each_entry(cfg, true, |key, value, implicit, _meta| {
+        // `git_config()` reads through the configset, whose `configset_add_value()` refuses a
+        // key with no section (config.c:1743-1745, 1764-1767), so an entry above the first
+        // `[...]` line never reaches `show_config()`.
+        if !key.contains('.') {
+            return Ok(());
+        }
         if left == 0 {
             return Ok(());
         }

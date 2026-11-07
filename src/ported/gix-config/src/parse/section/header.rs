@@ -41,6 +41,7 @@ impl HeaderData {
             name,
             separator,
             subsection_name,
+            headerless: false,
         })
     }
 }
@@ -92,10 +93,14 @@ impl HeaderData {
                 .as_ref()
                 .map(|name| name.copy_to_backing_in(source, target))
                 .transpose()?,
+            headerless: self.headerless,
         })
     }
 
     pub(crate) fn write_to_in(&self, backing: &[u8], mut out: impl std::io::Write) -> std::io::Result<()> {
+        if self.headerless {
+            return Ok(());
+        }
         out.write_all(b"[")?;
         out.write_all(self.name.as_slice_in(backing))?;
 

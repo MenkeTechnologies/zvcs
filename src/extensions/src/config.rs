@@ -1608,6 +1608,12 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
         if sec.meta().source == Source::EnvOverride {
             continue;
         }
+        // `configset_add_value()` refuses a key with no section (config.c:1743-1745,
+        // 1764-1767), so the entries above a file's first `[...]` line never reach a
+        // `git_config()` callback.
+        if sec.header().is_headerless() {
+            continue;
+        }
         let header = sec.header();
         let section = header.name().to_string().to_ascii_lowercase();
         let subsection = header

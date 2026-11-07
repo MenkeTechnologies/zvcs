@@ -58,10 +58,36 @@ impl File {
         let mut this = File::new(OwnShared::clone(&meta));
 
         this.backing = backing;
-        this.frontmatter_events = frontmatter;
 
-        this.sections.reserve(sections.len());
-        this.section_order.reserve(sections.len());
+        this.sections.reserve(sections.len() + 1);
+        this.section_order.reserve(sections.len() + 1);
+        // ```c
+        // strbuf_setlen(var, baselen);
+        // strbuf_addch(var, tolower(c));
+        // if (get_value(cs, kvi, fn, data, var) < 0)
+        // ```
+        //
+        // (`git_parse_source()`, config.c:1124-1135.) `baselen` is 0 until a `[...]` line
+        // sets a stem, so an entry above the first header is a key with an empty section,
+        // listed by `git config --list` as its bare name. Such entries become a section of
+        // their own, which carries this file's metadata and keeps their place among the
+        // sections when files are appended or included. Front matter of comments and blank
+        // lines alone stays front matter.
+        if frontmatter.iter().any(|event| matches!(event, parse::Event::SectionValueName(_))) {
+            this.push_section_internal(crate::file::SectionData {
+                header: parse::section::HeaderData {
+                    name: Default::default(),
+                    separator: None,
+                    subsection_name: None,
+                    headerless: true,
+                },
+                body: section::BodyData(frontmatter.into_vec()),
+                meta: OwnShared::clone(&meta),
+                id: Default::default(),
+            });
+        } else {
+            this.frontmatter_events = frontmatter;
+        }
         for section in sections {
             this.push_section_internal(crate::file::SectionData {
                 header: section.header,

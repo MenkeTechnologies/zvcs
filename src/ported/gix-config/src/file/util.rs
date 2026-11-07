@@ -22,13 +22,19 @@ impl File {
             .subsection_name
             .as_ref()
             .map(|name| name.value_in(&self.backing).to_owned());
+        let headerless = section.header.headerless;
         self.sections.insert(new_section_id, section);
+        self.section_order.push(new_section_id);
+        // The entries above a file's first header have no section to be looked up by: git's
+        // configset refuses their dotless keys (config.c:1743-1745, 1764-1767).
+        if headerless {
+            return new_section_id;
+        }
         let lookup = self.section_lookup_tree.entry(lookup_name).or_default();
         match subsection_name {
             Some(name) => lookup.by_subsection.entry(name).or_default().push(new_section_id),
             None => lookup.without_subsection.push(new_section_id),
         }
-        self.section_order.push(new_section_id);
         new_section_id
     }
 
@@ -43,8 +49,12 @@ impl File {
             .subsection_name
             .as_ref()
             .map(|name| name.value_in(&self.backing).to_owned());
+        let headerless = section.header.headerless;
         self.sections.insert(new_section_id, section);
         self.section_order.insert(before_order + 1, new_section_id);
+        if headerless {
+            return new_section_id;
+        }
 
         let order = self.section_order_position(new_section_id);
         let earlier_sections = &self.section_order[..order];

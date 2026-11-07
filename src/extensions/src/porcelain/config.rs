@@ -3501,6 +3501,8 @@ pub(crate) fn for_each_entry(
             let implicit = value.is_none();
             let value = value.unwrap_or_default();
             let key = match &subsection {
+                // An entry above the first `[...]` line is its bare name (config.c:1124-1135).
+                None if header.is_headerless() => value_name.clone(),
                 Some(sub) => format!("{section_name}.{sub}.{value_name}"),
                 None => format!("{section_name}.{value_name}"),
             };

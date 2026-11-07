@@ -161,11 +161,13 @@ fn section_header(backing: &[u8], i: &mut &[u8]) -> ParseResult<section::HeaderD
                 subsection_name: name
                     .get(index + 1..)
                     .map(|name| crate::parse::MaybeDecoded::raw(Span::new(backing, name))),
+                headerless: false,
             }),
             None => Ok(section::HeaderData {
                 name: Span::new(backing, name.as_bstr()),
                 separator: None,
                 subsection_name: None,
+                headerless: false,
             }),
         };
     }
@@ -184,6 +186,7 @@ fn section_header(backing: &[u8], i: &mut &[u8]) -> ParseResult<section::HeaderD
         name: Span::new(backing, name),
         separator: Some(Span::new(backing, whitespace)),
         subsection_name: Some(subsection_name),
+        headerless: false,
     })
 }
 

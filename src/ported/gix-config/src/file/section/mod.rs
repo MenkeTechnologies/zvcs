@@ -60,6 +60,15 @@ impl<'a> HeaderRef<'a> {
             .map(|subsection_name| subsection_name.value_in(self.backing))
     }
 
+    /// Return true for the section of entries read before the first `[...]` line of a file.
+    ///
+    /// Its name is empty and it has no subsection. git hands each of its entries to the
+    /// config callback under the bare variable name, with no section and no dot
+    /// (`git_parse_source()`, config.c:1124-1135).
+    pub fn is_headerless(&self) -> bool {
+        self.header.headerless
+    }
+
     /// Return the name of the header, like "remote" in `[remote "origin"]`.
     pub fn name(&self) -> &'a BStr {
         self.header.name.as_bstr_in(self.backing)
@@ -226,7 +235,10 @@ impl<'file> SectionRef<'file> {
             return Ok(());
         }
 
-        if !self
+        // Entries before the first header are the file's opening lines: no header was written,
+        // so none needs a line ending after it.
+        if !self.data.header.headerless
+            && !self
             .body_data()
             .as_ref()
             .iter()

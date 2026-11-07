@@ -986,7 +986,12 @@ fn emit_matching(ev: &Event, file: &gix::config::File, patterns: &[String]) {
             None => section_name,
         };
         for name in section.value_names() {
-            let key = format!("{prefix}.{}", name.to_lowercase());
+            // `read_early_config()` walks the files without the configset, so an entry above
+            // the first `[...]` line arrives as its bare name (config.c:1124-1135).
+            let key = match header.is_headerless() {
+                true => name.to_lowercase(),
+                false => format!("{prefix}.{}", name.to_lowercase()),
+            };
             if !patterns.iter().any(|p| glob_matches(p, &key)) {
                 continue;
             }

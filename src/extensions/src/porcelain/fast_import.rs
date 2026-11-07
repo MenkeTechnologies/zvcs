@@ -94,27 +94,27 @@
 //! (`cat-blob`, `ls`, `from`) before a pack would exist; a run that keeps its
 //! pack unlinks the loose files it created once the pack is in place.
 //!
-//! What the pack does *not* reproduce is its own bytes. git deltifies each
-//! object against the immediately preceding one and cycles to a new pack when
-//! `--max-pack-size`/`pack.packSizeLimit` would be crossed
-//! (`store_object()` at `fast-import.c:1024-1030`); this port hands the object
-//! set to the same writer `pack-objects` uses, in one pack, with its own delta
-//! window. git's delta *decisions* are still made — `store_object()` tries the
-//! same base under the same `--depth`/`pack.depth` and `--big-file-threshold`,
-//! with the port of `diff-delta.c`, and keeps the depth it would have given the
-//! object — because the statistics block counts them and a tree read back
-//! carries its depth. `--max-pack-size` is validated the way git validates it
-//! and then steers nothing. The object set, the index and the refs are a
-//! function of the stream and are identical; the compression and the grouping
-//! are not.
+//! The pack is git's own bytes. `store_object()` deflates each object, or its
+//! `OBJ_OFS_DELTA` against the last object of its kind, at
+//! `pack.compression`/`core.compression` with the transcription of zlib, and
+//! `stream_blob()` deflates a blob above `--big-file-threshold` in 64 KiB pieces;
+//! when the entry would push the pack past `--max-pack-size`/`pack.packSizeLimit`
+//! the pack is closed and a new one started, the delta dropped
+//! (`fast-import.c:1043-1065`, `:1136-1140`), so a run may leave several packs,
+//! each named by the hash of its bytes, each kept or exploded on its own count,
+//! each with its own `--export-pack-edges` line. The delta *decisions* are
+//! git's — the same base under the same `--depth`/`pack.depth`, with the port of
+//! `diff-delta.c` — which is also what the statistics block counts.
 //!
 //! Without `--quiet` the run ends in git's statistics block on stderr, and a
 //! fatal error writes git's crash report to `$GIT_DIR/fast_import_crash_<pid>`
 //! and names it after the `fatal:` line. The block's last four `pack_report`
-//! counters count the mmap windows `packfile.c` opens to read objects back out
-//! of packs; this port reads through gitoxide's object store, opens no such
-//! window, and reports zeros, which is what git reports for a run that never
-//! reads a packed object. The `warning:` lines `parse_one_option()` prints are
+//! counters count the mmap windows `packfile.c`'s `use_pack()` opens whenever
+//! anything in the process reads an object out of a pack — fast-import's own
+//! read-backs, the ref update's `parse_object()`, a `from` an existing branch.
+//! This port reads through gitoxide's object store, which has no such windows,
+//! and reports zeros, which is what git reports only for a run that never reads
+//! a packed object. The `warning:` lines `parse_one_option()` prints are
 //! ordinary stderr a caller reads, and they are reproduced.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -322,8 +322,9 @@ fn help(usage: &str) -> anyhow::Error {
 /// against git 2.55.0: a rejected command line leaves a zero-byte
 /// `tmp_pack_XXXXXX` mode 0444.
 ///
-/// `checkpoint`'s `cycle_packfile()` (3602) is not modelled, because it unlinks
-/// the temporary and immediately opens another: one temporary is alive either
+/// `cycle_packfile()` — at a `checkpoint` (3652) or past `--max-pack-size`
+/// (1050, 1146) — is not modelled for the temporary, because it unlinks it and
+/// immediately opens another: one temporary is alive either
 /// way, and only its random tail — which nothing reads — would differ.
 struct TempPack {
     path: std::path::PathBuf,
@@ -383,9 +384,11 @@ impl TempPack {
 /// store, which is exactly the distinction `fastimport.unpackLimit` is compared
 /// against.
 ///
-/// This port writes every object loose as it goes, because the stream can read
-/// any of them back before the pack would exist — `cat-blob`, `ls`, `from`, and
-/// the tree a later commit starts from all go through the object database.
+/// The pack bytes are built in memory exactly as `store_object()` and
+/// `stream_blob()` write them. This port also writes every object loose as it
+/// goes, because the stream can read any of them back before the pack is in
+/// place — `cat-blob`, `ls`, `from`, and the tree a later commit starts from
+/// all go through the object database, where git reads the pack it is writing.
 /// [`PackLog::flush`] is then `end_packfile()`: it decides which of the two
 /// shapes git would have left behind and makes the store match it.
 struct PackLog {
@@ -435,6 +438,22 @@ struct PackLog {
     /// written per pack *kept*, which is why a run whose objects all fit under
     /// `unpack_limit` leaves the file empty.
     edges: Option<std::path::PathBuf>,
+    /// `max_packsize`: `pack.packSizeLimit`, then `--max-pack-size`, 0 for none.
+    max_packsize: u64,
+    /// `pack_compression_level`: `pack.compression`, else `core.compression`,
+    /// else zlib's default.
+    compression: i32,
+    /// What `hashwrite(pack_file, …)` has written past the 12-byte header of
+    /// the pack now being built; `pack_size` is its length plus the header.
+    body: Vec<u8>,
+    /// `create_index()`'s table for that pack: each stored entry's offset and
+    /// `crc32_end()`, in store order.
+    entries: Vec<super::pack_objects::PackedEntry>,
+    /// Packs `end_packfile()` closed inside [`PackLog::store`], by `pack_id`,
+    /// with the `.pack` kept or `None` for one `loosen_small_pack()` exploded,
+    /// for the importer to name in `--export-pack-edges` or invalidate in its
+    /// branch and tag tables before anything moves them.
+    closed: Vec<(u32, Option<std::path::PathBuf>)>,
 }
 
 impl PackLog {
@@ -468,11 +487,16 @@ impl PackLog {
             unpack_limit: 100,
             index_version: 2,
             edges: None,
+            max_packsize: 0,
+            compression: -1,
+            body: Vec::new(),
+            entries: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
-    /// `git_pack_config()` (`builtin/fast-import.c:3869-3893`): the two config
-    /// keys that reach a pack this port can actually produce.
+    /// `git_pack_config()` (`builtin/fast-import.c:3955-3980`): the pack settings
+    /// the run is configured with before argv is parsed.
     ///
     /// ```c
     /// if (!repo_config_get_int(the_repository, "pack.indexversion", &indexversion_value)) {
@@ -485,9 +509,8 @@ impl PackLog {
     ///         unpack_limit = limit;
     /// ```
     ///
-    /// `pack.depth` and `pack.packSizeLimit` are read there too and steer the
-    /// delta window and the pack-cycling threshold; see the module header for
-    /// why neither is reproduced. They are still read, in git's order, because a value
+    /// `pack.depth` and `pack.packSizeLimit` are read there too, for the delta
+    /// chain and the pack-cycling threshold. All are read in git's order, because a value
     /// `git_config_ulong()` cannot parse is fatal, and the function ends in
     /// `repo_config(the_repository, git_default_config, NULL)`, which refuses every
     /// `core.*`, `push.*` and similar value the default callback refuses.
@@ -507,7 +530,12 @@ impl PackLog {
                 Some(&format!("bad pack.indexVersion={version}")),
             );
         }
-        crate::config::config_ulong(repo, "pack.packsizelimit").map_err(die)?;
+        // `if (!repo_config_get_ulong(…, "pack.packsizelimit", &packsizelimit_value))
+        //         max_packsize = packsizelimit_value;` (builtin/fast-import.c:3972-3973),
+        // taken as it is: the 1 MiB floor is `--max-pack-size`'s alone.
+        if let Some(limit) = crate::config::config_ulong(repo, "pack.packsizelimit").map_err(die)? {
+            self.max_packsize = limit;
+        }
         let unpack_limit = match crate::config::config_int(repo, "fastimport.unpacklimit").map_err(die)? {
             Some(limit) => Some(limit),
             None => crate::config::config_int(repo, "transfer.unpacklimit").map_err(die)?,
@@ -518,6 +546,14 @@ impl PackLog {
         if let Some(threshold) = crate::config::config_ulong(repo, "core.bigfilethreshold").map_err(die)? {
             self.big_file_threshold = threshold;
         }
+        // `pack_compression_level`: `pack.compression` wins over `core.compression`
+        // whichever comes first (`pack_compression_seen`, environment.c), and an
+        // out-of-range value has already died in the default callback above.
+        let level = match crate::config::config_int(repo, "pack.compression").map_err(die)? {
+            Some(level) => Some(level),
+            None => crate::config::config_int(repo, "core.compression").map_err(die)?,
+        };
+        self.compression = level.map_or(-1, |level| level as i32);
 
         self.unpack_limit = unpack_limit.unwrap_or(100);
         // 1 and 2 are the two versions `write_idx_file()` can write and [`index_file`] emits.
@@ -556,10 +592,10 @@ impl PackLog {
     /// The mark is the caller's to insert, through [`Importer::insert_mark`].
     /// The write happens either way — a duplicate is already in the store, so
     /// `write_buf` is a no-op for it — and only the bookkeeping differs. The
-    /// delta is computed with the port of `diff-delta.c` for the one thing
-    /// fast-import keeps of it: whether one at most `len - rawsz` bytes long
-    /// exists, which decides `delta_count_by_type` and the stored object's depth.
-    /// The pack bytes themselves are written by [`PackLog::flush`].
+    /// delta is computed with the port of `diff-delta.c`, deflated with the
+    /// object's entry header into [`PackLog::body`], unless the entry would cross
+    /// `max_packsize`: then the pack is closed through [`PackLog::end_pack`] and the
+    /// object written whole into the next one.
     ///
     /// The second half of the return is git's `!store_object()`: whether this
     /// object was *newly stored into the current pack*, which is what
@@ -570,67 +606,235 @@ impl PackLog {
         repo: &gix::Repository,
         kind: Kind,
         data: &[u8],
-        last: Last<'_>,
+        mut last: Last<'_>,
     ) -> Result<(ObjectId, bool)> {
         let id = gix::objs::compute_hash(repo.object_hash(), kind, data)?;
-        // Probed before the write, because that is the only moment the answer is
-        // still "was it there before this run put it there".
-        let loose = self.loose_path(&id);
-        let existed = loose.exists();
-
-        let written = repo.write_buf(kind, data).map_err(to_anyhow)?;
-        debug_assert_eq!(written, id);
-
-        if !existed && loose.exists() {
-            self.created.push(id);
-        }
-
-        let slot = type_slot(kind);
-        if self.table.contains_key(&id) {
-            self.duplicates_by_type[slot] += 1;
+        let Some(fresh) = self.write_loose(repo, kind, data, id)? else {
             return Ok((id, false));
-        }
-        if self.packed.iter().any(|idx| idx.lookup(id).is_some()) {
-            self.table.insert(id, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0 });
-            self.duplicates_by_type[slot] += 1;
-            return Ok((id, false));
-        }
-
-        let rawsz = repo.object_hash().len_in_bytes();
-        let max_depth = self.max_depth;
-        let last = match last {
-            Last::None => None,
-            Last::Blob => Some(&mut self.last_blob),
-            Last::Tree(lo) => Some(lo),
         };
-        let mut depth = 0;
-        if let Some(last) = &last {
-            if !last.data.is_empty() && u64::from(last.depth) < max_depth && data.len() > rawsz {
+
+        // ```c
+        // if (last && last->data.len && last->data.buf && last->depth < max_depth
+        //         && dat->len > the_hash_algo->rawsz) {
+        //         delta_count_attempts_by_type[type]++;
+        //         delta = diff_delta(last->data.buf, last->data.len,
+        //                 dat->buf, dat->len,
+        //                 &deltalen_st, dat->len - the_hash_algo->rawsz);
+        // ```
+        let slot = type_slot(kind);
+        let rawsz = repo.object_hash().len_in_bytes();
+        let base = match &last {
+            Last::None => None,
+            Last::Blob => Some(&self.last_blob),
+            Last::Tree(lo) => Some(&**lo),
+        };
+        let mut delta = None;
+        if let Some(base) = base {
+            if !base.data.is_empty() && u64::from(base.depth) < self.max_depth && data.len() > rawsz {
                 self.delta_attempts_by_type[slot] += 1;
-                let delta = gix::odb::pack::data::output::delta::encode::Index::new(last.data.as_slice())
-                    .and_then(|index| index.create(data, (data.len() - rawsz) as u64));
-                if delta.is_some() {
-                    self.deltas_by_type[slot] += 1;
-                    depth = last.depth + 1;
-                }
+                delta = gix::odb::pack::data::output::delta::encode::Index::new(base.data.as_slice())
+                    .and_then(|index| index.create(data, (data.len() - rawsz) as u64))
+                    .map(|delta| (delta, base.offset, base.depth));
             }
         }
-        self.table.insert(id, ObjectEntry { kind, pack_id: self.pack_id, depth });
-        self.stored_by_type[slot] += 1;
-        self.ids.push(id);
+        let wrap = gix::zlib::deflate::Wrap::Zlib;
+        let mut out = gix::zlib::deflate::compress(delta.as_ref().map_or(data, |(d, _, _)| d.as_slice()), self.compression, wrap);
+
+        // `/* Determine if we should auto-checkpoint. */` (builtin/fast-import.c:1043-1065)
+        if self.max_packsize != 0 && self.pack_size() + 3 * rawsz as u64 + out.len() as u64 > self.max_packsize {
+            self.end_pack(repo)?;
+            // `/* We cannot carry a delta into the new pack. */`
+            if delta.take().is_some() {
+                out = gix::zlib::deflate::compress(data, self.compression, wrap);
+            }
+        }
+
+        let offset = self.pack_size();
+        let start = self.body.len();
+        let depth = match &delta {
+            // `hdrlen = encode_in_pack_object_header(hdr, sizeof(hdr), OBJ_OFS_DELTA, deltalen);`
+            // and the base's distance back, as `OBJ_OFS_DELTA` spells it (1074-1088).
+            Some((bytes, base_offset, base_depth)) => {
+                self.deltas_by_type[slot] += 1;
+                gix::odb::pack::data::entry::Header::OfsDelta { base_distance: offset - base_offset }
+                    .write_to(bytes.len() as u64, &mut self.body)?;
+                base_depth + 1
+            }
+            None => {
+                pack_entry_header(kind).write_to(data.len() as u64, &mut self.body)?;
+                0
+            }
+        };
+        self.body.extend_from_slice(&out);
+        self.record(kind, id, offset, start, depth, fresh);
+        // `last->data = *dat` (or the swap), `last->offset = e->idx.offset;
+        // last->depth = e->depth;` (1101-1108).
+        let last = match &mut last {
+            Last::None => None,
+            Last::Blob => Some(&mut self.last_blob),
+            Last::Tree(lo) => Some(&mut **lo),
+        };
         if let Some(last) = last {
             last.data = data.to_vec();
+            last.offset = offset;
             last.depth = depth;
         }
         Ok((id, true))
     }
 
-    /// `end_packfile()` (`builtin/fast-import.c:870-945`) for the pack the log
+    /// `stream_blob()` (builtin/fast-import.c:1117-1236): a blob above the
+    /// big-file threshold, deflated in 64 KiB pieces without a delta, the pack
+    /// cycled ahead of it on its *inflated* length, and the bytes truncated away
+    /// again when the blob turns out to be a duplicate.
+    fn store_streamed(&mut self, repo: &gix::Repository, data: &[u8]) -> Result<ObjectId> {
+        use gix::zlib::deflate::{Deflate, Wrap, Z_BUF_ERROR, Z_FINISH, Z_NO_FLUSH, Z_OK, Z_STREAM_END};
+        const IN_SZ: usize = 64 * 1024;
+        const OUT_SZ: usize = 64 * 1024;
+
+        let rawsz = repo.object_hash().len_in_bytes() as u64;
+        let len = data.len() as u64;
+        if self.max_packsize != 0 && self.pack_size() + 3 * rawsz + len > self.max_packsize {
+            self.end_pack(repo)?;
+        }
+        let id = gix::objs::compute_hash(repo.object_hash(), Kind::Blob, data)?;
+        // `truncate_pack(&checkpoint)` for a duplicate puts the pack back where it
+        // was, so it is as if nothing had been written.
+        let Some(fresh) = self.write_loose(repo, Kind::Blob, data, id)? else {
+            return Ok(id);
+        };
+
+        let offset = self.pack_size();
+        let start = self.body.len();
+        let mut z = Deflate::new(self.compression, Wrap::Zlib);
+        let mut out_buf = vec![0u8; OUT_SZ];
+        let mut hdr = Vec::new();
+        pack_entry_header(Kind::Blob).write_to(len, &mut hdr)?;
+        out_buf[..hdr.len()].copy_from_slice(&hdr);
+        // `s.next_out = out_buf + hdrlen; s.avail_out = out_sz - hdrlen;`
+        let mut out_base = hdr.len();
+        z.set_output(OUT_SZ - out_base);
+        // `in_buf`: the piece `fread()` last filled, which `next_in` walks.
+        let (mut chunk, mut left) = (0..0, data.len());
+        let mut status = Z_OK;
+        while status != Z_STREAM_END {
+            if left > 0 && z.avail_in() == 0 {
+                let cnt = IN_SZ.min(left);
+                chunk = chunk.end..chunk.end + cnt;
+                z.set_input(cnt);
+                left -= cnt;
+            }
+            let flush = if left > 0 { Z_NO_FLUSH } else { Z_FINISH };
+            status = z.step(&data[chunk.clone()], &mut out_buf[out_base..], flush);
+            if z.avail_out() == 0 || status == Z_STREAM_END {
+                let n = out_base + z.out_pos();
+                self.body.extend_from_slice(&out_buf[..n]);
+                out_base = 0;
+                z.set_output(OUT_SZ);
+            }
+            if !matches!(status, Z_OK | Z_BUF_ERROR | Z_STREAM_END) {
+                crate::git_fatal!("unexpected deflate failure: {status}");
+            }
+        }
+        self.record(Kind::Blob, id, offset, start, 0, fresh);
+        Ok(id)
+    }
+
+    /// The head of `store_object()` and `stream_blob()`: write the object loose
+    /// for this port to read back, then git's two duplicate checks. `None` is a
+    /// duplicate, counted; otherwise whether the loose file is this run's own.
+    ///
+    /// ```c
+    /// e = insert_object(&oid);
+    /// if (e->idx.offset) { duplicate_count_by_type[type]++; return 1; }
+    /// … packfile_list_find_oid() … { …; duplicate_count_by_type[type]++; return 1; }
+    /// ```
+    fn write_loose(&mut self, repo: &gix::Repository, kind: Kind, data: &[u8], id: ObjectId) -> Result<Option<bool>> {
+        // Probed before the write, because that is the only moment the answer is
+        // still "was it there before this run put it there".
+        let loose = self.loose_path(&id);
+        let existed = loose.exists();
+        let written = repo.write_buf(kind, data).map_err(to_anyhow)?;
+        debug_assert_eq!(written, id);
+        let fresh = !existed && loose.exists();
+
+        let slot = type_slot(kind);
+        let duplicate = self.table.contains_key(&id) || {
+            let packed = self.packed.iter().any(|idx| idx.lookup(id).is_some());
+            if packed {
+                self.table.insert(id, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0, offset: 1 });
+            }
+            packed
+        };
+        if duplicate {
+            if fresh {
+                self.created.push(id);
+            }
+            self.duplicates_by_type[slot] += 1;
+            return Ok(None);
+        }
+        Ok(Some(fresh))
+    }
+
+    /// The tail of `store_object()` and `stream_blob()` once the entry's bytes
+    /// are in the pack from `start` on: `e->pack_id = pack_id; e->idx.offset =
+    /// …; object_count++; object_count_by_type[type]++; e->idx.crc32 =
+    /// crc32_end(pack_file);`.
+    fn record(&mut self, kind: Kind, id: ObjectId, offset: u64, start: usize, depth: u32, fresh: bool) {
+        let crc32 = gix::features::hash::crc32(&self.body[start..]);
+        self.entries.push(super::pack_objects::PackedEntry { id, offset, crc32, kind, name_hash: 0 });
+        self.table.insert(id, ObjectEntry { kind, pack_id: self.pack_id, depth, offset });
+        self.stored_by_type[type_slot(kind)] += 1;
+        self.ids.push(id);
+        // Recorded only now: a cycle ahead of the write closes the old pack, and
+        // this object's loose file belongs to the new one.
+        if fresh {
+            self.created.push(id);
+        }
+    }
+
+    /// `pack_size`: the 12-byte header `write_pack_header()` wrote, and every
+    /// entry since.
+    fn pack_size(&self) -> u64 {
+        PACK_HEADER_LEN + self.body.len() as u64
+    }
+
+    /// `end_packfile()` down to what the object table and `last_blob` see:
+    /// [`PackLog::flush`], then `invalidate_pack_id()` for a pack
+    /// `loosen_small_pack()` exploded or `pack_id++` for one kept, and `/* We
+    /// can't carry a delta across packfiles. */` (builtin/fast-import.c:888-963).
+    /// The closed pack is queued on [`PackLog::closed`] for the importer's
+    /// branch and tag tables. `start_packfile()` is the empty body it leaves.
+    fn end_pack(&mut self, repo: &gix::Repository) -> Result<()> {
+        let pack_id = self.pack_id;
+        let object_count = self.ids.len();
+        let kept = self.flush(repo)?;
+        self.last_blob = LastObject::default();
+        if object_count == 0 {
+            return Ok(());
+        }
+        match kept {
+            Some(_) => self.pack_id += 1,
+            None => {
+                for e in self.table.values_mut().filter(|e| e.pack_id == pack_id) {
+                    e.pack_id = MAX_PACK_ID;
+                }
+            }
+        }
+        self.closed.push((pack_id, kept));
+        Ok(())
+    }
+
+    /// `end_packfile()` (`builtin/fast-import.c:888-963`) for the pack the log
     /// has accumulated.
     ///
     /// ```c
     /// if (object_count) {
     ///         …
+    ///         finalize_hashfile(pack_file, cur_pack_oid.hash, FSYNC_COMPONENT_PACK, 0);
+    ///         fixup_pack_header_footer(the_hash_algo, pack_data->pack_fd,
+    ///                                  pack_data->hash, pack_data->pack_name,
+    ///                                  object_count, cur_pack_oid.hash,
+    ///                                  pack_size);
     ///         if (object_count <= unpack_limit) {
     ///                 if (!loosen_small_pack(pack_data)) {
     ///                         invalidate_pack_id(pack_id);
@@ -660,6 +864,11 @@ impl PackLog {
     ///     once the pack is in place. Loose objects that were already there stay
     ///     — git never touched them, and the packed copy sits beside them.
     ///
+    /// The pack is the bytes `store_object()` and `stream_blob()` wrote, with
+    /// `fixup_pack_header_footer()`'s object count in the header and the hash
+    /// of the whole file after it, so it is named `pack-<hash>` as git names it;
+    /// the index is `write_idx_file()` over `create_index()`'s entries.
+    ///
     /// `keep_pack()` also writes a `pack-<hash>.keep` beside the pack, and
     /// `cmd_fast_import` removes every one of them with `unkeep_all_packs()`
     /// before it returns (`builtin/fast-import.c:4028`). The file exists only for
@@ -669,39 +878,31 @@ impl PackLog {
     fn flush(&mut self, repo: &gix::Repository) -> Result<Option<std::path::PathBuf>> {
         let ids = std::mem::take(&mut self.ids);
         let created = std::mem::take(&mut self.created);
+        let mut body = std::mem::take(&mut self.body);
+        let mut entries = std::mem::take(&mut self.entries);
         if ids.is_empty() || ids.len() as i64 <= self.unpack_limit {
             return Ok(None);
         }
 
-        // fast-import's own deltas are `OBJ_OFS_DELTA` (`store_object()` at
-        // 1092), so the pack written here names its bases the same way. The
-        // *choice* of base is this port's delta search rather than git's
-        // last-object window; the pack's object set and its index are what a
-        // reader sees, and both are a function of the stream.
-        let packed = super::pack_objects::packed_for(
-            repo,
-            &ids,
-            super::pack_objects::WriteOptions {
-                allow_ofs_delta: true,
-                ..super::pack_objects::WriteOptions::default()
-            },
-        )?;
+        let kind = repo.object_hash();
+        let mut bytes = Vec::with_capacity(PACK_HEADER_LEN as usize + body.len() + kind.len_in_bytes());
+        bytes.extend_from_slice(b"PACK");
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+        bytes.append(&mut body);
+        let mut hasher = gix::hash::hasher(kind);
+        hasher.update(&bytes);
+        let pack_hash = hasher.try_finalize()?;
+        bytes.extend_from_slice(pack_hash.as_slice());
 
         let dir = self.objdir.join("pack");
         std::fs::create_dir_all(&dir)?;
-        let base = dir.join(format!("pack-{}", packed.id));
-        // Both companions index into the pack in object-id order, which is the
-        // order `write_idx_file()` sorts `create_index()`'s table into.
-        let mut by_oid = packed.entries.clone();
-        by_oid.sort_unstable_by_key(|entry| entry.id);
-        let index = super::pack_objects::index_file(
-            repo.object_hash(),
-            self.index_version,
-            &packed.id,
-            &by_oid,
-        )?;
+        let base = dir.join(format!("pack-{pack_hash}"));
+        // `write_idx_file()` sorts `create_index()`'s table by object id.
+        entries.sort_unstable_by_key(|entry| entry.id);
+        let index = super::pack_objects::index_file(kind, self.index_version, &pack_hash, &entries)?;
         let pack = base.with_extension("pack");
-        install_pack_file(&dir, "tmp_pack_XXXXXX", &pack, &packed.bytes)?;
+        install_pack_file(&dir, "tmp_pack_XXXXXX", &pack, &bytes)?;
         install_pack_file(&dir, "tmp_idx_XXXXXX", &base.with_extension("idx"), &index)?;
 
         for id in &created {
@@ -1232,19 +1433,21 @@ fn option_depth(value: &str) -> Result<u64> {
 /// }
 /// ```
 ///
-/// The clamped value steers only which pack an object lands in, which this
-/// port does not reproduce, but the refusal and the warnings are stderr a
-/// caller sees.
-fn option_max_pack_size(value: &str) -> Result<()> {
+/// Returns the clamped `max_packsize`, which `store_object()` and
+/// `stream_blob()` cycle the pack on.
+fn option_max_pack_size(value: &str) -> Result<u64> {
     let Some(v) = super::list_objects_filter::git_parse_ulong(value.as_bytes()) else {
         crate::git_fatal!("--max-pack-size: argument must be a non-negative integer");
     };
     if v < 8192 {
         eprintln!("warning: max-pack-size is now in bytes, assuming --max-pack-size={v}m");
-    } else if v < 1024 * 1024 {
-        eprintln!("warning: minimum max-pack-size is 1 MiB");
+        return Ok(v * 1024 * 1024);
     }
-    Ok(())
+    if v < 1024 * 1024 {
+        eprintln!("warning: minimum max-pack-size is 1 MiB");
+        return Ok(1024 * 1024);
+    }
+    Ok(v)
 }
 
 /// `option_big_file_threshold()` (builtin/fast-import.c:3827-3834): the size
@@ -1653,7 +1856,7 @@ impl Importer {
             "quiet" => self.show_stats = false,
             "force" => self.opts.force = true,
             "done" => self.opts.require_done = true,
-            "max-pack-size" => option_max_pack_size(value)?,
+            "max-pack-size" => self.pack.max_packsize = option_max_pack_size(value)?,
             "big-file-threshold" => self.pack.big_file_threshold = option_big_file_threshold(value)?,
             "depth" => self.pack.max_depth = option_depth(value)?,
             "active-branches" => self.max_active_branches = ulong_arg("--active-branches", value)?,
@@ -1722,6 +1925,7 @@ impl Importer {
                         kind: header.kind(),
                         pack_id: MAX_PACK_ID,
                         depth: 0,
+                        offset: 1,
                     },
                 );
             }
@@ -1973,45 +2177,45 @@ impl Importer {
 
     /// `end_packfile()`: close the pack the log has accumulated, and record its
     /// boundary when `--export-pack-edges` asked for one.
+    fn end_packfile(&mut self) -> Result<()> {
+        self.pack.end_pack(&self.repo)?;
+        self.drain_closed_packs()
+    }
+
+    /// The branch and tag half of every `end_packfile()` the log ran, whether
+    /// here or inside `store_object()`'s auto-checkpoint: `invalidate_pack_id()`
+    /// for a pack exploded loose, the `--export-pack-edges` line for one kept.
     ///
     /// The tips are collected here rather than in [`PackLog`] because they are
     /// branch and tag state: git reads `b->pack_id`/`t->pack_id` out of the
-    /// branch table and the tag list at exactly this point (`913-927`).
-    fn end_packfile(&mut self) -> Result<()> {
-        let object_count = self.pack.ids.len();
-        let pack_id = self.pack.pack_id;
-        let kept = self.pack.flush(&self.repo)?;
-        // `/* We can't carry a delta across packfiles. */` (955-962)
-        self.pack.last_blob = LastObject::default();
-        if object_count == 0 {
-            return Ok(());
+    /// branch table and the tag list at exactly this point (`913-927`). Every
+    /// store is followed by this, before any of those fields moves, so it reads
+    /// them as they were when the pack closed.
+    fn drain_closed_packs(&mut self) -> Result<()> {
+        for (pack_id, kept) in std::mem::take(&mut self.pack.closed) {
+            let Some(pack) = kept else {
+                // `loosen_small_pack()` exploded it: `invalidate_pack_id(pack_id)`
+                // (540-563) — nothing points into a pack any more.
+                for b in self.branches.iter_mut().filter(|b| b.pack_id == pack_id) {
+                    b.pack_id = MAX_PACK_ID;
+                }
+                for t in self.tags.iter_mut().filter(|t| t.pack_id == pack_id) {
+                    t.pack_id = MAX_PACK_ID;
+                }
+                continue;
+            };
+            let mut tips: Vec<ObjectId> = Vec::new();
+            for idx in self.branch_table_order() {
+                let b = &self.branches[idx];
+                if b.pack_id == pack_id {
+                    tips.push(b.head.unwrap_or_else(|| ObjectId::null(self.repo.object_hash())));
+                }
+            }
+            for t in self.tags.iter().filter(|t| t.pack_id == pack_id) {
+                tips.push(t.oid);
+            }
+            self.pack.write_edges(&pack, &tips)?;
         }
-        let Some(pack) = kept else {
-            // `loosen_small_pack()` exploded it: `invalidate_pack_id(pack_id)`
-            // (540-563) — nothing points into a pack any more.
-            for e in self.pack.table.values_mut().filter(|e| e.pack_id == pack_id) {
-                e.pack_id = MAX_PACK_ID;
-            }
-            for b in self.branches.iter_mut().filter(|b| b.pack_id == pack_id) {
-                b.pack_id = MAX_PACK_ID;
-            }
-            for t in self.tags.iter_mut().filter(|t| t.pack_id == pack_id) {
-                t.pack_id = MAX_PACK_ID;
-            }
-            return Ok(());
-        };
-        let mut tips: Vec<ObjectId> = Vec::new();
-        for idx in self.branch_table_order() {
-            let b = &self.branches[idx];
-            if b.pack_id == pack_id {
-                tips.push(b.head.unwrap_or_else(|| ObjectId::null(self.repo.object_hash())));
-            }
-        }
-        for t in self.tags.iter().filter(|t| t.pack_id == pack_id) {
-            tips.push(t.oid);
-        }
-        self.pack.write_edges(&pack, &tips)?;
-        self.pack.pack_id += 1;
         Ok(())
     }
 
@@ -2102,14 +2306,15 @@ impl Importer {
         let limit = self.pack.big_file_threshold;
         let streamed = !spec.starts_with(b"<<") && limit != 0 && (limit as u128) < strtoumax10(&spec) as u128;
         let payload = input.data(&spec)?;
-        let last = match streamed {
+        let id = match streamed {
             true => {
                 self.pack.last_blob = LastObject::default();
-                Last::None
+                self.pack.store_streamed(&self.repo, &payload)?
             }
-            false => Last::Blob,
+            false => self.pack.store(&self.repo, Kind::Blob, &payload, Last::Blob)?.0,
         };
-        Ok(self.pack.store(&self.repo, Kind::Blob, &payload, last)?.0)
+        self.drain_closed_packs()?;
+        Ok(id)
     }
 
     /// `insert_mark(&marks, mark, e)` (builtin/fast-import.c:571-596).
@@ -2259,6 +2464,7 @@ impl Importer {
         // `/* build the tree and the commit */`
         let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
         store_tree(&mut g, &mut self.branches[idx].tree)?;
+        self.drain_closed_packs()?;
         let branch_tree = &mut self.branches[idx].tree;
         branch_tree.versions[0].oid = branch_tree.versions[1].oid;
         let tree = branch_tree.versions[1].oid;
@@ -2300,6 +2506,7 @@ impl Importer {
         // `if (!store_object(OBJ_COMMIT, &new_data, NULL, &b->oid, next_mark))
         //          b->pack_id = pack_id;` (builtin/fast-import.c:3100-3101).
         let (id, stored) = self.pack.store(&self.repo, Kind::Commit, &buf, Last::None)?;
+        self.drain_closed_packs()?;
         if let Some(m) = mark {
             self.insert_mark(m, id);
         }
@@ -2399,6 +2606,7 @@ impl Importer {
         // `if (store_object(OBJ_TAG, …)) t->pack_id = MAX_PACK_ID; else
         //  t->pack_id = pack_id;` (builtin/fast-import.c:3272-3275).
         let (id, stored) = self.pack.store(&self.repo, Kind::Tag, &buf, Last::None)?;
+        self.drain_closed_packs()?;
         if let Some(m) = mark {
             self.insert_mark(m, id);
         }
@@ -2574,7 +2782,7 @@ impl Importer {
             crate::git_fatal!("got option command '{option}' after data command");
         }
         if let Some(v) = option.strip_prefix("max-pack-size=") {
-            option_max_pack_size(v)?;
+            self.pack.max_packsize = option_max_pack_size(v)?;
         } else if let Some(v) = option.strip_prefix("big-file-threshold=") {
             self.pack.big_file_threshold = option_big_file_threshold(v)?;
         } else if let Some(v) = option.strip_prefix("depth=") {
@@ -2915,7 +3123,7 @@ impl Importer {
         // A blob of the pack being written becomes the next blob's delta base
         // (builtin/fast-import.c:3416-3421).
         if let Some(oe) = self.pack.table.get(&oid).copied().filter(|oe| oe.pack_id == self.pack.pack_id) {
-            self.pack.last_blob = LastObject { data, depth: oe.depth };
+            self.pack.last_blob = LastObject { data, offset: oe.offset, depth: oe.depth };
         }
         Ok(())
     }
@@ -2963,6 +3171,7 @@ impl Importer {
         if s_isdir(leaf.versions[1].mode) {
             store_tree(&mut g, &mut leaf)?;
         }
+        self.drain_closed_packs()?;
 
         // `print_ls()` (builtin/fast-import.c:3584-3607).
         let mode = leaf.versions[1].mode;
@@ -3003,7 +3212,7 @@ impl Importer {
                         crate::git_fatal!("object not found: {oid}");
                     };
                     let kind = header.kind();
-                    self.pack.table.insert(oid, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0 });
+                    self.pack.table.insert(oid, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0, offset: 1 });
                     kind
                 }
             };
@@ -3890,6 +4099,20 @@ const S_IFREG: u32 = 0o100000;
 const NO_DELTA: u32 = 0o4000;
 /// `MAX_PACK_ID` (builtin/fast-import.c:35-36): "in no pack this run wrote".
 const MAX_PACK_ID: u32 = (1 << 16) - 1;
+/// What `write_pack_header()` writes ahead of the first entry: `PACK`, the
+/// version and the object count `fixup_pack_header_footer()` fills in.
+const PACK_HEADER_LEN: u64 = 12;
+
+/// The entry type `encode_in_pack_object_header()` is given for a whole object.
+fn pack_entry_header(kind: Kind) -> gix::odb::pack::data::entry::Header {
+    use gix::odb::pack::data::entry::Header;
+    match kind {
+        Kind::Blob => Header::Blob,
+        Kind::Tree => Header::Tree,
+        Kind::Commit => Header::Commit,
+        Kind::Tag => Header::Tag,
+    }
+}
 
 fn s_isdir(mode: u32) -> bool {
     mode & S_IFMT == S_IFDIR
@@ -3907,6 +4130,9 @@ struct ObjectEntry {
     pack_id: u32,
     /// `depth`: its delta chain length in that pack.
     depth: u32,
+    /// `idx.offset`: where its entry starts in that pack, or `1` ("just not
+    /// zero!") for an object the run did not write.
+    offset: u64,
 }
 
 /// `struct last_object`: the object the next one of its kind is deltified
@@ -3914,6 +4140,8 @@ struct ObjectEntry {
 #[derive(Default)]
 struct LastObject {
     data: Vec<u8>,
+    /// `offset`: the entry an `OBJ_OFS_DELTA` against `data` counts back to.
+    offset: u64,
     depth: u32,
 }
 
@@ -4312,13 +4540,14 @@ fn store_tree(g: &mut Ctx<'_>, root: &mut TreeEntry) -> Result<()> {
         load_tree(g, root)?;
     }
     let rawsz = g.repo.object_hash().len_in_bytes();
-    let pack_id = g.pack.pack_id;
     let t = root.tree.as_mut().expect("loaded above");
     for e in t.entries.iter_mut() {
         if e.tree.is_some() {
             store_tree(g, e)?;
         }
     }
+    // Read after the subtrees, any of which may have cycled the pack.
+    let pack_id = g.pack.pack_id;
 
     // Looked up after the subtrees are stored, as the C does: one of them may
     // be the object the old version names.
@@ -4329,6 +4558,7 @@ fn store_tree(g: &mut Ctx<'_>, root: &mut TreeEntry) -> Result<()> {
     let mut lo = LastObject::default();
     if s_isdir(root.versions[0].mode) && le.is_some_and(|le| le.pack_id == pack_id) {
         lo.data = mktree(t, 0, rawsz);
+        lo.offset = le.map_or(0, |le| le.offset);
         lo.depth = t.delta_depth;
     }
     let new_tree = mktree(t, 1, rawsz);

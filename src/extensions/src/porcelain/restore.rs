@@ -771,6 +771,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // the revision — resolved to a hex oid unless it is literally `HEAD`, since
     // `diff-index` cannot take an `<a>...<b>` range.
     if patch_mode {
+        // `git restore --staged` is `--source=HEAD` (builtin/checkout.c:1969-1973), set before
+        // `checkout_paths()` asks `!opts->checkout_worktree && !opts->from_treeish`
+        // (builtin/checkout.c:558-560), so `restore -p --staged` selects hunks to unstage
+        // against `HEAD` rather than refusing.
+        let source = source.clone().or_else(|| staged.then(|| "HEAD".to_string()));
         if !worktree && source.is_none() {
             eprintln!("fatal: '--worktree' must be used when '--source' is not specified");
             return Ok(ExitCode::from(128));
@@ -807,6 +812,18 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     if pathspecs.is_empty() {
+        // `checkout_main()` resolves `from_treeish` — `--source`, or the `HEAD` that `--staged`
+        // implies — before it looks at the pathspec (builtin/checkout.c:2023-2035, :2080-2084),
+        // so `git restore --staged` on an unborn branch is `could not resolve 'HEAD'`.
+        let source_or_head = source.clone().or_else(|| staged.then(|| "HEAD".to_string()));
+        if let Some(rev) = source_or_head {
+            let repo = crate::setup::discover()?;
+            let Some(id) = crate::objname::resolve(&repo, rev.as_str()) else {
+                crate::git_fatal!("could not resolve '{rev}'");
+            };
+            let id = super::checkout::branch_ref_id(&repo, rev.as_str()).unwrap_or(id);
+            super::checkout::classify_tree_ish(&repo, id)?.source_tree()?;
+        }
         eprintln!("fatal: you must specify path(s) to restore");
         return Ok(ExitCode::from(128));
     }

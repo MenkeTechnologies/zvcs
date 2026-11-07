@@ -1098,10 +1098,20 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // the scratch odb, as is the index read from it. Written to the repository, an `I` with
     // an unmatched path staged left a dangling tree stock never has.
     let index_odb = if opts.pathspecs.is_empty() { repo } else { &scratch };
+    // `-S` reverses every staged path in the worktree, but its `git reset -q --refresh --
+    // <pathspec>` (builtin/stash.c:1882-1893) puts back only the index entries the pathspec
+    // names: an unmatched staged path stays staged over a worktree that no longer has it.
+    let reset_paths: HashSet<BString> = if opts.staged_only && !opts.pathspecs.is_empty() {
+        let candidates: Vec<BString> = affected.iter().cloned().collect();
+        let keep = select_matching(repo, &opts.pathspecs, &candidates)?;
+        affected.iter().filter(|path| keep.contains(*path)).cloned().collect()
+    } else {
+        affected.clone()
+    };
     let index_target = if keep_index {
         i_tree_id
     } else {
-        revert_paths_in_tree(index_odb, i_tree_id, head_tree_id, &affected)?
+        revert_paths_in_tree(index_odb, i_tree_id, head_tree_id, &reset_paths)?
     };
     // `-S`'s target tree lives in the scratch odb, so both readers go through it; for
     // every other mode it is a real tree and the proxy just reads through.
@@ -1143,7 +1153,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         // `apply --index -R` that removes them again repairs nothing. Counting only
         // the tracked `affected` set left the root valid where stock leaves it
         // invalid on every `git stash push -u <pathspec>`.
-        let mut touched = if opts.pathspecs.is_empty() { HashSet::new() } else { affected.clone() };
+        let mut touched = if opts.pathspecs.is_empty() { HashSet::new() } else { reset_paths.clone() };
         if !opts.pathspecs.is_empty() {
             touched.extend(untracked_paths.iter().cloned());
         }
@@ -1170,8 +1180,11 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `reset: moving to HEAD` on `HEAD` — the branch does not move, so only that one
     // log gains an entry. Only the pathspec-less path runs that reset: with a
     // pathspec git restores the named paths through `checkout-index`/`clean` instead,
-    // and `-S` reverses the staged patch with `apply -R`; neither logs anything.
-    if opts.pathspecs.is_empty() && !opts.staged_only && !opts.patch {
+    // and `-S` reverses the staged patch with `apply -R`. `-S` without `--keep-index` then
+    // runs `git reset -q --refresh --` (builtin/stash.c:1882-1893): with no pathspec
+    // that mixed reset takes the same `reset_refs()` and `remove_branch_state()` arms
+    // (builtin/reset.c:534-543), so it logs the same line and moves `ORIG_HEAD` too.
+    if opts.pathspecs.is_empty() && !opts.patch && (!opts.staged_only || !keep_index) {
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
             // A detached `HEAD` is a plain ref whose unchanged value the update skips, so it logs
@@ -1185,8 +1198,9 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             // still *moves*, overwriting whatever an earlier operation left
             // there, which is what a `git stash push` in a repository that has
             // stashed before is observed to do. `--keep-index` and `-u`/`-a`
-            // take the same branch of `do_push_stash()`; only a pathspec
-            // (`git apply -R`) or `-S` skips the reset, and neither writes it.
+            // take the same branch of `do_push_stash()`, and `-S` reaches the
+            // mixed reset that writes it as well; a pathspec (`git apply -R`) or
+            // `-S --keep-index` runs no ref-moving reset, and neither writes it.
             super::reset::set_orig_head(repo, id)?;
         }
         // …and ends in `remove_branch_state()` (builtin/reset.c:542-543). A
@@ -1988,6 +2002,11 @@ fn build_stash_commit(
     // entirely and `W` ends up identical to `I`. The unstaged work does not
     // disappear, though — the reset in `push` has to preserve it — so the tree
     // the worktree actually holds is built first and handed back.
+    //
+    // Nor does a pathspec narrow `-S`: `stash_staged()` diffs `HEAD` against the whole index
+    // (builtin/stash.c:1339-1365), so its "No staged changes" and the `apply -R` that
+    // follows cover every staged path, and only the closing `reset -- <pathspec>` is
+    // limited (builtin/stash.c:1882-1893) — `push` narrows that set itself.
     let worktree_tree = if opts.staged_only {
         let tree = tree_with_worktree_mods(scratch, i_tree_id, &wt_mods)?;
         wt_mods.clear();
@@ -1995,7 +2014,7 @@ fn build_stash_commit(
     } else {
         None
     };
-    if !opts.pathspecs.is_empty() {
+    if !opts.pathspecs.is_empty() && !opts.staged_only {
         let mut candidates: Vec<BString> = wt_mods.iter().map(|(p, _)| p.clone()).collect();
         candidates.extend(affected.iter().cloned());
         let keep = select_matching(repo, &opts.pathspecs, &candidates)?;
@@ -2361,47 +2380,66 @@ fn first_hunk_line(
         .map(|(before_start, _)| *before_start)
 }
 
-/// Whether `theirs` merges into `ours` over `base` without conflicts, reporting
-/// the blocked paths when it does not and the merged tree when it does.
+/// `apply_cached()` of `diff_tree_binary()`'s patch and the `write_index_as_tree(&index_tree, …)`
+/// after it (builtin/stash.c:426-453, :670-688), run as the same two children:
 ///
-/// The failure side is a question, not a step: git asks it with `git apply --cached
-/// --check`, which writes nothing. The tree merge that answers it here resolves content
-/// merges, and resolving one means writing the merged blob — so it runs against a
-/// memory-backed handle and a *refused* merge leaves the object database exactly as it
-/// was.
+/// ```c
+/// strvec_pushl(&cp.args, "diff-tree", "--binary", "--no-color", NULL);
+/// strvec_pushf(&cp.args, "%s^2^..%s^2", w_commit_hex, w_commit_hex);
+/// ...
+/// strvec_pushl(&cp.args, "apply", "--cached", NULL);
+/// ```
 ///
-/// A clean merge is the other half of `apply_cached()` (builtin/stash.c:441-453) and does
-/// write: `git apply --cached` stages the patched blobs and
-/// `write_index_as_tree(&index_tree, …)` (builtin/stash.c:686-688) records the tree. So the
-/// memory the merge filled is flushed to the real database before the tree id is handed
-/// back — the caller goes on to expand that tree into the index.
-fn merge_trees_cleanly(
+/// The decision is `git apply`'s own — a patch with three lines of context placed hunk by
+/// hunk, which refuses edits a three-way tree merge would combine and reports each path it
+/// could not place (`patch failed: <path>:<line>`, `already exists in index`) on its stderr.
+/// The `apply` child stages into a copy of the index at `$GIT_DIR/index.stash.<pid>` rather
+/// than the index itself: in C the `reset_head()` that follows reloads the index from `HEAD`
+/// anyway, and this port carries that index in process (the caller's `reset_head()` arm), so
+/// the child's index is only read back for the tree it records.
+///
+/// `Err` carries the `error()` line C returns with: `could not generate diff <w>^!.`,
+/// `conflicts in index. Try without --index.` or `could not save index tree`.
+fn apply_cached_index_tree(
     repo: &gix::Repository,
-    base: ObjectId,
-    ours: ObjectId,
-    theirs: ObjectId,
-) -> Result<std::result::Result<ObjectId, Vec<BString>>> {
-    let mut mem = repo.clone().with_object_memory();
-    let labels = gix::merge::blob::builtin_driver::text::Labels::default();
-    let merge = mem.merge_trees(base, ours, theirs, labels, mem.tree_merge_options()?)?;
-    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
-    let blocked: Vec<BString> = merge
-        .conflicts
-        .iter()
-        .filter(|c| c.is_unresolved(unresolved))
-        .map(|c| c.changes_in_resolution().0.location().to_owned())
-        .collect();
-    if !blocked.is_empty() {
-        return Ok(Err(blocked));
+    w_commit: ObjectId,
+) -> Result<std::result::Result<ObjectId, String>> {
+    // The range is handed over as its two ends: `setup_revisions()` turns `<w>^2^..<w>^2` into
+    // the same two pending trees, and this port's `diff-tree` does not parse a `..` operand.
+    let args: Vec<String> = vec![
+        "diff-tree".to_string(),
+        "--binary".to_string(),
+        "--no-color".to_string(),
+        format!("{w_commit}^2^"),
+        format!("{w_commit}^2"),
+    ];
+    let (ok, patch) = super::add_patch::run_git(&args, None, true, None)?;
+    if !ok {
+        return Ok(Err(format!("could not generate diff {w_commit}^!.")));
     }
-    let mut merge = merge;
-    let tree = merge.tree.write()?.detach();
-    let written = mem.objects.take_object_memory().expect("object memory was just enabled");
-    for (_id, (kind, data)) in written.iter() {
-        gix::objs::Write::write_buf(repo, *kind, data)
-            .map_err(|e| anyhow!("failed to write stash index-merge object: {e}"))?;
-    }
-    Ok(Ok(tree))
+    let index_file = repo.git_dir().join(format!("index.stash.{}", std::process::id()));
+    let result = (|| -> Result<std::result::Result<ObjectId, String>> {
+        std::fs::copy(repo.index_path(), &index_file)?;
+        let exe = crate::hosted::git_exe()?;
+        let mut child = std::process::Command::new(exe)
+            .args(["apply", "--cached"])
+            .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
+            .env("GIT_INDEX_FILE", &index_file)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin piped");
+            let _ = stdin.write_all(&patch);
+        }
+        if !child.wait()?.success() {
+            return Ok(Err("conflicts in index. Try without --index.".to_string()));
+        }
+        Ok(super::history::tree_of_index_file(repo, &index_file)
+            .ok_or_else(|| "could not save index tree".to_string()))
+    })();
+    let _ = std::fs::remove_file(&index_file);
+    result
 }
 
 /// `repo_refresh_and_write_index()` refusing an unmerged index, which is how a
@@ -2561,6 +2599,13 @@ fn child_stash_create(built: Result<StashBuild>, parent: &str) -> Result<StashBu
                 eprintln!("fatal: {}", crate::fatal::report_text(&fatal.0));
                 crate::git_fatal!("{parent}")
             }
+            // A child that failed after reporting its own lines — `do_create_stash()`'s
+            // `Cannot save the current worktree state` over an intent-to-add entry — exits
+            // nonzero too, and the caller dies all the same (sequencer.c:4751-4758,
+            // builtin/merge.c:365-366).
+            None if err.downcast_ref::<crate::fatal::Silent>().is_some() => {
+                crate::git_fatal!("{parent}")
+            }
             None => Err(err),
         },
         ok => ok,
@@ -2628,8 +2673,11 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<Option<ExitCo
     // `do_create_stash()`'s own `check_changes()` (builtin/stash.c:1540-1543), after the
     // refresh: a stat-only change is gone now, and nothing to stash is `ret = 1`, exit 1
     // with nothing printed. A missing index file reads as an empty one, which differs from
-    // a non-empty `HEAD` tree by every one of its entries.
-    let dirty = match repo.is_dirty() {
+    // a non-empty `HEAD` tree by every one of its entries. It is the same
+    // `check_changes_tracked_files()` again (builtin/stash.c:1241-1280), under
+    // `ignore_submodules`, so a submodule at another commit or with untracked files in it
+    // is no change to stash.
+    let dirty = match tracked_changes_match(repo, &[]) {
         Ok(dirty) => dirty,
         Err(_) if !repo.index_path().exists() => {
             !repo.index_from_tree(&repo.head_tree_id()?.detach())?.entries().is_empty()
@@ -3964,11 +4012,7 @@ fn restore_stash_commit(
     // `--index` replays the stash's staged state onto the current index first
     // (`apply_cached()` of the `w_commit^!` diff), and a patch that does not
     // apply ends the whole command right there — before the worktree merge, so a
-    // refusal leaves everything as it was. The equivalent test is whether the
-    // stash's index tree merges into ours over the stash's base without
-    // conflicts. The patch git-apply could not place is named the same way as
-    // for `-S`: the diff here is the stash's own (`w_commit^!`), so its hunks
-    // are the ones that failed.
+    // refusal leaves everything as it was. See [`apply_cached_index_tree`].
     let has_index = restore_index && i_tree != base_tree && i_tree != c_tree;
     // `write_index_as_tree(&index_tree, …)` (builtin/stash.c:686-688) — the tree of the
     // index *after* `apply_cached()` put the stash's staged patch on top of it, which is
@@ -3983,17 +4027,11 @@ fn restore_stash_commit(
     // `reset_head()` note below. The paths come back space-joined in one `%s`.
     let mut unclean: Option<Vec<BString>> = None;
     if has_index {
-        match merge_trees_cleanly(repo, base_tree, c_tree, i_tree)? {
-            Ok(merged) => index_tree = merged,
-            Err(blocked) => {
-            for path in blocked {
-                if let Some(line) = first_hunk_line(repo, base_tree, i_tree, &path) {
-                    eprintln!("error: patch failed: {path}:{line}");
-                }
-                eprintln!("error: {path}: patch does not apply");
-            }
-            eprintln!("error: conflicts in index. Try without --index.");
-            return Ok(Err(failed()));
+        match apply_cached_index_tree(repo, commit_id)? {
+            Ok(applied) => index_tree = applied,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return Ok(Err(failed()));
             }
         }
         // The `--index` arm ends on `reset_head()`, which is
@@ -4291,6 +4329,16 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
         }
         crate::git_fatal!("Cannot autostash");
     }
+    // The child's `do_create_stash()` refreshes and writes the index before it builds
+    // anything (builtin/stash.c:1523-1528), so the index the reset below starts from carries
+    // fresh stat data; without it a worktree whose stat moved (a copy, a touch) came out of
+    // `checkout -m` listing every such file as modified.
+    if !repo.index_or_empty()?.entries().iter().any(|e| e.stage_raw() != 0) {
+        refresh_and_write_index(repo)?;
+    }
+    if let Some(mut index) = crate::held_index::take() {
+        let _ = super::write_tree::refresh_cache_tree(repo, &mut index, false)?;
+    }
     let StashBuild { w_commit, head_tree_id, affected, .. } = child_stash_create(
         build_stash_commit(repo, repo, Some(message), &PushOpts::with_message(None)),
         "Cannot autostash",
@@ -4312,6 +4360,11 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
         &fresh,
         CacheTree::LikeMixedReset { touched: HashSet::new() },
     )?;
+    // `reset_head()` leaves its result as the in-core index (reset.c), so whatever an earlier
+    // refresh was holding — `checkout -m`'s first `merge_working_tree()`, which still lists the
+    // staged paths just stashed — is stale now; the second `merge_working_tree()`
+    // (builtin/checkout.c:1226-1227) starts from this index.
+    crate::held_index::discard();
     Ok(w_commit.expect("autostash never takes the --patch branch"))
 }
 

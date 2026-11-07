@@ -2028,7 +2028,7 @@ fn reset_two_tree(
         match act {
             Act::Keep => {}
             Act::Delete => {
-                if conflicted || worktree_uptodate(repo, BStr::new(path), i.map(|(m, _)| *m), i.map(|(_, o)| *o)) {
+                if conflicted || worktree_uptodate(repo, old, BStr::new(path), i.map(|(m, _)| *m), i.map(|(_, o)| *o)) {
                     deletes.push((path.clone(), i.map(|(m, _)| *m)));
                 } else {
                     conflicts.insert((path.clone(), Refusal::NotUptodate));
@@ -2048,7 +2048,7 @@ fn reset_two_tree(
                 // 'squat.txt' would be overwritten by merge.`
                 let (clean, refusal) = match i {
                     Some((_, io)) => (
-                        worktree_uptodate(repo, BStr::new(path), i.map(|(m, _)| *m), Some(*io)),
+                        worktree_uptodate(repo, old, BStr::new(path), i.map(|(m, _)| *m), Some(*io)),
                         Refusal::NotUptodate,
                     ),
                     None => (
@@ -2077,7 +2077,14 @@ fn reset_two_tree(
     // first refused entry with `error()` and the traversal stops there
     // (unpack-trees.c:249-251); the caller (`reset_index`) prints the `fatal:` line and
     // exits 128. Nothing is written and HEAD is not moved.
-    if let Some((path, refusal)) = conflicts.iter().next() {
+    //
+    // "First" is in `unpack_trees()`'s visiting order, not path order: `unpack_callback()`
+    // takes an index entry through `find_cache_entry()` only when the tree walk reaches its
+    // name, so a path none of the walked trees has is left over and handled by the
+    // "Any left-over entries in the index?" loop after the walk (unpack-trees.c:2000-2012).
+    // A stale `.gitmodules` the target drops is therefore named after a stale `a` it keeps.
+    let walked = |path: &BString| target.contains_key(path) || head.contains_key(path);
+    if let Some((path, refusal)) = conflicts.iter().min_by_key(|(path, _)| (!walked(path), path.clone())) {
         eprintln!("error: {}", refusal.message(BStr::new(path)));
         return Ok(None);
     }
@@ -2239,6 +2246,7 @@ fn index_entry_map(index: &gix::index::File) -> HashMap<BString, (Mode, ObjectId
 /// gitlink and merely warns `unable to rmdir 'sub': Directory not empty`.
 fn worktree_uptodate(
     repo: &gix::Repository,
+    old: &gix::index::File,
     path: &BStr,
     mode: Option<Mode>,
     index_oid: Option<ObjectId>,
@@ -2262,7 +2270,20 @@ fn worktree_uptodate(
             None => true,
         };
     }
-    blob_oid(repo, &full, &meta) == Some(oid)
+    // `ie_match_stat(o->src_index, ce, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE)`
+    // (unpack-trees.c:2243-2256): nothing refreshed the index `repo_read_index_unmerged()`
+    // read, so a file whose stat data moved is "not uptodate" even when its bytes are still
+    // the entry's, and only a racily clean one is hashed. The two flags send an
+    // assume-unchanged or skip-worktree entry through the same stat comparison, which
+    // `probe()` does not short-circuit.
+    let backing = old.path_backing();
+    let Some(entry) = old.entries().iter().find(|e| e.stage_raw() == 0 && e.path_in(backing) == path) else {
+        return blob_oid(repo, &full, &meta) == Some(oid);
+    };
+    match super::read_tree::StatCtx::new(repo, old) {
+        Ok(stat) => !matches!(stat.probe(repo, entry, path), super::read_tree::Probe::Changed),
+        Err(_) => blob_oid(repo, &full, &meta) == Some(oid),
+    }
 }
 
 /// `verify_absent()` for a path the index does not track: whether it is safe to

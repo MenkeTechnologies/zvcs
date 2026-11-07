@@ -545,11 +545,9 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    // `cmd_switch` checks its own arguments and then hands over to `checkout_branch()`, whose
-    // first act is `die_if_some_operation_in_progress()` — `switch` clears
-    // `can_switch_when_in_progress`, so an unfinished merge, am, rebase, cherry-pick or revert
-    // stops every form of it here, before the worktree is looked at (builtin/checkout.c:1721).
-    // A bisect only earns a warning.
+    // `switch` clears `can_switch_when_in_progress`, so `checkout_branch()` stops every form of it
+    // at `die_if_some_operation_in_progress()` — after the argument checks, which each mode
+    // makes first; see [`operation_gate`].
     let plain_form = p.orphan.is_none()
         && p.create.is_none()
         && p.force_create.is_none()
@@ -557,16 +555,6 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
         && !p.detach;
     if plain_form && p.positionals.is_empty() {
         return fatal("missing branch or commit argument");
-    }
-    match super::status::switch_blocked_by_operation(&repo) {
-        Some(super::status::SwitchBlocker::Die(message)) => {
-            eprintln!("fatal: {message}");
-            return Ok(ExitCode::from(128));
-        }
-        Some(super::status::SwitchBlocker::WarnBisecting) => {
-            eprintln!("warning: you are switching branch while bisecting");
-        }
-        None => {}
     }
 
     // `opts->show_progress`: the flag when given, else `!quiet && isatty(2)`
@@ -620,6 +608,25 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
         merge_style, p.ignore_other_worktrees)
 }
 
+
+/// `die_if_some_operation_in_progress()` (builtin/checkout.c:1743-1744), which `checkout_branch()`
+/// reaches only after `parse_branchname_arg()` (`invalid reference`, `only one reference
+/// expected`), the new branch's name checks (`a branch named '<b>' already exists`) and
+/// `die_expecting_a_branch()` have had their say: an unfinished merge, am, rebase, cherry-pick or
+/// revert stops the switch here, before the worktree is looked at. A bisect only earns a warning.
+fn operation_gate(repo: &gix::Repository) -> Option<ExitCode> {
+    match super::status::switch_blocked_by_operation(repo) {
+        Some(super::status::SwitchBlocker::Die(message)) => {
+            eprintln!("fatal: {message}");
+            Some(ExitCode::from(128))
+        }
+        Some(super::status::SwitchBlocker::WarnBisecting) => {
+            eprintln!("warning: you are switching branch while bisecting");
+            None
+        }
+        None => None,
+    }
+}
 
 /// `git switch <branch>` — attach `HEAD` to an existing local branch, with DWIM
 /// (`--guess`) fallback to a remote-tracking branch.
@@ -675,12 +682,18 @@ fn switch_existing(
     // `Switched to` wordings (builtin/checkout.c:1017-1032). So a no-op
     // `git switch <current>` appends `checkout: moving from <b> to <b>` to
     // `logs/HEAD` every time, exactly as `git checkout <current>` does.
-    if repo.head_name()?.as_ref().map(|n| n.as_bstr())
-        == FullName::try_from(full.as_str())
-            .ok()
-            .as_ref()
-            .map(|n| n.as_bstr())
+    //
+    // `!strcmp(old_branch_info->path, new_branch_info->path)` (builtin/checkout.c:1022)
+    // compares two branch paths, so a detached `HEAD` (no `old_branch_info->path`) is never
+    // "already on" anything: `git switch HEAD~1` there is `a branch is expected`.
+    let head_name = repo.head_name()?;
+    if head_name.is_some()
+        && head_name.as_ref().map(|n| n.as_bstr())
+            == FullName::try_from(full.as_str()).ok().as_ref().map(|n| n.as_bstr())
     {
+        if let Some(code) = operation_gate(repo) {
+            return Ok(code);
+        }
         if let Some(code) = unmerged_gate(repo, force)? {
             return Ok(code);
         }
@@ -744,6 +757,16 @@ fn switch_existing(
 
     // Not a local branch: DWIM to a remote-tracking branch, else classify.
     if repo.try_find_reference(full.as_str())?.is_none() {
+        // `parse_branchname_arg()` resolves and DWIMs the `@{-N}` spelling itself
+        // (builtin/checkout.c:1495-1531): a previous branch since deleted is
+        // `invalid reference: @{-1}`, and no remote-tracking branch is guessed for it.
+        if raw == "-" || raw.starts_with("@{-") {
+            let spelled = if raw == "-" { "@{-1}" } else { raw };
+            if super::branch::get_oid_mb(repo, spelled).is_none() {
+                return fatal(format!("invalid reference: {spelled}"));
+            }
+            return branch_expected(repo, branch);
+        }
         if guess {
             match unique_remote_branch(repo, branch)? {
                 Dwim::One(remote_short) => {
@@ -768,6 +791,9 @@ fn switch_existing(
         return branch_expected(repo, branch);
     }
 
+    if let Some(code) = operation_gate(repo) {
+        return Ok(code);
+    }
     // `die_if_checked_out(new_branch_info->path, 1)`: a branch belongs to one
     // worktree at a time. Reached only for a branch that exists locally — the
     // DWIM arm above creates a new one, which nobody can have checked out.
@@ -918,6 +944,9 @@ fn switch_create(
     let existed = repo.try_find_reference(full.as_str())?.is_some();
     if existed && !reset {
         return fatal(format!("a branch named '{branch}' already exists"));
+    }
+    if let Some(code) = operation_gate(repo) {
+        return Ok(code);
     }
 
     // Unborn HEAD with no start-point: point HEAD at the new branch; the ref
@@ -1154,6 +1183,9 @@ fn switch_detach(
             }
         }
     };
+    if let Some(code) = operation_gate(repo) {
+        return Ok(code);
+    }
     let target_tree = repo
         .find_object(target_id)?
         .peel_to_commit()?
@@ -1283,6 +1315,9 @@ fn switch_orphan(
     if repo.try_find_reference(full.as_str())?.is_some() {
         return fatal(format!("a branch named '{branch}' already exists"));
     }
+    if let Some(code) = operation_gate(repo) {
+        return Ok(code);
+    }
 
     if let Some(code) = unmerged_gate(repo, force)? {
         return Ok(code);
@@ -1300,7 +1335,13 @@ fn switch_orphan(
                 return Ok(code);
             }
         }
-        clear_tracked_worktree(repo, &old)?;
+        // Without `-f` this is `merge_working_tree()`'s `twoway_merge()` from `HEAD`'s tree to
+        // the empty one (builtin/checkout.c:842-851): an entry `HEAD` does not have is in
+        // neither tree and is kept, staged file and all, so `git switch --orphan` on an unborn
+        // branch or over a staged new file leaves it in place. `-f` is `reset_tree()`'s
+        // `oneway_merge()`, which drops every entry.
+        let head = if force { None } else { head_tree(repo)? };
+        clear_tracked_worktree(repo, &old, force, head)?;
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -1545,35 +1586,16 @@ fn attach_head(
     Ok(())
 }
 
-/// Point `HEAD` directly at object `id` (detached).
-/// Detach `HEAD` at `id`, logging the move.
-///
-/// `from` is what `HEAD` resolved to beforehand: the vendored `gix-ref` leaves the
-/// old field of a `deref: false` update null when the previous value was a symref,
-/// so the line is repaired afterwards by [`super::checkout::record_head_move`].
+/// Detach `HEAD` at `id`, logging the move — `checkout`'s own writer, so a `HEAD`
+/// already detached at `id` is neither rewritten nor logged (refs/files-backend.c:2857-2866):
+/// a bare `git switch --detach` on a detached `HEAD` leaves `logs/HEAD` alone.
 fn set_head_detached(
     repo: &gix::Repository,
     id: ObjectId,
     message: &str,
     from: Option<ObjectId>,
 ) -> Result<()> {
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: message.into(),
-            },
-            expected: PreviousValue::Any,
-            new: Target::Object(id),
-        },
-        name: "HEAD"
-            .try_into()
-            .map_err(|e| anyhow!("invalid ref name HEAD: {e}"))?,
-        deref: false,
-    })?;
-    super::checkout::record_head_move(repo, from, Some(id), message);
-    Ok(())
+    super::checkout::set_head_detached(repo, id, message, from)
 }
 
 /// Human description of where `HEAD` currently is, for the reflog `from` field.
@@ -1607,33 +1629,37 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
     Ok((abbrev, summary))
 }
 
-/// Remove every tracked file from the worktree (pruning emptied parent dirs) and
-/// write an empty index — the state a `--orphan` switch leaves behind.
-fn clear_tracked_worktree(repo: &gix::Repository, old: &gix::index::File) -> Result<()> {
+/// Remove the tracked files a `--orphan` switch drops from the worktree (pruning emptied
+/// parent dirs) and from the index: every entry under `force`, else only those `head_tree` has.
+fn clear_tracked_worktree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    force: bool,
+    head_tree: Option<ObjectId>,
+) -> Result<()> {
+    let in_head: std::collections::HashSet<gix::bstr::BString> = match head_tree {
+        Some(tree) if !force => {
+            let index = repo.index_from_tree(&tree)?;
+            let backing = index.path_backing();
+            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        }
+        _ => Default::default(),
+    };
+    let dropped = |path: &gix::bstr::BStr| force || in_head.contains(path);
     // The refresh behind the clean-gate holds the pre-clear index; this step supersedes it, and
     // the final flush must not write it back over the emptied one.
     let _ = crate::held_index::take();
-    let workdir = repo.workdir().map(|p| p.to_owned());
     {
         let backing = old.path_backing();
         for e in old.entries() {
             let path = e.path_in(backing);
-            if let Some(full) = repo.workdir_path(path) {
-                let _ = std::fs::remove_file(&full);
-                if let Some(wd) = &workdir {
-                    let mut dir = full.parent().map(|p| p.to_owned());
-                    while let Some(d) = dir {
-                        if d.as_path() == wd.as_path() || std::fs::remove_dir(&d).is_err() {
-                            break;
-                        }
-                        dir = d.parent().map(|p| p.to_owned());
-                    }
-                }
+            if dropped(path) {
+                super::checkout::unlink_entry(repo, path, Some(e.mode));
             }
         }
     }
     let mut idx = repo.index_or_load_from_head()?.into_owned();
-    idx.remove_entries(|_, _, _| true);
+    idx.remove_entries(|_, path, _| dropped(path));
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::rebuild_cache_tree(repo, &mut idx);

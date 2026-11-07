@@ -589,8 +589,15 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     if let Some(first) = pre.first() {
         prev_branch_expansion = expand_prev_branch(&repo, first);
     }
+    //
+    // The same holds for an `@{-N}` that names a branch since deleted: the
+    // `repo_get_oid_mb()` of `@{-1}` fails (builtin/checkout.c:1495-1498), the
+    // `--guess` DWIM is asked about `@{-1}` itself, and the pathspec error quotes
+    // `argv[0]` — `-` or `@{-1}`, never the name it expanded to.
     if let Some(name) = prev_branch_expansion.as_deref() {
-        pre[0] = name;
+        if super::branch::get_oid_mb(&repo, name).is_some() {
+            pre[0] = name;
+        }
     }
     // `if (conflict_style) { opts->merge = 1; git_xmerge_config(…); }`, run after
     // the whole command line has been parsed — which is why a `--no-conflict`
@@ -4009,12 +4016,7 @@ pub(super) fn update_worktree_to_tree(
         .filter(|p| !new_flat.contains_key(*p) && !skipped_before.contains(*p))
     {
         updating.tick();
-        if let Some(full) = repo.workdir_path(path.as_bstr()) {
-            let _ = std::fs::remove_file(&full);
-            if let Some(workdir) = repo.workdir() {
-                crate::worktree::prune_empty_dirs(workdir, &full);
-            }
-        }
+        unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
     }
 
     // `merged_entry()`: the touched paths the new tree has are written out.
@@ -4178,13 +4180,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             let path = e.path_in(backing);
             if !new_paths.contains(&path.to_owned()) {
                 updating.tick();
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(&full);
-                    // `unlink_entry()`'s `schedule_dir_for_removal()`.
-                    if let Some(workdir) = repo.workdir() {
-                        crate::worktree::prune_empty_dirs(workdir, &full);
-                    }
-                }
+                unlink_entry(repo, path, Some(e.mode));
             }
         }
     }
@@ -4357,15 +4353,35 @@ pub(super) fn checkout_interleaved(
         let end = next_write + writes[next_write..].partition_point(|w| w < path);
         write_batch(&writes[next_write..end], &mut fresh)?;
         next_write = end;
-        if let Some(full) = repo.workdir_path(BStr::new(path)) {
-            let _ = std::fs::remove_file(&full);
-            if let Some(workdir) = repo.workdir() {
-                crate::worktree::prune_empty_dirs(workdir, &full);
-            }
-        }
+        unlink_entry(repo, BStr::new(path), attr_source.entry_by_path(BStr::new(path)).map(|e| e.mode));
     }
     write_batch(&writes[next_write..], &mut fresh)?;
     Ok(fresh)
+}
+
+/// `unlink_entry()`'s removal (entry.c:200-203, unpack-trees.c:350-374): `remove_or_warn()`
+/// rmdirs a gitlink and unlinks anything else, `warn_if_unremovable()` (wrapper.c:518-527)
+/// reports a failure other than `ENOENT`, and only a removal that worked goes on to
+/// `schedule_dir_for_removal()`. A submodule directory that still holds its checkout is
+/// therefore `warning: unable to rmdir '<path>': Directory not empty` and stays.
+pub(super) fn unlink_entry(repo: &gix::Repository, path: &BStr, mode: Option<Mode>) {
+    let Some(full) = repo.workdir_path(path) else {
+        return;
+    };
+    let (op, removed) = if mode == Some(Mode::COMMIT) {
+        ("rmdir", std::fs::remove_dir(&full))
+    } else {
+        ("unlink", std::fs::remove_file(&full))
+    };
+    if let Err(err) = removed {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("warning: unable to {op} '{path}': {}", crate::external::strerror(&err));
+            return;
+        }
+    }
+    if let Some(workdir) = repo.workdir() {
+        crate::worktree::prune_empty_dirs(workdir, &full);
+    }
 }
 
 /// Set `HEAD` to point symbolically at `branch` (attached), logging the move.
@@ -4567,7 +4583,7 @@ fn reftable_head_log(repo: &gix::Repository, from: Option<ObjectId>, to: Option<
 /// `git bisect` is where it is load-bearing — `bisect_replay` runs
 /// `bisect_auto_next()` once for its `start` line and once more at the end, so
 /// the same commit is checked out twice in a row.
-fn set_head_detached(
+pub(super) fn set_head_detached(
     repo: &gix::Repository,
     id: ObjectId,
     message: &str,

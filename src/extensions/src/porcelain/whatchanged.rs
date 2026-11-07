@@ -693,7 +693,9 @@ fn args_without_opt_in(args: &[String]) -> Vec<String> {
         if after_dashdash || a != "--i-still-use-this" {
             out.push(a.clone());
         }
-        if a == "--" {
+        // parse_options_step() stops at `--end-of-options` as at `--`
+        // (parse-options.c:1119-1124), so a later `--i-still-use-this` is a revision.
+        if a == "--" || a == "--end-of-options" {
             after_dashdash = true;
         }
     }
@@ -746,7 +748,9 @@ fn extract_log_options(args: &[String]) -> Result<Phase1, Fatal> {
             out.rest.push(a.clone());
             continue;
         }
-        if a == "--" {
+        // parse_options_step() also stops at `--end-of-options`, keeping it for
+        // setup_revisions() under PARSE_OPT_KEEP_UNKNOWN_OPT (parse-options.c:1119-1124).
+        if a == "--" || a == "--end-of-options" {
             seen_dashdash = true;
             out.rest.push(a.clone());
             continue;
@@ -797,6 +801,7 @@ fn parse_args(
     }
     let mut unrecognized: Option<String> = None;
     let mut seen_dashdash = false;
+    let mut seen_end_of_options = false;
     // The revision operands this pass has accepted, for [`warn_up_to`].
     let mut accepted: Vec<&str> = Vec::new();
 
@@ -827,18 +832,25 @@ fn parse_args(
             i += 1;
             continue;
         }
+        // `if (!seen_end_of_options && *arg == '-')` (revision.c:3077, :3100-3103):
+        // past `--end-of-options` every word is handed to handle_revision_arg().
+        if !seen_end_of_options && a == "--end-of-options" {
+            seen_end_of_options = true;
+            i += 1;
+            continue;
+        }
         // parse_options_step()'s `internal_help`. `git whatchanged` is
         // `builtin/log.c`, so the block is `git log`'s — stdout, 0.
-        if a == "-h" {
+        if !seen_end_of_options && a == "-h" {
             return Err(Fatal::help(super::log::USAGE));
         }
         // `--help-all` renders `USAGE_FULL`: the same block with the hidden
         // `--i-still-use-this` left in.
-        if a == "--help-all" {
+        if !seen_end_of_options && a == "--help-all" {
             return Err(Fatal::help(super::log::USAGE_ALL));
         }
 
-        if a.starts_with('-') && a.len() > 1 {
+        if !seen_end_of_options && a.starts_with('-') && a.len() > 1 {
             i += consume_option(repo, args, i, &mut p, &mut st, &mut unrecognized)?;
             continue;
         }

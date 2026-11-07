@@ -115,6 +115,8 @@ impl Twin {
 
 fn env<'a>(cmd: &'a mut Command, root: &Path) -> &'a mut Command {
     cmd.env("HOME", root)
+        // The fixture's `notes add --allow-empty` has no `-m`, so stock opens the editor.
+        .env("GIT_EDITOR", "true")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "A U Thor")

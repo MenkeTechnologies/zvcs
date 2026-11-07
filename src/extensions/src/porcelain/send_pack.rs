@@ -43,10 +43,6 @@
 //!     its own connection from the remote's URL and cannot be handed a pair of
 //!     streams, so an advertisement that really arrives is refused rather than
 //!     silently redirected to `<directory>`.
-//!   * **`--thin` and `--progress`.** Both describe how the sender builds and
-//!     narrates its pack, not what the receiver is asked to do. The pack this
-//!     sends is never thin and reports no progress, which is a valid choice for
-//!     either flag's value, so neither changes the bytes on the wire.
 //!   * **`--force-with-lease=<ref>:<expect>`** resolves `<expect>` through
 //!     gitoxide's `rev_parse_single` rather than git's `repo_get_oid`; the two
 //!     accept the same everyday spellings but are not proven byte-identical on
@@ -164,6 +160,9 @@ struct State {
     /// on stderr — `send_pack()`'s `args.progress`, which reaches `pack-objects`
     /// and is what makes it print its `Total …` summary.
     progress: Option<bool>,
+    /// `--thin`: `args.use_thin_pack` (builtin/send-pack.c:176, :202, :235), off
+    /// unless given.
+    thin: bool,
     /// `--stdin`: read the refspec list from stdin instead of argv.
     from_stdin: bool,
     /// `--stateless-rpc`: the smart-HTTP framing. `cmd_send_pack` skips
@@ -384,6 +383,7 @@ fn push(st: &State) -> Result<ExitCode> {
             use std::io::IsTerminal;
             std::io::stderr().is_terminal()
         }),
+        thin: st.thin,
         // `git send-pack` talks to `git_connect()` itself, so no transport helper is handed a verbosity.
         verbosity: 0,
         // `cmd_send_pack()` never sets `args.negotiation_include` or `args.negotiation_restrict`
@@ -1081,12 +1081,8 @@ fn resolve_rev(spec: &str) -> bool {
 /// and `value` is whatever the option consumed (always `None` for a boolean and
 /// for a negation, which parse-options never lets carry one).
 ///
-/// `--thin` and `--stateless-rpc` are accepted and dropped: the first only
-/// changes how the pack is produced (this one is never thin, and that is the
-/// sender's choice, not the receiver's), and the second is the smart-HTTP
-/// framing, which has no local destination. `--progress` is recorded: it is
-/// `args.progress`, which `send_pack()` hands to `pack-objects` and which makes
-/// the pack summary line appear.
+/// `--thin` and `--progress` are recorded: they are `args.use_thin_pack` and
+/// `args.progress`, which `send_pack()` hands to `pack-objects`.
 fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
     match long {
         "all" => st.send_all = on,
@@ -1097,6 +1093,7 @@ fn set_long(long: &str, on: bool, value: Option<&str>, st: &mut State) {
         "quiet" => st.verbose = st.verbose && !on,
         "atomic" => st.atomic = on,
         "progress" => st.progress = Some(on),
+        "thin" => st.thin = on,
         "stdin" => st.from_stdin = on,
         "stateless-rpc" => st.stateless_rpc = on,
         "helper-status" => st.helper_status = on,

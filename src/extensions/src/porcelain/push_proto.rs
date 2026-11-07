@@ -30,8 +30,9 @@
 //! have run. Push certificates (`--signed`), `--atomic` and `push-options` ARE
 //! negotiated here, each refused when the server does not advertise the
 //! capability rather than silently downgraded. Not ported: shallow grafts. The
-//! pack is complete but undeltified (see [`super::pack_objects`]); a non-thin
-//! pack is valid for receive-pack, `--thin` is only a size optimization.
+//! pack is what `pack-objects --revs --stdout` writes for it (send-pack.c:61-115),
+//! thin unless `--no-thin` or a `no-thin` server says otherwise, with offset
+//! deltas when the server advertised `ofs-delta`.
 //!
 //! # Configuration
 //!
@@ -306,6 +307,12 @@ pub struct SendOptions {
     /// `pack-objects` child as `--progress` and which is what makes that child
     /// print its `Total …` summary.
     pub progress: bool,
+    /// `args->use_thin_pack`: `push`'s `--[no-]thin` (default on, builtin/push.c:59,
+    /// :380), `send-pack --thin` (default off, builtin/send-pack.c:176), and always
+    /// on through a remote helper, whose `push_git()` passes `--thin` from
+    /// `options.thin = 1` (remote-curl.c:1375-1376, :1573) and which never takes
+    /// `TRANS_OPT_THIN` from the transport (transport-helper.c:275-280).
+    pub thin: bool,
     /// The `-v`/`-q` count, which `transport_set_verbosity()` hands the transport (builtin/push.c:374).
     pub verbosity: i32,
     /// `args->negotiation_include`: `remote.<name>.negotiationInclude`, which
@@ -1468,37 +1475,13 @@ pub fn send_pack(
         // before the old tips (`pack_objects()`, send-pack.c:86-96).
         haves.extend(commons.iter().copied());
         haves.extend(wire.iter().map(|w| w.old).filter(|o| *o != null));
-        let objects = objects_to_send(repo, &wants, &haves);
-        let bytes = super::pack_objects::pack_bytes_for(repo, &objects)?;
-        // ```c
-        // if (progress)
-        //         fprintf_ln(stderr,
-        //                    _("Total %"PRIu32" (delta %"PRIu32"),"
-        //                      " reused %"PRIu32" (delta %"PRIu32"),"
-        //                      " pack-reused %"PRIu32" (from %"PRIuMAX")"),
-        //                    written, written_delta, reused, reused_delta,
-        //                    reuse_packfile_objects, reuse_packfiles_used_nr);
-        // ```
-        //
-        // (`cmd_pack_objects()`, builtin/pack-objects.c:4507-4513; the trailing
-        // `(from %ju)` is git 2.55's spelling of the field — `git 2.55.0 --progress`
-        // prints `pack-reused 0 (from 0)`.) `send_pack()` runs `pack-objects` with
-        // `--progress` whenever the transport is progressing, so the line belongs
-        // to the push, not to the pack writer's own logging.
-        //
-        // Four of the six counters are structurally zero here: this pack is
-        // written complete and undeltified from the object list above (see the
-        // module header), so nothing is delta-encoded (`written_delta`), nothing
-        // is copied out of an existing pack (`reused`, `reused_delta`), and no
-        // whole packfile range is reused (`reuse_packfile_objects`). `written` is
-        // the object list's length.
-        if opts.progress {
-            eprintln!(
-                "Total {} (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)",
-                objects.len()
-            );
-        }
-        bytes
+        // `pack_objects()` (send-pack.c:61-115): `--thin` from `args->use_thin_pack`,
+        // which a server advertising `no-thin` clears (:548-549), `--delta-base-offset`
+        // when the server advertised `ofs-delta` (:538-539), and `--all-progress`
+        // under `args->progress` (:74-75, odb/source-files.c:847-849), which draws
+        // every meter and the closing `Total …` line on stderr.
+        let thin = opts.thin && !caps.contains("no-thin");
+        super::pack_objects::pack_for_push(repo, &wants, &haves, thin, caps.contains("ofs-delta"), opts.progress)?
     } else {
         Vec::new()
     };
@@ -2710,14 +2693,36 @@ fn reachable_objects(repo: &gix::Repository, tips: &[ObjectId]) -> HashSet<Objec
         return HashSet::new();
     }
 
-    // Walk the commit ancestry; fall back to the bare tips if the walk fails.
+    // `handle_commit()` (revision.c) peels an UNINTERESTING tag and marks what it
+    // names, one level at a time: a commit joins the ancestry walk, a tree or
+    // blob is marked itself. A tag tip handed to the walk as it stands named
+    // no commit, so the walk failed and the commit's whole history counted as
+    // missing from the remote — `pack-objects --revs` fed `--not <tag>` sent it.
+    let mut commits: Vec<ObjectId> = Vec::new();
     let mut roots: Vec<ObjectId> = Vec::new();
-    match repo.rev_walk(tips.iter().copied()).all() {
-        Ok(walk) => roots.extend(walk.filter_map(|info| info.ok().map(|info| info.id))),
-        Err(_) => roots.extend(tips.iter().copied()),
+    for &tip in &tips {
+        let mut id = tip;
+        for _ in 0..16 {
+            roots.push(id);
+            let Ok(object) = repo.find_object(id) else { break };
+            match object.kind {
+                gix::object::Kind::Tag => match object.into_tag().decode().map(|tag| tag.target()) {
+                    Ok(target) => id = target,
+                    Err(_) => break,
+                },
+                gix::object::Kind::Commit => {
+                    commits.push(id);
+                    break;
+                }
+                _ => break,
+            }
+        }
     }
-    // Include the tips themselves so a tag object (not a commit) is packed too.
-    roots.extend(tips.iter().copied());
+    // Walk the commit ancestry; fall back to the bare commits if the walk fails.
+    match repo.rev_walk(commits.iter().copied()).all() {
+        Ok(walk) => roots.extend(walk.filter_map(|info| info.ok().map(|info| info.id))),
+        Err(_) => roots.extend(commits.iter().copied()),
+    }
     expand_roots(repo, &roots)
 }
 

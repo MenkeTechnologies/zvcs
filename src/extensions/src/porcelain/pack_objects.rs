@@ -66,16 +66,16 @@
 //! preferred bases, so an entry may be an `OBJ_REF_DELTA` on an object the pack
 //! does not carry because the receiver reached it already. `bundle create` is
 //! the caller that does this, because `write_pack_data()` spawns
-//! `pack-objects --thin` unconditionally. This command's own `--thin` reaches
-//! only half of that. `--thin` is what makes git ask for edges at all
-//! (`cmd_pack_objects()` pushes `--objects-edge` under it and plain `--objects`
-//! otherwise, builtin/pack-objects.c:5233-5237), and it turns the *internal rev
-//! list* on in the same breath — which is reproduced, because that is what
-//! decides whether stdin is a list of revisions or a bare object list, and it is
-//! also what `--stdin-packs` and `--cruft` refuse to be combined with (:5312,
-//! :5316). What is not reproduced is the edge itself: [`collect_counts`] drops a
-//! `^rev` rather than walking to a boundary, so there is no edge to hand over
-//! and the pack comes out complete rather than thin.
+//! `pack-objects --thin` unconditionally, and `push`/`send-pack` do the same
+//! with `pack-objects --revs --thin --stdout` (odb/source-files.c:827-832).
+//! This command's own `--thin` is what makes git ask for edges at all
+//! (`cmd_pack_objects()` pushes `--objects-edge` under it, or
+//! `--objects-edge-aggressive` with `--shallow`, and plain `--objects`
+//! otherwise, builtin/pack-objects.c:5323-5329), and it turns the *internal rev
+//! list* on in the same breath — which decides whether stdin is a list of
+//! revisions or a bare object list, and is also what `--stdin-packs` and
+//! `--cruft` refuse to be combined with. [`walk_edges`] is
+//! `mark_edges_uninteresting()`'s report of the edge commits a `^rev` leaves.
 //!
 //! The pack's **entry order is the caller's**: [`write_pack`] writes `counts`
 //! in the order it arrives in, and git's own order is its revision walk's. Given
@@ -492,6 +492,9 @@ const STDIN_PACKS_MODES: [&str; 2] = ["", "follow"];
 struct State {
     stdout: bool,
     thin: bool,
+    /// `--shallow`: `cmd_pack_objects()` asks for `--objects-edge-aggressive`
+    /// rather than `--objects-edge` under `--thin` (builtin/pack-objects.c:5323-5327).
+    shallow: bool,
     cruft: bool,
     stdin_packs: bool,
     unpacked: bool,
@@ -979,7 +982,8 @@ fn execute(st: &State) -> Result<ExitCode> {
     let mut stdin = Vec::new();
     std::io::stdin().read_to_end(&mut stdin).ok();
 
-    let counts = match collect_counts(&repo, st, &stdin) {
+    let mut edges: Vec<ObjectId> = Vec::new();
+    let counts = match collect_counts(&repo, st, &stdin, &mut edges) {
         Ok(counts) => counts,
         Err(message) => {
             // `vreportf()` appends its newline unconditionally, so a message
@@ -1006,7 +1010,11 @@ fn execute(st: &State) -> Result<ExitCode> {
     // (:5410); with no object shown `last_value` stays `-1` and the phase ends
     // without a line (progress.c:375-376).
     {
-        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", st.progress != 0);
+        // With edges the preferred bases join the count too, and they are known
+        // only once the pack writer has walked the boundary trees, so the meter
+        // is drawn there instead.
+        let mut enumerating =
+            crate::progress::Meter::unknown("Enumerating objects", st.progress != 0 && edges.is_empty());
         for _ in 0..counts.len() {
             enumerating.tick();
         }
@@ -1054,9 +1062,8 @@ fn execute(st: &State) -> Result<ExitCode> {
         let _ = std::fs::OpenOptions::new().create(true).write(true).open(tmp);
     }
 
-    // No boundary: `collect_counts()` drops a `^rev` rather than walking to it,
-    // so this command has no edge commits to hand over and `--thin` still steers
-    // nothing here. See the module header.
+    // `show_edge()`'s commits, which only `--thin` asks for: their trees become
+    // preferred bases, so a delta may name a base the pack does not carry.
     let packed = write_pack(
         &repo,
         &counts,
@@ -1067,7 +1074,8 @@ fn execute(st: &State) -> Result<ExitCode> {
         // `--stdout` only `--all-progress` (2) shows `Writing objects`.
         st.progress > 1,
         st.stdout,
-        &[],
+        &edges,
+        Some(counts.len()),
     )?;
 
     if st.stdout {
@@ -1339,6 +1347,48 @@ pub(crate) fn pack_for_upload(
     Ok(packed_for(repo, ids, options)?.bytes)
 }
 
+/// The pack `send_pack()` streams to receive-pack: what `pack_objects()`
+/// (send-pack.c:61-115) asks `odb_generate_pack()` for, which the files backend
+/// turns into `pack-objects --revs --stdout [--thin] [--delta-base-offset]
+/// [--all-progress | --quiet]` fed `<want>…`, `--not`, `<have>…` on stdin
+/// (odb/source-files.c:825-874).
+///
+/// `--revs` with an exclusion makes the object set everything the wants reach
+/// that the haves do not, and `--thin` adds the walk's edge commits as preferred
+/// bases ([`walk_edges`]), so a delta may name a base only the receiver holds.
+/// `--all-progress` is `progress = 2`, which `--stdout` does not silence: every
+/// meter `write_pack_file()` draws and the closing `Total …` line go to stderr.
+pub(crate) fn pack_for_push(
+    repo: &gix::Repository,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    thin: bool,
+    allow_ofs_delta: bool,
+    progress: bool,
+) -> Result<Vec<u8>> {
+    let objects = super::push_proto::objects_to_send(repo, wants, haves);
+    let edges = if thin { walk_edges(repo, wants, haves, false) } else { Vec::new() };
+    // `start_progress(_("Enumerating objects"), 0)` around `get_object_list()`
+    // (builtin/pack-objects.c:5386-5387, :5410). Under `--thin` the writer
+    // draws it, because the preferred bases it adds are counted as well.
+    if edges.is_empty() {
+        let mut enumerating = crate::progress::Meter::unknown("Enumerating objects", progress);
+        for _ in 0..objects.len() {
+            enumerating.tick();
+        }
+        enumerating.stop("done");
+    }
+    let options = WriteOptions {
+        allow_ofs_delta,
+        progress,
+        all_progress: progress,
+        to_stdout: true,
+        enumerated: Some(objects.len()),
+        ..WriteOptions::default()
+    };
+    Ok(packed_for_thin(repo, &objects, options, &edges)?.bytes)
+}
+
 /// What a caller outside this module can steer the pack writer with. Everything
 /// left unset comes from the repository's `pack.*` config, as it does for
 /// `pack-objects` itself.
@@ -1379,6 +1429,10 @@ pub(crate) struct WriteOptions {
     /// Stated in the negative so `Default` keeps git's default, which is to
     /// reuse.
     pub(crate) no_reuse_delta: bool,
+    /// How many objects the caller's walk showed, when the writer is to draw
+    /// `Enumerating objects` itself: a thin pack counts its preferred bases
+    /// there too, and only the writer knows them.
+    pub(crate) enumerated: Option<usize>,
 }
 
 /// Build the pack for `ids` and hand back its bytes together with the per-entry
@@ -1433,6 +1487,7 @@ pub(crate) fn packed_for_thin(
         options.all_progress,
         options.to_stdout,
         boundary,
+        options.enumerated,
     )
 }
 
@@ -1662,6 +1717,7 @@ fn write_pack(
     all_progress: bool,
     to_stdout: bool,
     boundary: &[ObjectId],
+    enumerated: Option<usize>,
 ) -> Result<Packed> {
     use crate::progress::Meter;
     use pack::data::output::delta;
@@ -1698,7 +1754,9 @@ fn write_pack(
     // write reaches it. Raising it here rather than at the write is a step
     // earlier than git; stdout is empty and the exit code 128 either way, since
     // git's pack bytes are still sitting in the hashfile buffer when it dies.
-    let mut counting = Meter::counted("Counting objects", counts.len(), progress);
+    // A thin pack adds its preferred bases to the list before `get_object_details()`
+    // counts it, so the meter waits for [`interleave_preferred_bases`] there.
+    let mut counting = Meter::counted("Counting objects", counts.len(), progress && boundary.is_empty());
     let mut objects: Vec<delta::Object> = Vec::with_capacity(counts.len());
     for count in counts {
         use gix::odb::HeaderExt;
@@ -1735,7 +1793,25 @@ fn write_pack(
     // entry and closes with `stop_progress()` (builtin/pack-objects.c:2627-2629),
     // which draws nothing for an empty list (progress.c:375-376).
     counting.stop("done");
-    interleave_preferred_bases(repo, boundary, delta.search.window, &mut objects);
+    let pbase_entries = interleave_preferred_bases(repo, boundary, delta.search.window, &mut objects);
+    if !boundary.is_empty() {
+        // `add_object_entry()` ticks `Enumerating objects` before `have_duplicate_entry()`
+        // (builtin/pack-objects.c:1875-1884), so each preferred base
+        // `add_pbase_object()` offers is counted, a repeat included; `Counting objects`
+        // is `to_pack.nr_objects`, the preferred bases among them (:2627-2629).
+        if let Some(shown) = enumerated {
+            let mut enumerating = Meter::unknown("Enumerating objects", progress);
+            for _ in 0..shown + pbase_entries {
+                enumerating.tick();
+            }
+            enumerating.stop("done");
+        }
+        let mut counting = Meter::counted("Counting objects", objects.len(), progress);
+        for _ in 0..objects.len() {
+            counting.tick();
+        }
+        counting.stop("done");
+    }
     assign_name_hashes(repo, &mut objects);
 
     // Phase 2: the delta search, steered by `pack.island` when asked. git
@@ -2106,10 +2182,17 @@ fn reused_delta_bases(
     let at: std::collections::HashMap<ObjectId, usize> = objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect();
     for (target, stored) in in_pack.iter().enumerate() {
         let Some(stored) = stored else { continue };
-        // `can_reuse_delta()`: the base has to be one we are sending, and islands
-        // must allow the pair. git's second arm — a base the receiver is known to
-        // have from a reachability bitmap — belongs to `--thin`, which this port
-        // does not produce.
+        // `if (reuse_delta && !entry->preferred_base)` guards both delta arms of
+        // `check_object()` (builtin/pack-objects.c:2304, :2336): a preferred base
+        // is never written, so its stored delta is not reused and it stays a
+        // whole candidate in the window the search slides over.
+        if objects[target].preferred_base {
+            continue;
+        }
+        // `can_reuse_delta()`: the base has to be in the packing list — sent, or a
+        // preferred base under `--thin` — and islands must allow the pair. git's
+        // second arm, a base a reachability bitmap says the receiver has
+        // (:2223-2230), needs the bitmap walk this port does not do.
         let Some(base) = stored.base_id.and_then(|id| at.get(&id).copied()) else { continue };
         if base == target || !islands.in_same_island(target, base) {
             continue;
@@ -2794,19 +2877,23 @@ fn deflate_into(data: &[u8], level: gix::zlib::Compression, out: &mut Vec<u8>) -
 /// gives a tag no path at all. A ref name matching a top-level entry of a
 /// boundary tree is the only case that would differ, and it differs only in
 /// which paths the `done_pbase_paths` memo has already consumed.
+///
+/// Returns how many preferred bases `add_pbase_object()` offered to
+/// `add_object_entry()`, repeats included: each one ticked `Enumerating objects`.
 fn interleave_preferred_bases(
     repo: &gix::Repository,
     boundary: &[ObjectId],
     window: usize,
     objects: &mut Vec<pack::data::output::delta::Object>,
-) {
+) -> usize {
     if boundary.is_empty() {
-        return;
+        return 0;
     }
     let mut bases = PreferredBases::new(repo, boundary, window);
     if bases.trees.is_empty() {
-        return;
+        return 0;
     }
+    let mut offered = 0usize;
 
     let ids: Vec<(ObjectId, gix::object::Kind)> = objects.iter().map(|o| (o.id, o.kind)).collect();
     let paths = traversal_paths(repo, &ids);
@@ -2830,6 +2917,7 @@ fn interleave_preferred_bases(
     for (object, path) in std::mem::take(objects).into_iter().zip(paths) {
         if let Some(path) = &path {
             for base in bases.for_name(repo, path) {
+                offered += 1;
                 let Ok(header) = gix::odb::HeaderExt::header(&repo.objects, base.id) else {
                     // `check_object()` records `OBJ_BAD` for a preferred base it
                     // cannot read and `prepare_pack()` skips it; nothing else
@@ -2852,6 +2940,7 @@ fn interleave_preferred_bases(
         push(&mut out, &mut position, object);
     }
     *objects = out;
+    offered
 }
 
 /// git's `pbase_tree` list: the boundary trees a thin pack is allowed to deltify
@@ -4668,6 +4757,7 @@ fn collect_counts(
     repo: &gix::Repository,
     st: &State,
     stdin: &[u8],
+    edges: &mut Vec<ObjectId>,
 ) -> Result<Vec<pack::data::output::Count>, String> {
     let mut ids: Vec<ObjectId> = if st.stdin_packs {
         // Here `--unpacked` *adds* the loose objects rather than restricting the
@@ -4696,7 +4786,7 @@ fn collect_counts(
         ids.retain(|id| !covered.contains(id));
         ids
     } else {
-        let mut ids = rev_list_objects(repo, st, stdin)?;
+        let mut ids = rev_list_objects(repo, st, stdin, edges)?;
         // Restricting to what no pack holds only makes sense for a set derived
         // from a reachability walk; the two branches above name their packs
         // outright.
@@ -4942,6 +5032,7 @@ fn rev_list_objects(
     repo: &gix::Repository,
     st: &State,
     stdin: &[u8],
+    edges: &mut Vec<ObjectId>,
 ) -> Result<Vec<ObjectId>, String> {
     // `revs->pending`, in the order git fills it. `cmd_pack_objects()` builds the
     // rev-list argv as `--all`, `--reflog`, `--indexed-objects`, then the stdin
@@ -5045,7 +5136,85 @@ fn rev_list_objects(
     // Everything `pending` reaches that `hidden` does not — the difference
     // `push` and `bundle create` pack as well.
     out.extend(super::push_proto::objects_to_send(repo, &pending, &hidden));
+    // `--thin` pushes `--objects-edge` (`--objects-edge-aggressive` under
+    // `--shallow`) onto the internal rev list (builtin/pack-objects.c:5323-5327),
+    // and `get_object_list()` runs `mark_edges_uninteresting(revs, show_edge,
+    // sparse)` before the traversal (:4975), whose `show_edge()` makes each
+    // edge commit a preferred base (:4494-4497). Without `--thin` the walk asks
+    // for no edge at all.
+    if st.thin && st.internal_rev_list_at_stdin() {
+        *edges = walk_edges(repo, &pending, &hidden, st.shallow);
+    }
     Ok(out)
+}
+
+/// The commits `mark_edges_uninteresting()` hands to `show_edge()`, in the order
+/// it hands them over.
+///
+/// ```c
+/// for (list = revs->commits; list; list = list->next) {
+///         struct commit *commit = list->item;
+///         if (commit->object.flags & UNINTERESTING) {
+///                 mark_tree_uninteresting(revs->repo, ...);
+///                 if (revs->edge_hint_aggressive && !(commit->object.flags & SHOWN)) {
+///                         commit->object.flags |= SHOWN;
+///                         show_edge(commit);
+///                 }
+///                 continue;
+///         }
+///         mark_edge_parents_uninteresting(commit, revs, show_edge);
+/// }
+/// ```
+///
+/// (list-objects.c:308-320; the `sparse` branch at :289-306 reaches the same
+/// parents in the same order through `add_edge_parents()`, :255-281.) The walk
+/// has a `^rev`, so `handle_commit()` set `revs->limited` and `limit_list()`
+/// left only the interesting commits in `revs->commits`: the first arm is dead
+/// and each edge is an UNINTERESTING parent of a commit the walk shows, taken
+/// in parent order and reported once (`SHOWN`). `mark_parents_uninteresting()`
+/// has painted the whole ancestry of every excluded commit, so "uninteresting"
+/// is that closure, not the excluded tips alone.
+///
+/// The aggressive pass (:323-336) adds every excluded command-line operand that
+/// is itself a commit; an annotated tag naming one contributes nothing.
+fn walk_edges(repo: &gix::Repository, pending: &[ObjectId], hidden: &[ObjectId], aggressive: bool) -> Vec<ObjectId> {
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    // `handle_commit()` peels an excluded tag and marks its commit, so the
+    // closure starts from the peeled ids.
+    let peeled: Vec<ObjectId> = hidden
+        .iter()
+        .filter_map(|id| repo.find_object(*id).ok()?.peel_to_commit().ok().map(|c| c.id))
+        .collect();
+    let Ok(uninteresting) = super::log::ancestor_closure(repo, &peeled) else {
+        return Vec::new();
+    };
+    let mut edges: Vec<ObjectId> = Vec::new();
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    for id in traversal_commits(repo, pending.to_vec()) {
+        if uninteresting.contains(&id) {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(id) else { continue };
+        for parent in commit.parent_ids() {
+            let parent = parent.detach();
+            if uninteresting.contains(&parent) && shown.insert(parent) {
+                edges.push(parent);
+            }
+        }
+    }
+    if aggressive {
+        for id in hidden {
+            let is_commit = repo
+                .find_object(*id)
+                .is_ok_and(|object| object.kind == gix::object::Kind::Commit);
+            if is_commit && shown.insert(*id) {
+                edges.push(*id);
+            }
+        }
+    }
+    edges
 }
 
 /// `list-objects.c::traverse_commit_list()`: the order git shows objects in, and
@@ -5870,6 +6039,7 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
     match long {
         "stdout" => st.stdout = on,
         "thin" => st.thin = on,
+        "shallow" => st.shallow = on,
         // git's `--cruft-expiration` callback sets the `cruft` flag itself, so
         // the expiration alone is enough to reach every `--cruft` diagnostic,
         // and `--no-cruft-expiration` clears it again.

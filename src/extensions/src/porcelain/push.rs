@@ -219,7 +219,9 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // port produces.
             "--progress" => f.progress = Some(true),
             "--no-progress" => f.progress = Some(false),
-            "--thin" | "--no-thin" | "-4" | "--ipv4" | "-6" | "--ipv6" => {}
+            "--thin" => f.no_thin = false,
+            "--no-thin" => f.no_thin = true,
+            "-4" | "--ipv4" | "-6" | "--ipv6" => {}
             // `--no-verify` sets `TRANSPORT_PUSH_NO_HOOK`, which is the only
             // thing that suppresses the `pre-push` hook in `transport_push()`
             // (transport.c): `if (!(flags & TRANSPORT_PUSH_NO_HOOK)) run_pre_push_hook(…)`.
@@ -967,6 +969,10 @@ git push <groupname>\n"
             use std::io::IsTerminal;
             std::io::stderr().is_terminal()
         }) && !f.quiet,
+        // `transport_set_option(transport, TRANS_OPT_THIN, thin ? "yes" : NULL)`
+        // (builtin/push.c:380) reaches `git_transport_push()` only; a helper keeps
+        // its own `options.thin = 1` (remote-curl.c:1573).
+        thin: !f.no_thin || push_proto::through_remote_helper(&transport_url),
         verbosity: f.verbosity,
         negotiation_include,
         negotiation_restrict,
@@ -1168,6 +1174,9 @@ struct Flags {
     /// `--progress` forced on / `--no-progress` forced off / unset = follow
     /// `isatty(2)` on stderr, as `transport_set_verbosity()` does.
     progress: Option<bool>,
+    /// `--no-thin`: git's `static int thin = 1` cleared (builtin/push.c:59, :727).
+    /// Stated in the negative so `Default` keeps git's default.
+    no_thin: bool,
     /// `--no-verify`, git's `TRANSPORT_PUSH_NO_HOOK`: skip the `pre-push` hook.
     /// Independent of `dry_run` — a dry run still runs the hook.
     no_verify: bool,

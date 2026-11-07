@@ -1958,22 +1958,20 @@ fn write_batched_pack(
     pack_dir: &Path,
     ids: &[gix::ObjectId],
 ) -> Result<()> {
-    // midx.c:2021 and 2035: git reads the same two `repack.*` keys `builtin/
-    // repack.c` does, and defaults them the same way.
+    // git reads the same two `repack.*` keys `builtin/repack.c` does, and
+    // defaults them the same way (midx-write.c:2130-2140). The child is fed a
+    // bare object list on stdin, though, so its `--delta-islands` never reaches
+    // `load_delta_islands()`, which only `get_object_list()` calls
+    // (builtin/pack-objects.c:4955-4956): the islands stay off.
     let allow_ofs_delta = repo
         .config_snapshot()
         .boolean("repack.useDeltaBaseOffset")
         .unwrap_or(true);
-    let use_delta_islands = repo
-        .config_snapshot()
-        .boolean("repack.useDeltaIslands")
-        .unwrap_or(false);
     let packed = super::pack_objects::packed_for(
         repo,
         ids,
         super::pack_objects::WriteOptions {
             allow_ofs_delta,
-            use_delta_islands,
             ..super::pack_objects::WriteOptions::default()
         },
     )?;

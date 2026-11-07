@@ -201,6 +201,17 @@ pub struct Islands {
     /// Indexed like the `objects` slice given to [`find_deltas()`]. `None` is
     /// git's "no entry in the hash": an object no island reaches.
     pub marks: Vec<Option<std::sync::Arc<[u32]>>>,
+    /// The sort `QSORT(delta_list, n, type_size_sort)` runs through once the
+    /// marks are in play (builtin/pack-objects.c:3682): the platform `qsort()`,
+    /// handed the positions to order and the comparator.
+    ///
+    /// `island_delta_cmp()` answers "first" for both orderings of two objects
+    /// on islands neither of which contains the other, so with islands the
+    /// comparator is no total order and the sorted list is whatever the C
+    /// library's algorithm makes of it. The call needs `unsafe`, which this
+    /// crate does not allow, so the caller supplies it. `None` sorts as if the
+    /// comparator were total.
+    pub qsort: Option<fn(&mut [usize], &dyn Fn(usize, usize) -> std::cmp::Ordering)>,
 }
 
 impl Islands {
@@ -322,7 +333,13 @@ where
     if list.len() < 2 || candidates == 0 {
         return out;
     }
-    list.sort_by(|&a, &b| type_size_sort(&objects[a], a, &objects[b], b, islands));
+    // `QSORT(delta_list, n, type_size_sort)` (builtin/pack-objects.c:3682).
+    // Without islands the comparator is a total order and any sort lands on the
+    // one answer; with them the order is the platform `qsort()`'s.
+    match islands.qsort.filter(|_| !islands.marks.is_empty()) {
+        Some(qsort) => qsort(&mut list, &|a, b| type_size_sort(&objects[a], a, &objects[b], b, islands)),
+        None => list.sort_by(|&a, &b| type_size_sort(&objects[a], a, &objects[b], b, islands)),
+    }
 
     // `prepare_pack()` passes `window + 1`, so a window of N really means N
     // candidate bases plus the slot holding the object being deltified.
@@ -1145,6 +1162,7 @@ mod tests {
             marks: (0..objects.len())
                 .map(|at| Some(if at % 2 == 0 { both.clone() } else { one.clone() }))
                 .collect(),
+            qsort: None,
         };
 
         let unrestricted = search(&objects, &bodies, &options);
@@ -1178,6 +1196,7 @@ mod tests {
             marks: (0..objects.len())
                 .map(|at| (at < objects.len() / 2).then(|| marked.clone()))
                 .collect(),
+            qsort: None,
         };
         let deltas = find_deltas(
             &objects,

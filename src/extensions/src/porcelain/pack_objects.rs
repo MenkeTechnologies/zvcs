@@ -55,10 +55,13 @@
 //! already has instead of a differently-deltified one, and both are off under
 //! `--no-reuse-delta`.
 //!
-//! One layout input is still absent, and is not reachable from the default
-//! configuration: delta islands do not split the write order into layers — with
-//! islands off `oe_layer()` is 0 throughout and there is exactly one layer,
-//! which is what [`compute_write_order`] reproduces.
+//! Delta islands (`--delta-islands`, which `repack -i` passes) are
+//! `delta-islands.c` ported whole — see [`IslandMarks`]: the internal rev list
+//! walks under `--topo-order`, the marks steer both the search's sort and its
+//! base choice, and `pack.islandCore` splits the write order into two layers.
+//! The sort is the one place the C library shows through: `island_delta_cmp()`
+//! is not a total order, so the pack is whatever the platform `qsort()` makes
+//! of it, and that is the `qsort()` called.
 //!
 //! A **thin** pack is written where the caller supplies the revision walk's edge
 //! commits — see [`write_pack`]'s `boundary`, [`PreferredBases`] and
@@ -88,7 +91,7 @@
 //! defect in this module and neither can be repaired here.
 //!
 //! The knobs with nothing to steer are the ones tied to substrate that is still
-//! missing: `--delta-islands`, `--name-hash-version`, `--path-walk`, `--sparse`
+//! missing: `--name-hash-version`, `--path-walk`, `--sparse`
 //! and `--shallow`. `--write-bitmap-index` *does* write a `.bitmap` — see
 //! [`bitmap_file`] — unless the pack is missing part of the closure a bitmap
 //! must cover, in which case it warns as git does and writes none.
@@ -993,6 +996,26 @@ fn execute(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // ```c
+    // if (stdin_packs) {
+    //         read_stdin_packs(stdin_packs, rev_list_unpacked);
+    // } else if (cruft) {
+    //         read_cruft_objects();
+    // } else if (!use_internal_rev_list) {
+    //         read_object_list_from_stdin();
+    // } else {
+    //         [...] get_object_list(&revs, &rp);
+    // }
+    // ```
+    //
+    // (builtin/pack-objects.c:5388-5404.) Only `get_object_list()` calls
+    // `load_delta_islands()` (:4955-4956), after the revisions are read and
+    // before the traversal reaches the attribute check below, so every other
+    // enumeration packs with `island_marks` NULL — islands off.
+    let islands = match st.delta_islands && !st.stdin_packs && !st.cruft && st.internal_rev_list_at_stdin() {
+        true => Some(load_delta_islands(&repo, st.progress != 0)?),
+        false => None,
+    };
     // Every enumeration but `--cruft`'s adds entries through a path that calls
     // `no_try_delta()` (builtin/pack-objects.c:1891, 3859, 4179), so the first
     // object added reaches the attribute source; the cruft entries are added
@@ -1076,6 +1099,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         st.stdout,
         &edges,
         Some(counts.len()),
+        islands,
     )?;
 
     if st.stdout {
@@ -1421,8 +1445,10 @@ pub(crate) struct WriteOptions {
     /// hashfile with the progress attached (`builtin/pack-objects.c:1350-1363`)
     /// and `Writing objects` closes with the byte count and rate.
     pub(crate) to_stdout: bool,
-    /// `repack.useDeltaIslands`: pass `--delta-islands` on, so the search
-    /// honours `pack.island`.
+    /// `--delta-islands`, which `repack` passes from `-i` or
+    /// `repack.useDeltaIslands`: load `pack.island` and steer the search and
+    /// the write order by it. `ids` must then be the traversal's, in the order
+    /// [`traverse_commit_list_topo`] shows them.
     pub(crate) use_delta_islands: bool,
     /// `--no-reuse-delta`, which `repack -f` passes and `gc --aggressive` gets
     /// through the `-f` it pushes onto its `repack` (`builtin/gc.c:920`).
@@ -1457,6 +1483,14 @@ pub(crate) fn packed_for_thin(
     options: WriteOptions,
     boundary: &[ObjectId],
 ) -> Result<Packed> {
+    // `--delta-islands` on the internal rev list: `get_object_list()` loads the
+    // islands before its traversal (builtin/pack-objects.c:4955-4956). Every
+    // caller asking for islands hands over that traversal's ids, in its
+    // order, run under `--topo-order` (:5440-5441).
+    let islands = match options.use_delta_islands {
+        true => Some(load_delta_islands(repo, options.progress)?),
+        false => None,
+    };
     prefetch_to_pack(repo, ids)?;
     let counts: Vec<pack::data::output::Count> = ids
         .iter()
@@ -1467,7 +1501,6 @@ pub(crate) fn packed_for_thin(
         .collect();
     let mut delta = DeltaConfig::from_repo(repo).unwrap_or_default();
     delta.allow_ofs_delta = options.allow_ofs_delta;
-    delta.use_islands = options.use_delta_islands;
     delta.reuse_delta &= !options.no_reuse_delta;
     delta.reuse_object &= !options.no_reuse_object;
     // `if (!reuse_object) reuse_delta = 0;` (builtin/pack-objects.c:5370-5371).
@@ -1494,6 +1527,7 @@ pub(crate) fn packed_for_thin(
         options.to_stdout,
         boundary,
         options.enumerated,
+        islands,
     )
 }
 
@@ -1593,10 +1627,6 @@ struct DeltaConfig {
     /// git's `allow_ofs_delta`, which defaults off — `git repack` is what turns
     /// it on, from `repack.useDeltaBaseOffset`.
     allow_ofs_delta: bool,
-    /// `--delta-islands`: restrict the search to bases at least as reachable as
-    /// their targets, per `pack.island`. git's `use_delta_islands`, which
-    /// `git repack` turns on from `repack.useDeltaIslands`.
-    use_islands: bool,
     /// `--[no-]reuse-delta`: whether an object already stored as a delta in one
     /// of the repository's packs keeps that delta instead of being searched for
     /// a fresh one. git's `reuse_delta`, which defaults on
@@ -1616,7 +1646,6 @@ impl Default for DeltaConfig {
         DeltaConfig {
             search: pack::data::output::delta::Options::default(),
             allow_ofs_delta: false,
-            use_islands: false,
             reuse_delta: true,
             reuse_object: true,
         }
@@ -1683,7 +1712,6 @@ impl DeltaConfig {
         // after parse-options: `--no-reuse-object` takes delta reuse with it
         // whatever `--reuse-delta` said.
         self.reuse_delta &= self.reuse_object;
-        self.use_islands |= st.delta_islands;
 
         // `depth >= 1 << OE_DEPTH_BITS` and `cache_max_small_delta_size >= 1 <<
         // OE_Z_DELTA_BITS`, with git's own wording.
@@ -1728,6 +1756,7 @@ fn write_pack(
     to_stdout: bool,
     boundary: &[ObjectId],
     enumerated: Option<usize>,
+    islands: Option<IslandMarks>,
 ) -> Result<Packed> {
     use crate::progress::Meter;
     use pack::data::output::delta;
@@ -1766,11 +1795,9 @@ fn write_pack(
     // git's pack bytes are still sitting in the hashfile buffer when it dies.
     // A thin pack adds its preferred bases to the list before `get_object_details()`
     // counts it, so the meter waits for [`interleave_preferred_bases`] there.
-    let mut counting = Meter::counted("Counting objects", counts.len(), progress && boundary.is_empty());
     let mut objects: Vec<delta::Object> = Vec::with_capacity(counts.len());
     for count in counts {
         use gix::odb::HeaderExt;
-        counting.tick();
         let (kind, size) = match repo.objects.header(count.id) {
             Ok(header) => (header.kind(), header.size()),
             // ```c
@@ -1799,10 +1826,6 @@ fn write_pack(
             preferred_base: false,
         });
     }
-    // `get_object_details()` ticks `display_progress(progress_state, i + 1)` per
-    // entry and closes with `stop_progress()` (builtin/pack-objects.c:2627-2629),
-    // which draws nothing for an empty list (progress.c:375-376).
-    counting.stop("done");
     let pbase_entries = interleave_preferred_bases(repo, boundary, delta.search.window, &mut objects);
     if !boundary.is_empty() {
         // `add_object_entry()` ticks `Enumerating objects` before `have_duplicate_entry()`
@@ -1816,12 +1839,35 @@ fn write_pack(
             }
             enumerating.stop("done");
         }
-        let mut counting = Meter::counted("Counting objects", objects.len(), progress);
-        for _ in 0..objects.len() {
-            counting.tick();
-        }
-        counting.stop("done");
     }
+    // `prepare_pack()` resolves the tree islands before `get_object_details()`
+    // counts anything (builtin/pack-objects.c:3638-3641), and the marks the
+    // traversal's `show_commit()` propagates (:4419-4420) are in place before
+    // that. Neither needs more than the types, so both run here, ahead of the
+    // `Counting objects` meter.
+    let islands_state = match islands {
+        Some(mut state) => {
+            for object in &objects {
+                if object.kind == gix::object::Kind::Commit && !object.preferred_base {
+                    state.propagate_island_marks(repo, object.id);
+                }
+            }
+            let depths = island_tree_depths(repo, &objects);
+            state.resolve_tree_islands(repo, progress, &objects, &depths)?;
+            Some(state)
+        }
+        None => None,
+    };
+    // `get_object_details()` ticks `display_progress(progress_state, i + 1)` per
+    // entry and closes with `stop_progress()` (builtin/pack-objects.c:2627-2629),
+    // which draws nothing for an empty list (progress.c:375-376). The headers
+    // were all read above; the meter is drawn once the island pass git runs
+    // first is done. A thin pack's count includes its preferred bases.
+    let mut counting = Meter::counted("Counting objects", objects.len(), progress);
+    for _ in 0..objects.len() {
+        counting.tick();
+    }
+    counting.stop("done");
     assign_name_hashes(repo, &mut objects);
 
     // Phase 2: the delta search, steered by `pack.island` when asked. git
@@ -1833,11 +1879,9 @@ fn write_pack(
     // Both lines are skipped when no delta can be attempted at all, which is
     // `prepare_pack()`'s gate (builtin/pack-objects.c:3633-3667): a zero window
     // or depth returns early, and the search runs only for `nr_deltas && n > 1`.
-    let islands = if delta.use_islands {
-        load_delta_islands(repo, &objects)
-    } else {
-        delta::Islands::default()
-    };
+    let islands = islands_state
+        .as_ref()
+        .map_or_else(delta::Islands::default, |state| state.for_objects(&objects));
     // `check_object()` runs before the search, because what it settles is also
     // what the search must leave alone: an object that keeps a delta from an
     // existing pack is not a search candidate at all. The same pass records how
@@ -1954,7 +1998,10 @@ fn write_pack(
     // entries appended — the same total, and monotone, which is what the display
     // needs.
     let kept_delta: Vec<bool> = reused.iter().map(Option::is_some).collect();
-    let write_order = compute_write_order(&objects, &deltas, &kept_delta, &tag_tips(repo));
+    // `compute_pack_layers()` runs inside `compute_write_order()`
+    // (builtin/pack-objects.c:1024-1027) and is the islands' last use.
+    let layers = islands_state.as_ref().and_then(|state| state.compute_pack_layers(&objects));
+    let write_order = compute_write_order(&objects, &deltas, &kept_delta, &tag_tips(repo), layers.as_deref());
     // `if (progress > pack_to_stdout)` (builtin/pack-objects.c:1340).
     let mut writing = Meter::counted("Writing objects", to_write, writing_progress);
     let mut body: Vec<u8> = Vec::new();
@@ -2435,14 +2482,17 @@ fn tag_tips(repo: &gix::Repository) -> HashSet<ObjectId> {
 /// remaining commits and tags, then the trees, then everything else walked
 /// family by family so a delta base and its deltas stay together.
 ///
-/// Delta islands are not modelled here. git splits the order into one layer per
-/// island and runs `compute_layer_order()` per layer; with no islands `oe_layer()`
-/// is always 0 and there is exactly one layer, which is the case reproduced.
+/// `layers` is `compute_pack_layers()`'s answer under `pack.islandCore`: the
+/// whole of `compute_layer_order()` runs once per layer, each pass placing only
+/// that layer's entries (`add_to_write_order()` refuses the rest), so the core
+/// island's objects are written ahead of everything else. `None` is git's
+/// single layer 0 (builtin/pack-objects.c:1024-1033).
 fn compute_write_order(
     objects: &[pack::data::output::delta::Object],
     deltas: &[Option<pack::data::output::delta::Delta>],
     kept_delta: &[bool],
     tagged: &HashSet<ObjectId>,
+    layers: Option<&[u8]>,
 ) -> Vec<usize> {
     let n = objects.len();
 
@@ -2473,8 +2523,12 @@ fn compute_write_order(
 
     let mut wo: Vec<usize> = Vec::with_capacity(n);
     let mut filled = vec![false; n];
-    let add = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, i: usize| {
-        if !filled[i] {
+    // `oe_layer()`: 0 for every entry without layers.
+    let layer = |i: usize| layers.map_or(0, |layers| layers[i]);
+    // `add_to_write_order()`: an entry is placed once, and only in its own
+    // layer's pass.
+    let add = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, write_layer: u8, i: usize| {
+        if !filled[i] && layer(i) == write_layer {
             filled[i] = true;
             wo.push(i);
         }
@@ -2484,15 +2538,15 @@ fn compute_write_order(
     // reached "from above" the node and all its later siblings are added, then
     // the walk descends into the first child and repeats; a node with no child
     // steps right, or climbs until it can, without adding again.
-    let add_descendants = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, root: usize| {
+    let add_descendants = |wo: &mut Vec<usize>, filled: &mut Vec<bool>, write_layer: u8, root: usize| {
         let mut add_to_order = true;
         let mut e = Some(root);
         while let Some(cur) = e {
             if add_to_order {
-                add(wo, filled, cur);
+                add(wo, filled, write_layer, cur);
                 let mut s = sibling(cur);
                 while let Some(next) = s {
-                    add(wo, filled, next);
+                    add(wo, filled, write_layer, next);
                     s = sibling(next);
                 }
             }
@@ -2520,46 +2574,50 @@ fn compute_write_order(
         }
     };
 
-    // 1. Everything up to the first tagged entry, in enumeration order.
-    let mut last_untagged = n;
-    for i in 0..n {
-        if tagged.contains(&objects[i].id) {
-            last_untagged = i;
-            break;
-        }
-        add(&mut wo, &mut filled, i);
-    }
-    // 2. The tag tips.
-    for i in last_untagged..n {
-        if tagged.contains(&objects[i].id) {
-            add(&mut wo, &mut filled, i);
-        }
-    }
     // `oe_type()` of an entry `check_object()` kept a stored delta for is that
     // delta's in-pack type, `OBJ_OFS_DELTA` or `OBJ_REF_DELTA` —
     // `oe_set_type(entry, entry->in_pack_type)` (builtin/pack-objects.c:2351) —
     // so steps 3 and 4 pass over it and it is written with its family in step 5.
     let kind = |i: usize| (!kept_delta[i]).then_some(objects[i].kind);
-    // 3. The remaining commits and tags.
-    for i in last_untagged..n {
-        if matches!(kind(i), Some(gix::object::Kind::Commit | gix::object::Kind::Tag)) {
-            add(&mut wo, &mut filled, i);
-        }
-    }
-    // 4. The trees.
-    for i in last_untagged..n {
-        if kind(i) == Some(gix::object::Kind::Tree) {
-            add(&mut wo, &mut filled, i);
-        }
-    }
-    // 5. The rest, family by family from each family's root.
-    for i in last_untagged..n {
-        if !filled[i] {
-            let mut root = i;
-            while let Some(p) = parent(root) {
-                root = p;
+    // `for (; write_layer < max_layers; ++write_layer) compute_layer_order(wo, &wo_end);`
+    let max_layers: u8 = if layers.is_some() { 2 } else { 1 };
+    for write_layer in 0..max_layers {
+        // 1. Everything up to the first tagged entry, in enumeration order.
+        let mut last_untagged = n;
+        for i in 0..n {
+            if tagged.contains(&objects[i].id) {
+                last_untagged = i;
+                break;
             }
-            add_descendants(&mut wo, &mut filled, root);
+            add(&mut wo, &mut filled, write_layer, i);
+        }
+        // 2. The tag tips.
+        for i in last_untagged..n {
+            if tagged.contains(&objects[i].id) {
+                add(&mut wo, &mut filled, write_layer, i);
+            }
+        }
+        // 3. The remaining commits and tags.
+        for i in last_untagged..n {
+            if matches!(kind(i), Some(gix::object::Kind::Commit | gix::object::Kind::Tag)) {
+                add(&mut wo, &mut filled, write_layer, i);
+            }
+        }
+        // 4. The trees.
+        for i in last_untagged..n {
+            if kind(i) == Some(gix::object::Kind::Tree) {
+                add(&mut wo, &mut filled, write_layer, i);
+            }
+        }
+        // 5. The rest of this layer, family by family from each family's root.
+        for i in last_untagged..n {
+            if !filled[i] && layer(i) == write_layer {
+                let mut root = i;
+                while let Some(p) = parent(root) {
+                    root = p;
+                }
+                add_descendants(&mut wo, &mut filled, write_layer, root);
+            }
         }
     }
     wo
@@ -3432,9 +3490,9 @@ pub(super) fn reverse_index_file(
     Ok(bytes)
 }
 
-/// Load the delta islands `pack.island` describes, as marks over `objects`;
-/// git's `load_delta_islands()` followed by the propagation
-/// `propagate_island_marks()` and `resolve_tree_islands()` do.
+/// `delta-islands.c`'s file-scope state — `island_marks`, `island_counter`,
+/// `island_counter_core` and `core_island_name` — as [`load_delta_islands`]
+/// leaves it and the traversal then grows it.
 ///
 /// # What an island is for
 ///
@@ -3451,275 +3509,585 @@ pub(super) fn reverse_index_file(
 /// A ref belongs to the island named by joining that regex's capture groups
 /// with `-`, so `refs/heads/(.*)` puts every branch on its own island and
 /// `refs/remotes/([^/]+)/` puts each remote on one. Later values win over
-/// earlier ones. Two islands whose refs point at exactly the same objects are
-/// collapsed into one, which is what keeps a thousand identical forks from
-/// costing a thousand bits.
+/// earlier ones. Two islands whose refs sum to the same hash are collapsed into
+/// one, which is what keeps a thousand identical forks from costing a thousand
+/// bits.
 ///
-/// The marks then flow the way objects are reachable: a commit passes its marks
-/// to its tree and its parents, and a tree to everything it names — trees first
-/// in ascending depth, so a subtree that several parents share ends up with all
-/// of their marks rather than whichever happened to be walked last.
-///
-/// An empty result means islands are switched off, which the search reads as
-/// "every pair is eligible".
-fn load_delta_islands(
-    repo: &gix::Repository,
-    objects: &[pack::data::output::delta::Object],
-) -> pack::data::output::delta::Islands {
-    use pack::data::output::delta::Islands;
+/// The marks then flow the way objects are reachable: the traversal hands each
+/// commit it shows to [`IslandMarks::propagate_island_marks`], which passes the
+/// commit's marks to its tree and its parents, and
+/// [`IslandMarks::resolve_tree_islands`] then passes each tree's marks to
+/// everything it names, shallowest trees first.
+#[derive(Debug, Default)]
+pub(crate) struct IslandMarks {
+    /// `island_marks`: every object some island reaches, with the bitmap of
+    /// those islands. Keyed by object id because git's hash holds objects the
+    /// pack never carries — every ref a regex matched, and every parent a shown
+    /// commit names.
+    marks: std::collections::HashMap<ObjectId, Vec<u32>>,
+    /// `island_bitmap_size`, in 32-bit words.
+    words: usize,
+    /// `island_counter`: how many islands survived deduplication.
+    island_counter: u32,
+    /// `island_counter_core`: the bit of the `pack.islandCore` island. It stays
+    /// 0 when no island has that name, which [`IslandMarks::compute_pack_layers`]
+    /// then reads as bit 0 all the same.
+    island_counter_core: u32,
+    /// `core_island_name`, `pack.islandCore`.
+    core_island_name: Option<String>,
+}
 
-    let snapshot = repo.config_snapshot();
-    let patterns: Vec<String> = snapshot
-        .strings("pack.island")
-        .map(|values| values.iter().map(|v| v.to_string()).collect())
-        .unwrap_or_default();
-    if patterns.is_empty() {
-        return Islands::default();
+/// `struct remote_island` (delta-islands.c:28-31).
+struct RemoteIsland {
+    hash: u64,
+    oids: Vec<ObjectId>,
+}
+
+/// `load_delta_islands()` (delta-islands.c:484-500): read `pack.island` and
+/// `pack.islandCore`, sort every ref into the island its last matching regex
+/// names, collapse duplicate islands, and mark each island's tips.
+///
+/// git calls it from `get_object_list()` (builtin/pack-objects.c:4955-4956)
+/// once the revisions are read and before the traversal, so only a pack built
+/// by the internal rev list has islands at all: a bare object list,
+/// `--stdin-packs` and `--cruft` leave `island_marks` NULL, which every island
+/// question answers as "no islands".
+pub(crate) fn load_delta_islands(repo: &gix::Repository, progress: bool) -> Result<IslandMarks> {
+    let mut state = IslandMarks::default();
+
+    // `repo_config(r, island_config_callback, &ild)` (delta-islands.c:340-370):
+    // every value in config order, a regex compiled the moment it is read.
+    let mut regexes: Vec<PosixRegex> = Vec::new();
+    for value in crate::config::walk_config(repo) {
+        match value.key.as_str() {
+            "pack.island" => {
+                let Some(v) = value.value.as_deref() else {
+                    return Err(crate::default_config::nonbool(&value).into_error());
+                };
+                // ```c
+                // if (*v != '^')
+                //         strbuf_addch(&re, '^');
+                // strbuf_addstr(&re, v);
+                // if (regcomp(&ild->rx[ild->nr], re.buf, REG_EXTENDED))
+                //         die(_("failed to load island regex for '%s': %s"), k, re.buf);
+                // ```
+                let re = if v.starts_with('^') { v.to_owned() } else { format!("^{v}") };
+                match PosixRegex::extended(&re) {
+                    Some(regex) => regexes.push(regex),
+                    None => crate::git_fatal!("failed to load island regex for '{}': {re}", value.key),
+                }
+            }
+            // `git_config_string(&core_island_name, k, v)`.
+            "pack.islandcore" => match value.value.as_deref() {
+                Some(v) => state.core_island_name = Some(v.to_owned()),
+                None => return Err(crate::default_config::nonbool(&value).into_error()),
+            },
+            _ => {}
+        }
     }
-    let core_name = snapshot.string("pack.islandCore").map(|v| v.to_string());
 
-    // git anchors every island regex at the start of the ref name, adding the
-    // `^` itself when the value does not already carry one.
-    let mut expressions = Vec::with_capacity(patterns.len());
-    for pattern in &patterns {
-        let anchored = if pattern.starts_with('^') {
-            pattern.clone()
-        } else {
-            format!("^{pattern}")
-        };
-        match regex::Regex::new(&anchored) {
-            Ok(re) => expressions.push(re),
-            Err(err) => {
-                eprintln!("fatal: failed to load island regex for 'pack.island': {anchored} ({err})");
-                return Islands::default();
+    // `refs_for_each_ref(..., find_island_for_ref, &ild)` (delta-islands.c:393-436):
+    // `remote_islands` is a khash keyed by island name, so the names are kept
+    // in the order they were first put, which is what [`khash_str_order`]
+    // replays.
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut islands: Vec<RemoteIsland> = Vec::new();
+    let mut by_name: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    if !regexes.is_empty() {
+        if let Ok(platform) = repo.references() {
+            if let Ok(all) = platform.all() {
+                for reference in all.flatten() {
+                    // `refs_for_each_ref()` calls back only for a ref that resolves,
+                    // with `ref->oid` the object it names, unpeeled.
+                    let name = reference.name().as_bstr().to_vec();
+                    let mut reference = reference;
+                    let Ok(id) = reference.follow_to_object() else { continue };
+                    // ```c
+                    // /* walk backwards to get last-one-wins ordering */
+                    // for (i = ild->nr - 1; i >= 0; i--) {
+                    //         if (!regexec(&ild->rx[i], ref->name,
+                    //                      ARRAY_SIZE(matches), matches, 0))
+                    //                 break;
+                    // }
+                    // ```
+                    let Some(matches) = regexes.iter().rev().find_map(|regex| regex.exec(&name)) else {
+                        continue;
+                    };
+                    if matches[ISLAND_MATCHES - 1].is_some() {
+                        eprintln!(
+                            "warning: island regex from config has too many capture groups (max={})",
+                            ISLAND_MATCHES - 2
+                        );
+                    }
+                    // Every group that took part, joined with `-`; an empty
+                    // match still contributes its (empty) piece.
+                    let mut island_name: Vec<u8> = Vec::new();
+                    for (so, eo) in matches[1..].iter().flatten() {
+                        if !island_name.is_empty() {
+                            island_name.push(b'-');
+                        }
+                        island_name.extend_from_slice(&name[*so..*eo]);
+                    }
+                    // `add_ref_to_island()` (delta-islands.c:372-391): the
+                    // island's hash is the wrapping sum of the first eight bytes
+                    // of each tip, read as a native-endian `uint64_t`.
+                    let at = *by_name.entry(island_name.clone()).or_insert_with(|| {
+                        names.push(island_name);
+                        islands.push(RemoteIsland {
+                            hash: 0,
+                            oids: Vec::new(),
+                        });
+                        islands.len() - 1
+                    });
+                    let bytes: [u8; 8] = id.as_bytes()[..8].try_into().expect("8 bytes");
+                    islands[at].hash = islands[at].hash.wrapping_add(u64::from_ne_bytes(bytes));
+                    islands[at].oids.push(id.detach());
+                }
             }
         }
     }
 
-    // Every ref, bucketed by the island name its matching regex names.
-    let mut islands: std::collections::BTreeMap<String, Vec<ObjectId>> = std::collections::BTreeMap::new();
-    if let Ok(platform) = repo.references() {
-        if let Ok(all) = platform.all() {
-            for reference in all.flatten() {
-                let name = reference.name().as_bstr().to_string();
-                // git walks the regexes backwards, so the last configured value
-                // that matches is the one that names the island.
-                let Some(matched) = expressions.iter().rev().find_map(|re| re.captures(&name)) else {
-                    continue;
-                };
-                let island_name = matched
-                    .iter()
-                    .skip(1)
-                    .flatten()
-                    .map(|group| group.as_str())
-                    .collect::<Vec<_>>()
-                    .join("-");
-                let mut reference = reference;
-                let Ok(id) = reference.peel_to_id_in_place() else {
-                    continue;
-                };
-                islands.entry(island_name).or_default().push(id.detach());
-            }
-        }
+    // `deduplicate_islands()` (delta-islands.c:449-482): the islands in
+    // `kh_foreach_value()` order, each later one carrying an earlier one's hash
+    // dropped.
+    let mut list: Vec<usize> = khash_str_order(&names);
+    let mut reference = 0;
+    while reference + 1 < list.len() {
+        let hash = islands[list[reference]].hash;
+        let mut kept: Vec<usize> = list[..=reference].to_vec();
+        kept.extend(list[reference + 1..].iter().copied().filter(|&at| islands[at].hash != hash));
+        list = kept;
+        reference += 1;
     }
-    if islands.is_empty() {
-        return Islands::default();
-    }
-
-    // git's `deduplicate_islands()`: an island is identified by the sum of the
-    // first eight bytes of each of its object ids, and only the first island
-    // with a given sum survives. Forks that have not diverged therefore share
-    // one bit rather than each burning their own.
-    let hash_of = |ids: &Vec<ObjectId>| -> u64 {
-        ids.iter().fold(0u64, |sum, id| {
-            let bytes: [u8; 8] = id.as_bytes()[..8].try_into().expect("8 bytes");
-            sum.wrapping_add(u64::from_ne_bytes(bytes))
-        })
-    };
-    let core_hash = core_name
+    state.words = list.len() / 32 + 1;
+    // `get_core_island()`: looked up by name, then recognised by hash.
+    let core_hash = state
+        .core_island_name
         .as_deref()
-        .and_then(|name| islands.get(name))
-        .map(&hash_of);
-    let mut seen: HashSet<u64> = HashSet::new();
-    let surviving: Vec<(u64, &Vec<ObjectId>)> = islands
-        .values()
-        .map(|ids| (hash_of(ids), ids))
-        .filter(|(hash, _)| seen.insert(*hash))
-        .collect();
+        .and_then(|name| by_name.get(name.as_bytes()))
+        .map(|&at| islands[at].hash);
+    for &at in &list {
+        state.mark_remote_island_1(repo, &islands[at], core_hash == Some(islands[at].hash));
+    }
 
-    let position: std::collections::HashMap<ObjectId, usize> = objects
-        .iter()
-        .enumerate()
-        .map(|(at, object)| (object.id, at))
-        .collect();
-    let width = surviving.len().div_ceil(32).max(1);
-    let mut marks: Vec<Option<Vec<u32>>> = vec![None; objects.len()];
-    let mut core_bit = None;
-    for (bit, (hash, ids)) in surviving.iter().enumerate() {
-        if core_hash == Some(*hash) {
-            core_bit = Some(bit);
-        }
-        for id in ids.iter() {
-            if let Some(&at) = position.get(id) {
-                marks[at].get_or_insert_with(|| vec![0u32; width])[bit / 32] |= 1 << (bit % 32);
+    if progress {
+        crate::progress::write_stderr(format!("Marked {} islands, done.\n", state.island_counter).as_bytes());
+    }
+    Ok(state)
+}
+
+/// `regmatch_t matches[16]` in `find_island_for_ref()` (delta-islands.c:402):
+/// the whole match and fifteen groups, the last of which only exists to tell a
+/// regex with too many groups apart.
+const ISLAND_MATCHES: usize = 16;
+
+/// A regex compiled by the C library's `regcomp(REG_EXTENDED)`, which is what
+/// `island_config_callback()` uses: POSIX leftmost-longest matching decides
+/// which text each group captures, and a pattern the library refuses is the
+/// one git dies over.
+struct PosixRegex(Box<libc::regex_t>);
+
+impl PosixRegex {
+    fn extended(pattern: &str) -> Option<Self> {
+        let pattern = std::ffi::CString::new(pattern.split('\0').next().unwrap_or_default()).ok()?;
+        // SAFETY: `regex_t` is plain data that `regcomp()` initialises in place;
+        // it is boxed so the address the library may have recorded stays put.
+        unsafe {
+            let mut regex: Box<libc::regex_t> = Box::new(std::mem::zeroed());
+            if libc::regcomp(&mut *regex, pattern.as_ptr(), libc::REG_EXTENDED) != 0 {
+                return None;
             }
+            Some(PosixRegex(regex))
         }
     }
-    // `pack.islandCore` names the island whose objects git puts in the first
-    // pack layer; nothing here writes layered packs, so the only thing left to
-    // do with it is to have resolved which island it is, which the mark above
-    // records.
-    let _ = core_bit;
 
-    propagate_island_marks(repo, objects, &position, &mut marks, width);
-
-    Islands {
-        marks: marks
-            .into_iter()
-            .map(|mark| mark.map(std::sync::Arc::from))
-            .collect(),
+    /// `regexec(&rx, name, ARRAY_SIZE(matches), matches, 0)`: the byte range of
+    /// the match and of each group, `None` for a group that took no part
+    /// (`rm_so == -1`), or `None` overall when the name does not match.
+    fn exec(&self, name: &[u8]) -> Option<[Option<(usize, usize)>; ISLAND_MATCHES]> {
+        let name = std::ffi::CString::new(name.to_vec()).ok()?;
+        // SAFETY: the regex was compiled by `regcomp()` and `matches` has room
+        // for exactly the number of entries passed.
+        let mut matches: [libc::regmatch_t; ISLAND_MATCHES] = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::regexec(&*self.0, name.as_ptr(), ISLAND_MATCHES, matches.as_mut_ptr(), 0) };
+        if rc != 0 {
+            return None;
+        }
+        let mut out = [None; ISLAND_MATCHES];
+        for (slot, m) in out.iter_mut().zip(&matches) {
+            if m.rm_so >= 0 && m.rm_eo >= m.rm_so {
+                *slot = Some((m.rm_so as usize, m.rm_eo as usize));
+            }
+        }
+        Some(out)
     }
 }
 
-/// Flow island marks from commits to their trees and parents, and from trees to
-/// their entries; git's `propagate_island_marks()` and `resolve_tree_islands()`.
+impl Drop for PosixRegex {
+    fn drop(&mut self) {
+        // SAFETY: only a successfully compiled regex is ever wrapped.
+        unsafe { libc::regfree(&mut *self.0) }
+    }
+}
+
+/// The order `kh_foreach()` visits a `kh_str_t` built by `kh_put_str()` of
+/// `keys` in order (khash.h): ascending bucket index over the open-addressed
+/// table, which starts empty, grows to four buckets on the first put and
+/// doubles once 77% full, relocating in place with khash's kick-out.
 ///
-/// Commits are walked newest first, which is the order git's own revision walk
-/// hands them over, so a mark reaches an ancestor before that ancestor is asked
-/// to pass it on. Trees are then walked in ascending depth for the same reason:
-/// a tree must have collected every mark that reaches it before it hands them
-/// to its children.
-fn propagate_island_marks(
-    repo: &gix::Repository,
-    objects: &[pack::data::output::delta::Object],
-    position: &std::collections::HashMap<ObjectId, usize>,
-    marks: &mut [Option<Vec<u32>>],
-    width: usize,
-) {
-    fn merge(marks: &mut [Option<Vec<u32>>], into: usize, from: &[u32], width: usize) {
-        let target = marks[into].get_or_insert_with(|| vec![0u32; width]);
-        for (word, bits) in target.iter_mut().zip(from) {
+/// Returns indices into `keys`; the keys are distinct.
+fn khash_str_order(keys: &[Vec<u8>]) -> Vec<usize> {
+    /// `__ac_X31_hash_string()`, over `char` as the platform signs it.
+    fn x31(key: &[u8]) -> u32 {
+        let mut bytes = key.iter().map(|&b| b as std::ffi::c_char as u32);
+        let Some(mut h) = bytes.next() else { return 0 };
+        if h != 0 {
+            for c in bytes {
+                h = (h << 5).wrapping_sub(h).wrapping_add(c);
+            }
+        }
+        h
+    }
+
+    // `slots[i]` is the key in bucket `i`; with no deletions, "empty" is the
+    // only other state a bucket can be in.
+    let mut slots: Vec<Option<usize>> = Vec::new();
+    let mut upper_bound = 0usize;
+    for (key, bytes) in keys.iter().enumerate() {
+        // `if (h->n_occupied >= h->upper_bound)`: grow first, then place.
+        let size = slots.iter().flatten().count();
+        if size >= upper_bound {
+            let new_buckets = (slots.len() + 1).next_power_of_two().max(4);
+            // `kh_resize()`'s rehash (khash.h), in place: each bucket in
+            // ascending order hands its key to the new geometry, and a key
+            // landing on a bucket whose old occupant has not moved yet kicks
+            // that occupant out to be placed next.
+            let old_len = slots.len();
+            slots.resize(new_buckets, None);
+            let mut moved = vec![false; old_len];
+            let mut taken = vec![false; new_buckets];
+            let mask = new_buckets - 1;
+            for j in 0..old_len {
+                if moved[j] {
+                    continue;
+                }
+                let Some(mut carried) = slots[j] else { continue };
+                moved[j] = true;
+                slots[j] = None;
+                loop {
+                    let mut i = x31(&keys[carried]) as usize & mask;
+                    let mut step = 0;
+                    while taken[i] {
+                        step += 1;
+                        i = (i + step) & mask;
+                    }
+                    taken[i] = true;
+                    if i < old_len && !moved[i] && slots[i].is_some() {
+                        let kicked = slots[i].replace(carried).expect("occupied");
+                        moved[i] = true;
+                        carried = kicked;
+                    } else {
+                        slots[i] = Some(carried);
+                        break;
+                    }
+                }
+            }
+            upper_bound = (new_buckets as f64 * 0.77 + 0.5) as usize;
+        }
+        // `kh_put()`'s probe: the first empty bucket along the quadratic path.
+        let mask = slots.len() - 1;
+        let mut i = x31(bytes) as usize & mask;
+        let mut step = 0;
+        while slots[i].is_some() {
+            step += 1;
+            i = (i + step) & mask;
+        }
+        slots[i] = Some(key);
+    }
+    slots.into_iter().flatten().collect()
+}
+
+impl IslandMarks {
+    /// `island_bitmap_set()` on `create_or_get_island_marks()`.
+    fn set_bit(&mut self, id: ObjectId, bit: u32) {
+        let words = self.words;
+        let marks = self.marks.entry(id).or_insert_with(|| vec![0; words]);
+        marks[bit as usize / 32] |= 1 << (bit % 32);
+    }
+
+    /// `set_island_marks()` (delta-islands.c:161-188): OR `marks` into the
+    /// object's bitmap, creating it when the object has none. git shares the
+    /// bitmap copy-on-write; the bits are the same.
+    fn set_island_marks(&mut self, id: ObjectId, marks: &[u32]) {
+        let words = self.words;
+        let target = self.marks.entry(id).or_insert_with(|| vec![0; words]);
+        for (word, bits) in target.iter_mut().zip(marks) {
             *word |= bits;
         }
     }
 
-    let mut commits: Vec<(usize, i64)> = Vec::new();
-    for (at, object) in objects.iter().enumerate() {
-        if object.kind != gix::object::Kind::Commit {
-            continue;
-        }
-        let Ok(commit) = repo.find_commit(object.id) else {
-            continue;
-        };
-        commits.push((at, commit.time().map(|time| time.seconds).unwrap_or(0)));
-    }
-    commits.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (at, _) in commits {
-        let Some(source) = marks[at].clone() else { continue };
-        let Ok(commit) = repo.find_commit(objects[at].id) else {
-            continue;
-        };
-        if let Ok(tree) = commit.tree_id() {
-            if let Some(&tree_at) = position.get(&tree.detach()) {
-                merge(marks, tree_at, &source, width);
+    /// `mark_remote_island_1()` (delta-islands.c:190-224): set this island's
+    /// bit on each tip `parse_object()` can read, and on everything a tag tip
+    /// peels through.
+    fn mark_remote_island_1(&mut self, repo: &gix::Repository, island: &RemoteIsland, is_core_island: bool) {
+        let bit = self.island_counter;
+        for &tip in &island.oids {
+            let Ok(object) = repo.find_object(tip) else { continue };
+            self.set_bit(tip, bit);
+            // ```c
+            // /* If it was a tag, also make sure we hit the underlying object. */
+            // while (obj && obj->type == OBJ_TAG) {
+            //         obj = ((struct tag *)obj)->tagged;
+            //         if (obj) {
+            //                 parse_object(r, &obj->oid);
+            //                 marks = create_or_get_island_marks(obj);
+            //                 island_bitmap_set(marks, island_counter);
+            //         }
+            // }
+            // ```
+            let mut kind = object.kind;
+            let mut data = object.detach();
+            while kind == gix::object::Kind::Tag {
+                let Ok(target) = gix::objs::TagRefIter::from_bytes(&data.data, repo.object_hash()).target_id() else { break };
+                self.set_bit(target, bit);
+                let Ok(next) = repo.find_object(target) else { break };
+                kind = next.kind;
+                data = next.detach();
             }
+        }
+        if is_core_island {
+            self.island_counter_core = self.island_counter;
+        }
+        self.island_counter += 1;
+    }
+
+    /// `propagate_island_marks()` (delta-islands.c:502-516), which `show_commit()`
+    /// calls for every commit the traversal shows (builtin/pack-objects.c:4419-4420):
+    /// a marked commit passes its marks to its tree and to every parent.
+    ///
+    /// The traversal runs under `--topo-order` when islands are on
+    /// (builtin/pack-objects.c:5440-5441), so a commit is shown only after every
+    /// child that could mark it.
+    fn propagate_island_marks(&mut self, repo: &gix::Repository, commit: ObjectId) {
+        let Some(root_marks) = self.marks.get(&commit).cloned() else { return };
+        let Ok(commit) = repo.find_commit(commit) else { return };
+        if let Ok(tree) = commit.tree_id() {
+            self.set_island_marks(tree.detach(), &root_marks);
         }
         for parent in commit.parent_ids() {
-            if let Some(&parent_at) = position.get(&parent.detach()) {
-                merge(marks, parent_at, &source, width);
-            }
+            self.set_island_marks(parent.detach(), &root_marks);
         }
     }
 
-    // Tree depth, as git's `show_object()` records it from the path a tree was
-    // seen at: a root tree is depth zero and every path component adds one.
-    let depths = tree_depths(repo, objects, position);
-    let mut trees: Vec<(usize, u32)> = objects
-        .iter()
-        .enumerate()
-        .filter(|(_, object)| object.kind == gix::object::Kind::Tree)
-        .map(|(at, _)| (at, depths.get(&at).copied().unwrap_or(0)))
-        .collect();
-    trees.sort_by_key(|(_, depth)| *depth);
+    /// `resolve_tree_islands()` (delta-islands.c:239-310): every tree in the
+    /// pack list, shallowest first, passes its marks to every entry but a
+    /// gitlink. Shallow first so that a subtree several trees share has all of
+    /// their marks before it hands them on.
+    ///
+    /// The order is `QSORT(todo, nr, tree_depth_compare)` through the platform
+    /// `qsort()`, which is what decides between trees of equal depth.
+    fn resolve_tree_islands(
+        &mut self,
+        repo: &gix::Repository,
+        progress: bool,
+        objects: &[pack::data::output::delta::Object],
+        depths: &[u32],
+    ) -> Result<()> {
+        #[repr(C)]
+        struct Todo {
+            at: usize,
+            depth: u32,
+        }
+        unsafe extern "C" fn tree_depth_compare(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+            // SAFETY: `qsort()` hands back pointers into the `todo` array.
+            let (a, b) = unsafe { (&*a.cast::<Todo>(), &*b.cast::<Todo>()) };
+            // `return todo_a->depth - todo_b->depth;`, unsigned arithmetic
+            // narrowed to the `int` the comparator returns.
+            a.depth.wrapping_sub(b.depth) as libc::c_int
+        }
 
-    let mut buf = Vec::new();
-    for (at, _) in trees {
-        let Some(source) = marks[at].clone() else { continue };
-        let Ok((object, _location)) = repo.objects.find(&objects[at].id, &mut buf) else {
-            continue;
-        };
-        let Ok(tree) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
-            continue;
-        };
-        let children: Vec<ObjectId> = tree
-            .entries
+        let mut todo: Vec<Todo> = objects
             .iter()
-            .filter(|entry| !entry.mode.is_commit())
-            .map(|entry| entry.oid.to_owned())
+            .enumerate()
+            .filter(|(_, object)| object.kind == gix::object::Kind::Tree)
+            .map(|(at, _)| Todo { at, depth: depths[at] })
             .collect();
-        for child in children {
-            if let Some(&child_at) = position.get(&child) {
-                merge(marks, child_at, &source, width);
+        // `sane_qsort()` skips the call for fewer than two elements.
+        if todo.len() > 1 {
+            // SAFETY: `todo` is a live, initialised array of `Todo` of the stated
+            // length and element size; the comparator only reads two of them.
+            unsafe {
+                libc::qsort(
+                    todo.as_mut_ptr().cast::<libc::c_void>(),
+                    todo.len(),
+                    std::mem::size_of::<Todo>(),
+                    Some(tree_depth_compare),
+                );
             }
         }
+
+        let mut meter = crate::progress::Meter::counted("Propagating island marks", todo.len(), progress);
+        let mut buf = Vec::new();
+        for (i, item) in todo.iter().enumerate() {
+            let id = objects[item.at].id;
+            // An unmarked tree is skipped before `display_progress(progress_state,
+            // i+1)`, so the closing line shows the last marked tree's count.
+            let Some(root_marks) = self.marks.get(&id).cloned() else { continue };
+            let entries: Vec<ObjectId> = match repo.objects.find(&id, &mut buf) {
+                Ok((object, _)) if object.kind == gix::object::Kind::Tree => {
+                    match gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) {
+                        Ok(tree) => tree
+                            .entries
+                            .iter()
+                            .filter(|entry| !entry.mode.is_commit())
+                            .map(|entry| entry.oid.to_owned())
+                            .collect(),
+                        Err(_) => crate::git_fatal!("bad tree object {id}"),
+                    }
+                }
+                _ => crate::git_fatal!("bad tree object {id}"),
+            };
+            for entry in entries {
+                self.set_island_marks(entry, &root_marks);
+            }
+            meter.set(i + 1);
+        }
+        meter.stop("done");
+        Ok(())
+    }
+
+    /// The marks of `objects`, indexed like them, for the delta search.
+    fn for_objects(&self, objects: &[pack::data::output::delta::Object]) -> pack::data::output::delta::Islands {
+        pack::data::output::delta::Islands {
+            marks: objects
+                .iter()
+                .map(|object| self.marks.get(&object.id).map(|marks| std::sync::Arc::from(&marks[..])))
+                .collect(),
+            qsort: Some(platform_qsort),
+        }
+    }
+
+    /// `compute_pack_layers()` (delta-islands.c:534-556): with `pack.islandCore`
+    /// set, the objects the core island reaches are written as layer 0 and
+    /// everything else as layer 1; without it there is one layer and `None`.
+    fn compute_pack_layers(&self, objects: &[pack::data::output::delta::Object]) -> Option<Vec<u8>> {
+        self.core_island_name.as_ref()?;
+        let core = self.island_counter_core as usize;
+        Some(
+            objects
+                .iter()
+                .map(|object| match self.marks.get(&object.id) {
+                    Some(marks) if marks[core / 32] & (1 << (core % 32)) != 0 => 0,
+                    _ => 1,
+                })
+                .collect(),
+        )
     }
 }
 
-/// How deep in a tree each object was first seen, keyed by its position in
-/// `objects`.
-///
-/// git gets this for free from the path its object walk carries; the walk that
-/// produced `objects` keeps no paths, so this recovers the depths by descending
-/// from every commit's root tree once.
-fn tree_depths(
-    repo: &gix::Repository,
-    objects: &[pack::data::output::delta::Object],
-    position: &std::collections::HashMap<ObjectId, usize>,
-) -> std::collections::HashMap<usize, u32> {
-    use std::collections::VecDeque;
-
-    let mut out: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-    let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    for object in objects {
-        if object.kind != gix::object::Kind::Commit {
-            continue;
-        }
-        let Ok(commit) = repo.find_commit(object.id) else {
-            continue;
-        };
-        if let Ok(tree) = commit.tree_id() {
-            if seen.insert(tree.detach()) {
-                queue.push_back((tree.detach(), 0));
-            }
-        }
+/// `QSORT(delta_list, n, type_size_sort)` (builtin/pack-objects.c:3682) as git
+/// makes the call: the C library's `qsort()` over an array of pointers, one per
+/// entry, so the algorithm sees the same element count and the same answers
+/// from the comparator. With islands that is what decides the order, since
+/// `island_delta_cmp()` puts each of two objects on unrelated islands ahead of
+/// the other.
+fn platform_qsort(list: &mut [usize], cmp: &dyn Fn(usize, usize) -> std::cmp::Ordering) {
+    struct Entry<'a> {
+        at: usize,
+        cmp: &'a dyn Fn(usize, usize) -> std::cmp::Ordering,
     }
 
-    let mut buf = Vec::new();
-    while let Some((id, depth)) = queue.pop_front() {
+    unsafe extern "C" fn compare(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+        // SAFETY: `qsort()` hands back pointers into the array of entry pointers
+        // below, each naming an `Entry` that outlives the call.
+        let (a, b) = unsafe { (&**a.cast::<*const Entry<'_>>(), &**b.cast::<*const Entry<'_>>()) };
+        (a.cmp)(a.at, b.at) as libc::c_int
+    }
+
+    // `sane_qsort()` skips the call for fewer than two elements.
+    if list.len() < 2 {
+        return;
+    }
+    let entries: Vec<Entry<'_>> = list.iter().map(|&at| Entry { at, cmp }).collect();
+    let mut sorted: Vec<*const Entry<'_>> = entries.iter().map(std::ptr::from_ref).collect();
+    // SAFETY: `sorted` is a live, initialised array of pointers of the stated
+    // length and element size, each pointing into `entries`, which stays alive
+    // and unmoved until the loop below has read them back.
+    unsafe {
+        libc::qsort(
+            sorted.as_mut_ptr().cast::<libc::c_void>(),
+            sorted.len(),
+            std::mem::size_of::<*const Entry<'_>>(),
+            Some(compare),
+        );
+    }
+    for (slot, entry) in list.iter_mut().zip(&sorted) {
+        // SAFETY: as above.
+        *slot = unsafe { (**entry).at };
+    }
+}
+
+/// `oe_tree_depth()` for every entry of `objects`: the depth `record_tree_depth()`
+/// (builtin/pack-objects.c:2750-2764) took from the name `show_object()` was
+/// handed — zero for a root tree, one more per path component.
+///
+/// The names are recovered by replaying the traversal's tree walk: `objects` is
+/// in the order the traversal showed them, so each tree not yet reached from
+/// an earlier one is a root `traverse_non_commits()` took from `pending` at
+/// depth zero, and its subtrees are reached depth-first in entry order with
+/// everything already shown skipped, as `process_tree()` does. Anything the
+/// walk never names keeps the zero `CALLOC_ARRAY()` leaves.
+fn island_tree_depths(repo: &gix::Repository, objects: &[pack::data::output::delta::Object]) -> Vec<u32> {
+    fn walk(
+        repo: &gix::Repository,
+        id: ObjectId,
+        depth: u32,
+        position: &std::collections::HashMap<ObjectId, usize>,
+        seen: &mut HashSet<ObjectId>,
+        depths: &mut [u32],
+    ) {
         if let Some(&at) = position.get(&id) {
-            out.entry(at).and_modify(|d| *d = (*d).max(depth)).or_insert(depth);
+            depths[at] = depth;
         }
-        let Ok((object, _location)) = repo.objects.find(&id, &mut buf) else {
-            continue;
-        };
+        let mut buf = Vec::new();
+        let Ok((object, _)) = repo.objects.find(&id, &mut buf) else { return };
         let Ok(tree) = gix::objs::TreeRef::from_bytes(object.data, repo.object_hash()) else {
-            continue;
+            return;
         };
-        let children: Vec<ObjectId> = tree
+        let entries: Vec<(ObjectId, bool)> = tree
             .entries
             .iter()
-            .filter(|entry| entry.mode.is_tree())
-            .map(|entry| entry.oid.to_owned())
+            .filter(|entry| !entry.mode.is_commit())
+            .map(|entry| (entry.oid.to_owned(), entry.mode.is_tree()))
             .collect();
-        for child in children {
-            if seen.insert(child) {
-                queue.push_back((child, depth + 1));
+        for (child, is_tree) in entries {
+            if seen.insert(child) && is_tree {
+                walk(repo, child, depth + 1, position, seen, depths);
             }
         }
     }
-    out
+
+    let position: std::collections::HashMap<ObjectId, usize> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| !object.preferred_base)
+        .map(|(at, object)| (object.id, at))
+        .collect();
+    let mut depths = vec![0u32; objects.len()];
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for object in objects {
+        if object.preferred_base {
+            continue;
+        }
+        if object.kind != gix::object::Kind::Tree {
+            seen.insert(object.id);
+            continue;
+        }
+        if seen.insert(object.id) {
+            walk(repo, object.id, 0, &position, &mut seen, &mut depths);
+        }
+    }
+    depths
 }
 
 /// Whether a `.bitmap` accompanies the pack, and what goes in it.
@@ -3801,9 +4169,7 @@ const MIN_PSEUDO_MERGE_SIZE: usize = 8;
 /// older than the group's own `stableThreshold`, an unparseable timestamp, and
 /// a value that is not a number where one is wanted. Here each is reported with
 /// git's wording and then drops its group, which costs the pack that group's
-/// pseudo-merges and nothing else — the same choice [`load_delta_islands`]
-/// already makes for a `pack.island` regex that will not compile. Dropping
-/// rather than defaulting is the point: a mistyped threshold must not quietly
+/// pseudo-merges and nothing else. Dropping rather than defaulting is the point: a mistyped threshold must not quietly
 /// become the built-in one and fill the file with merges nobody asked for.
 ///
 /// The out-of-range numeric values are not in that set. git only warns about
@@ -5152,7 +5518,21 @@ fn rev_list_objects(
     let mut out = from_stdin;
     // Everything `pending` reaches that `hidden` does not — the difference
     // `push` and `bundle create` pack as well.
-    out.extend(super::push_proto::objects_to_send(repo, &pending, &hidden));
+    if st.delta_islands {
+        // `--topo-order` joins the rev list under islands
+        // (builtin/pack-objects.c:5440-5441): the same objects, shown in the
+        // topological walk's order.
+        let wanted: HashSet<ObjectId> = super::push_proto::objects_to_send(repo, &pending, &hidden)
+            .into_iter()
+            .collect();
+        out.extend(
+            traverse_commit_list_topo(repo, pending.clone())
+                .into_iter()
+                .filter(|id| wanted.contains(id)),
+        );
+    } else {
+        out.extend(super::push_proto::objects_to_send(repo, &pending, &hidden));
+    }
     // `--thin` pushes `--objects-edge` (`--objects-edge-aggressive` under
     // `--shallow`) onto the internal rev list (builtin/pack-objects.c:5323-5327),
     // and `get_object_list()` runs `mark_edges_uninteresting(revs, show_edge,
@@ -5257,11 +5637,32 @@ fn walk_edges(repo: &gix::Repository, pending: &[ObjectId], hidden: &[ObjectId],
 /// names commits that have since been pruned, and git's `parse_object()` gives it
 /// a NULL it skips.
 pub(crate) fn traverse_commit_list(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
+    traverse(repo, pending, false)
+}
+
+/// [`traverse_commit_list`] with `--topo-order` on the walk, which
+/// `cmd_pack_objects()` pushes onto its internal rev list whenever delta islands
+/// are on (builtin/pack-objects.c:5440-5441): `show_commit()` propagates island
+/// marks from each commit to its parents, so no commit may be shown before a
+/// child that marks it.
+///
+/// Without a commit-graph `--topo-order` makes the walk `limited`
+/// (revision.c:3195-3196), so `prepare_revision_walk()` runs `limit_list()` —
+/// which takes the commits in the very date order phase 1 below produces — and
+/// then `sort_in_topological_order(&revs->commits, REV_SORT_IN_GRAPH_ORDER)`
+/// (revision.c:4053-4057); with one it is `init_topo_walk()` (:4058-4059),
+/// which is not reproduced here. `do_traverse()` then pends each commit's tree as it
+/// shows the commit, so the trees follow the topological order too.
+pub(crate) fn traverse_commit_list_topo(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
+    traverse(repo, pending, true)
+}
+
+fn traverse(repo: &gix::Repository, pending: Vec<ObjectId>, topo: bool) -> Vec<ObjectId> {
     let CommitWalk {
         commits: mut out,
         objects,
         mut seen,
-    } = walk_commits(repo, pending);
+    } = walk_commits(repo, pending, topo);
     // Phase 2: `traverse_trees_and_blobs()`. `objects` grows only in phase 1, so
     // the index walk is over a fixed list; subtrees are expanded in place.
     for id in objects {
@@ -5275,7 +5676,7 @@ pub(crate) fn traverse_commit_list(repo: &gix::Repository, pending: Vec<ObjectId
 /// `find_commits_for_midx_bitmap()` (midx-write.c:836-878) runs this walk with a
 /// callback that only looks at commits.
 pub(crate) fn traversal_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
-    walk_commits(repo, pending).commits
+    walk_commits(repo, pending, false).commits
 }
 
 /// What phase 1 of [`traverse_commit_list`] leaves behind.
@@ -5291,7 +5692,7 @@ struct CommitWalk {
 
 /// Phase 1 of [`traverse_commit_list`]: `prepare_revision_walk()` and the commit
 /// loop of `do_traverse()`.
-fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> CommitWalk {
+fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>, topo: bool) -> CommitWalk {
     use gix::object::Kind;
 
     let mut seen: HashSet<ObjectId> = HashSet::new();
@@ -5339,7 +5740,11 @@ fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> CommitWalk {
     // `commit_list_sort_by_date()` — a stable merge sort, newest first.
     queue.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // Phase 1b: `do_traverse()`'s commit loop.
+    // Phase 1b: `do_traverse()`'s commit loop. Under `topo` it is
+    // `limit_list()`'s instead, which shows nothing: the trees are pended once
+    // the list is sorted.
+    let mut parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = std::collections::HashMap::new();
+    let mut trees: std::collections::HashMap<ObjectId, ObjectId> = std::collections::HashMap::new();
     let mut at = 0usize;
     while at < queue.len() {
         let (id, _) = queue[at];
@@ -5350,9 +5755,13 @@ fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> CommitWalk {
             continue;
         };
         let (tree, parents) = commit;
-        // `add_pending_tree()` runs *before* `show_commit()`, but the tree joins
-        // `pending` while the commit joins the output, so the two never interleave.
-        if seen.insert(tree) {
+        if topo {
+            parents_of.insert(id, parents.clone());
+            trees.insert(id, tree);
+        } else if seen.insert(tree) {
+            // `add_pending_tree()` runs *before* `show_commit()`, but the tree
+            // joins `pending` while the commit joins the output, so the two
+            // never interleave.
             objects.push(tree);
         }
         out.push(id);
@@ -5369,6 +5778,16 @@ fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> CommitWalk {
                 .position(|(_, d)| *d < date)
                 .map_or(queue.len(), |i| at + i);
             queue.insert(pos, (parent, date));
+        }
+    }
+    if topo {
+        out = super::rev_list::topo_sort(&out, &parents_of, None);
+        for id in &out {
+            if let Some(&tree) = trees.get(id) {
+                if seen.insert(tree) {
+                    objects.push(tree);
+                }
+            }
         }
     }
     CommitWalk {

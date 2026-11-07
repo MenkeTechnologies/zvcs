@@ -1040,9 +1040,17 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     let mut rank: HashMap<ObjectId, usize> = HashMap::new();
     if geometry.is_none() {
         let pending = pack_objects_pending(&repo, &promisor_held);
-        for (position, id) in
-            super::pack_objects::traverse_commit_list(&repo, pending).into_iter().enumerate()
-        {
+        // `--delta-islands` reaches this child (builtin/repack.c:503-504), and
+        // the child then walks under `--topo-order`
+        // (builtin/pack-objects.c:5440-5441).
+        let use_delta_islands = st.delta_islands.unwrap_or_else(|| {
+            repo.config_snapshot().boolean("repack.useDeltaIslands").unwrap_or(false)
+        });
+        let shown = match use_delta_islands {
+            true => super::pack_objects::traverse_commit_list_topo(&repo, pending),
+            false => super::pack_objects::traverse_commit_list(&repo, pending),
+        };
+        for (position, id) in shown.into_iter().enumerate() {
             rank.entry(id).or_insert(position);
         }
     }
@@ -2084,8 +2092,11 @@ fn write_pack_with(
     // `use_delta_islands`: `repack.useDeltaIslands`, overridden by `-i` /
     // `--[no-]delta-islands` (builtin/repack.c:82-84, 225-226), which
     // `cmd_repack()` turns into `pack-objects --delta-islands` for the main
-    // child only (:503-504).
+    // child only (:503-504). A geometric run hands that child `--stdin-packs`
+    // instead of `--all` (:480-494, :532-540), which never reaches
+    // `load_delta_islands()` (builtin/pack-objects.c:4955-4956).
     let use_delta_islands = main
+        && st.geometric_factor == 0.0
         && st.delta_islands.unwrap_or_else(|| {
             repo.config_snapshot().boolean("repack.useDeltaIslands").unwrap_or(false)
         });

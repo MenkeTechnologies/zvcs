@@ -350,6 +350,32 @@ pub trait Content {
     fn size(&mut self, spec: &FileSpec) -> Option<u64>;
     /// The blob's bytes.
     fn data(&mut self, spec: &FileSpec) -> Option<Vec<u8>>;
+    /// `diff_populate_filespec()` with `check_size_only = 0` as git makes the read: `contentp` and
+    /// `sizep` and no `typep` (diff.c:4580-4617), so a packed entry that does not unpack leaves
+    /// `s->data` `NULL` with the size `unpack_entry()` stored (packfile.c:1323-1327, 1703-1706).
+    /// A source that is not the object database only ever has bytes.
+    fn populate(&mut self, spec: &FileSpec) -> Option<Populated> {
+        self.data(spec).map(Populated::Data)
+    }
+}
+
+/// What [`Content::populate`] leaves in a filespec.
+pub enum Populated {
+    /// `s->data`.
+    Data(Vec<u8>),
+    /// `s->data` `NULL` with `s->size` the given size, after the unpack printed its `error()`
+    /// lines. `diff_populate_filespec()` returns early only for data it holds (diff.c:4496-4497),
+    /// so the next populate of the side reads the object again.
+    Null(u64),
+}
+
+/// [`Content::populate`] of a side the object database holds; `None` is an object no source
+/// produced.
+pub fn populate_from_odb(repo: &gix::Repository, oid: ObjectId) -> Option<Populated> {
+    Some(match super::filespec::read_content_or_null(&repo.objects, oid)? {
+        Ok(data) => Populated::Data(data),
+        Err(size) => Populated::Null(size),
+    })
 }
 
 /// The object-database side of `diff_populate_filespec()`: every spec of a
@@ -369,6 +395,10 @@ impl Content for OdbContent<'_> {
 
     fn data(&mut self, spec: &FileSpec) -> Option<Vec<u8>> {
         self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
+
+    fn populate(&mut self, spec: &FileSpec) -> Option<Populated> {
+        populate_from_odb(self.repo, spec.oid)
     }
 }
 
@@ -402,11 +432,16 @@ fn populate_data(specs: &mut [FileSpec], idx: usize, c: &mut dyn Content) -> boo
     if specs[idx].data.is_some() {
         return true;
     }
-    let probed = c.data(&specs[idx]);
+    let probed = c.populate(&specs[idx]);
     match probed {
-        Some(buf) => {
+        Some(Populated::Data(buf)) => {
             specs[idx].size = Some(buf.len() as u64);
             specs[idx].data = Some(buf);
+            true
+        }
+        // A `NULL` read succeeds; what reads the data next reads no bytes.
+        Some(Populated::Null(size)) => {
+            specs[idx].size = Some(size);
             true
         }
         None => {

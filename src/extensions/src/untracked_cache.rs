@@ -279,7 +279,7 @@ fn ce_uptodate(
 /// `would_convert_to_git()` (convert.h:139-143): `convert_to_git()` without a buffer, which
 /// answers from the attributes and configuration alone — a clean filter driver, a
 /// working-tree encoding, any end-of-line action but binary, or `ident`.
-struct Convert<'r> {
+pub(crate) struct Convert<'r> {
     stack: gix::AttributeStack<'r>,
     outcome: gix::attrs::search::Outcome,
     auto_crlf: AutoCrlf,
@@ -294,7 +294,7 @@ enum AutoCrlf {
 }
 
 impl<'r> Convert<'r> {
-    fn new(repo: &'r gix::Repository, index: &gix::index::State) -> anyhow::Result<Self> {
+    pub(crate) fn new(repo: &'r gix::Repository, index: &gix::index::State) -> anyhow::Result<Self> {
         let config = repo.config_snapshot();
         let auto_crlf = match config.string("core.autocrlf").as_deref().map(|v| v.to_ascii_lowercase()) {
             Some(v) if v.as_slice() == b"input" => AutoCrlf::Input,
@@ -319,7 +319,7 @@ impl<'r> Convert<'r> {
         })
     }
 
-    fn would_convert_to_git(&mut self, rela: &BStr) -> bool {
+    pub(crate) fn would_convert_to_git(&mut self, rela: &BStr) -> bool {
         use gix::attrs::StateRef;
         let mode = Some(gix::index::entry::Mode::FILE);
         if self.stack.at_entry(rela, mode).is_err() {

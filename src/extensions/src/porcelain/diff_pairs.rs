@@ -818,6 +818,9 @@ struct Opts {
     /// other caller of `diffcore_std()` — `diff-tree` routed through here included —
     /// runs `diff_resolve_rename_copy()` and expects it to assign them.
     resolve_statuses: bool,
+    /// `r->index` once the command has read it, which is what lets `reuse_worktree_file()` hand
+    /// `diff_populate_filespec()` a checked-out file in place of its blob (diff.c:4505-4506).
+    istate: Option<super::filespec::Istate>,
 }
 
 /// git's `enum diff_submodule_format`, restricted to the two this port renders.
@@ -995,6 +998,10 @@ pub(crate) struct RouteCtx<'a> {
     /// against 2.55.0). A routed `diff-tree` is the first kind, so it says yes here
     /// and its `--stat --compact-summary` annotates a reversed creation `(gone)`.
     pub queue_time_reverse: bool,
+    /// Whether the caller read the index before queueing, as `cmd_diff_tree()` does
+    /// (builtin/diff-tree.c:133-134); `builtin/diff-pairs.c` reads it only through a gitlink
+    /// (see [`queues_read_index`]).
+    pub index_read: bool,
     /// `DIFF_PICKAXE_IGNORE_CASE`. It is not one of `add_diff_options()`'s: the caller's
     /// `setup_revisions()` sets it from `-i` / `--regexp-ignore-case`
     /// (revision.c:2690-2692), which is why `git diff-pairs -i` is an unknown switch
@@ -1059,6 +1066,7 @@ pub(crate) fn render_raw_stream(
         allow_external: false,
         log_header: route.log_header.map(<[u8]>::to_vec),
         resolve_statuses: false,
+        istate: None,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does not
     // overwrite it (git reads the config first and the command line last).
@@ -1852,12 +1860,15 @@ pub(crate) fn render_raw_stream(
                 drivers: d,
                 env: ext_env,
                 counter: std::cell::Cell::new(0),
-                index_read: std::cell::Cell::new(false),
+                index_read: std::cell::Cell::new(route.index_read),
                 index: std::cell::OnceCell::new(),
             })
         }
         _ => None,
     };
+    if route.index_read {
+        opts.istate = super::filespec::Istate::read(&repo);
+    }
 
     // Finalize the pickaxe now that the whole line has been read.
     opts.pickaxe = match finalize_pickaxe(
@@ -1988,9 +1999,12 @@ pub(crate) fn render_raw_stream(
         let (_, mut pair) = pair;
         pair.old_path = old_path;
         pair.new_path = new_path;
-        if let Some(ctx) = ext.as_ref() {
-            if queues_read_index(&pair, opts.ignore_submodules_set) {
+        if queues_read_index(&pair, opts.ignore_submodules_set) {
+            if let Some(ctx) = ext.as_ref() {
                 ctx.index_read.set(true);
+            }
+            if opts.istate.is_none() {
+                opts.istate = super::filespec::Istate::read(&repo);
             }
         }
         batch.push(pair);
@@ -2375,21 +2389,45 @@ fn parse_oid(body: &[u8], at: usize, hexsz: usize) -> Result<ObjectId, String> {
 }
 
 /// Reads a filespec's blob for [`diffcore_rename`]. Every side of a `diff-pairs`
-/// record names an object in the database, so `diff_populate_filespec()` here is just
-/// an odb lookup.
+/// record names an object in the database, so `diff_populate_filespec()` here is an
+/// odb lookup, unless `reuse_worktree_file()` hands it the checked-out file instead
+/// (diff.c:4505-4506).
 struct OdbContent<'a> {
     repo: &'a gix::Repository,
+    istate: Option<&'a super::filespec::Istate>,
+}
+
+impl OdbContent<'_> {
+    /// The index, when the side is a checked-out file it vouches for.
+    fn reused(&self, spec: &diffcore_rename::FileSpec) -> Option<&super::filespec::Istate> {
+        self.istate
+            .filter(|istate| spec.oid_valid && istate.reuse_worktree_file(self.repo, spec.path.as_bstr(), &spec.oid, false))
+    }
 }
 
 impl diffcore_rename::Content for OdbContent<'_> {
     fn size(&mut self, spec: &diffcore_rename::FileSpec) -> Option<u64> {
+        // `s->size = xsize_t(st.st_size)` of the reused file (diff.c:4515).
+        if let Some(istate) = self.reused(spec) {
+            return Some(std::fs::symlink_metadata(istate.worktree_path(spec.path.as_bstr())).map_or(0, |m| m.len()));
+        }
         // `check_size_only = 1`: the odb header answers without inflating the blob.
         let header = self.repo.find_header(spec.oid).ok()?;
         (header.kind() == gix::object::Kind::Blob).then(|| header.size())
     }
 
     fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        if let Some(istate) = self.reused(spec) {
+            return Some(istate.populate(spec.path.as_bstr()));
+        }
         self.repo.find_object(spec.oid).ok().map(|o| o.detach().data)
+    }
+
+    fn populate(&mut self, spec: &diffcore_rename::FileSpec) -> Option<diffcore_rename::Populated> {
+        if let Some(istate) = self.reused(spec) {
+            return Some(diffcore_rename::Populated::Data(istate.populate(spec.path.as_bstr())));
+        }
+        diffcore_rename::populate_from_odb(self.repo, spec.oid)
     }
 }
 
@@ -2398,6 +2436,7 @@ impl diffcore_rename::Content for OdbContent<'_> {
 /// tokens `diff_resolve_rename_copy()` assigns.
 fn run_rename_detection(
     repo: &gix::Repository,
+    istate: Option<&super::filespec::Istate>,
     pairs: &mut Vec<Pair>,
     opts: &diffcore_rename::Options,
     resolve_statuses: bool,
@@ -2428,7 +2467,7 @@ fn run_rename_detection(
 
     let mut opts = *opts;
     opts.hash_kind = repo.object_hash();
-    let mut content = OdbContent { repo };
+    let mut content = OdbContent { repo, istate };
     let warnings = diffcore_rename::run(&mut q, &opts, &mut content);
     // `builtin/diff-pairs.c` sets `skip_resolving_statuses` when no rename detection
     // was asked for, leaving the statuses read off stdin alone.
@@ -2546,7 +2585,7 @@ fn flush(
     // `skip_resolving_statuses` when no detection was asked for — so the status
     // letters read off stdin survive untouched unless `-M`/`-C`/`-B` is present.
     if opts.rename.detect_rename != 0 || opts.rename.break_opt != -1 {
-        match run_rename_detection(repo, &mut pairs, &opts.rename, opts.resolve_statuses) {
+        match run_rename_detection(repo, opts.istate.as_ref(), &mut pairs, &opts.rename, opts.resolve_statuses) {
             // `needed_rename_limit` is reset by every `too_many_rename_candidates()`
             // call, so the last batch's value is the one `diff_result_code()` reports;
             // `degraded_cc_to_c` is only ever set, never cleared.
@@ -3265,15 +3304,7 @@ pub(crate) struct ExtCtx<'a, 'repo> {
     /// [`queues_read_index`].
     pub(crate) index_read: std::cell::Cell<bool>,
     /// The worktree index, opened the first time it is needed.
-    pub(crate) index: std::cell::OnceCell<Option<WorktreeIndex>>,
-}
-
-/// The worktree index plus the `core.trustCtime` / `core.checkStat` knobs
-/// `ie_match_stat()` obeys.
-pub(crate) struct WorktreeIndex {
-    state: gix::worktree::IndexPersistedOrInMemory,
-    stat: gix::index::entry::stat::Options,
-    workdir: std::path::PathBuf,
+    pub(crate) index: std::cell::OnceCell<Option<super::filespec::Istate>>,
 }
 
 impl ExtCtx<'_, '_> {
@@ -3288,51 +3319,10 @@ impl ExtCtx<'_, '_> {
         if !self.index_read.get() {
             return false;
         }
-        let idx = self
-            .index
-            .get_or_init(|| {
-                let state = repo.index_or_load_from_head().ok()?;
-                Some(WorktreeIndex {
-                    state,
-                    stat: repo.stat_options().ok()?,
-                    workdir: repo.workdir()?.to_path_buf(),
-                })
-            })
-            .as_ref();
-        let Some(idx) = idx else {
-            return false;
-        };
-        let Some(entry) = idx.state.entry_by_path(path.as_bstr()) else {
-            return false;
-        };
-        // "This is not the sha1 we are looking for, or unreusable because it is not
-        // a regular file."
-        if entry.id != *oid
-            || !matches!(
-                entry.mode,
-                gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
-            )
-        {
-            return false;
-        }
-        // `CE_VALID` ("assume unchanged") and skip-worktree both mean the worktree
-        // is not guaranteed to hold the entry's content.
-        if entry
-            .flags
-            .intersects(gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE)
-        {
-            return false;
-        }
-        // `ce_uptodate()` is an in-core marker that a fresh `repo_read_index()` never
-        // sets, so the answer always comes from `lstat()` + `ie_match_stat()`.
-        let full = idx.workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
-        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
-            return false;
-        };
-        let Ok(stat) = gix::index::entry::Stat::from_fs(&meta) else {
-            return false;
-        };
-        entry.stat.matches(&stat, idx.stat)
+        self.index
+            .get_or_init(|| super::filespec::Istate::read(repo))
+            .as_ref()
+            .is_some_and(|istate| istate.reuse_worktree_file(repo, path.as_bstr(), oid, true))
     }
 }
 
@@ -4573,8 +4563,23 @@ fn analyze(
     // unpack leaves `s->data` `NULL` rather than failing (packfile.c:1323-1327): that side is
     // handed to the platform as the empty filespec, which is how xdiff reads a `NULL` buffer.
     // A blob that cannot be read at all is `die("unable to read %s")` (diff.c:4596-4598).
-    let set = |cache: &mut gix::diff::blob::Platform, id: ObjectId, mode, path: &BString, kind| {
+    //
+    // `if (!s->oid_valid || reuse_worktree_file(r->index, s->path, &s->oid, 0))` (diff.c:4505-4506):
+    // a side the index vouches for is the checked-out file, and the object is never read.
+    let reused = |id: ObjectId, valid: bool, path: &BString| {
+        valid
+            && !id.is_null()
+            && opts.istate.as_ref().is_some_and(|istate| istate.reuse_worktree_file(repo, path.as_bstr(), &id, false))
+    };
+    let old_reused = reused(p.old_id, p.old_valid(), &p.old_path);
+    let new_reused = reused(p.new_id, p.new_valid(), &p.new_path);
+    let set = |cache: &mut gix::diff::blob::Platform, id: ObjectId, mode, path: &BString, kind, reuse: bool| {
         use gix::diff::blob::{pipeline::convert_to_diffable, platform::set_resource};
+        if let Some(istate) = opts.istate.as_ref().filter(|_| reuse) {
+            return super::worktree_filespec::set_reused_resource(cache, (id, mode), path.as_bstr(), kind, &repo.objects, istate.workdir())
+                .map(|()| false)
+                .map_err(|_| fatal("unable to diff blob pair"));
+        }
         // `diff_filespec_is_binary()` populates with `check_binary`: the size alone first.
         if !id.is_null() && super::filespec::read_size(&repo.objects, id).is_err() {
             return Err(fatal(&format!("unable to read {}", id.to_hex())));
@@ -4597,8 +4602,8 @@ fn analyze(
         };
         res.map_err(|_| fatal("unable to diff blob pair"))
     };
-    let old_null = set(cache, p.old_id, old_kind, &p.old_path, ResourceKind::OldOrSource)?;
-    let new_null = set(cache, p.new_id, new_kind, &p.new_path, ResourceKind::NewOrDestination)?;
+    let old_null = set(cache, p.old_id, old_kind, &p.old_path, ResourceKind::OldOrSource, old_reused)?;
+    let new_null = set(cache, p.new_id, new_kind, &p.new_path, ResourceKind::NewOrDestination, new_reused)?;
     // `builtin_diffstat()`'s `fill_mmfile()` populates a `NULL` side once more when the ids may
     // differ (diff.c:4190-4235), which reads it again; `diff_filespec_is_binary()` leaves a `NULL`
     // side text (diff.c:3703-3709).
@@ -4640,11 +4645,13 @@ fn analyze(
     let old_data = match prep.old.data.as_slice() {
         Some(d) => d.to_vec(),
         None if old_null => Vec::new(),
+        None if old_reused => opts.istate.as_ref().map(|istate| istate.populate(p.old_path.as_bstr())).unwrap_or_default(),
         None => read_blob(repo, p.old_id, p.old_valid())?,
     };
     let new_data = match prep.new.data.as_slice() {
         Some(d) => d.to_vec(),
         None if new_null => Vec::new(),
+        None if new_reused => opts.istate.as_ref().map(|istate| istate.populate(p.new_path.as_bstr())).unwrap_or_default(),
         None => read_blob(repo, p.new_id, p.new_valid())?,
     };
     // Whether gitoxide classified each side on its own as binary. `as_slice()` is `None`

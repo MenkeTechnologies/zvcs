@@ -190,3 +190,30 @@ pub(crate) fn set_absent_resource(
     res?;
     Ok(())
 }
+
+/// Hand the blob platform a side `reuse_worktree_file()` vouched for: `diff_populate_filespec()`
+/// then reads the checked-out file at `rela_path` instead of the blob `id` (diff.c:4505-4560).
+///
+/// The inverse of [`set_absent_resource`]'s lift: `workdir` is put in as the root of `kind` for
+/// the one call, so the pipeline reads the path off disk (`gix-diff/src/blob/pipeline.rs:276`)
+/// and keys the entry by that path.
+pub(crate) fn set_reused_resource(
+    cache: &mut gix::diff::blob::Platform,
+    (id, mode): (ObjectId, EntryKind),
+    rela_path: &BStr,
+    kind: ResourceKind,
+    objects: &gix::OdbHandle,
+    workdir: &std::path::Path,
+) -> std::result::Result<(), gix::diff::blob::platform::set_resource::Error> {
+    let slot = match kind {
+        ResourceKind::OldOrSource => &mut cache.filter.roots.old_root,
+        ResourceKind::NewOrDestination => &mut cache.filter.roots.new_root,
+    };
+    let root = slot.replace(workdir.to_owned());
+    let res = cache.set_resource(id, mode, rela_path, kind, objects);
+    match kind {
+        ResourceKind::OldOrSource => cache.filter.roots.old_root = root,
+        ResourceKind::NewOrDestination => cache.filter.roots.new_root = root,
+    }
+    res
+}

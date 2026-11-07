@@ -588,13 +588,6 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     if let Some(code) = die_path_inside_submodule(&index, &typed, &resolved) {
         return Ok(code);
     }
-    // `fill_directory()` (builtin/add.c:510) runs before the pathspec check can die,
-    // so its `could not open directory` warning is the first thing on stderr. Only
-    // the modes that look for untracked files reach it (`add_new_files`,
-    // builtin/add.c:451).
-    if !tracked_only {
-        warn_unopenable_walk_prefix(&repo, &typed, &resolved);
-    }
     if at_root {
         for spec in pathspecs.iter_mut() {
             if spec == "." || spec == "./" {
@@ -611,6 +604,22 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .iter()
         .map(|s| BString::from(s.clone().into_bytes()))
         .collect();
+    // `fill_directory()` (builtin/add.c:510) runs before the pathspec check can die,
+    // so its `could not open directory` warning is the first thing on stderr. Only
+    // the modes that look for untracked files reach it (`add_new_files`,
+    // builtin/add.c:451). Without `-f` it collects `dir.ignored` under
+    // `DIR_COLLECT_IGNORED` (builtin/add.c:504-508), the walk
+    // [`super::add_support::collect_ignored`] ports, which warns for itself; with
+    // `-f` the walk lists only what gitoxide's walk below finds, so only its
+    // diagnostic is reproduced.
+    let dir_ignored: Vec<BString> = match (tracked_only, force) {
+        (true, _) => Vec::new(),
+        (false, true) => {
+            warn_unopenable_walk_prefix(&repo, &typed, &resolved);
+            Vec::new()
+        }
+        (false, false) => super::add_support::collect_ignored(&repo, &index, &patterns)?,
+    };
 
     // `--refresh` is `refresh()` (builtin/add.c:123-133): `refresh_index()` over the
     // pathspec, which dies at the first racily clean entry it has to hash under a
@@ -1372,7 +1381,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         ignore_errors,
         files_to_cache_die,
         ignored_too: force,
-        patterns: &patterns,
+        dir_ignored: &dir_ignored,
         mode: match (refresh, renormalize, update_only) {
             (true, _, _) => super::add_support::SpecMode::Refresh,
             (_, true, _) => super::add_support::SpecMode::Renormalize,

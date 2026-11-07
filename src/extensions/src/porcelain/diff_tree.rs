@@ -2960,20 +2960,28 @@ fn render_all(
                 // creation is a deletion by the time any format reads its status.
                 queue_time_reverse: opts.route_reverse,
                 pickaxe_icase: opts.pickaxe_icase,
+                // `cmd_diff_tree()` reads the index before anything is queued
+                // (builtin/diff-tree.c:133-134).
+                index_read: true,
                 log_header,
             },
         )?;
         return Ok(status.code());
     }
+    // `cmd_diff_tree()` reads the index before anything is queued (builtin/diff-tree.c:133-134),
+    // which is what `reuse_worktree_file()` consults.
+    let istate = matches!(opts.format, Format::NumStat | Format::ShortStat)
+        .then(|| super::filespec::Istate::read(repo))
+        .flatten();
     match opts.format {
         Format::NumStat => {
             let mut drivers = super::cat_file::Textconv::new(repo)?;
             for c in changes {
-                render_numstat(repo, &mut drivers, out, c, opts)?;
+                render_numstat(repo, istate.as_ref(), &mut drivers, out, c, opts)?;
             }
         }
         Format::ShortStat => {
-            render_shortstat(repo, &mut super::cat_file::Textconv::new(repo)?, out, changes)?
+            render_shortstat(repo, istate.as_ref(), &mut super::cat_file::Textconv::new(repo)?, out, changes)?
         }
         Format::Summary => {
             for c in changes {
@@ -3021,10 +3029,19 @@ fn raw_pair_stream(changes: &[Change]) -> Vec<u8> {
 
 /// The raw blob bytes on one side of a change; an absent side is the empty content. `None` is
 /// a side `diff_populate_filespec()` left `NULL` (see [`super::filespec::populate`]), which is
-/// diffed as no lines.
-fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Option<Vec<u8>>> {
+/// diffed as no lines. A side `reuse_worktree_file()` vouches for is the checked-out file at
+/// `path`, and its object is never read (diff.c:4505-4506).
+fn side_bytes(
+    repo: &gix::Repository,
+    istate: Option<&super::filespec::Istate>,
+    path: &BString,
+    side: Option<Side>,
+) -> Result<Option<Vec<u8>>> {
     match side {
-        Some(s) => super::filespec::populate_blob(&repo.objects, s.id),
+        Some(s) => match istate.filter(|istate| istate.reuse_worktree_file(repo, path.as_bstr(), &s.id, false)) {
+            Some(istate) => Ok(Some(istate.populate(path.as_bstr()))),
+            None => super::filespec::populate_blob(&repo.objects, s.id),
+        },
         None => Ok(Some(Vec::new())),
     }
 }
@@ -3039,11 +3056,12 @@ fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Option<Vec<u
 /// newline counts as one removal plus one addition exactly as git reports.
 fn numstat_counts(
     repo: &gix::Repository,
+    istate: Option<&super::filespec::Istate>,
     drivers: &mut super::cat_file::Textconv<'_>,
     c: &Change,
 ) -> Result<Option<(u32, u32)>> {
-    let old_data = side_bytes(repo, c.old)?;
-    let new_data = side_bytes(repo, c.new)?;
+    let old_data = side_bytes(repo, istate, &c.path, c.old)?;
+    let new_data = side_bytes(repo, istate, &c.path, c.new)?;
     let (old_null, new_null) = (old_data.is_none(), new_data.is_none());
     let (old, new) = (old_data.unwrap_or_default(), new_data.unwrap_or_default());
     let driver = drivers.binary_attr(c.path.as_bstr())?;
@@ -3066,12 +3084,13 @@ fn numstat_counts(
 /// NUL and leaves the path unquoted, otherwise the path is C-quoted like git's.
 fn render_numstat(
     repo: &gix::Repository,
+    istate: Option<&super::filespec::Istate>,
     drivers: &mut super::cat_file::Textconv<'_>,
     out: &mut Vec<u8>,
     c: &Change,
     opts: &Opts,
 ) -> Result<()> {
-    match numstat_counts(repo, drivers, c)? {
+    match numstat_counts(repo, istate, drivers, c)? {
         Some((add, del)) => {
             out.extend_from_slice(format!("{add}\t{del}\t").as_bytes());
         }
@@ -3086,6 +3105,7 @@ fn render_numstat(
 /// count toward the file total but contribute no line counts.
 fn render_shortstat(
     repo: &gix::Repository,
+    istate: Option<&super::filespec::Istate>,
     drivers: &mut super::cat_file::Textconv<'_>,
     out: &mut Vec<u8>,
     changes: &[Change],
@@ -3096,7 +3116,7 @@ fn render_shortstat(
     let mut insertions: u64 = 0;
     let mut deletions: u64 = 0;
     for c in changes {
-        if let Some((add, del)) = numstat_counts(repo, drivers, c)? {
+        if let Some((add, del)) = numstat_counts(repo, istate, drivers, c)? {
             insertions += add as u64;
             deletions += del as u64;
         }

@@ -4947,6 +4947,13 @@ impl diffcore_rename::Content for DeltaContent<'_> {
     fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
         self.read(spec)
     }
+
+    fn populate(&mut self, spec: &diffcore_rename::FileSpec) -> Option<diffcore_rename::Populated> {
+        if spec.mode & 0o170000 != 0o160000 && spec.oid_valid && !spec.oid.is_null() {
+            return diffcore_rename::populate_from_odb(self.repo, spec.oid);
+        }
+        self.read(spec).map(diffcore_rename::Populated::Data)
+    }
 }
 
 /// The `diffcore_std()` rename/copy/break slice, bridged onto this module's [`Delta`]

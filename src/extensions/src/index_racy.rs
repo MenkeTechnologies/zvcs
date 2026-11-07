@@ -126,6 +126,62 @@ fn match_stat_basic_differs(
         || (entry.stat.size == 0 && entry.id != *empty_blob)
 }
 
+/// `is_racy_stat()` (read-cache.c:353-366): the entry is racy when the index is not strictly newer
+/// than the file it recorded. The nanosecond refinement there is behind `USE_NSEC`, which the
+/// git this port targets is not built with — measured on the stock binary, which smudges an
+/// entry whose recorded nanoseconds are *earlier* than the index's within the same second. So
+/// the comparison is on whole seconds, exactly as the non-`USE_NSEC` branch does it.
+fn is_racy_stat(index: &gix::index::File, stat: &gix::index::entry::Stat) -> bool {
+    let isec = index.timestamp().unix_seconds();
+    isec != 0 && isec as u32 <= stat.mtime.secs
+}
+
+/// `!ie_match_stat(istate, ce, &st, 0)` (read-cache.c:383-442) for `entry` of `index`, whose
+/// worktree file is `full`: whether the checked-out file is known to hold the entry's content.
+/// `core.fileMode` and `core.symlinks` are `trust_executable_bit` and `has_symlinks`.
+///
+/// The fsmonitor arms (`refresh_fsmonitor()`, `CE_FSMONITOR_VALID`) are not taken: no index this
+/// port reads carries a valid fsmonitor bit.
+pub(crate) fn ie_match_stat_unchanged(
+    index: &gix::index::File,
+    entry: &gix::index::Entry,
+    full: &std::path::Path,
+    opts: gix::index::entry::stat::Options,
+    trust_executable_bit: bool,
+    has_symlinks: bool,
+) -> bool {
+    use gix::index::entry::Flags;
+    // "If it's marked as always valid in the index, it's valid whatever the checked-out copy
+    // says. skip-worktree has the same effect with higher precedence."
+    if entry.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID) {
+        return true;
+    }
+    // "Intent-to-add entries have not been added, so the index entry by definition never
+    // matches what is in the work tree until it actually gets added."
+    if entry.flags.contains(Flags::INTENT_TO_ADD) {
+        return false;
+    }
+    // The caller's `lstat()`; a path it cannot stat never gets here in git.
+    let Ok(meta) = std::fs::symlink_metadata(full) else {
+        return false;
+    };
+    let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(full) else {
+        return false;
+    };
+    let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
+        return false;
+    };
+    let empty_blob = index.object_hash().empty_blob();
+    // `changed = ce_match_stat_basic(ce, st);`
+    if match_stat_basic_differs(entry, &fs_meta, &current, opts, trust_executable_bit, has_symlinks, &empty_blob) {
+        return false;
+    }
+    // `if (!changed && is_racy_timestamp(istate, ce)) changed |= ce_modified_check_fs(istate, ce, st);`
+    // `is_racy_timestamp()` is never true for a gitlink.
+    let racy = entry.mode != gix::index::entry::Mode::COMMIT && is_racy_stat(index, &entry.stat);
+    !(racy && modified_check_fs(index.object_hash(), full, &meta, &entry.id))
+}
+
 /// Smudge every racily-clean entry of `index`, as `do_write_index()` does before serialising.
 ///
 /// ```c
@@ -186,15 +242,7 @@ fn racy_comparisons(
         return out;
     }
 
-    // `is_racy_stat()` (read-cache.c:355): the entry is racy when the index is not strictly newer
-    // than the file it recorded. The nanosecond refinement there is behind `USE_NSEC`, which the
-    // git this port targets is not built with — measured on the stock binary, which smudges an
-    // entry whose recorded nanoseconds are *earlier* than the index's within the same second. So
-    // the comparison is on whole seconds, exactly as the non-`USE_NSEC` branch does it.
-    let racy = |stat: &gix::index::entry::Stat| -> bool {
-        let isec = timestamp.unix_seconds() as u32;
-        isec <= stat.mtime.secs
-    };
+    let racy = |stat: &gix::index::entry::Stat| is_racy_stat(index, stat);
 
     // `match_stat_data()` reads `core.trustctime` / `core.checkStat`; `ce_match_stat_basic()`
     // reads `trust_executable_bit` (`core.fileMode`) and `has_symlinks` (`core.symlinks`).

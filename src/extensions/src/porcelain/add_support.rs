@@ -140,8 +140,9 @@ pub(super) struct SpecCheck<'a> {
     /// `-f` (`ignored_too`): no exclude list is set up and `DIR_COLLECT_IGNORED`
     /// is not set (builtin/add.c:504-508), so nothing is ever reported ignored.
     pub ignored_too: bool,
-    /// The patterns the walk matched with, 1:1 with `original`.
-    pub patterns: &'a [BString],
+    /// `dir.ignored` as [`collect_ignored`] left it when `cmd_add()` ran `fill_directory()`
+    /// (builtin/add.c:510), before anything here could die.
+    pub dir_ignored: &'a [BString],
     /// The `die()` `add_files_to_cache()` reaches before it stages anything; see
     /// [`super::worktree_filespec::unusable_gitlinks`]. It comes after the
     /// "did not match any files" loop and before `report_path_error()` and
@@ -170,7 +171,7 @@ pub(super) fn unmatched_pathspec_check(
     // once the loop below has had its chance to die, since the fatal outranks it
     // in either argv order.
     let mut ignored: Vec<BString> = match c.mode {
-        SpecMode::Add if !c.ignored_too => collect_ignored(repo, index, c.patterns)?,
+        SpecMode::Add if !c.ignored_too => c.dir_ignored.to_vec(),
         _ => Vec::new(),
     };
     // `is_excluded()`, built only if the `--ignore-missing` arm actually asks.
@@ -343,7 +344,7 @@ pub(super) fn unmatched_pathspec_check(
 /// (`nowildcard_len`) is empty, so when every element is such an item (`.` at the
 /// root, `:/`, a leading wildcard) the walk would collect nothing and is skipped.
 /// Below the root each item's literal part starts with the prefix, so it is not.
-fn collect_ignored(
+pub(super) fn collect_ignored(
     repo: &gix::Repository,
     index: &gix::index::File,
     patterns: &[BString],

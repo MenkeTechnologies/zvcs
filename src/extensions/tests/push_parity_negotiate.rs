@@ -345,18 +345,15 @@ fn push_parity_negotiate_over_smart_http() {
                 posts.load(std::sync::atomic::Ordering::SeqCst),
             ));
         }
-        // `git-remote-curl` has no `thin` option, so stock pushes a thin pack over
+        // `git-remote-curl` has no `thin` option, so both push a thin pack over
         // HTTP whatever `--no-thin` says, and the server's `index-pack --fix-thin`
-        // appends the bases it names; this port never sends a thin pack. So the
-        // kept packs are checked one by one rather than against each other.
-        let (pack_s, pack_z) = (runs[0].4, runs[1].4);
-        runs.iter_mut().for_each(|r| r.4 = 0);
+        // appends the bases it names — the kept packs match along with the rest.
         assert_eq!(runs[1], runs[0], "protocol {protocol}: zvcs and stock git differ");
+        let pack = runs[0].4;
         if protocol == "2" {
-            assert_eq!(pack_z, 3, "protocol 2: only what negotiation left out");
-            assert!(pack_s < 21, "protocol 2: stock negotiated too: {pack_s}");
+            assert!(pack < 21, "protocol 2: only what negotiation left out: {pack}");
         } else {
-            assert_eq!((pack_z, pack_s), (21, 21), "protocol 0: everything");
+            assert_eq!(pack, 21, "protocol 0: everything");
         }
     }
 }

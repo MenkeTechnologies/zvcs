@@ -293,12 +293,10 @@ fn the_signature_placeholder_family_renders() {
     assert_eq!(out(&cmd(&repo, &home, &["log", "--format=%GT", "-1"])), "undefined\n");
     assert_eq!(out(&cmd(&repo, &home, &["show", "-s", "--format=%GT", "HEAD"])), "undefined\n");
 
-    // `%GF` prints `sigc->fingerprint`, which the shared verifier does not fill for
-    // an ssh signature; it stays refused rather than printing an empty field where
-    // stock prints one. This pins that refusal so it is not quietly widened without
-    // the verifier being fixed first.
-    let gf = cmd(&repo, &home, &["log", "--format=%GF", "-1"]);
-    assert!(!gf.status.success(), "%GF was accepted without the field behind it");
+    // `%GF` prints `sigc->fingerprint`, which an unsigned commit leaves empty.
+    let gf = cmd(&repo, &home, &["log", "--format=[%GF]", "-1"]);
+    assert!(gf.status.success(), "{}", err(&gf));
+    assert_eq!(out(&gf), "[]\n");
 }
 
 /// `show_signature()` (log-tree.c:580, called at :851) runs for every pretty format.

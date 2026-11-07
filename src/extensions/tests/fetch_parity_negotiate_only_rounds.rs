@@ -85,9 +85,12 @@ impl Fixture {
         Fixture { root }
     }
 
+    /// Stock git with auto-maintenance off: a fetch would otherwise leave a detached
+    /// `maintenance run --auto` writing into `dir` while [`Fixture::run`] copies it.
     fn stock(&self, dir: &str, args: &[&str]) -> String {
         let stock = stock_git::stock_git().expect("checked by caller");
-        let (out, err, code) = git(stock, &self.root.join(dir), &self.root, &[], args);
+        let all = [&["-c", "maintenance.auto=false"][..], args].concat();
+        let (out, err, code) = git(stock, &self.root.join(dir), &self.root, &[], &all);
         assert_eq!(code, 0, "{args:?}: {err}");
         out
     }

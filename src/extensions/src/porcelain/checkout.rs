@@ -1126,7 +1126,7 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         // `switch_branches()` names the missing branch "HEAD", takes the current
         // commit, and `update_refs_for_switch()` then does nothing to any ref.
         // Only the worktree reconciliation happens.
-        let code = checkout_head_in_place(&repo, quiet, force)?;
+        let code = checkout_head_in_place(&repo, quiet, force, merge_opt(merge, &conflict_style, "HEAD"))?;
         maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
         return Ok(code);
     }
@@ -1193,7 +1193,7 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         // its name is "HEAD", and `update_refs_for_switch()`'s first arm leaves
         // every ref alone. Only the worktree reconciliation runs.
         if !detach && matches!(spec, "HEAD" | "@") && !is_branch && rev.is_some() {
-            let code = checkout_head_in_place(&repo, quiet, force)?;
+            let code = checkout_head_in_place(&repo, quiet, force, merge_opt(merge, &conflict_style, "HEAD"))?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
@@ -1515,9 +1515,15 @@ pub(super) fn maybe_recurse_submodules(
 /// `git checkout` with no arguments and by `git checkout HEAD`.
 ///
 /// Only `merge_working_tree()` has an effect: forced, it resets the worktree and
-/// index to `HEAD`'s tree; unforced, the 2-way merge against an identical tree is
-/// a no-op and all that remains is the local-changes listing.
-fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> Result<ExitCode> {
+/// index to `HEAD`'s tree; unforced, the 2-way merge against an identical tree moves
+/// nothing outside a sparse checkout or an unborn index, and all that remains is the
+/// local-changes listing.
+fn checkout_head_in_place(
+    repo: &gix::Repository,
+    quiet: bool,
+    force: bool,
+    merge: Option<MergeOpt<'_>>,
+) -> Result<ExitCode> {
     // `merge_working_tree()` refreshes the index before it lists anything, so a file that was
     // only touched, copied or restored without its stat data is not reported as `M`; it also
     // refuses an unmerged index. A forced checkout skips it, as in every other switch.
@@ -1539,10 +1545,12 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
     } else {
         // The two-way merge onto `HEAD`'s own tree has nothing to move unless the index is
         // unborn, when `initial_checkout` sends every path to `merged_entry()`
-        // (builtin/checkout.c:829, unpack-trees.c:2977-2987).
-        if let (Ok(tree), true) = (repo.head_tree_id(), index_unborn(repo)?) {
+        // (builtin/checkout.c:829, unpack-trees.c:2977-2987), or a sparse checkout's loops
+        // re-judge the kept entries (see [`same_tree_unpacks`]), quiet under `-m`
+        // (builtin/checkout.c:831).
+        if let (Ok(tree), true) = (repo.head_tree_id(), same_tree_unpacks(repo)?) {
             let tree = tree.detach();
-            if let Moved::Refused(code) = move_worktree(repo, tree, tree, None)? {
+            if let Moved::Refused(code) = move_worktree(repo, tree, tree, merge)? {
                 return Ok(code);
             }
         }
@@ -1787,7 +1795,16 @@ pub(crate) fn switch_to_branch_opts(
             } else {
                 // `switch_branch_doing_nothing_is_ok`: the switch is a no-op, but
                 // `merge_working_tree()` still runs, so the local changes are
-                // still listed — before `Already on '<branch>'`.
+                // still listed — before `Already on '<branch>'`. Its `unpack_trees()`
+                // between `HEAD`'s tree and itself rejects no path (unpack-trees.c:2939-2947),
+                // but still runs the sparse loops (see [`same_tree_unpacks`]), quiet under
+                // `-m` (builtin/checkout.c:831).
+                if let (Ok(tree), true) = (repo.head_tree_id(), same_tree_unpacks(repo)?) {
+                    let tree = tree.detach();
+                    if let Moved::Refused(code) = move_worktree(repo, tree, tree, merge)? {
+                        return Ok(code);
+                    }
+                }
                 show_local_changes(spec, quiet)?;
             }
             let branch_full: FullName = format!("refs/heads/{spec}")
@@ -1846,7 +1863,7 @@ pub(crate) fn switch_to_branch_opts(
     let mut autostash_conflicted = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree || index_unborn(repo)? {
+    } else if target_tree != cur_tree || same_tree_unpacks(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
             Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
@@ -1944,7 +1961,7 @@ fn detached_checkout(
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else {
-        if target_tree != cur_tree || index_unborn(repo)? {
+        if target_tree != cur_tree || same_tree_unpacks(repo)? {
             match move_worktree(repo, cur_tree, target_tree, merge)? {
                 Moved::Refused(code) => return Ok(code),
                 Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
@@ -2109,7 +2126,7 @@ fn create_and_switch(
         // two trees are (builtin/checkout.c:871-876) — a same-tree `checkout -f -B`
         // still rewrites the index through `unpack_trees()`, cache-tree included.
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if merge_worktree && (target_tree != cur_tree || index_unborn(repo)?) {
+    } else if merge_worktree && (target_tree != cur_tree || same_tree_unpacks(repo)?) {
         // `do_merge = 0` (builtin/checkout.c:1206-1207) skips `merge_working_tree()` whole,
         // so a bare `git checkout -b <branch>` over a missing index file writes none.
         match move_worktree(repo, cur_tree, target_tree, merge)? {
@@ -2441,7 +2458,7 @@ fn orphan_checkout(
     }
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree || index_unborn(repo)? {
+    } else if target_tree != cur_tree || same_tree_unpacks(repo)? {
         if let Some(code) = ensure_clean(repo, cur_tree, target_tree)? {
             return Ok(code);
         }
@@ -3703,14 +3720,28 @@ pub(super) fn index_unborn(repo: &gix::Repository) -> Result<bool> {
     Ok(index.entries().is_empty() && index.timestamp().unix_seconds() == 0)
 }
 
+/// Whether a switch whose two trees are identical still has to run the two-way unpack.
+///
+/// `merge_working_tree()` calls `unpack_trees()` whatever the two trees are
+/// (builtin/checkout.c:916). Between identical trees `twoway_merge()` `keep_entry()`s
+/// every index entry and leaves a staged deletion alone (unpack-trees.c:2939-2947,
+/// :2979-2983), so the run moves nothing unless [`index_unborn`] sends every path to
+/// `merged_entry()`, or a sparse checkout is on: `o->skip_sparse_checkout` is then clear
+/// (unpack-trees.c:1931-1936) and the sparse loops re-judge every entry of the result
+/// (:2035-2075), so a cone widened or narrowed without a reapply writes, removes and warns
+/// as it would on a switch between different trees.
+pub(super) fn same_tree_unpacks(repo: &gix::Repository) -> Result<bool> {
+    Ok(index_unborn(repo)? || crate::merge_guard::sparse_patterns(repo).is_some())
+}
+
 /// `merge_working_tree()` as every switch in this file runs it: gate the move,
 /// write the target tree out, and put back whatever `-m` had to stash to get
 /// there. Returns the exit code of a refusal, or `None` when the worktree moved.
 ///
 /// Called when the two trees differ, which is the caller's own
 /// `target_tree != cur_tree` test — an identical-tree switch has no path for
-/// `twoway_merge()` to reject and nothing to carry — or when [`index_unborn`]
-/// says the worktree has yet to be written at all.
+/// `twoway_merge()` to reject and nothing to carry — or when [`same_tree_unpacks`]
+/// says the identical-tree run still has work: an unborn index, or a sparse checkout.
 pub(super) fn move_worktree(
     repo: &gix::Repository,
     cur_tree: ObjectId,

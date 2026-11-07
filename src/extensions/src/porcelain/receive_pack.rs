@@ -898,6 +898,7 @@ impl Config {
         zero: gix::ObjectId,
         head: Option<&str>,
         band: &mut Band,
+        worktree: Option<&super::worktree::SharedHead>,
         update_worktree: &mut bool,
     ) -> Option<String> {
         let name = cmd.name.as_str();
@@ -910,13 +911,16 @@ impl Config {
         //         switch (deny_current_branch) {
         // ```
         //
-        // (receive-pack.c:1506-1541.) The gate is the *worktree*, not the kind of
+        // (receive-pack.c:1506-1541.) `find_shared_symref()` walks every worktree,
+        // so a branch a linked worktree has checked out is refused as well, and so
+        // is one a detached worktree is rebasing or bisecting. The gate is the
+        // *worktree*, not the kind of
         // update: a **delete** of the checked-out branch is refused here, by
         // `receive.denyCurrentBranch`, and never reaches the
         // `receive.denyDeleteCurrent` block below — that one only sees deletes of
         // a branch some worktree has checked out *and* that this check let past,
         // which is `ignore`, `warn` and `updateInstead`.
-        if head == Some(name) && !repo.is_bare() {
+        if worktree.is_some() {
             match self.deny_current_branch {
                 DenyAction::Ignore => {}
                 DenyAction::Warn => band.warning("updating the current branch"),
@@ -937,12 +941,29 @@ impl Config {
             }
         }
 
+        // ```c
+        // if (!is_null_oid(new_oid) &&
+        //     !odb_has_object(the_repository->objects, new_oid, …)) {
+        //         error("unpack should have generated %s, "
+        //               "but I can't find it!", oid_to_hex(new_oid));
+        //         ret = "bad pack";
+        // ```
+        //
+        // (receive-pack.c:1544-1551.) `error()`, not `rp_error()`: the line goes
+        // to receive-pack's own stderr, never down the side band.
+        if !deleting && !repo.has_object(cmd.new) {
+            eprintln!("error: unpack should have generated {}, but I can't find it!", cmd.new);
+            return Some("bad pack".into());
+        }
+
         if deleting {
             if self.deny_deletes && name.starts_with("refs/heads/") {
                 band.error(&format!("denying ref deletion for {name}"));
                 return Some("deletion prohibited".into());
             }
-            if head == Some(name) {
+            // `if (worktree || (head_name && !strcmp(namespaced_name, head_name)))`
+            // (receive-pack.c:1561).
+            if worktree.is_some() || head == Some(name) {
                 match self.deny_delete_current {
                     DenyAction::Ignore => {}
                     DenyAction::Warn => band.warning("deleting the current branch"),
@@ -957,6 +978,21 @@ impl Config {
             }
         }
 
+        if self.deny_non_fast_forwards && !deleting && cmd.old != zero && name.starts_with("refs/heads/") {
+            // Both ends have to parse as commits before the ancestry question is
+            // asked; a tag, tree or blob on either side, or an old value this
+            // repository lacks, is `error("bad sha1 objects for %s", name)` —
+            // `error()` again, on receive-pack's own stderr — and `bad ref`
+            // (receive-pack.c:1581-1594).
+            let is_commit = |id| {
+                repo.find_header(id)
+                    .is_ok_and(|h| h.kind() == gix::object::Kind::Commit)
+            };
+            if !is_commit(cmd.old) || !is_commit(cmd.new) {
+                eprintln!("error: bad sha1 objects for {name}");
+                return Some("bad ref".into());
+            }
+        }
         if self.deny_non_fast_forwards
             && !deleting
             && cmd.old != zero
@@ -1503,16 +1539,26 @@ fn check_command(
     // one-level name like `refs/stash` is refused. git's own matching pass leaves
     // such a ref out of a `--mirror`, which is why this fires only for a refspec
     // that names one explicitly.
+    //
+    // ```c
+    // check_refname_format(name + 5, is_null_oid(new_oid) ?
+    //                      REFNAME_ALLOW_ONELEVEL : 0)
+    // ```
+    //
+    // A delete may name a one-level ref, so `:refs/foo` gets past this and on
+    // to `deleting a non-existent ref` (receive-pack.c:1491-1497).
+    let flags = if cmd.new == zero { super::check_ref_format::ALLOW_ONELEVEL } else { 0 };
     let funny = match cmd.name.strip_prefix("refs/") {
-        Some(tail) => !super::check_ref_format::check_refname_format(tail.as_bytes(), 0),
+        Some(tail) => !super::check_ref_format::check_refname_format(tail.as_bytes(), flags),
         None => true,
     };
     if funny {
         band.error(&format!("refusing to update funny ref '{}' remotely", cmd.name));
         return Err("funny refname".into());
     }
+    let worktree = super::worktree::find_shared_head(repo, &cmd.name);
     let mut update_worktree = false;
-    if let Some(reason) = config.refuse(repo, cmd, zero, head, band, &mut update_worktree) {
+    if let Some(reason) = config.refuse(repo, cmd, zero, head, band, worktree.as_ref(), &mut update_worktree) {
         return Err(reason);
     }
     // The `update` hook is the last of `update()`'s checks, and a non-zero exit
@@ -1524,8 +1570,8 @@ fn check_command(
     // `if (do_update_worktree) { ret = update_worktree(new_oid->hash, worktree); … }`
     // (receive-pack.c:1617-1621), after the hook and before the ref is queued: a work
     // tree that cannot be moved is a rejection, not a half-done update.
-    if update_worktree {
-        if let Some(reason) = update_worktree_to(repo, cmd.new) {
+    if let Some(worktree) = worktree.as_ref().filter(|_| update_worktree) {
+        if let Some(reason) = update_worktree_to(repo, worktree, cmd.new) {
             return Err(reason);
         }
     }
@@ -1559,6 +1605,36 @@ fn check_command(
             band.warning("deleting a non-existent ref");
         }
         old = zero;
+    }
+    // `ref_transaction_update()`'s check of the new value (refs.c:1433-1448),
+    // which `update()` reports with `rp_error("%s", err.buf)` and the
+    // `ref_transaction_error_msg()` of `REF_TRANSACTION_ERROR_INVALID_NEW_VALUE`
+    // as the status (receive-pack.c:1635-1650). The name it judges is
+    // `namespaced_name`, so under a namespace no ref is a branch to
+    // `is_branch()`.
+    if cmd.new != zero {
+        let namespaced = format!(
+            "{}{}",
+            repo.namespace().map(|ns| ns.as_bstr().to_string()).unwrap_or_default(),
+            cmd.name
+        );
+        match repo.find_header(cmd.new) {
+            Err(_) => {
+                band.error(&format!(
+                    "trying to write ref '{namespaced}' with nonexistent object {}",
+                    cmd.new
+                ));
+                return Err("invalid new value provided".into());
+            }
+            Ok(header) if header.kind() != gix::object::Kind::Commit && namespaced.starts_with("refs/heads/") => {
+                band.error(&format!(
+                    "trying to write non-commit object {} to branch '{namespaced}'",
+                    cmd.new
+                ));
+                return Err("invalid new value provided".into());
+            }
+            Ok(_) => {}
+        }
     }
     ref_edit(&cmd.name, old, cmd.new, zero)
 }
@@ -1619,24 +1695,36 @@ fn execute_commands_non_atomic(
     head: Option<&str>,
     band: &mut Band,
 ) {
-    for i in 0..cmds.len() {
-        if cmds[i].error.is_some() || cmds[i].proc_receive {
-            continue;
+    // Deletions go first, in a transaction of their own, so a delete and a
+    // create that would meet in a D/F conflict both go through
+    // (`PHASE_DELETIONS`, `PHASE_OTHERS`, receive-pack.c:1895-1917). Within a
+    // phase `update()` runs over every command before the transaction is
+    // committed, so every check's message precedes the backend's, and those
+    // come in the order of the updates (`ref_transaction_for_each_rejected_update()`,
+    // receive-pack.c:1939-1950).
+    for deletions in [true, false] {
+        let mut queued = Vec::new();
+        for i in 0..cmds.len() {
+            if cmds[i].error.is_some() || cmds[i].proc_receive || (cmds[i].new == zero) != deletions {
+                continue;
+            }
+            match check_command(repo, config, &cmds[i], zero, head, band) {
+                Ok(edit) => queued.push((i, edit)),
+                Err(reason) => cmds[i].error = Some(reason),
+            }
         }
-        let verdict = check_command(repo, config, &cmds[i], zero, head, band).and_then(|edit| {
+        for (i, edit) in queued {
             // The transaction is what refuses a bad old value, so its diagnostic
             // is git's — `rp_error("%s", err.buf)` from the commit, then the
             // per-ref reason out of the rejection list (receive-pack.c:1955-1972).
             if let Some((text, reason)) = lock_failure(repo, &edit) {
                 band.error(&text);
-                return Err(reason.to_string());
+                cmds[i].error = Some(reason.to_string());
+                continue;
             }
-            repo.edit_references([edit])
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
-        if let Err(reason) = verdict {
-            cmds[i].error = Some(reason);
+            if let Err(e) = repo.edit_references([edit]) {
+                cmds[i].error = Some(e.to_string());
+            }
         }
     }
 }
@@ -2908,10 +2996,17 @@ fn run_receive_hook(
 ///
 /// `Some(reason)` is the `ng <ref> <reason>` the client reports; nothing goes to
 /// band 2, which is why the pusher sees only the summary line.
-fn update_worktree_to(repo: &gix::Repository, new: gix::ObjectId) -> Option<String> {
-    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
-        return Some("denyCurrentBranch = updateInstead needs a worktree".into());
-    };
+fn update_worktree_to(
+    repo: &gix::Repository,
+    worktree: &super::worktree::SharedHead,
+    new: gix::ObjectId,
+) -> Option<String> {
+    // `worktree` is whichever worktree `find_shared_symref()` found, linked ones
+    // included: the children run in `worktree->path` with
+    // `GIT_DIR=get_worktree_git_dir(worktree)` (receive-pack.c:1453-1475). It is
+    // never bare, as `is_shared_symref()` skips a bare one.
+    let workdir = worktree.path.clone();
+    let git_dir = worktree.git_dir.as_path();
 
     // `push_to_checkout()`: the hook takes over the whole job when it exists, and a
     // non-zero exit is the refusal. `invoked_hook` is false when there is no hook.
@@ -2920,14 +3015,14 @@ fn update_worktree_to(repo: &gix::Repository, new: gix::ObjectId) -> Option<Stri
         let ok = std::process::Command::new(&hook)
             .arg(new.to_hex().to_string())
             .current_dir(&workdir)
-            .env("GIT_DIR", repo.common_dir())
+            .env("GIT_DIR", git_dir)
             .env("GIT_WORK_TREE", &workdir)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         return (!ok).then(|| "push-to-checkout hook declined".to_string());
     }
-    push_to_deploy(repo, &workdir, new)
+    push_to_deploy(repo, worktree, new)
 }
 
 /// `push_to_deploy()` (receive-pack.c:1388): four `git` children in the work tree,
@@ -2945,12 +3040,14 @@ fn update_worktree_to(repo: &gix::Repository, new: gix::ObjectId) -> Option<Stri
 /// which case git compares against the empty tree instead.
 fn push_to_deploy(
     repo: &gix::Repository,
-    workdir: &std::path::Path,
+    worktree: &super::worktree::SharedHead,
     new: gix::ObjectId,
 ) -> Option<String> {
-    let head = match repo.head_id() {
-        Ok(_) => "HEAD".to_string(),
-        Err(_) => gix::ObjectId::empty_tree(repo.object_hash()).to_string(),
+    let workdir = worktree.path.as_path();
+    // `!is_null_oid(&worktree->head_oid) ? "HEAD" : empty_tree_oid_hex()`.
+    let head = match worktree.head_unborn {
+        false => "HEAD".to_string(),
+        true => gix::ObjectId::empty_tree(repo.object_hash()).to_string(),
     };
     let new = new.to_hex().to_string();
     let steps: [(&[&str], &str); 4] = [
@@ -2985,7 +3082,7 @@ fn push_to_deploy(
         }
         let ok = cmd
             .current_dir(workdir)
-            .env("GIT_DIR", repo.common_dir())
+            .env("GIT_DIR", &worktree.git_dir)
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
             .env_remove("GIT_PREFIX")

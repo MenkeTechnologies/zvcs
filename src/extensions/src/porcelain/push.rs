@@ -887,7 +887,7 @@ git push <groupname>\n"
             .iter()
             .filter_map(|s| {
                 let body = s.strip_prefix('+').unwrap_or(s);
-                let (src, dst) = body.split_once(':').unwrap_or((body, body));
+                let (src, dst) = body.rsplit_once(':').unwrap_or((body, body));
                 (src.contains('*') && dst.contains('*')).then(|| push_proto::PruneSpec::Pattern {
                     src: src.to_string(),
                     dst: dst.to_string(),
@@ -1674,7 +1674,9 @@ fn parse_refspec(
         Some(rest) => (rest, true),
         None => (spec, force),
     };
-    let (src, dst_spec) = match spec.split_once(':') {
+    // `rhs = strrchr(lhs, ':')` (refspec.c:37): the *last* colon splits the
+    // refspec, so `main:f:refs/heads/x` pushes the blob `main:f`.
+    let (src, dst_spec) = match spec.rsplit_once(':') {
         Some((s, d)) => (s, Some(d)),
         None => (spec, None),
     };
@@ -3239,7 +3241,7 @@ pub(super) fn expand_pattern_refspec(
         Some(rest) => (rest, true),
         None => (spec, force),
     };
-    let (src, dst) = match spec.split_once(':') {
+    let (src, dst) = match spec.rsplit_once(':') {
         Some((s, d)) => (s, d),
         None => (spec, spec),
     };

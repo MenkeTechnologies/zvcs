@@ -2275,6 +2275,10 @@ fn split_conflicts(
     refnames.sort();
     // `backend_data->ref_locks`: every name `lock_ref_for_update()` has locked.
     let mut locked: std::collections::HashSet<String> = Default::default();
+    // `lock->old_oid` of each lock: what the reference held when it was taken, or
+    // for the lock the log-only `HEAD` update took, its `old_oid` when it has one
+    // and else the parent branch's (refs/files-backend.c:2735-2763).
+    let mut lock_old: std::collections::HashMap<String, Option<ObjectId>> = Default::default();
     // One update in `transaction->updates`, as `lock_ref_for_update()` takes it.
     struct Update {
         /// The update the input queued, whose index the conflict is reported at.
@@ -2330,6 +2334,11 @@ fn split_conflicts(
             if !locked.insert(name.clone()) {
                 crate::git_fatal!("HEAD has been racily updated");
             }
+            let old = match have_old(&edits[at], ObjectId::null(repo.object_hash())) {
+                Ok(Some(old)) => Some(old),
+                _ => resolve_to_oid(repo, &name),
+            };
+            lock_old.insert(name, old);
             continue;
         }
         if !via_head && head_ref.as_deref() == Some(name.as_str()) {
@@ -2350,8 +2359,43 @@ fn split_conflicts(
             });
         }
         // A reused lock leaves `update->type` 0, so the update is not split as a
-        // symref's would be.
-        if !locked.insert(name.clone()) || !deref {
+        // symref's would be: it takes the regular-ref branch of
+        // `lock_ref_for_update()` and, holding a new value other than the
+        // `lock->old_oid` read when the lock was taken, writes it through
+        // `write_ref_to_lockfile()` — into a lock whose file the first user
+        // already closed, so the write fails, a `REF_TRANSACTION_ERROR_GENERIC`
+        // that dies with `--batch-updates` too (refs/files-backend.c:2714-2733,
+        // :2856-2885, :2056-2076). An update through a symref that points at
+        // `HEAD`, beside an update of the branch `HEAD` names, meets the lock
+        // `split_head_update()`'s log-only `HEAD` update took.
+        if !locked.insert(name.clone()) {
+            if let Change::Update { new: Target::Object(new), .. } = &edits[at].change {
+                // Every update the input queued is locked before any split, so an
+                // old value one of them refuses is met first, and this update's own
+                // old value is checked against the lock before the write
+                // (`check_old_oid()`, refs/files-backend.c:2615-2660).
+                let refused = |i: usize| !log_only(&edits[i]) && check_old_value(repo, &edits[i]).is_err();
+                if !batch_updates && (0..edits.len()).any(refused) {
+                    break;
+                }
+                let lock_old = lock_old.get(&name).copied().flatten();
+                let old_matches = match have_old(&edits[at], ObjectId::null(repo.object_hash())) {
+                    Ok(Some(old)) => lock_old == Some(old),
+                    Ok(None) => true,
+                    Err(()) => false,
+                };
+                if !refused(at) && old_matches && lock_old != Some(*new) {
+                    let path = std::path::absolute(ref_file_path(repo, &name))?;
+                    crate::git_fatal!(
+                        "cannot update ref '{name}': couldn't write '{}.lock'",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
+        lock_old.insert(name.clone(), resolve_to_oid(repo, &name));
+        if !deref {
             continue;
         }
         let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {

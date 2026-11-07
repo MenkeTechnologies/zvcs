@@ -3055,6 +3055,18 @@ fn is_fast_forward(repo: &gix::Repository, old: ObjectId, new: ObjectId) -> Opti
     if repo.find_object(old).is_err() {
         return None;
     }
+    // `ref_newer()` asks its question of `deref_tag()` of either side
+    // (commit-reach.c:786-808), so a tag pushed over the commit it points at
+    // fast-forwards it.
+    let peel = |id: ObjectId| {
+        repo.find_object(id)
+            .ok()
+            .and_then(|o| o.peel_to_kind(gix::objs::Kind::Commit).ok())
+            .map(|c| c.id)
+    };
+    let (Some(old), Some(new)) = (peel(old), peel(new)) else {
+        return Some(false);
+    };
     // `new` fast-forwards `old` iff `old` is an ancestor of `new`, i.e. the
     // merge base of the two is `old`.
     match repo.merge_base(new, old) {

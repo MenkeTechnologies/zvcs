@@ -3367,6 +3367,67 @@ enum CheckoutKind {
     UpdateRef,
 }
 
+/// The worktree [`find_shared_head`] found: where it is checked out, its
+/// `get_worktree_git_dir()`, and whether its `HEAD` names no commit
+/// (`is_null_oid(&worktree->head_oid)`).
+pub(super) struct SharedHead {
+    pub(super) path: PathBuf,
+    pub(super) git_dir: PathBuf,
+    pub(super) head_unborn: bool,
+}
+
+/// `find_shared_symref(get_worktrees(), "HEAD", target)` (worktree.c:500-537):
+/// the first non-bare worktree whose `HEAD` is a symref to `target`, or whose
+/// detached `HEAD` is a rebase of `target` (`is_worktree_being_rebased()`,
+/// :462-477) or a bisect started from it (`is_worktree_being_bisected()`,
+/// :479-492). Linked worktrees count as well as the main one.
+pub(super) fn find_shared_head(repo: &gix::Repository, target: &str) -> Option<SharedHead> {
+    let common = gix::path::realpath(repo.common_dir()).ok()?;
+    let branch = target.strip_prefix("refs/heads/");
+    for wt in collect(repo, u64::MAX).ok()? {
+        if wt.is_bare {
+            continue;
+        }
+        let wt_gitdir = match &wt.id {
+            Some(id) => common.join("worktrees").join(id),
+            None => common.clone(),
+        };
+        let shared = match &wt.head {
+            HeadInfo::Branch { name, .. } => name.as_bstr() == target.as_bytes(),
+            HeadInfo::Detached(_) => {
+                // `wt_status_check_rebase()`: `rebase-apply` with `applying` is an
+                // `am`, which records no branch; `rebase-merge` is a rebase either
+                // way. `wt_status_check_bisect()`: `BISECT_LOG` marks a bisect and
+                // `BISECT_START` names what it started from.
+                let rebase_head_name = if wt_gitdir.join("rebase-apply").is_dir() {
+                    (!wt_gitdir.join("rebase-apply/applying").exists())
+                        .then(|| wt_gitdir.join("rebase-apply/head-name"))
+                } else if wt_gitdir.join("rebase-merge").is_dir() {
+                    Some(wt_gitdir.join("rebase-merge/head-name"))
+                } else {
+                    None
+                };
+                let rebased = rebase_head_name.and_then(|p| state_branch(&p));
+                let bisected = wt_gitdir
+                    .join("BISECT_LOG")
+                    .exists()
+                    .then(|| state_branch(&wt_gitdir.join("BISECT_START")))
+                    .flatten();
+                branch.is_some() && (rebased.as_deref() == branch || bisected.as_deref() == branch)
+            }
+            HeadInfo::Unknown(_) => false,
+        };
+        if shared {
+            let head_unborn = match &wt.head {
+                HeadInfo::Branch { oid, .. } => oid.is_null(),
+                HeadInfo::Detached(oid) | HeadInfo::Unknown(oid) => oid.is_null(),
+            };
+            return Some(SharedHead { path: wt.path, git_dir: wt_gitdir, head_unborn });
+        }
+    }
+    None
+}
+
 /// `struct checked_out_branch` (branch.c:395-399).
 struct CheckedOut {
     refname: String,

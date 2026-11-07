@@ -45,7 +45,12 @@ impl Repository {
                 },
             )?
             .inner;
-        let filter = gix_filter::Pipeline::new(self.command_context()?, crate::filter::Pipeline::options(self)?);
+        // `renormalize_buffer()` converts with `CONV_EOL_RENORMALIZE` alone
+        // (convert.c:1542-1556), never `CONV_EOL_RNDTRP_WARN`/`_DIE`, so
+        // `core.safecrlf` has nothing to say about a blob being merged.
+        let mut filter_options = crate::filter::Pipeline::options(self)?;
+        filter_options.crlf_roundtrip_check = gix_filter::pipeline::CrlfRoundTripCheck::Skip;
+        let filter = gix_filter::Pipeline::new(self.command_context()?, filter_options);
         let filter = gix_merge::blob::Pipeline::new(worktree_roots, filter, self.config.merge_pipeline_options()?);
         let options = gix_merge::blob::platform::Options {
             default_driver: self.config.resolved.string(tree::Merge::DEFAULT),

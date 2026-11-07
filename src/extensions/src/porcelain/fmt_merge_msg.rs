@@ -697,12 +697,26 @@ fn fmt_merge_msg_sigs(
     comment: &BStr,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let origins: Vec<(BString, ObjectId)> =
+        origins.iter().map(|(name, origin)| (name.clone(), origin.oid)).collect();
+    merged_tag_bodies(repo, &origins, comment, out)
+}
+
+/// The loop of [`fmt_merge_msg_sigs`] over `(origin string, id on the line)`
+/// pairs, for `git merge`, whose `fmt_merge_msg()` call (builtin/merge.c:1224)
+/// reaches it through fmt-merge-msg.c:700-701.
+pub(crate) fn merged_tag_bodies(
+    repo: &Repository,
+    origins: &[(BString, ObjectId)],
+    comment: &BStr,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let mut tagbuf: Vec<u8> = Vec::new();
     let mut tag_number = 0usize;
     let mut first_tag = 0usize;
 
-    for (i, (name, origin)) in origins.iter().enumerate() {
-        let Ok(object) = repo.find_object(origin.oid) else {
+    for (i, (name, oid)) in origins.iter().enumerate() {
+        let Ok(object) = repo.find_object(*oid) else {
             continue;
         };
         if object.kind != gix::object::Kind::Tag {

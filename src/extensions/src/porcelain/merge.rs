@@ -700,7 +700,11 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     // stdio holds the stdout half off a terminal, which is why stock prints the
     // refusal first into a pipe. See `crate::cstdio`.
     crate::cstdio::defer();
-    let mut op = Op::Merge;
+    // `abort_current_merge`, `quit_current_merge` and `continue_current_merge`
+    // (builtin/merge.c:89-91, :315-320) are three independent OPT_BOOLs, tested
+    // in that order after parsing (:1417, :1446, :1456), so `--abort --quit`
+    // is the `--abort` refusal and `--no-quit` clears only `--quit`.
+    let (mut abort_flag, mut quit_flag, mut continue_flag) = (false, false, false);
     let mut opts = Opts::default();
     let mut refs: Vec<String> = Vec::new();
     // git's `merge_log_config`, applied only after the options are parsed: a
@@ -800,9 +804,9 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             }
         };
         match a {
-            "--abort" => op = Op::Abort,
-            "--quit" => op = Op::Quit,
-            "--continue" => op = Op::Continue,
+            "--abort" => abort_flag = true,
+            "--quit" => quit_flag = true,
+            "--continue" => continue_flag = true,
             "--ff" => opts.ff = Ff::Allow,
             "--no-ff" => opts.ff = Ff::Never,
             "--ff-only" => opts.ff = Ff::Only,
@@ -914,7 +918,9 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // `OPT_BOOL(0, "abort"|"quit"|"continue", …)`: the negation stores 0,
             // putting the command back on the ordinary merge path it would have
             // taken had the flag never been given.
-            "--no-abort" | "--no-quit" | "--no-continue" => op = Op::Merge,
+            "--no-abort" => abort_flag = false,
+            "--no-quit" => quit_flag = false,
+            "--no-continue" => continue_flag = false,
             // `--[no-]verify-signatures` / `merge.verifySignatures`: check every
             // head's signature before merging it. `None` leaves the config to
             // decide.
@@ -1144,6 +1150,12 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     if opts.log_len < 0 {
         opts.log_len = if merge_log_config > 0 { merge_log_config } else { 0 };
     }
+    let op = match (abort_flag, quit_flag, continue_flag) {
+        (true, _, _) => Op::Abort,
+        (_, true, _) => Op::Quit,
+        (_, _, true) => Op::Continue,
+        _ => Op::Merge,
+    };
 
     match op {
         // ```c
@@ -1878,18 +1890,33 @@ fn setup_with_upstream(repo: &gix::Repository) -> std::result::Result<Vec<String
     // source to. gix resolves the whole `branch.<name>.{remote,merge}` pair at
     // once, so a single source (git's overwhelmingly common case) is looked up
     // directly; git reports the unmapped ones by name.
+    let remote = snap
+        .string(format!("branch.{name}.remote").as_str())
+        .map(|v| v.to_str_lossy().into_owned())
+        .unwrap_or_default();
+    // `set_merge()` (remote.c:1798-1808): a source with no fetch refspec to map
+    // it through, on the remote `.`, is its own `dst` — the ref `repo_dwim_ref()`
+    // names when exactly one matches, the source as written otherwise — so a
+    // branch whose upstream is another local branch merges that branch.
+    if remote == "." {
+        return Ok(sources
+            .iter()
+            .map(|src| {
+                let src = src.to_str_lossy().into_owned();
+                let mut found = super::rev_parse::dwim_ref_matches(repo, &src);
+                match found.len() {
+                    1 => found.remove(0),
+                    _ => src,
+                }
+            })
+            .collect());
+    }
     match repo.branch_remote_tracking_ref_name(full.as_ref(), gix::remote::Direction::Fetch) {
         Some(Ok(dst)) if sources.len() == 1 => Ok(vec![dst.as_bstr().to_string()]),
-        _ => {
-            let remote = snap
-                .string(format!("branch.{name}.remote").as_str())
-                .map(|v| v.to_str_lossy().into_owned())
-                .unwrap_or_default();
-            Err(format!(
-                "No remote-tracking branch for {} from {remote}",
-                sources[0]
-            ))
-        }
+        _ => Err(format!(
+            "No remote-tracking branch for {} from {remote}",
+            sources[0]
+        )),
     }
 }
 
@@ -1948,17 +1975,12 @@ fn merge_into_unborn(repo: &gix::Repository, refs: &[String], opts: &Opts) -> Re
     let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
     for spec in refs {
         crate::objname::warn_ambiguous_refname(repo, spec.as_str());
-        let resolved = repo
-            .rev_parse_single(spec.as_str())
-            .ok()
-            .and_then(|o| o.object().ok())
-            .and_then(|o| o.peel_to_commit().ok());
-        let Some(commit) = resolved else {
+        let Some(commit) = merge_parent_commit(repo, spec) else {
             // `help_unknown_ref()`, the same refusal the born-`HEAD` path gives.
             eprintln!("merge: {spec} - not something we can merge");
             return Err(anyhow::Error::new(crate::fatal::Silent(1)));
         };
-        targets.push(commit.id);
+        targets.push(commit);
     }
     let reaches = |a: ObjectId, b: ObjectId| -> Result<bool> {
         Ok(repo.merge_bases_many(a, &[b])?.iter().any(|base| base.detach() == b))
@@ -2116,6 +2138,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         }
+    } else if refs.len() == 1 && refs[0] == "-" {
+        // `else if (argc == 1 && !strcmp(argv[0], "-")) argv[0] = "@{-1}";`
+        // (builtin/merge.c:1526-1527): everything downstream, the reflog
+        // action included, sees `@{-1}`.
+        upstream_refs = vec!["@{-1}".to_string()];
+        &upstream_refs
     } else {
         refs
     };
@@ -2177,6 +2205,9 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             .and_then(|object| object.peel_to_kind(gix::objs::Kind::Commit).ok())
             .map(|commit| commit.id)
             .unwrap_or(*id);
+        // `get_merge_parent(<hex>)` (builtin/merge.c:1267) records the line's
+        // own object as the head's `merge_remote_util()->obj`.
+        set_merge_remote_obj(commit, *id);
         targets.push(commit);
     }
     for spec in refs.iter().filter(|_| fetch_head.is_empty()) {
@@ -2188,16 +2219,11 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         // `cmd_merge`'s own refusal, which is neither a `fatal:` nor exit 128:
         // `merge: <arg> - not something we can merge`, on stderr, exit 1. It also
         // covers a name that resolves to something that is not a commit.
-        let resolved = repo
-            .rev_parse_single(spec.as_str())
-            .ok()
-            .and_then(|o| o.object().ok())
-            .and_then(|o| o.peel_to_commit().ok());
-        let Some(commit) = resolved else {
+        let Some(commit) = merge_parent_commit(&repo, spec) else {
             eprintln!("merge: {spec} - not something we can merge");
             return Err(anyhow::Error::new(crate::fatal::Silent(1)));
         };
-        targets.push(commit.id);
+        targets.push(commit);
     }
 
     // `collect_parents()` ends every arm with `reduce_parents()`
@@ -3511,15 +3537,30 @@ fn finalize_clean(
     settle_index_for_commit(repo, merged_tree, true)?;
     // `pre-merge-commit` runs before the commit; a non-zero exit vetoes it. The
     // hook's own output (inherited on stderr) is the whole diagnostic, as in git.
+    // `abort_commit()` (builtin/merge.c:900-908): every refusal on the commit
+    // path prints its error, then the notice, and `write_merge_state()`
+    // (:1150-1156) leaves MERGE_HEAD plus `merge_msg` and a newline in
+    // MERGE_MSG. `merge_msg` is the message as it stood before
+    // `prepare_to_commit()` built its local copy (:944), so neither the editor
+    // comment, the sign-off nor what the editor or a hook wrote survives there.
+    let abort_commit = |err: Option<&str>| -> Result<ExitCode> {
+        if let Some(err) = err {
+            eprintln!("error: {err}");
+        }
+        eprintln!("Not committing merge; use 'git commit' to complete the merge.");
+        write_merge_heads(repo, targets, opts.ff)?;
+        std::fs::write(repo.git_dir().join("MERGE_MSG"), format!("{message}\n"))?;
+        Ok(ExitCode::from(1))
+    };
     if !opts.no_verify && !commit_hook("pre-merge-commit", &[])? {
-        return Ok(ExitCode::from(1));
+        return abort_commit(None);
     }
 
     // git's `prepare_to_commit()` from here: build the buffer, persist the merge
     // state, run the editor and the `commit-msg` hook over that file, then clean
     // the message up and refuse an empty one.
     let comment = comment_char(repo);
-    let mut msg = message;
+    let mut msg = message.clone();
     if opts.signoff {
         append_signoff(repo, &mut msg)?;
     }
@@ -3552,17 +3593,16 @@ fn finalize_clean(
     // `git_path_merge_msg()`, spelled on the git directory setup left.
     let msg_arg = crate::setup::git_path_spelled(repo, "MERGE_MSG").to_string_lossy().into_owned();
     if !commit_hook("prepare-commit-msg", &[&msg_arg, "merge"])? {
-        return Ok(ExitCode::from(1));
+        return abort_commit(None);
     }
 
     if edit && crate::editor::launch_editor(Some(repo), &msg_path, &[]).is_err() {
-        eprintln!("Not committing merge; use 'git commit' to complete the merge.");
-        return Ok(ExitCode::from(1));
+        return abort_commit(None);
     }
     // `commit-msg` gets the same file and may rewrite it.
     if !opts.no_verify {
         if !commit_hook("commit-msg", &[&msg_arg])? {
-            return Ok(ExitCode::from(1));
+            return abort_commit(None);
         }
     }
     msg = std::fs::read_to_string(&msg_path)?;
@@ -3576,9 +3616,7 @@ fn finalize_clean(
     };
     msg = cleanup_message(&msg, cleanup, &comment);
     if msg.is_empty() {
-        eprintln!("error: Empty commit message.");
-        eprintln!("Not committing merge; use 'git commit' to complete the merge.");
-        return Ok(ExitCode::from(1));
+        return abort_commit(Some("Empty commit message."));
     }
 
     // `commit_tree()` → `commit_tree_extended()`: `git_author_info(IDENT_STRICT)`
@@ -3750,11 +3788,15 @@ fn cache_tree_node(
 
 /// git's `write_merge_heads()`: every merged head in `MERGE_HEAD`, plus the
 /// `MERGE_MODE` marker that records whether the merge may fast-forward.
+///
+/// Each line is `merge_remote_util(c)->obj` when the head has one
+/// (builtin/merge.c:1128-1139): the object the operand named, so a merged
+/// annotated tag is recorded by the tag's id rather than its commit's.
 fn write_merge_heads(repo: &gix::Repository, targets: &[ObjectId], ff: Ff) -> Result<()> {
     let git_dir = repo.git_dir();
     let mut merge_head = String::new();
     for t in targets {
-        merge_head.push_str(&format!("{t}\n"));
+        merge_head.push_str(&format!("{}\n", merge_remote_obj(*t)));
     }
     std::fs::write(git_dir.join("MERGE_HEAD"), merge_head)?;
     std::fs::write(git_dir.join("MERGE_MODE"), merge_mode(ff))?;
@@ -4516,6 +4558,31 @@ fn compose_message(
             octopus_message(repo, &specs, branch, opts.into_name.as_deref())
         }
     };
+    // `fmt_merge_msg_sigs()` (fmt-merge-msg.c:700-701, :523-589) runs on every
+    // `fmt_merge_msg()` call, which `collect_parents()` makes only for an
+    // `autogen` list (builtin/merge.c:1293-1294, :1318-1319): the body of each
+    // merged annotated tag follows the title (or the `-m` text under `--log`).
+    // `origins` carries the id on each `merge_names` line, which is the tag
+    // object `merge_name()` and FETCH_HEAD name, not the commit it peels to.
+    if opts.message.is_none() || opts.log_len != 0 {
+        let origins = refs
+            .iter()
+            .zip(targets.iter())
+            .map(|(spec, target)| {
+                let origin = describe_spec(repo, spec).origin;
+                (origin.into(), merge_names_line_id(repo, spec, *target))
+            })
+            .collect::<Vec<(BString, ObjectId)>>();
+        let mut sigs = Vec::new();
+        let comment = comment_char(repo);
+        super::fmt_merge_msg::merged_tag_bodies(
+            repo,
+            &origins,
+            comment.as_bytes().as_bstr(),
+            &mut sigs,
+        )?;
+        msg.push_str(&String::from_utf8_lossy(&sigs));
+    }
     if opts.log_len != 0 {
         append_shortlog(repo, refs, targets, local_id, opts, &mut msg)?;
     }
@@ -5570,10 +5637,16 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
         return origin;
     }
     if let Some(full) = dwim_full_name(repo, spec) {
-        // `merge_name()` reports the name `dwim_ref()` landed on with its category
-        // prefix cut off, not the spelling it was handed: `@{-1}` is the branch it
-        // names, `heads/topic` is `topic`.
+        // `merge_name()` (builtin/merge.c:556-580) classifies by the ref
+        // `repo_dwim_ref()` landed on but names the head by `bname`, the
+        // operand after `copy_branchname()`: `@{-1}` is the branch it names,
+        // while `heads/topic` and `refs/heads/topic` stay as typed.
+        let spelled = |name: &str| match spec.contains("@{") {
+            true => name.to_string(),
+            false => spec.to_string(),
+        };
         if let Some(name) = full.strip_prefix("refs/heads/") {
+            let name = spelled(name);
             return SpecOrigin {
                 described: format!("branch '{name}'"),
                 origin: name.to_string(),
@@ -5581,6 +5654,7 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
             };
         }
         if let Some(name) = full.strip_prefix("refs/tags/") {
+            let name = spelled(name);
             return SpecOrigin {
                 described: format!("tag '{name}'"),
                 origin: format!("tag '{name}'"),
@@ -5588,6 +5662,7 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
             };
         }
         if let Some(name) = full.strip_prefix("refs/remotes/") {
+            let name = spelled(name);
             return SpecOrigin {
                 described: format!("remote-tracking branch '{name}'"),
                 origin: name.to_string(),
@@ -5605,6 +5680,21 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
                 name
             },
             is_local_branch: true,
+        };
+    }
+    // `if (desc && desc->obj && desc->obj->type == OBJ_TAG)` (builtin/merge.c:
+    // 625-631): an operand that named a tag object by any other spelling, such
+    // as its object id, is still `tag '<operand>'`.
+    let names_tag = repo
+        .rev_parse_single(spec)
+        .ok()
+        .and_then(|id| repo.find_header(id.detach()).ok())
+        .is_some_and(|header| header.kind() == gix::object::Kind::Tag);
+    if names_tag {
+        return SpecOrigin {
+            described: format!("tag '{spec}'"),
+            origin: format!("tag '{spec}'"),
+            is_local_branch: false,
         };
     }
     SpecOrigin {
@@ -6237,9 +6327,11 @@ fn collect(
     // measured against its source the way `diff_filespec` pairs them.
     let old_sides: HashMap<BString, Option<(ObjectId, bool)>> =
         raw.iter().map(|(p, _, _, o, _, _, _)| (p.clone(), *o)).collect();
+    let old_modes: HashMap<BString, u32> =
+        raw.iter().map(|(p, _, _, _, _, _, modes)| (p.clone(), modes.0)).collect();
 
     let mut rows: Vec<(BString, StatRow)> = Vec::with_capacity(raw.len());
-    for (path, mut name, counts, old_id, new_id, compact, _) in raw {
+    for (path, mut name, counts, old_id, new_id, mut compact, modes) in raw {
         // The source half of a detected rename is not a row of its own.
         if renamed.values().any(|(src, _)| *src == path) {
             continue;
@@ -6254,6 +6346,18 @@ fn collect(
             let before = old_sides.get(src).copied().flatten();
             let (added, deleted) =
                 filespec::count_changed_lines(&content(before)?, &content(new_id)?)?;
+            counts = Some((added as u64, deleted as u64));
+            // `get_compact_summary(p, is_renamed)` (diff.c:4135-4158): a rename
+            // is never `new` or `gone`, only a mode transition between its two
+            // sides.
+            compact = renamed_compact_comment(old_modes.get(src).copied().unwrap_or(0), modes.1);
+        } else if counts.is_some() {
+            // `builtin_diffstat()` runs xdiff over both blobs as stored
+            // (diff.c:4192-4235), a CR before each LF included; the tree
+            // diff's own line counter folds a CRLF line into its LF twin, so a
+            // line-ending conversion measured as nothing changed.
+            let (added, deleted) =
+                filespec::count_changed_lines(&content(old_id)?, &content(new_id)?)?;
             counts = Some((added as u64, deleted as u64));
         }
         // The tree diff has no blob to hand its resource cache for a gitlink, so it
@@ -6324,4 +6428,71 @@ fn emit_stats(out: &mut String, files: &[StatRow]) {
         &super::diff_color::DiffColors::disabled(),
     );
     out.push_str(&String::from_utf8_lossy(&bytes));
+}
+/// `get_merge_parent()` (commit.c:1876-1889): the operand resolved, then
+/// `repo_peel_to_type(name, 0, obj, OBJ_COMMIT)` (object.c:880-902), which
+/// follows tags and, at a tree or a blob, reports `error: <name>: expected
+/// commit type, but the object dereferences to <type> type` before the caller's
+/// `not something we can merge`. A name that resolves to nothing is silent.
+fn merge_parent_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let named = repo.rev_parse_single(spec).ok()?.detach();
+    let object = repo.find_object(named).ok()?.peel_tags_to_end().ok()?;
+    if object.kind == gix::object::Kind::Commit {
+        set_merge_remote_obj(object.id, named);
+        return Some(object.id);
+    }
+    eprintln!(
+        "error: {spec}: expected commit type, but the object dereferences to {} type",
+        object.kind
+    );
+    None
+}
+
+/// The id `merge_name()` writes on a head's `merge_names` line
+/// (builtin/merge.c:1295-1322 via `merge_remote_util()->obj`), or the id of
+/// the FETCH_HEAD line a described head came from (`handle_fetch_head()`
+/// copies those lines whole): the object the operand named, before peeling.
+fn merge_names_line_id(repo: &gix::Repository, spec: &str, target: ObjectId) -> ObjectId {
+    if described_line(spec).is_some() {
+        return fetch_head_for_merge(repo)
+            .ok()
+            .and_then(|heads| heads.into_iter().find(|(_, d)| d == spec))
+            .map_or(target, |(id, _)| id);
+    }
+    repo.rev_parse_single(spec).map_or(target, |id| id.detach())
+}
+
+/// `get_compact_summary()` (diff.c:4135-4158) for a renamed pair: only the
+/// symlink and executable-bit transitions between the source's and the
+/// destination's modes.
+fn renamed_compact_comment(old: u32, new: u32) -> Option<&'static str> {
+    let is_link = |mode: u32| mode & 0o170000 == 0o120000;
+    match (old, new) {
+        (o, n) if is_link(o) && !is_link(n) => Some("mode -l"),
+        (o, n) if !is_link(o) && is_link(n) => Some("mode +l"),
+        (o, n) if o & 0o777 == 0o644 && n & 0o777 == 0o755 => Some("mode +x"),
+        (o, n) if o & 0o777 == 0o755 && n & 0o777 == 0o644 => Some("mode -x"),
+        _ => None,
+    }
+}
+
+/// The commit-slab side table behind `set_merge_remote_desc()` and
+/// `merge_remote_util()` (commit.c:1863-1889): per merged commit, the object
+/// its operand named before peeling. Only the first naming sticks, as
+/// `get_merge_parent()` sets it only `if (!merge_remote_util(commit))`.
+static MERGE_REMOTE_OBJ: std::sync::Mutex<Vec<(ObjectId, ObjectId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn set_merge_remote_obj(commit: ObjectId, named: ObjectId) {
+    let mut table = MERGE_REMOTE_OBJ.lock().unwrap_or_else(|e| e.into_inner());
+    if !table.iter().any(|(c, _)| *c == commit) {
+        table.push((commit, named));
+    }
+}
+
+/// `merge_remote_util(c)->obj`, or the commit itself for a head no operand
+/// named (builtin/merge.c:1133-1137).
+fn merge_remote_obj(commit: ObjectId) -> ObjectId {
+    let table = MERGE_REMOTE_OBJ.lock().unwrap_or_else(|e| e.into_inner());
+    table.iter().find(|(c, _)| *c == commit).map_or(commit, |(_, named)| *named)
 }

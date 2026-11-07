@@ -392,14 +392,14 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             if input.read_line(&mut line)? == 0 {
                 break;
             }
-            // `strbuf_getline_lf` strips only the trailing LF. git then splits on
-            // single spaces with `STRING_LIST_SPLIT_TRIM` and maxsplit -1: each
-            // field is trimmed but empties are kept, so a run of spaces inflates
-            // `split.nr` into a malformed line.
+            // `strbuf_getline_lf` strips only the trailing LF. git then splits
+            // the buffer in place (builtin/merge-tree.c:628-629), so the line
+            // its `malformed input line` die() quotes is `buf.buf` up to the
+            // first NUL the split wrote: the first field's end.
             let body = line.strip_suffix('\n').unwrap_or(&line);
-            let fields: Vec<&str> = body.split(' ').map(str::trim).collect();
+            let (fields, quoted) = split_in_place_trim(body);
             if fields.len() < 2 {
-                eprintln!("fatal: malformed input line: '{body}'.");
+                eprintln!("fatal: malformed input line: '{quoted}'.");
                 return Ok(ExitCode::from(128));
             }
             // git sets the base whenever field[1] is `--`, then only merges when
@@ -410,7 +410,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
             } else if fields[1] != "--" && fields.len() == 2 {
                 (None, fields[0], fields[1])
             } else {
-                eprintln!("fatal: malformed input line: '{body}'.");
+                eprintln!("fatal: malformed input line: '{quoted}'.");
                 return Ok(ExitCode::from(128));
             };
 
@@ -1795,4 +1795,29 @@ fn render_path(path: &BStr, nul: bool) -> Vec<u8> {
 /// other verb that prints a path.
 fn quote_path(path: impl AsRef<[u8]>) -> String {
     crate::quote::quoted_name_string(path.as_ref())
+}
+
+/// `string_list_split_in_place_f(&split, buf, " ", -1, STRING_LIST_SPLIT_TRIM)`
+/// (string-list.c:297-388): each field starts past leading whitespace and ends
+/// at the next space, right-trimmed, so a run of spaces never yields an empty
+/// field but a trailing one does. Also returns `buf.buf` as the split leaves it,
+/// which ends at the NUL written over the first field's end.
+fn split_in_place_trim(line: &str) -> (Vec<&str>, &str) {
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut fields = Vec::new();
+    let mut first_end = None;
+    let mut p = 0;
+    loop {
+        p += line[p..].len() - line[p..].trim_start_matches(is_space).len();
+        let end = line[p..].find(' ').map(|at| p + at);
+        let stop = end.unwrap_or(line.len());
+        let field = line[p..stop].trim_end_matches(is_space);
+        first_end.get_or_insert(p + field.len());
+        fields.push(field);
+        match end {
+            Some(at) => p = at + 1,
+            None => break,
+        }
+    }
+    (fields, &line[..first_end.unwrap_or(0)])
 }

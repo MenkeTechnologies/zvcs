@@ -579,6 +579,14 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         if a == "--" || a == "-" || !a.starts_with('-') {
             break;
         }
+        // parse_options_step() consumes `--end-of-options` and stops
+        // (parse-options.c:1119-1124; no PARSE_OPT_KEEP_UNKNOWN_OPT,
+        // builtin/grep.c:1179-1181), so the next word is the pattern whatever it
+        // looks like.
+        if a == "--end-of-options" {
+            i += 1;
+            break;
+        }
         // Resolve the long name the way `parse_long_opt()` resolves it, so a
         // unique abbreviation reaches the arm its full spelling reaches.
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {

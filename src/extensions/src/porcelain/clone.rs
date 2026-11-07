@@ -1302,15 +1302,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
     }
 
-    // `transport_check_allowed()`, here rather than at the top of the command
-    // because git reaches it inside `transport_get()`/`git_connect()` — after the
-    // banner. `git clone <path>` under `$GIT_PROTOCOL_FROM_USER=0` therefore
-    // prints `Cloning into '<dir>'...` and only then refuses, which is what a
-    // caller reading the two streams together sees.
-    if let Some(code) = crate::setup::check_url_allowed(&url) {
-        return Ok(code);
-    }
-
     // `cmd_clone`'s local-clone block: when the source is a *path* on this
     // machine, git copies the object store instead of running the transport, so
     // every shallow selector is ignored — with a warning naming the `file://`
@@ -1351,7 +1342,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // (`connect.c:1480`) right after the banner and before a single byte moves.
     // A transport the policy forbids is fatal here, which is what stops a
     // submodule URL from choosing the transport (CVE-2022-39253).
-    if let Err(e) = check_transport_allowed(&url) {
+    if let Err(e) = check_transport_allowed(&url, &config_pairs) {
         eprintln!("fatal: {e}");
         return Ok(ExitCode::from(128));
     }
@@ -1659,6 +1650,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if let Some(reject) = reject_shallow {
         overrides.push(format!("clone.rejectShallow={reject}"));
     }
+    // git decides the transport policy once, in transport_check_allowed()
+    // (transport.c:1201-1205), which [`check_transport_allowed`] above has already
+    // passed. gitoxide's `connect()` asks again with its own reading of
+    // `protocol.*.allow`, which neither honours `GIT_ALLOW_PROTOCOL` nor ranks a
+    // `git -c` over the clone's own `-c`, so it is handed that answer.
+    overrides.push(format!("protocol.{}.allow=always", crate::setup::transport_name(&url)));
     if !overrides.is_empty() {
         prepare = prepare.with_in_memory_config_overrides(overrides);
     }
@@ -4309,11 +4306,18 @@ fn run_self(dir: &str, args: &[&str], from_user: bool, setup: Option<&ChildSetup
 /// `https`, `git` and `ssh` are `always`; `ext` is `never`; everything else —
 /// `file` included — is `user`, meaning it is permitted only when the URL came
 /// from the user rather than from a file the repository carries.
-fn transport_allowed(kind: &str) -> Result<bool> {
+///
+/// `config_pairs` are clone's own `-c <key>=<value>` options. `write_config()` has
+/// written them into the new repository before `transport_get()` runs
+/// (builtin/clone.c:1241, :1345), so the policy reads them as repository-local
+/// configuration: over the system and global files, under the command line's
+/// `git -c` (do_git_config_sequence(), config.c:1556-1622).
+fn transport_allowed(kind: &str, config_pairs: &[(String, String)]) -> Result<bool> {
     if let Ok(list) = std::env::var("GIT_ALLOW_PROTOCOL") {
         return Ok(list.split(':').any(|entry| entry == kind));
     }
     let config = crate::config::global_config();
+    let command_line = gix::config::File::from_environment_overrides().unwrap_or_default();
     // git's `parse_protocol_config`: anything but these three is fatal.
     let parse = |key: &str, value: &str| match value.to_ascii_lowercase().as_str() {
         "always" => Ok(Allow::Always),
@@ -4321,10 +4325,19 @@ fn transport_allowed(kind: &str) -> Result<bool> {
         "user" => Ok(Allow::User),
         other => Err(anyhow::anyhow!("unknown value for config '{key}': {other}")),
     };
+    let string = |file: &gix::config::File, key: &str| {
+        file.string(key).and_then(|v| v.to_str().ok().map(str::to_string))
+    };
     let read = |key: &str| {
-        config
-            .string(key)
-            .and_then(|v| v.to_str().ok().map(str::to_string))
+        string(&command_line, key)
+            .or_else(|| {
+                config_pairs
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| same_config_key(k, key))
+                    .map(|(_, v)| v.clone())
+            })
+            .or_else(|| string(&config, key))
     };
     let key = format!("protocol.{kind}.allow");
     let policy = match read(&key) {
@@ -4346,6 +4359,17 @@ fn transport_allowed(kind: &str) -> Result<bool> {
     })
 }
 
+/// Whether a `-c` key names `want`: section and variable compare without case,
+/// the subsection exactly, as `git_config_parse_key()` normalizes them.
+fn same_config_key(given: &str, want: &str) -> bool {
+    let split = |k: &str| -> Option<(String, String, String)> {
+        let (section, rest) = k.split_once('.')?;
+        let (sub, var) = rest.rsplit_once('.').unwrap_or(("", rest));
+        Some((section.to_ascii_lowercase(), sub.to_string(), var.to_ascii_lowercase()))
+    };
+    split(given).is_some_and(|g| Some(g) == split(want))
+}
+
 /// git's `protocol_allow_config` (`transport.c:1066`).
 enum Allow {
     Never,
@@ -4355,7 +4379,7 @@ enum Allow {
 
 /// git's `transport_check_allowed()` (`transport.c:1156`) for the transport
 /// `url` selects. The error text is git's `transport '%s' not allowed`.
-fn check_transport_allowed(url: &gix::Url) -> Result<()> {
+fn check_transport_allowed(url: &gix::Url, config_pairs: &[(String, String)]) -> Result<()> {
     let kind = match url.scheme {
         gix::url::Scheme::File => "file",
         gix::url::Scheme::Git => "git",
@@ -4364,7 +4388,7 @@ fn check_transport_allowed(url: &gix::Url) -> Result<()> {
         gix::url::Scheme::Https => "https",
         gix::url::Scheme::Ext(ref name) => name.as_str(),
     };
-    if !transport_allowed(kind)? {
+    if !transport_allowed(kind, config_pairs)? {
         crate::git_fatal!("transport '{kind}' not allowed");
     }
     Ok(())

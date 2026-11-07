@@ -1531,6 +1531,8 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
     let mut fmt: u32 = 0;
     let mut trailing_paths: Vec<String> = Vec::new();
     let mut after_dashdash = false;
+    // `setup_revisions()`'s `seen_end_of_options` (revision.c:3049).
+    let mut seen_end_of_options = false;
     // `setup_revisions()`'s `seen_dashdash`, established by a scan of the whole
     // argument vector before anything is resolved — so it is already in force
     // for the arguments standing in front of the separator.
@@ -2116,33 +2118,48 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
             trailing_paths.push(a.clone());
             continue;
         }
-        if diff_color::needs_separate_value(a)
-            || indicator_slot(a).is_some()
-            || a == "--diff-merges"
-            || matches!(
-                a.as_str(),
-                "--diff-algorithm" | "--find-object" | "-S" | "-G" | "--anchored"
-            )
+        // `if (!seen_end_of_options && *arg == '-')` (revision.c:3077, :3100-3103):
+        // past `--end-of-options` every word but `--` goes to handle_revision_arg(),
+        // so `git diff --end-of-options -x` diffs against a branch named `-x`.
+        if !seen_end_of_options && a == "--end-of-options" {
+            seen_end_of_options = true;
+            continue;
+        }
+        let operand_only = seen_end_of_options && a != "--";
+        if !operand_only
+            && (diff_color::needs_separate_value(a)
+                || indicator_slot(a).is_some()
+                || a == "--diff-merges"
+                || matches!(
+                    a.as_str(),
+                    "--diff-algorithm" | "--find-object" | "-S" | "-G" | "--anchored"
+                ))
         {
             pending_value = Some(a.clone());
             continue;
         }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen,
         // ahead of every other decision this loop makes about the argument.
-        if let Some(line) = super::diff_optval::reject(a) {
+        if let Some(line) = super::diff_optval::reject(a).filter(|_| !operand_only) {
             eprintln!("{line}");
             return Ok(ExitCode::from(129));
         }
         // `--color-moved[=<mode>]`, `--color-moved-ws=<modes>`, `--word-diff[=<mode>]`,
         // `--word-diff-regex=<re>` and `--color-words[=<re>]`.
-        if let Some(res) = move_word.parse_flag(a, &mut color_when) {
+        let move_word_flag = match operand_only {
+            true => None,
+            false => move_word.parse_flag(a, &mut color_when),
+        };
+        if let Some(res) = move_word_flag {
             if let Err(msg) = res {
                 eprintln!("{msg}");
                 return Ok(ExitCode::from(129));
             }
             continue;
         }
-        match a.as_str() {
+        // An operand past `--end-of-options` reaches the positional arm whatever
+        // it is spelled like; the sentinel matches no option arm.
+        match if operand_only { "\u{0}end-of-options" } else { a.as_str() } {
             "--" => after_dashdash = true,
             "--cached" | "--staged" => cached = true,
             "--raw" => fmt |= F_RAW,
@@ -2866,7 +2883,8 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                 pickaxe_arg = Some((b'G', s.as_bytes()[2..].to_vec()));
             }
             s if s.starts_with('-') => bail!("unsupported option {s:?}"),
-            s => {
+            _ => {
+                let s = a.as_str();
                 // A positional is a revision while we are still in the revision
                 // region, otherwise a pathspec. Once a positional is neither a
                 // resolvable revision nor an existing path, git dies with the

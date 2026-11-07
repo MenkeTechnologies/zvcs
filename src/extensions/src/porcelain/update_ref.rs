@@ -334,6 +334,23 @@ pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr:
     {
         return Ok(transaction_failure(name, &reason, w.delete, onerr));
     }
+    // A null `<old-oid>` finds any existing ref "reference already exists", whatever
+    // it holds (check_old_oid(), refs/files-backend.c:2647-2651). gitoxide's `MustNotExist` passes a
+    // ref that already holds the new value, a leniency clone and fetch rely on, so
+    // the check is made here.
+    if let (Val::Zero, Val::Oid(id)) = (old, new) {
+        let absent = Absent {
+            name: name.to_string(),
+            deref: w.deref,
+            new: Some(*id),
+            at: 0,
+            guards_edit: true,
+        };
+        if absent_violated(repo, &absent)? {
+            let reason = format!("cannot lock ref '{name}': reference already exists");
+            return Ok(transaction_failure(name, &reason, w.delete, onerr));
+        }
+    }
 
     match repo.edit_reference(edit) {
         Ok(_) => Ok(ExitCode::SUCCESS),
@@ -2225,6 +2242,11 @@ fn stage_oid_command(
                 .unwrap_or(Val::Missing);
             extra_input(cur, cmd, name)?;
             check_new_object(repo, name, &new)?;
+            // A null `<old-oid>` must find no ref at all, as for `create`
+            // (refs/files-backend.c:2647-2651).
+            if let (Val::Zero, Val::Oid(id)) = (&old, &new) {
+                batch.require_absent(name, deref, Some(*id));
+            }
             batch
                 .edits
                 .push(build_edit(name, &new, &old, deref, create_reflog, msg)?);

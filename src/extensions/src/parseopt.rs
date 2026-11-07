@@ -710,7 +710,9 @@ fn expand(args: &[String], table: Shorts<'_>, mode: Mode) -> Vec<String> {
         // `if (*arg != '-' || !arg[1])`: a positional or a lone `-`. A `--`
         // word is `parse_long_opt()`'s.
         let operand = !a.starts_with('-') || a.as_str() == "-";
-        if a == "--" || (operand && mode.stop_at_non_option) {
+        // `--end-of-options` ends parse_options_step() the way `--` does
+        // (parse-options.c:1119-1124), so nothing behind it is a clump.
+        if a == "--" || a == "--end-of-options" || (operand && mode.stop_at_non_option) {
             out.push(a.clone());
             out.extend(rest.cloned());
             return out;

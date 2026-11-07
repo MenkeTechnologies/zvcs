@@ -228,6 +228,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut notes_opt = super::notes::DisplayOpt::default();
     let mut show_notes_by_default = false;
     let mut after_dashdash = false;
+    // `setup_revisions()`'s `seen_end_of_options` (revision.c:3049, :3100-3103):
+    // once `--end-of-options` is read every later word but `--` is a revision,
+    // however it is spelled, so `git show --end-of-options -x` shows a branch `-x`.
+    let mut seen_end_of_options = false;
     // `setup_revisions()`'s `seen_dashdash`, which it establishes in a scan of
     // the whole argument vector *before* it resolves anything — so it is in
     // force for the arguments in front of the separator as well, unlike
@@ -438,12 +442,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         let s = a.as_str();
         // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,
         // so the block it prints is `git log`'s — on stdout at exit 0.
-        if !after_dashdash && s == "-h" {
+        if !after_dashdash && !seen_end_of_options && s == "-h" {
             return Ok(super::show_usage(super::log::USAGE));
         }
         // `--help-all` is the same block with the hidden `--i-still-use-this`
         // left in (`USAGE_FULL`), and `git show` shares that too.
-        if !after_dashdash && s == "--help-all" {
+        if !after_dashdash && !seen_end_of_options && s == "--help-all" {
             return Ok(super::show_usage(super::log::USAGE_ALL));
         }
         // Everything after `--` is a pathspec, even tokens that look like flags:
@@ -461,6 +465,24 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             || pending_ws_error_highlight
             || pending_decorate_refs.is_some()
             || pending_ref_value.is_some();
+        // `if (!seen_end_of_options && *arg == '-')` (revision.c:3077): past
+        // `--end-of-options` a word goes straight to handle_revision_arg().
+        if !value_slot && seen_end_of_options && s != "--" {
+            if crate::objname::is_parent_directory_pathspec(s, seen_dashdash) {
+                pathspecs.push(s.as_bytes().to_vec());
+                continue;
+            }
+            if super::log::argument_excludes(s, negate_revs) {
+                no_walk = false;
+            }
+            specs.push(s);
+            spec_negated.push(negate_revs);
+            continue;
+        }
+        if !value_slot && s == "--end-of-options" {
+            seen_end_of_options = true;
+            continue;
+        }
         if !value_slot && s.starts_with('-') && s != "--" && !super::log::log_parse_options_word(s) {
             setup_opts.push((specs.len(), s));
         }
@@ -2632,6 +2654,12 @@ fn bad_revision(repo: &gix::Repository, spec: &str, seen_dashdash: bool) -> Exit
     // `handle_revision_arg_1()` makes of it. `cmd_show()` sets no
     // `REVARG_COMMITTISH` (builtin/log.c:661-700).
     eprint!("{}", crate::objname::revision_arg_report(repo, spec, false, seen_dashdash, false));
+    // An operand `--end-of-options` let through still meets verify_filename()'s
+    // first test, `if (*arg == '-') die(...)` (setup.c:285-286).
+    if !seen_dashdash && spec.starts_with('-') {
+        eprintln!("fatal: option '{spec}' must come before non-option arguments");
+        return ExitCode::from(128);
+    }
     eprint!(
         "{}",
         super::log::bad_revision_message_in_gated(repo, spec, seen_dashdash)

@@ -361,6 +361,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // `--all`, `--branches`, `--tags`, `--remotes`, `--glob`, `--exclude`,
     // `--not` and bare revisions do not arm it, everything else does.
     let mut argv_consumed = false;
+    // `--end-of-options` was read, and the first word setup_revisions() would
+    // then leave unparsed; see the loop below.
+    let mut options_done = false;
+    let mut leftover: Option<String> = None;
 
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -376,6 +380,15 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             // that look like options or revisions — is a pathspec.
             pathspecs.extend(argv[i..].iter().map(|s| s.as_bytes().to_vec()));
             break;
+        }
+        // `--end-of-options` ends parse_options_step() and is consumed there
+        // (parse-options.c:1119-1124, no PARSE_OPT_KEEP_UNKNOWN_OPT), so every word
+        // after it reaches setup_revisions() alone: shortlog's own options and
+        // unknown ones are left over for `error: unrecognized argument: %s`
+        // (builtin/shortlog.c:457-459).
+        if !options_done && a == "--end-of-options" {
+            options_done = true;
+            continue;
         }
         if a.len() < 2 || !a.starts_with('-') {
             // `handle_revision_arg_1()` refuses a bare `..` before
@@ -396,7 +409,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // an `=<value>`, which is why it is absent from [`LONG_OPTS`] and
         // checked here instead. shortlog's table has no `PARSE_OPT_HIDDEN`
         // entry, so `USAGE_FULL` renders the same block `-h` prints.
-        if a == "--help-all" {
+        if !options_done && a == "--help-all" {
             return Ok(super::show_usage(USAGE));
         }
 
@@ -407,10 +420,11 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // abbreviating — so a name outside [`LONG_OPTS`] must come back untouched,
         // which is exactly what the resolver does.
         let canonical;
-        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS).filter(|_| !options_done) {
             return Ok(code);
         }
         let a = match super::canonical_long(a, LONG_OPTS) {
+            _ if options_done => a,
             super::Long::Name(name) => {
                 canonical = name;
                 canonical.as_ref()
@@ -438,6 +452,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     | "email"
                     | "no-email"
             );
+            if options_done && (native_bool || name == "group" || name == "no-group") {
+                leftover.get_or_insert_with(|| a.to_string());
+                continue;
+            }
             if native_bool {
                 if value.is_some() {
                     eprintln!("error: option `{name}' takes no value");
@@ -725,6 +743,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 ("abbrev", None) => abbrev_arg = None,
                 ("no-abbrev", None) => abbrev_arg = Some(AbbrevArg::Full),
                 ("abbrev", Some(v)) => abbrev_arg = Some(AbbrevArg::Len(v.to_string())),
+                _ if options_done => {
+                    leftover.get_or_insert_with(|| a.to_string());
+                }
                 _ => return Ok(unknown_option(a, argv_consumed)),
             }
             argv_consumed = true;
@@ -772,6 +793,18 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             _ => {}
         }
 
+        // Past `--end-of-options` no cluster is split: handle_revision_opt() takes
+        // the word whole (`-n <n>`) or leaves it over.
+        if options_done {
+            match apply_count_opt(argv, i - 1, &mut filters) {
+                Some(Ok(consumed)) => i += consumed - 1,
+                Some(Err(code)) => return Ok(code),
+                None => {
+                    leftover.get_or_insert_with(|| a.to_string());
+                }
+            }
+            continue;
+        }
         // A cluster of short options. `-w` takes an optional *attached* argument,
         // so it swallows whatever remains of the cluster.
         for (off, c) in body.char_indices() {
@@ -1114,6 +1147,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // chance to emit git's exact `fatal:`/usage exit code in argv order. Only if
     // none did do we surface a git-valid-but-unported flag as our own failure —
     // never producing wrong output for a feature we cannot execute.
+    // `if (setup_revisions(argc, argv, &rev, NULL) != 1) { error(_("unrecognized
+    // argument: %s"), argv[1]); usage_with_options(...); }` (builtin/shortlog.c:457-459),
+    // after every revision has resolved and every pattern compiled.
+    if let Some(arg) = leftover {
+        eprint!("error: unrecognized argument: {arg}\n{USAGE}");
+        return Ok(ExitCode::from(129));
+    }
     if let Some(flag) = unsupported {
         bail!("unsupported flag {flag:?}");
     }

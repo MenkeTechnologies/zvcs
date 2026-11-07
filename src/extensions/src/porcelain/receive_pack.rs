@@ -2364,12 +2364,14 @@ fn fsck_received(
 /// `unpack-objects`: write every object of the received pack into the loose
 /// object store of the quarantine, so nothing of the pack survives.
 fn explode_pack(incoming: &Incoming<'_>, received: &[gix::ObjectId]) -> Result<()> {
-    use gix::objs::Write;
+    use gix::objs::{Exists, Write};
     for id in received {
         // Writing an object some source already has only freshens it
         // (`odb_freshen_object()`, odb.c:824-832, odb/source-loose.c:949), and the
-        // real store is one of the quarantine's sources.
-        if incoming.repo.has_object(*id) {
+        // real store is one of the quarantine's sources. Freshening looks for the
+        // file itself, so the empty tree, which `has_object()` answers for whether
+        // or not the store holds it (find_cached_object(), odb.c), is written.
+        if incoming.repo.objects.exists(id) {
             continue;
         }
         let (kind, data) = incoming.find(*id).ok_or_else(|| anyhow!("unable to read {id}"))?;

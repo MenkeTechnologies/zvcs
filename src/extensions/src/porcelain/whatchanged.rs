@@ -858,7 +858,11 @@ fn parse_args(
 
         // `^<rev>` never degrades into a pathspec.
         if let Some(rest) = a.strip_prefix('^') {
-            if rest.is_empty() || repo.rev_parse(rest).is_err() {
+            if rest.is_empty()
+                || (repo.rev_parse(rest).is_err() && !crate::objname::resolves_committish_quietly(repo, rest))
+            {
+                let cant_be_filename = args.iter().any(|x| x == "--");
+                eprint!("{}", crate::objname::revision_arg_report(repo, a, true, cant_be_filename, true));
                 return Err(Fatal::die(format!("bad revision '{a}'")));
             }
             // `verify_non_filename()` (revision.c:2156-2157) with the `^` already
@@ -882,7 +886,12 @@ fn parse_args(
         // not get the chance. See
         // [`crate::objname::is_parent_directory_pathspec`].
         let parent_dir = crate::objname::is_parent_directory_pathspec(a, args.iter().any(|x| x == "--"));
-        if !parent_dir && !a.is_empty() && repo.rev_parse(a).is_ok() {
+        // `cmd_whatchanged()` sets `REVARG_COMMITTISH` (builtin/log.c:546), the hint
+        // gitoxide's parser has no equivalent of.
+        if !parent_dir
+            && !a.is_empty()
+            && (repo.rev_parse(a).is_ok() || crate::objname::resolves_committish_quietly(repo, a))
+        {
             // `verify_non_filename()`, on the operand as written: a range keeps its
             // separator (`handle_dotdot_1()` puts it back, revision.c:2024-2028),
             // so only a token that is itself a path is ambiguous. The separator is
@@ -905,12 +914,22 @@ fn parse_args(
         // before returning non-zero, so its warnings precede the fatal
         // `verify_filename()` raises — `git whatchanged <40-hex-ref>..nosuch` warns
         // about the left endpoint and only then dies.
+        // Its `get_short_oid()` reports are among them, and `die_verify_filename()`'s
+        // `maybe_die_on_misspelt_object_name()` pass repeats the ones below a
+        // `~<n>`/`^<n>` (setup.c:200-221, object-name.c:1880-1889).
+        let cant_be_filename = args.iter().any(|x| x == "--");
+        let report = crate::objname::revision_arg_report(repo, a, true, cant_be_filename, true);
         for (n, arg) in args[i..].iter().enumerate() {
             if let Err(fatal) = verify_filename(arg, n == 0) {
                 warn_up_to(&accepted, a);
+                eprint!("{report}");
+                if n == 0 && !arg.starts_with('-') {
+                    eprint!("{}", crate::objname::misspelt_short_oid_report(repo, a));
+                }
                 return Err(fatal);
             }
         }
+        eprint!("{report}");
         p.pathspecs.extend(args[i..].iter().cloned());
         break;
     }

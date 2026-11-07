@@ -3010,6 +3010,10 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // leave nothing behind: a pending tree or blob is dropped by
     // `handle_commit()` but the flag was already set, so `revs->def` stays out.
     let mut rev_input_given = false;
+    // `REVARG_COMMITTISH`, which `cmd_log()` and `cmd_whatchanged()` set and
+    // `cmd_log_reflog()`'s zeroed `setup_revision_opt` does not (builtin/log.c:546,
+    // :844, :799-800).
+    let committish = flavor != Flavor::Reflog;
     let mut resolve_neg = |spec: &str, token: &str, gated: bool, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
         match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
             Ok(id) => {
@@ -3033,6 +3037,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // been seen anywhere on the line the operand can no longer be a
                 // pathspec, so the three-line `ambiguous argument` advice is not
                 // printed.
+                eprint!("{}", crate::objname::revision_arg_report(&repo, token, committish, gated, false));
                 eprint!("{}", bad_revision_message_in_gated(&repo, token, gated));
                 Some(ExitCode::from(128))
             }
@@ -3103,6 +3108,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // `strtol_i()` refused the `<n>`, so `add_parents_only()` is never
                 // reached: `ret = -1` and the operand is diagnosed as written.
                 crate::objname::ParentsOnly::BadParent => {
+                    eprint!("{}", crate::objname::revision_arg_report(&repo, spec, committish, gated, false));
                     eprint!("{}", bad_revision_message_in_gated(&repo, spec, gated));
                     return Ok(ExitCode::from(128));
                 }
@@ -3129,6 +3135,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                         // for `^@`, `^!` or `^-<n>` — so this is the bad-revision
                         // fatal rather than a fall-through.
                         crate::objname::Parents::None => {
+                            eprint!("{}", crate::objname::revision_arg_report(&repo, spec, committish, gated, false));
                             eprint!(
                                 "{}",
                                 bad_revision_message_in_gated(&repo, spec, gated)
@@ -3423,6 +3430,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // One `verify_non_filename()` per operand, not per endpoint: a range is
         // split into two specs here and git checks the token once.
         let mut token_checked = false;
+        // One `handle_revision_arg_1()` per operand too, so its ambiguity reports
+        // are given once however many of the token's endpoints failed.
+        let mut token_reported = false;
         let mut fatal_msg: Option<String> = None;
         push_ref_tips(
             at,
@@ -3503,20 +3513,31 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             let resolved = if crate::objname::resolves_through_reflog(spec) {
                 crate::objname::reflog_spec_oid(&repo, spec).ok_or(())
             } else {
-                repo.rev_parse_single(crate::objname::canonical_spec(&repo, spec).as_ref())
-                    .map(|id| id.detach())
+                // A hex prefix in it is `get_short_oid()`'s to decide under the hint
+                // its frame carries, not gitoxide's (see [`crate::objname::hinted_spec`]).
+                let want = if committish { Some("committish") } else { crate::objname::disambiguate_filter(&repo) };
+                crate::objname::hinted_spec(&repo, spec, want)
+                    .ok_or(())
+                    .and_then(|spec| {
+                        repo.rev_parse_single(crate::objname::canonical_spec(&repo, &spec).as_ref())
+                            .map(|id| id.detach())
+                            .map_err(drop)
+                    })
                     // `GET_OID_COMMITTISH`, which `cmd_log_init()` asks for and
                     // gitoxide's parser has no equivalent of — see
                     // [`committish_short_oid`].
                     .or_else(|_| committish_short_oid(&repo, spec).ok_or(()))
                     .map_err(|_| ())
             };
-            // A bare prefix that names more than one object and that the
+            // A prefix that names more than one object and that the
             // `GET_OID_COMMITTISH` hint leaves ambiguous is reported by
             // `get_short_oid()` itself, ahead of whatever `setup_revisions()` then
-            // makes of the operand (object-name.c:507-543).
-            if resolved.is_err() && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
-                crate::objname::short_oid_ambiguous_as(&repo, spec, Some("committish"), false);
+            // makes of the operand (object-name.c:507-543), for each resolution
+            // `handle_revision_arg_1()` makes of the token as written.
+            if resolved.is_err() && !token_reported {
+                token_reported = true;
+                let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
+                eprint!("{}", crate::objname::revision_arg_report(&repo, token, committish, gated, false));
             }
             match resolved {
                 Ok(id) => {
@@ -7529,7 +7550,10 @@ pub(super) fn bad_revision_message_in_gated(
         // `die_verify_filename()` resolves the operand once more, so its
         // `error()` comes out a second time — but only on this branch: the
         // `bad revision`/`bad object` shapes die inside `handle_revision_arg()`
-        // and never reach `verify_filename()`.
+        // and never reach `verify_filename()`. A prefix below a `~<n>`/`^<n>` lost
+        // that pass's `GET_OID_QUIETLY`, so its ambiguity block comes out again
+        // too (object-name.c:1880-1889).
+        message.push_str(&crate::objname::misspelt_short_oid_report(repo, spec));
         if let Some(peel) = crate::objname::peel_type_error(repo, spec) {
             message.push_str(&format!("error: {peel}\n"));
         }
@@ -9076,6 +9100,10 @@ pub(super) fn revision_endpoints(spec: &str) -> Vec<&str> {
 }
 
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
+    // `get_short_oid()` under `GET_OID_COMMITTISH` decides a hex prefix in it
+    // (revision.c:2074, :2227-2228); see [`crate::objname::hinted_spec`].
+    let spec = crate::objname::hinted_spec(repo, spec, Some("committish")).ok_or(())?;
+    let spec = spec.as_ref();
     repo.rev_parse_single(spec)
         .map(|id| id.detach())
         .or_else(|_| committish_short_oid(repo, spec).ok_or(()))

@@ -2193,6 +2193,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     &mut seeds,
                     &mut pending,
                 ) {
+                    // `handle_revision_arg_1()`'s `get_short_oid()` reports come out while the
+                    // operand is resolved, ahead of whatever `setup_revisions()` then makes
+                    // of its failure; `cmd_rev_list()` sets no `REVARG_COMMITTISH`.
+                    if e == unresolvable_in(&repo, s, seen_dashdash || from_stdin) {
+                        let report = crate::objname::revision_arg_report(&repo, s, false, seen_dashdash || from_stdin, false);
+                        eprint!("{report}");
+                    }
                     // `setup_revisions()`'s filename fallback, which `rev-list`
                     // shares with `log` because both run the same function:
                     //
@@ -4854,7 +4861,7 @@ fn seed_revision(
         crate::setup::verify_non_filename(repo, name).map(|m| format!("fatal: {m}\n"))
     };
     if let Some(rest) = spec.strip_prefix('^') {
-        let Some((id, cmdline_commit)) = resolve_named(repo, rest, !negate, pending) else {
+        let Some((id, cmdline_commit)) = resolve_named(repo, rest, !negate, pending, crate::objname::disambiguate_filter(repo)) else {
             // `handle_commit()`'s tree/blob arms again: an excluded non-commit
             // pends nothing and is not an error. Stock `git rev-list --objects
             // ^main^{tree}` exits 0 with no output.
@@ -4879,8 +4886,8 @@ fn seed_revision(
     if let Some((l, r)) = spec.split_once("...") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let (left, left_commit) = resolve_named(repo, left_spec, negate, pending).ok_or_else(|| unknown(spec))?;
-        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending).ok_or_else(|| unknown(spec))?;
+        let (left, left_commit) = resolve_named(repo, left_spec, negate, pending, Some("committish")).ok_or_else(|| unknown(spec))?;
+        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending, Some("committish")).ok_or_else(|| unknown(spec))?;
         // `handle_dotdot_1()` restores the separator first, so the token is
         // checked as written rather than endpoint by endpoint.
         if let Some(message) = non_filename(spec) {
@@ -4917,8 +4924,8 @@ fn seed_revision(
     if let Some((l, r)) = spec.split_once("..") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let (left, left_commit) = resolve_named(repo, left_spec, !negate, pending).ok_or_else(|| unknown(spec))?;
-        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending).ok_or_else(|| unknown(spec))?;
+        let (left, left_commit) = resolve_named(repo, left_spec, !negate, pending, Some("committish")).ok_or_else(|| unknown(spec))?;
+        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending, Some("committish")).ok_or_else(|| unknown(spec))?;
         // Same restore-then-check as the symmetric form above.
         if let Some(message) = non_filename(spec) {
             return Err(message);
@@ -4975,7 +4982,7 @@ fn seed_plain(
     seeds: &mut Vec<Seed>,
     pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
-    let Some((id, cmdline_commit)) = resolve_named(repo, spec, negate, pending) else {
+    let Some((id, cmdline_commit)) = resolve_named(repo, spec, negate, pending, crate::objname::disambiguate_filter(repo)) else {
         // `get_oid_basic()` reads a ref without touching the object it names, so a
         // ref pointing at something the database does not have resolves and then
         // dies in `get_reference()`: `die(_("bad object %s"), name)`
@@ -5702,7 +5709,7 @@ fn resolve(
     // tree and blob arms pend under it. Without it a `<rev>:<path>` operand
     // reached its tree arm with an empty path and the walk under that tree was
     // named from the root — `s.txt` where git says `sub/s.txt`.
-    resolve_named(repo, spec, uninteresting, pending).map(|(id, _)| id)
+    resolve_named(repo, spec, uninteresting, pending, crate::objname::disambiguate_filter(repo)).map(|(id, _)| id)
 }
 
 /// [`resolve`], also reporting whether the object the operand *named* — before
@@ -5713,7 +5720,14 @@ fn resolve_named(
     spec: &str,
     uninteresting: bool,
     pending: &mut Vec<Pending>,
+    want: Option<&'static str>,
 ) -> Option<(ObjectId, bool)> {
+    // `want` is the disambiguator `get_oid_with_context()` is called with:
+    // `GET_OID_COMMITTISH` for `handle_dotdot_1()`'s endpoints (revision.c:2074), none
+    // for a name, since `cmd_rev_list()` sets no `REVARG_COMMITTISH`. A hex prefix is
+    // `get_short_oid()`'s to decide under it (see [`crate::objname::hinted_spec`]).
+    let spec = crate::objname::hinted_spec(repo, spec, want)?;
+    let spec = spec.as_ref();
     let path = operand_path(repo, spec);
     let named = if crate::objname::resolves_through_reflog(spec) {
         crate::objname::reflog_spec_oid(repo, spec)?

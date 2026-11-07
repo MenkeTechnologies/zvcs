@@ -660,7 +660,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // `Could not parse object` below rather than treating the token as a
         // filename. `rev_parse_single()` alone resolves through the odb and would
         // misfile it as a pathspec, producing `ambiguous argument` instead.
-        if crate::objname::resolve(&repo, first).is_some() {
+        // A lone operand cannot be a tree, so it is asked for as a committish; with
+        // paths after it, as a treeish (builtin/reset.c:278-279).
+        let resolved = if rest.is_empty() {
+            crate::objname::resolve_committish(&repo, first)
+        } else {
+            crate::objname::resolve_treeish(&repo, first)
+        };
+        if resolved.is_some() {
             commit_spec = Some(*first);
             paths.extend(rest.iter().map(|s| s.to_string()));
         } else {
@@ -674,7 +681,10 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // tracked-but-deleted path fails it just like a typo'd revision does, and both die
     // before anything is touched.
     if let Some(first) = unverified {
-        if let Some(message) = crate::setup::verify_filename(first, true) {
+        // `die_verify_filename()` runs `maybe_die_on_misspelt_object_name()` before its
+        // fallback (setup.c:215-221): the second resolution's reports and its more
+        // specific `<rev>:<path>` / `:<path>` messages.
+        if let Some(message) = crate::objpath::verify_filename_fatal(&repo, first, true) {
             eprintln!("fatal: {message}");
             return Ok(ExitCode::from(128));
         }
@@ -843,7 +853,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // decodes a full-length hex name without consulting the odb (see
         // [`crate::objname`]), so a well-formed but absent id gets past here and
         // falls into the peel's `Could not parse object` instead.
-        let target_id = match crate::objname::resolve(&repo, reflog_spec) {
+        // `repo_get_oid_treeish()` for the pathspec form, `repo_get_oid_committish()`
+        // for the whole tree (builtin/reset.c:412, :420).
+        let resolved = if with_paths {
+            crate::objname::resolve_treeish(&repo, reflog_spec)
+        } else {
+            crate::objname::resolve_committish(&repo, reflog_spec)
+        };
+        let target_id = match resolved {
             Some(id) => id,
             None => crate::git_fatal!(
                 "Failed to resolve '{reflog_spec}' as a valid {}.",

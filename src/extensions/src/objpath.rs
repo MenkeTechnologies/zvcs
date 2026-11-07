@@ -239,7 +239,10 @@ pub fn misspelt_object_name(repo: &gix::Repository, name: &str) -> Option<String
             // `len` is the offset of the splitting colon, so the name is the rev
             // half alone — `main^{blob}` for `main^{blob}:f1`, with its own
             // `error: … dereferences to tree type` line already printed above it.
-            let Some(tree) = crate::objname::resolve_quiet(repo, rev) else {
+            // `sub_flags` swaps the disambiguators for `GET_OID_TREEISH`
+            // (object-name.c:1835-1840), so a prefix a commit shares with a tree is
+            // ambiguous here whatever `core.disambiguate` says.
+            let Some(tree) = crate::objname::resolve_quiet_as(repo, rev, Some("treeish")) else {
                 return Some(format!("invalid object name '{rev}'."));
             };
             let path = match resolve_relative_path(repo, path) {
@@ -477,6 +480,10 @@ pub fn verify_filename_fatal(
     if !diagnose_misspelt_rev {
         return Some(generic);
     }
+    // The second pass's `get_short_oid()` reports, from the frames below a
+    // `~<n>`/`^<n>` that lost its `GET_OID_QUIETLY` (object-name.c:1880-1889). A
+    // name opening with `:` has no frame, so setup.c:215-216's guard needs no test.
+    eprint!("{}", crate::objname::misspelt_short_oid_report(repo, arg));
     if let Some(message) = crate::objname::peel_type_error(repo, arg) {
         eprintln!("error: {message}");
     }

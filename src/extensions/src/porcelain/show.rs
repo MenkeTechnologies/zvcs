@@ -1777,7 +1777,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 Some(id) => RevSpec::Include(id),
                 None => return Ok(bad_revision(&repo, spec, seen_dashdash)),
             },
-            None => match repo.rev_parse(BStr::new(spec)) {
+            // A hex prefix in it is `get_short_oid()`'s to decide under the hint its
+            // frame carries, not gitoxide's (see [`crate::objname::hinted_spec`]).
+            None => match crate::objname::hinted_spec(&repo, spec, crate::objname::disambiguate_filter(&repo))
+                .ok_or(())
+                .and_then(|spec| repo.rev_parse(BStr::new(spec.as_ref())).map_err(drop))
+            {
                 Ok(p) => p.detach(),
                 // `repo_get_oid()`'s rewrites are wider than gitoxide's grammar:
                 // `@@{u}` and `@{-2}@{u}` are `reinterpret()`'s recursion and
@@ -2623,9 +2628,10 @@ fn bad_revision(repo: &gix::Repository, spec: &str, seen_dashdash: bool) -> Exit
     // `get_short_oid()` is the last thing `get_oid_1()` tries (object-name.c:1134),
     // so a hex prefix that names more than one object earns its own
     // `error: short object ID <p> is ambiguous` and the `hint:` list *before*
-    // `setup_revisions()` gives up on the operand. Both lines are printed for the
-    // same argument, in that order — measured against 2.55.0.
-    crate::objname::short_oid_ambiguous(repo, crate::objname::ambiguity_base_of(spec), false);
+    // `setup_revisions()` gives up on the operand, once for each resolution
+    // `handle_revision_arg_1()` makes of it. `cmd_show()` sets no
+    // `REVARG_COMMITTISH` (builtin/log.c:661-700).
+    eprint!("{}", crate::objname::revision_arg_report(repo, spec, false, seen_dashdash, false));
     eprint!(
         "{}",
         super::log::bad_revision_message_in_gated(repo, spec, seen_dashdash)

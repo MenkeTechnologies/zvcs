@@ -1738,7 +1738,7 @@ pub(crate) fn head_commit_id(repo: &gix::Repository) -> Option<ObjectId> {
 /// picked.
 pub(crate) fn setup_new_branch_info_rev(repo: &gix::Repository, spec: &str, rev: ObjectId) -> ObjectId {
     if super::rev_parse::dwim_ref_matches(repo, spec).is_empty() {
-        crate::objname::resolve(repo, spec);
+        crate::objname::resolve_committish(repo, spec);
     }
     branch_ref_id(repo, spec).unwrap_or(rev)
 }

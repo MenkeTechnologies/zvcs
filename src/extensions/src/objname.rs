@@ -460,7 +460,14 @@ fn peel_onion_error(repo: &gix::Repository, name: &str) -> Option<String> {
     if !matches!(crate::objpath::split(base), crate::objpath::Split::Rev) {
         return None;
     }
-    let mut id = resolve_quiet(repo, base)?;
+    // `get_oid_1()` on the base with the disambiguator replaced: a committish for
+    // `^{commit}`, a treeish for `^{tree}`, none otherwise (object-name.c:952-958).
+    let hint = match want {
+        "commit" => Some("committish"),
+        "tree" => Some("treeish"),
+        _ => disambiguate_filter(repo),
+    };
+    let mut id = resolve_quiet_as(repo, base, hint)?;
     loop {
         let object = repo.find_object(id).ok()?;
         let kind = match object.kind {
@@ -871,6 +878,17 @@ pub fn resolve_with_flags(
     spec: &str,
     flags: OidFlags,
 ) -> Option<ObjectId> {
+    resolve_as(repo, spec, flags, disambiguate_filter(repo))
+}
+
+/// [`resolve_with_flags`] with the disambiguator the caller passes as `want`:
+/// [`disambiguate_filter`] for none, `"committish"` for `GET_OID_COMMITTISH`.
+fn resolve_as(
+    repo: &gix::Repository,
+    spec: &str,
+    flags: OidFlags,
+    want: Option<&'static str>,
+) -> Option<ObjectId> {
     // `repo_dwim_ref()` calls `substitute_branch_name()` before it expands
     // anything (`refs.c:795-803`), and `interpret_branch_mark()`'s `die()` fires
     // from in there — so an `@{u}`/`@{push}` mark that names no upstream ends the
@@ -906,12 +924,13 @@ pub fn resolve_with_flags(
         // `HEAD@{<old date>}^{blob}` and answers with the oldest entry.
         reflog_diagnostics(repo, spec);
     }
-    let resolved = resolve_quiet(repo, spec);
+    let resolved = resolve_quiet_as(repo, spec, want);
     if resolved.is_none() {
         // `get_short_oid()` is the last thing `get_oid_1()` tries
         // (`object-name.c:1134`), so its ambiguity report belongs after every
-        // other diagnostic and only for a name nothing else answered.
-        short_oid_ambiguous(repo, ambiguity_base(spec), false);
+        // other diagnostic and only for a name nothing else answered — under
+        // the hint each frame carries down to it (see [`short_oid_frame`]).
+        report_short_oid(repo, spec, want, flags.quiet);
     }
     resolved
 }
@@ -1009,6 +1028,11 @@ fn reflog_diagnostics(repo: &gix::Repository, name: &str) {
 /// then reads a log rather than an object, so the warning cannot be bolted onto
 /// the resolution the way [`resolve`] bolts it on.
 pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    resolve_quiet_as(repo, spec, disambiguate_filter(repo))
+}
+
+/// [`resolve_quiet`] under the caller's disambiguator `want`, as [`resolve_as`] passes it.
+pub fn resolve_quiet_as(repo: &gix::Repository, spec: &str, want: Option<&'static str>) -> Option<ObjectId> {
     // `get_oid_1()`'s dispatch comes first, and it is a *narrower* grammar than
     // gitoxide's rev-parse: the `^!`/`^@`/`^-<n>` marks belong to
     // `handle_revision_arg_1()` and never reach `repo_get_oid()`.
@@ -1017,6 +1041,14 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     }
     if let Some(id) = full_hex(repo, spec) {
         return Some(id);
+    }
+    // A prefix two objects share is decided by `get_short_oid()` under the hint its
+    // frame carries (object-name.c:507-543), not by gitoxide's own tie-break: the
+    // hint's one pick resolves in its place, and anything else is ambiguous, so
+    // `<commit+tree prefix>:<path>` fails under `GET_OID_TREEISH` and `<commit+blob
+    // prefix>~1` walks from the commit.
+    if let std::borrow::Cow::Owned(picked) = hinted_spec(repo, spec, want)? {
+        return resolve_quiet_as(repo, &picked, want);
     }
     // The rule survives the suffixes. `get_oid_1()` recurses down to
     // [`ambiguity_base`] before anything else happens, so a full-length hex there
@@ -1729,7 +1761,9 @@ pub fn add_parents_only(
 ) -> Parents {
     let (arg, marked) = uninteresting_mark(arg_);
     let not = not ^ marked;
-    let Some(id) = resolve(repo, arg) else {
+    // `repo_get_oid_committish()` (revision.c:1909), whose `get_short_oid()` picks a
+    // commit or tag out of a prefix shared with a tree or a blob.
+    let Some(id) = resolve_committish(repo, arg) else {
         return Parents::None;
     };
     // `get_reference()` `parse_object()`s what `repo_get_oid_committish()`
@@ -1954,7 +1988,11 @@ pub fn dotdot(repo: &gix::Repository, spec: &str) -> Dotdot {
     // Quiet: this is a classifier, and every caller asks it at least twice
     // ("is this a range?", then "what range?"). The ambiguity warning for the two
     // endpoints belongs to whichever resolution the command actually keeps.
-    let (Some(a_oid), Some(b_oid)) = (resolve_quiet(repo, a), resolve_quiet(repo, b)) else {
+    // `oc_flags = GET_OID_COMMITTISH | GET_OID_RECORD_PATH` (revision.c:2074), so a prefix an
+    // endpoint shares with a tree or a blob names the commit.
+    let (Some(a_oid), Some(b_oid)) =
+        (resolve_quiet_as(repo, a, Some("committish")), resolve_quiet_as(repo, b, Some("committish")))
+    else {
         return Dotdot::NotARange;
     };
     // `parse_object()` on both, ahead of any type check: a missing object here
@@ -3869,6 +3907,17 @@ pub fn short_oid_candidates(
     name: &str,
     want: Option<&str>,
 ) -> Option<Vec<ObjectId>> {
+    short_oid_lookup(repo, name, want)?.err()
+}
+
+/// [`short_oid_candidates`] with the other answer kept: `Ok` is the one candidate the hint picks
+/// out of two or more, `Err` the list `get_short_oid()` reports as ambiguous, and `None` a name
+/// with fewer than two candidates, which `get_short_oid()` answers without asking the hint.
+fn short_oid_lookup(
+    repo: &gix::Repository,
+    name: &str,
+    want: Option<&str>,
+) -> Option<Result<ObjectId, Vec<ObjectId>>> {
     // `init_object_disambiguation()` refuses the name outright outside
     // `[MINIMUM_ABBREV, hexsz]` or when it is not hex (`object-name.c:273-279`).
     if name.len() < crate::abbrev::MINIMUM_ABBREV
@@ -3888,13 +3937,241 @@ pub fn short_oid_candidates(
             let passed: Vec<ObjectId> =
                 candidates.iter().copied().filter(|id| kind_passes(repo, id, want)).collect();
             match passed.len() {
-                1 => None,
-                0 => Some(candidates.into_iter().collect()),
-                _ => Some(passed),
+                1 => Some(Ok(passed[0])),
+                0 => Some(Err(candidates.into_iter().collect())),
+                _ => Some(Err(passed)),
             }
         }
-        None => Some(candidates.into_iter().collect()),
+        None => Some(Err(candidates.into_iter().collect())),
     }
+}
+
+/// The `get_oid_1()` frame that hands `get_short_oid()` a hex name while resolving `name`, with
+/// the `ds.fn` hint and `GET_OID_QUIETLY` that frame carries (object-name.c:1083-1141), or `None`
+/// when no frame does.
+///
+/// `want` and `quietly` are the caller's flags; [`navigation_step`] walks the frames down.
+/// `get_parent()` and `get_nth_ancestor()` recurse with a literal `GET_OID_COMMITTISH`
+/// (object-name.c:832-833, :866), so below a `~<n>`/`^<n>` the hint is committish and the caller's
+/// `GET_OID_QUIETLY` is gone. `peel_onion()` keeps the caller's flags but replaces the
+/// disambiguator: `^{commit}` and `^{/<text>}` ask for a committish, `^{tree}` for a treeish, and
+/// every other type for none, which is `default_disambiguate_hint()`, `core.disambiguate`
+/// (object-name.c:952-956, :486).
+///
+/// At the bottom, `get_oid_basic()` answers a full-length hex itself, and a name `repo_dwim_ref()`
+/// matches before `get_short_oid()` is reached (object-name.c:687-700, :745-750).
+fn short_oid_frame<'a>(
+    repo: &gix::Repository,
+    name: &'a str,
+    mut want: Option<&'static str>,
+    mut quietly: bool,
+) -> Option<(&'a str, Option<&'static str>, bool)> {
+    let mut base = name;
+    while let Some((rest, through_parent)) = navigation_step(base) {
+        if through_parent {
+            want = Some("committish");
+            quietly = false;
+        } else {
+            let kind = &base[rest.len() + 2..];
+            want = if kind.starts_with("commit}") || kind.starts_with('/') {
+                Some("committish")
+            } else if kind.starts_with("tree}") {
+                Some("treeish")
+            } else {
+                disambiguate_filter(repo)
+            };
+        }
+        base = rest;
+    }
+    let hexsz = repo.object_hash().len_in_hex();
+    if base.len() < crate::abbrev::MINIMUM_ABBREV
+        || base.len() >= hexsz
+        || !base.bytes().all(|b| b.is_ascii_hexdigit())
+        || !crate::porcelain::rev_parse::dwim_ref_matches(repo, base).is_empty()
+    {
+        return None;
+    }
+    Some((base, want, quietly))
+}
+
+/// The `get_short_oid()` frames `get_oid_with_context_1()` reaches for `name` under the
+/// caller's `want` and `quietly` (object-name.c:1735-1868), in the order it reaches them.
+///
+/// The whole name goes through `get_oid_1()` first. A `:<path>` name has no object half and is
+/// looked up in the index; a `<rev>:<path>` name, which the whole-name call cannot resolve, then
+/// resolves `<rev>` again with the disambiguators replaced by `GET_OID_TREEISH` and the caller's
+/// `GET_OID_QUIETLY` kept (object-name.c:1832-1840).
+fn short_oid_frames<'a>(
+    repo: &gix::Repository,
+    name: &'a str,
+    want: Option<&'static str>,
+    quietly: bool,
+) -> Vec<(&'a str, Option<&'static str>, bool)> {
+    if name.starts_with(':') {
+        return Vec::new();
+    }
+    let mut frames: Vec<_> = short_oid_frame(repo, name, want, quietly).into_iter().collect();
+    let object = object_part(name);
+    if object.len() < name.len() {
+        frames.extend(short_oid_frame(repo, object, Some("treeish"), quietly));
+    }
+    frames
+}
+
+/// `get_short_oid()`'s report for every frame of `get_oid_with_context_1()` that reaches it
+/// with `GET_OID_QUIETLY` clear and finds the name ambiguous (object-name.c:507-543), for a
+/// `name` that did not resolve: the `error:` and `hint:` lines, each with its newline.
+///
+/// `want` is the disambiguator the caller passes, [`disambiguate_filter`] for none. The
+/// `GET_OID_ONLY_TO_DIE | GET_OID_QUIETLY` pass of `maybe_die_on_misspelt_object_name()`
+/// (object-name.c:1880-1889) is [`misspelt_short_oid_report`].
+pub fn short_oid_report(repo: &gix::Repository, name: &str, want: Option<&'static str>, quietly: bool) -> String {
+    let mut out = String::new();
+    for (base, want, quietly) in short_oid_frames(repo, name, want, quietly) {
+        let Some(mut listed) = short_oid_candidates(repo, base, want).filter(|_| !quietly) else {
+            continue;
+        };
+        sort_ambiguous(repo, &mut listed);
+        for line in ambiguity_lines(repo, base, &listed) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// [`short_oid_report`], printed where `get_short_oid()` prints it.
+pub fn report_short_oid(repo: &gix::Repository, name: &str, want: Option<&'static str>, quietly: bool) {
+    eprint!("{}", short_oid_report(repo, name, want, quietly));
+}
+
+/// [`short_oid_report`] for `maybe_die_on_misspelt_object_name()`'s pass, which passes
+/// `GET_OID_ONLY_TO_DIE | GET_OID_QUIETLY` and no disambiguator (object-name.c:1880-1889). Only
+/// a frame below a `~<n>`/`^<n>`, which lost `GET_OID_QUIETLY`, reports, which is why stock
+/// prints the block twice for `<prefix>~1` and once for `<prefix>`.
+pub fn misspelt_short_oid_report(repo: &gix::Repository, name: &str) -> String {
+    short_oid_report(repo, name, disambiguate_filter(repo), true)
+}
+
+/// The `get_short_oid()` reports `handle_revision_arg_1()` gives an operand it could not
+/// resolve (revision.c:2159-2240), in its order. `committish` is `REVARG_COMMITTISH`, which
+/// `log` and `whatchanged` set and `rev-list`, `show` and `diff` do not (builtin/log.c:546,
+/// :844).
+///
+/// `handle_dotdot()` resolves both endpoints with `GET_OID_COMMITTISH`, the second only once
+/// the first has resolved (revision.c:2074-2084); a failed range carries on as one name.
+/// `add_parents_only()` resolves the base of a `^@`, `^!` or `^-<n>` mark with
+/// `repo_get_oid_committish()` (revision.c:1905-1910), and a `^-<n>` it refuses ends the
+/// operand before anything is resolved (revision.c:2204-2214). What is left loses its
+/// exclusion `^` and is resolved last (revision.c:2222-2235).
+///
+/// `with_parents` includes `add_parents_only()`'s report; a caller that runs
+/// [`add_parents_only`] has had it printed already.
+pub fn revision_arg_report(
+    repo: &gix::Repository,
+    arg: &str,
+    committish: bool,
+    cant_be_filename: bool,
+    with_parents: bool,
+) -> String {
+    if !cant_be_filename && arg == ".." {
+        return String::new();
+    }
+    let mut out = dotdot_report(repo, arg);
+    let mut arg = arg;
+    match parents_only(arg) {
+        ParentsOnly::Absent => {}
+        ParentsOnly::BadParent => return out,
+        ParentsOnly::Mark { base, replaces, .. } => {
+            let name = base.strip_prefix('^').unwrap_or(base);
+            if with_parents {
+                out.push_str(&short_oid_report(repo, name, Some("committish"), false));
+            }
+            if resolve_quiet_as(repo, name, Some("committish")).is_some() {
+                if replaces {
+                    return out;
+                }
+                arg = base;
+            }
+        }
+    }
+    let arg = arg.strip_prefix('^').unwrap_or(arg);
+    let want = if committish { Some("committish") } else { disambiguate_filter(repo) };
+    out.push_str(&short_oid_report(repo, arg, want, false));
+    out
+}
+
+/// The answer `get_short_oid()` gives the last frame of `get_oid_with_context_1()` for `name`
+/// (see [`short_oid_frames`]): `Some(Ok((len, id)))` when the hint picks `id` out of two or more
+/// candidates for the first `len` bytes of `name`, `Some(Err(()))` when it leaves them
+/// ambiguous, and `None` when no frame finds two candidates.
+fn hinted_short_oid(
+    repo: &gix::Repository,
+    name: &str,
+    want: Option<&'static str>,
+) -> Option<Result<(usize, ObjectId), ()>> {
+    let (base, want, _) = short_oid_frames(repo, name, want, true).pop()?;
+    match short_oid_lookup(repo, base, want)? {
+        Ok(id) => Some(Ok((base.len(), id))),
+        Err(_) => Some(Err(())),
+    }
+}
+
+/// `repo_get_oid_committish()` (object-name.c:1573-1578): [`resolve`] with `GET_OID_COMMITTISH`
+/// as the outer frame's disambiguator, so `get_short_oid()` picks a commit or a tag out of a
+/// prefix it shares with a tree or a blob.
+pub fn resolve_committish(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    resolve_as(repo, spec, OidFlags::default(), Some("committish"))
+}
+
+/// `spec` as `get_oid_with_context()` under the caller's disambiguator `want` lets a revision
+/// parser read it, for a caller that hands the name to gitoxide's parser rather than to
+/// [`resolve_quiet`]: `None` when `get_short_oid()` finds a hex prefix in it ambiguous under the
+/// hint its frame carries, the name with that prefix spelled out in full when the hint picks one
+/// of several objects, and the name unchanged otherwise (object-name.c:507-543).
+pub fn hinted_spec<'a>(
+    repo: &gix::Repository,
+    spec: &'a str,
+    want: Option<&'static str>,
+) -> Option<std::borrow::Cow<'a, str>> {
+    match hinted_short_oid(repo, spec, want) {
+        Some(Err(())) => None,
+        Some(Ok((len, id))) => Some(std::borrow::Cow::Owned(format!("{id}{}", &spec[len..]))),
+        None => Some(std::borrow::Cow::Borrowed(spec)),
+    }
+}
+
+/// The `get_short_oid()` reports of `handle_dotdot_1()`'s two `get_oid_with_context()` calls,
+/// which pass `GET_OID_COMMITTISH` and stop at the first endpoint that fails (revision.c:2074-2084),
+/// or nothing for an `arg` without `..`.
+pub fn dotdot_report(repo: &gix::Repository, arg: &str) -> String {
+    let Some(Range { a, b, .. }) = split_range(arg) else {
+        return String::new();
+    };
+    let mut out = short_oid_report(repo, a, Some("committish"), false);
+    if resolve_quiet_as(repo, a, Some("committish")).is_some() {
+        out.push_str(&short_oid_report(repo, b, Some("committish"), false));
+    }
+    out
+}
+
+/// Whether `handle_revision_arg_1()` under `REVARG_COMMITTISH` resolves `arg` as a name or as
+/// a range, saying nothing: both endpoints of a range with `GET_OID_COMMITTISH`
+/// (revision.c:2074-2084), and the name with it too (revision.c:2227-2235).
+pub fn resolves_committish_quietly(repo: &gix::Repository, arg: &str) -> bool {
+    match split_range(arg) {
+        Some(Range { a, b, .. }) => {
+            resolve_quiet_as(repo, a, Some("committish")).is_some()
+                && resolve_quiet_as(repo, b, Some("committish")).is_some()
+        }
+        None => resolve_quiet_as(repo, arg, Some("committish")).is_some(),
+    }
+}
+
+/// `repo_get_oid_treeish()` (object-name.c:1580-1585): [`resolve`] with `GET_OID_TREEISH` as the
+/// outer frame's disambiguator.
+pub fn resolve_treeish(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    resolve_as(repo, spec, OidFlags::default(), Some("treeish"))
 }
 
 /// Whether `get_oid_with_context()` returns `SHORT_NAME_AMBIGUOUS` for a name

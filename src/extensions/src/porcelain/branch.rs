@@ -2521,9 +2521,11 @@ fn get_oid_mb_inner(repo: &gix::Repository, name: &str, quiet: bool) -> Option<O
 /// `repo_get_oid_committish()` followed by `lookup_commit_reference_gently()`:
 /// the commit a `...` endpoint names, or `None`.
 fn commit_of(repo: &gix::Repository, spec: &str, quiet: bool) -> Option<ObjectId> {
+    // `GET_OID_COMMITTISH` (object-name.c:1326, :1335), so a prefix an endpoint shares
+    // with a tree or a blob names the commit.
     let id = match quiet {
-        true => crate::objname::resolve_quiet(repo, spec)?,
-        false => crate::objname::resolve(repo, spec)?,
+        true => crate::objname::resolve_quiet_as(repo, spec, Some("committish"))?,
+        false => crate::objname::resolve_committish(repo, spec)?,
     };
     // `lookup_commit_reference_gently(r, &oid_tmp, 0)` (object-name.c:1331, :1337) is
     // not quiet: an endpoint naming a tree says so before the resolution fails.

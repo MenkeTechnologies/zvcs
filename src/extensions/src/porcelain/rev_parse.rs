@@ -655,9 +655,13 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     {
                         return Ok(code);
                     }
+                    // `repo_get_oid_committish()` passes no `GET_OID_QUIETLY`, so its
+                    // `get_short_oid()` reports whatever `--quiet` said
+                    // (builtin/rev-parse.c:302).
+                    eprint!("{}", crate::objname::short_oid_report(&repo, range.a, Some("committish"), false));
                     // The endpoint has already been warned about on the line
                     // above; this is the same resolution, not a second operand.
-                    let a_resolved = crate::objname::resolve_quiet(&repo, range.a).is_some();
+                    let a_resolved = crate::objname::resolves_committish_quietly(&repo, range.a);
                     if a_resolved {
                         warn_ambiguous_refname(&repo, range.b, o.quiet);
                         if let ControlFlow::Break(code) =
@@ -665,6 +669,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                         {
                             return Ok(code);
                         }
+                        eprint!("{}", crate::objname::short_oid_report(&repo, range.b, Some("committish"), false));
                     }
                 }
                 None => {
@@ -769,9 +774,11 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             // else resolved — before rev-parse's own "ambiguous argument"/"Needed
             // a single revision". `--quiet` is git's `GET_OID_QUIETLY`, which
             // silences it (`builtin/rev-parse.c:1010`).
-            crate::objname::short_oid_ambiguous(
+            // A range's name is the whole token, which no frame reads as hex.
+            crate::objname::report_short_oid(
                 &repo,
-                crate::objname::ambiguity_base_of(crate::objname::uninteresting_mark(arg).0),
+                crate::objname::uninteresting_mark(arg).0,
+                crate::objname::disambiguate_filter(&repo),
                 o.quiet,
             );
             // `peel_onion()`'s `error()` is *not* raised here. It comes out of the
@@ -854,9 +861,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // endpoints rather than defaulting to them. Unlike
                 // `revision.c`'s version of the guard this one does not care
                 // whether a `--` was seen.
+                // A hex prefix `get_short_oid()` found ambiguous is not gitoxide's to
+                // pick from (see [`crate::objname::hinted_spec`]).
                 let parsed = if arg.is_empty()
                     || reflog_operand_anywhere(arg)
                     || carries_walk_mark(arg)
+                    || crate::objname::hinted_spec(&repo, arg, crate::objname::disambiguate_filter(&repo)).is_none()
                 {
                     None
                 } else {
@@ -972,6 +982,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // `GET_OID_ONLY_TO_DIE`, and a `<rev>:<path>` / `:<n>:<path>`
                     // failure has a message of its own there.
                     warn_reflog_reach_again(&repo, arg);
+                    // The pass's `get_short_oid()` reports, below a `~<n>`/`^<n>` that
+                    // dropped its `GET_OID_QUIETLY` (object-name.c:1880-1889).
+                    eprint!("{}", crate::objname::misspelt_short_oid_report(&repo, arg));
                     if let Some(message) = crate::objname::peel_type_error(&repo, arg) {
                         eprintln!("error: {message}");
                     }

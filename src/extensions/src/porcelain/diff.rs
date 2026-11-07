@@ -2900,11 +2900,21 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                         eprint!("{fatal}");
                         return Ok(ExitCode::from(128));
                     }
-                    if let crate::objname::Dotdot::Ok { a, b } =
-                        crate::objname::dotdot(&repo, s)
-                    {
+                    let dotdot = crate::objname::dotdot(&repo, s);
+                    // A range that did not resolve leaves its endpoints'
+                    // `get_short_oid()` reports behind (revision.c:2082-2084).
+                    if !matches!(dotdot, crate::objname::Dotdot::Ok { .. }) {
+                        eprint!("{}", crate::objname::dotdot_report(&repo, s));
+                    }
+                    if let crate::objname::Dotdot::Ok { a, b } = dotdot {
                         let range = crate::objname::split_range(s)
                             .expect("dotdot() answers Ok only for a token that split");
+                        // Each endpoint as `GET_OID_COMMITTISH` resolved it (revision.c:2074),
+                        // a hex prefix it shares with a tree or a blob spelled out in full.
+                        let endpoint = |name: &str| {
+                            crate::objname::hinted_spec(&repo, name, Some("committish"))
+                                .map_or_else(|| name.to_owned(), std::borrow::Cow::into_owned)
+                        };
                         if range.symmetric {
                             // `A...B` diffs the merge-base of A and B against B,
                             // exactly like `git diff $(git merge-base A B) B`.
@@ -2935,7 +2945,7 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                             }
                             revs.push(base.to_hex().to_string());
                         } else {
-                            revs.push(range.a.to_owned());
+                            revs.push(endpoint(range.a));
                         }
                         // `handle_dotdot_1()`: `a_flags = flags_exclude` for `A..B`, and
                         // the merge bases a symmetric range pends go in with the same
@@ -2944,7 +2954,7 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                         // order these two are pushed in, so the swap below never fires
                         // for a range.
                         revs_uninteresting.push(true);
-                        revs.push(range.b.to_owned());
+                        revs.push(endpoint(range.b));
                         revs_uninteresting.push(false);
                         range_operands += 1;
                         continue;

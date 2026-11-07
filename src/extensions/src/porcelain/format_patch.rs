@@ -7761,7 +7761,7 @@ fn pp_remainder_tabs(mut msg: &[u8], out: &mut Vec<u8>, tabwidth: usize) {
 /// before it in *display columns*. A prefix that is not well-formed UTF-8 — or
 /// whose width is undefined — makes git give up on aligning, so the rest of the
 /// line is copied verbatim, tabs included.
-fn add_tabexpand(out: &mut Vec<u8>, mut line: &[u8], tabwidth: usize) {
+pub(super) fn add_tabexpand(out: &mut Vec<u8>, mut line: &[u8], tabwidth: usize) {
     while let Some(at) = line.iter().position(|&b| b == b'\t') {
         let Some(width) = pp_utf8_width(&line[..at]) else {
             break;

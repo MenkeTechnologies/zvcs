@@ -43,9 +43,8 @@ const DEFAULT_ABBREV: usize = 7;
 /// [`super::log::get_commit_format`] and the header is written by
 /// [`super::log::EntryRenderer`] — `medium`, `short`, `full`, `fuller`, `raw`,
 /// `oneline`, `reference`, the mail formats `email`/`mboxrd`, and
-/// `--format=`/`--pretty=` with the placeholder set listed in `git log`'s
-/// `check_format`. A placeholder neither command implements is rejected rather
-/// than silently dropped, and it is rejected identically by both.
+/// `--format=`/`--pretty=` through the same placeholder expander, which prints a
+/// placeholder `format_commit_one()` does not know as typed, in both commands.
 ///
 /// The record separator follows from that parse: `get_commit_format` also answers
 /// `show_log()`'s `use_terminator`, so `oneline`, `reference` and `tformat:`/
@@ -398,6 +397,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--reverse`: reverses `cmd_log_walk`'s output. Inert while `no_walk` holds,
     // because `cmd_show` prints its pending list without consulting it.
     let mut reverse = false;
+    // `--graph` / `--no-graph` (revision.c:2653-2658): the last one wins.
+    let mut graph = false;
     // `-g`/`--walk-reflogs` (`init_reflog_walk()`): the revision slot it stood at,
     // and how many ref-set options had been read by then. A commit operand read
     // after it is handed to `add_reflog_for_walk()` instead of the pending list
@@ -1081,6 +1082,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     // `revs->reverse ^= 1` (revision.c): a toggle, so an even
                     // number of `--reverse`s leaves the order alone.
                     reverse = !reverse;
+                } else if s == "--graph" || s == "--no-graph" {
+                    graph = s == "--graph";
                 // The ref-selecting pseudo-options, at the slot `setup_revisions()`
                 // would pend their refs at. `--glob` and `--exclude` may carry
                 // their value as the next argv element (`parse_long_opt`), which
@@ -1988,16 +1991,32 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // loop — see through an annotated tag to the commit it names, on the positive and the negative
     // side alike, which is why `git show v1 ^v1` prints nothing rather than the tag's own header.
     let needs_walk = !no_walk;
-    // `if (revs->reflog_info && revs->limited) die(...)` and the `--reverse` leg of
-    // `die_for_incompatible_opt3()` (revision.c:3180-3192). `-L` sets
-    // `topo_order`, which is what limits it.
-    if reflog_from.is_some() {
-        if order != super::log::Order::Default || line_level {
-            return Ok(fatal("cannot combine --walk-reflogs with history-limiting options\n"));
-        }
-        if reverse {
-            return Ok(fatal("options '--reverse' and '--walk-reflogs' cannot be used together\n"));
-        }
+    // `if (revs->reflog_info && revs->limited) die(...)` (revision.c:3218-3219).
+    // `-L` and `--graph` set `topo_order` (revision.c:3177, :2788), which is what
+    // limits it (revision.c:3195-3196).
+    if reflog_from.is_some() && (order != super::log::Order::Default || line_level || graph) {
+        return Ok(fatal("cannot combine --walk-reflogs with history-limiting options\n"));
+    }
+    // `die_for_incompatible_opt3(graph, reverse, reflog_info)` (revision.c:3228-3230,
+    // parse-options.c:1538-1566), then `--no-walk` against `--graph`
+    // (revision.c:3235-3236), which `cmd_show`'s `rev.no_walk = 1` meets unless
+    // a range cleared it.
+    let together: Vec<&str> = [(graph, "--graph"), (reverse, "--reverse"), (reflog_from.is_some(), "--walk-reflogs")]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect();
+    match together[..] {
+        [a, b, c] => return Ok(fatal(&format!("options '{a}', '{b}', and '{c}' cannot be used together\n"))),
+        [a, b] => return Ok(fatal(&format!("options '{a}' and '{b}' cannot be used together\n"))),
+        _ => {}
+    }
+    if no_walk && graph {
+        return Ok(fatal("options '--no-walk' and '--graph' cannot be used together\n"));
+    }
+    if graph {
+        // `cmd_log_walk()` under `--graph` draws the graph `git log` does; this
+        // walk has no graph renderer behind it.
+        bail!("unsupported option --graph");
     }
     if needs_walk {
         for id in walk_tips.iter_mut().chain(walk_hidden.iter_mut()) {

@@ -792,7 +792,8 @@ fn parse_ssh_output(out: &[u8]) -> SigCheck {
     };
 
     // `strstr(line, "key ")`: everything after it is the fingerprint, which is
-    // also what git reports as the key (`%GK`).
+    // also what git reports as the key (`%GK`): `sigc->fingerprint` and
+    // `sigc->key = xstrdup(sigc->fingerprint)` (gpg-interface.c:445-448).
     match rest.find("key ").map(|at| rest[at + 4..].to_string()) {
         Some(key) => SigCheck {
             // Both branches set `sigc->result = 'G'` (gpg-interface.c:434, :439);
@@ -800,6 +801,7 @@ fn parse_ssh_output(out: &[u8]) -> SigCheck {
             // `TRUST_UNDEFINED` for a valid signature by an unknown key. Folding
             // the latter into `U` here would be reading `%G?` back into the result.
             status: GStatus::Good,
+            fingerprint: key.clone(),
             key,
             signer,
             trust,

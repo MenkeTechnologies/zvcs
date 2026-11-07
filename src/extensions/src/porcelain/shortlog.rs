@@ -2216,6 +2216,13 @@ fn insert_one_record(
     ident: BString,
     oneline: &BStr,
 ) {
+    // Both arrive as C strings (`const char *ident, const char *oneline`,
+    // builtin/shortlog.c:57-59), so a NUL a format put in either ends it there.
+    let c_str = |s: &[u8]| -> usize { s.iter().position(|&b| b == 0).unwrap_or(s.len()) };
+    let mut ident = ident;
+    let end = c_str(&ident);
+    ident.truncate(end);
+    let oneline = &oneline[..c_str(oneline)];
     let entry = groups.entry(ident).or_default();
     entry.count += 1;
     if opts.summary {
@@ -2342,27 +2349,23 @@ fn read_from_stdin(
         [&b"Author: "[..], &b"author "[..]]
     };
 
-    let mut lines = LinesLf { data: &buf, pos: 0 };
-    while let Some(line) = lines.next_line() {
-        let Some(ident_line) = matches.iter().find_map(|prefix| line.strip_prefix(*prefix)) else {
+    let mut lines = LinesLf { data: &buf, pos: 0, eof: false };
+    // `ident` and `oneline` are two strbufs that live across the whole loop
+    // (builtin/shortlog.c:121-123), and a read at end of input leaves them as
+    // they were, so a record cut short by the end of the input keeps the last
+    // line either one read.
+    let mut ident = Vec::new();
+    let mut oneline = Vec::new();
+    while lines.getline(&mut ident) {
+        let Some(ident_line) = matches.iter().find_map(|prefix| ident.strip_prefix(*prefix)) else {
             continue;
         };
         let ident_line = BString::from(ident_line.to_vec());
 
         // Discard the remaining headers, up to the blank separator line.
-        while let Some(l) = lines.next_line() {
-            if l.is_empty() {
-                break;
-            }
-        }
+        while lines.getline(&mut oneline) && !oneline.is_empty() {}
         // Discard blank lines; the first non-blank one is the subject.
-        let mut oneline = BString::default();
-        while let Some(l) = lines.next_line() {
-            if !l.is_empty() {
-                oneline = BString::from(l.to_vec());
-                break;
-            }
-        }
+        while lines.getline(&mut oneline) && oneline.is_empty() {}
 
         // git skips records whose ident it cannot split.
         let Some((name, email)) = split_ident_line(ident_line.as_bstr()) else {
@@ -2373,38 +2376,47 @@ fn read_from_stdin(
             email,
             time: "",
         };
-        let ident = format_ident(sig, mailmap, opts.email);
-        insert_one_record(groups, opts, ident, oneline.as_bstr());
+        let mapped = format_ident(sig, mailmap, opts.email);
+        insert_one_record(groups, opts, mapped, oneline.as_bstr());
     }
     Ok(())
 }
 
-/// A `strbuf_getline_lf()` equivalent: yields each `\n`-terminated record with
-/// the terminator removed, and no phantom empty record after a trailing `\n`.
+/// `strbuf_getline_lf()` over stdin, end-of-file state included.
 struct LinesLf<'a> {
     data: &'a [u8],
     pos: usize,
+    /// `feof(stdin)`.
+    eof: bool,
 }
 
-impl<'a> LinesLf<'a> {
-    fn next_line(&mut self) -> Option<&'a BStr> {
-        // Copy the slice out of `self` so the result is tied to `'a`, not to
-        // the `&mut self` borrow.
-        let data: &'a [u8] = self.data;
-        if self.pos >= data.len() {
-            return None;
+impl LinesLf<'_> {
+    /// `strbuf_getwholeline()`'s getdelim() branch (strbuf.c:642-685) and the
+    /// `'\n'` strip of `strbuf_getline_lf()`. Once the stream is at end of file
+    /// the call returns EOF with `sb` untouched (strbuf.c:646-647); the read
+    /// that first finds nothing left empties it (strbuf.c:680-684). A last line
+    /// with no newline is returned and sets end of file, as getdelim() does.
+    fn getline(&mut self, sb: &mut Vec<u8>) -> bool {
+        if self.eof {
+            return false;
         }
-        let rest = &data[self.pos..];
-        Some(match rest.iter().position(|&b| b == b'\n') {
-            Some(nl) => {
-                self.pos += nl + 1;
-                rest[..nl].as_bstr()
-            }
+        let rest = &self.data[self.pos..];
+        if rest.is_empty() {
+            self.eof = true;
+            sb.clear();
+            return false;
+        }
+        let len = match rest.iter().position(|&b| b == b'\n') {
+            Some(nl) => nl + 1,
             None => {
-                self.pos = data.len();
-                rest.as_bstr()
+                self.eof = true;
+                rest.len()
             }
-        })
+        };
+        self.pos += len;
+        sb.clear();
+        sb.extend_from_slice(rest[..len].strip_suffix(b"\n").unwrap_or(&rest[..len]));
+        true
     }
 }
 

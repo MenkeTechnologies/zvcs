@@ -2592,9 +2592,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // `revs->abbrev` is the minimum width every abbreviation in the run is asked
     // for, so it goes in front of the same `core.abbrev` lookup gitoxide already
-    // makes. Zero (`--no-abbrev`) is handled at the print site instead — it turns
-    // abbreviation off rather than choosing a width.
-    if let Some(n) = abbrev_len.filter(|n| *n > 0) {
+    // makes. Zero (`--no-abbrev`) turns abbreviation off at the name's print site;
+    // the `%h`/`%p`/`%t` it reaches as `ctx.abbrev` (builtin/rev-list.c:333) get
+    // the whole id from `odb_find_abbrev_len()`'s `!len` arm (odb.c:952-955).
+    if let Some(n) = abbrev_len.map(|n| if n == 0 { repo.object_hash().len_in_hex() } else { n }) {
         let mut config = repo.config_snapshot_mut();
         config.append_config(Some(format!("core.abbrev={n}")), gix::config::Source::Cli)?;
         config.commit()?;
@@ -4147,6 +4148,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 if !body.is_empty() {
                     out.extend_from_slice(&body);
                     out.push(hdr_term);
+                } else if matches!(p, Pretty::Oneline) {
+                    // An empty message under `oneline` still ends the line the
+                    // `' '` after the name began (builtin/rev-list.c:373-374).
+                    out.push(b'\n');
                 }
             }
         }

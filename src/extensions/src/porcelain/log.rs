@@ -10102,18 +10102,15 @@ pub(crate) fn get_commit_format(
     // `skip_prefix(arg, "format:", &arg)` comes first, so a `pretty.<name>` can
     // never shadow the `format:` shortcut.
     if let Some(fmt) = spec.strip_prefix("format:") {
-        check_format(fmt)?;
         return Ok(Some((Pretty::User(fmt.to_string()), false)));
     }
     if spec.is_empty() {
         return Ok(Some((Pretty::User(String::new()), true)));
     }
     if let Some(fmt) = spec.strip_prefix("tformat:") {
-        check_format(fmt)?;
         return Ok(Some((Pretty::User(fmt.to_string()), true)));
     }
     if spec.contains('%') {
-        check_format(spec)?;
         return Ok(Some((Pretty::User(spec.to_string()), true)));
     }
     match super::pretty_formats::resolve(repo, spec)? {
@@ -10123,7 +10120,6 @@ pub(crate) fn get_commit_format(
         // (pretty.c:218-221): a `pretty.<name>` entry renders as its stored format
         // string, with the entry's own terminator/separator answer.
         Some(super::pretty_formats::Resolved::User { format, is_tformat }) => {
-            check_format(&format)?;
             Ok(Some((Pretty::User(format), is_tformat)))
         }
     }
@@ -10148,93 +10144,6 @@ pub(crate) fn builtin_pretty(b: super::pretty_formats::Builtin) -> (Pretty, bool
         Builtin::Email => (Pretty::Email, false),
         Builtin::MboxRd => (Pretty::MboxRd, false),
     }
-}
-
-/// Reject any placeholder [`expand_format`] does not implement, so an unsupported
-/// format fails loudly instead of expanding to something plausible but wrong.
-///
-/// `%C` is always accepted: like git, an unrecognized color word after it renders
-/// literally rather than erroring, and its `(...)` argument is ordinary text the
-/// outer scan skips. `%d`/`%D` are the ref decorations.
-fn check_format(fmt: &str) -> Result<()> {
-    let mut it = fmt.chars();
-    while let Some(c) = it.next() {
-        if c != '%' {
-            continue;
-        }
-        match it.next() {
-            Some(
-                'H' | 'h' | 'T' | 't' | 'P' | 'p' | 's' | 'b' | 'B' | 'f' | 'n' | '%' | 'C' | 'd'
-                | 'D' | 'N',
-            ) => {}
-            // `format_person_part()` (pretty.c:788-867) in full: `n`/`N` the name,
-            // `e`/`E` the address, `l`/`L` its local part, `t` the raw timestamp
-            // and `d`/`D`/`r`/`i`/`I`/`h`/`s` the seven dates. The capitalized
-            // three are the mailmap-resolved forms, which the function looks up
-            // whether or not `--use-mailmap` is on.
-            Some('a' | 'c') => match it.next() {
-                Some(
-                    'n' | 'N' | 'e' | 'E' | 'l' | 'L' | 't' | 'd' | 'D' | 'r' | 'i' | 'I' | 'h'
-                    | 's',
-                ) => {}
-                Some(x) => anyhow::bail!("unsupported format placeholder %a{x}"),
-                None => anyhow::bail!("unsupported trailing % in format"),
-            },
-            // Reflog placeholders, all empty outside a `--walk-reflogs` walk:
-            // `%gd`/`%gD` are the short and full selector, `%gn`/`%gN`/`%ge`/`%gE`
-            // the entry's identity, and `%gs` its message.
-            Some('g') => match it.next() {
-                Some('d' | 'D' | 'n' | 'N' | 'e' | 'E' | 's') => {}
-                Some(x) => anyhow::bail!("unsupported format placeholder %g{x}"),
-                None => anyhow::bail!("unsupported trailing % in format"),
-            },
-            // The `%G…` family (pretty.c:1659-1710), all seven of which share one
-            // `check_commit_signature()` call: `%GG` the checker's own report, `%G?`
-            // the status character, `%GS` the signer, `%GK` the key, `%GF` the
-            // fingerprint, `%GP` the primary key's fingerprint and `%GT` the trust
-            // level's name.
-            //
-            // `%GF` is deliberately absent: `sigc->fingerprint` is what it prints, and
-            // the shared verifier leaves that field empty for an ssh signature (where
-            // git sets it to the key, gpg-interface.c:445-447). Accepting it would
-            // print an empty line where stock prints a fingerprint, so it stays
-            // refused until the verifier fills the field.
-            Some('G') => match it.next() {
-                Some('G' | '?' | 'S' | 'K' | 'P' | 'T') => {}
-                Some(x) => anyhow::bail!("unsupported format placeholder %G{x}"),
-                None => anyhow::bail!("unsupported trailing % in format"),
-            },
-            // `%e` is the commit's `encoding` header, empty when there is none —
-            // which is every commit git itself writes, since it re-encodes to
-            // UTF-8 and drops the header.
-            Some('e') => {}
-            // `%xNN` is always accepted: two hex digits emit that byte, and
-            // anything else prints literally rather than failing, so there is
-            // nothing here to reject.
-            Some('x') => {}
-            // `%(trailers[:<options>])`, whose option list is validated when it is
-            // expanded — an unknown option prints literally there rather than
-            // failing here, exactly as git does.
-            Some('(') => {}
-            // The column-control atoms — `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)`
-            // and their `|`, `trunc`, `ltrunc` and `mtrunc` forms — and the `%w(…)`
-            // wrap atom are validated where they are expanded: a malformed one is
-            // not a placeholder at all, and git prints it literally rather than
-            // failing (see [`pretty_pad`]).
-            Some('<' | '>' | 'w') => {}
-            // `%m` is `get_revision_mark()`'s marker and `%S` the `--source` ref;
-            // both read walk state off the render context. `%S` without a source
-            // map prints literally rather than failing, which is git's `return 0`
-            // for it — so neither is rejected here.
-            Some('m' | 'S') => {}
-            // Anything else is not a placeholder git knows either.
-            // `format_commit_item()` returns 0 for it and the driver prints the `%`
-            // and rescans from the character after it — so `%zz` is `%zz` and a
-            // format ending in `%` ends in `%`.
-            Some(_) | None => {}
-        }
-    }
-    Ok(())
 }
 
 /// Render one commit through a bare user format string, uncolored, undecorated
@@ -10320,7 +10229,7 @@ fn unabbreviated(fmt: &str) -> String {
     out
 }
 
-/// Expand the placeholders accepted by [`check_format`] for `commit`, using the
+/// Expand the placeholders of a user format for `commit`, using the
 /// render knobs in `ctx` (`--date=`, color enablement, decorations, and the clock
 /// for relative dates).
 /// A `%(trailers...)` placeholder starting at `chars[i] == '('`: its option text
@@ -10582,10 +10491,7 @@ fn expand_format(
         }
         let Some(&p) = chars.get(i) else {
             // A `%` with nothing after it: `format_commit_one()` switches on the
-            // NUL and returns 0, so the driver prints the `%`. [`check_format`]
-            // rejects a format that simply ends in one, so the only way here is a
-            // `%C…` chain having realigned onto the second `%` of a trailing `%%`
-            // — which has already laid out the field it was holding open.
+            // NUL and returns 0, so the driver prints the `%`.
             out.push(b'%');
             break;
         };
@@ -10825,7 +10731,14 @@ fn expand_one(
                 true,
             )?);
         }
-        'f' => out.extend_from_slice(&sanitized_subject(&subject(commit.message_raw()?))),
+        // `case 'f'` (pretty.c:1765-1767) sanitizes only the subject's first
+        // line, up to `strchrnul(msg + c->subject_off, '\n')`, not the folded
+        // subject `%s` prints.
+        'f' => {
+            let subject = super::format_patch::skip_blank_lines(commit.message_raw()?);
+            let eol = subject.iter().position(|&b| b == b'\n').unwrap_or(subject.len());
+            out.extend_from_slice(&sanitized_subject(&subject[..eol]));
+        }
         // ```c
         // case 'e':	/* encoding */
         //         if (c->commit_encoding)
@@ -10909,9 +10822,14 @@ fn expand_one(
         }
         // The reflog placeholders. `format_reflog_person()` and the selector both
         // read `pretty_ctx->reflog_info`, which is only set under `--walk-reflogs`;
-        // without one every `%g…` expands to nothing at all.
+        // without one every `%g…` expands to nothing at all. A letter the switch
+        // does not name is `return 0;	/* unknown %g placeholder */`
+        // (pretty.c:1626-1649), walk or not, so it prints as typed.
         'g' => {
             let which = chars.get(*i).copied();
+            if !matches!(which, Some('d' | 'D' | 'n' | 'N' | 'e' | 'E' | 's')) {
+                return Ok(false);
+            }
             if let Some(rl) = ctx.reflog {
                 match which {
                     Some('d') => write_reflog_selector(out, rl, ctx, true),
@@ -10925,7 +10843,7 @@ fn expand_one(
                         mapped_ident(&rl.who_name, &rl.who_email, Some(Mailmap::for_pretty(ctx.repo))).1,
                     ),
                     Some('s') => out.extend_from_slice(&rl.message),
-                    _ => unreachable!("check_format rejected this already"),
+                    _ => unreachable!("the unknown letters returned above"),
                 }
             }
             *i += 1;
@@ -10950,13 +10868,15 @@ fn expand_one(
                 Some('?') => out.push(sig.pretty_status().code() as u8),
                 Some('S') => out.extend_from_slice(sig.signer.as_bytes()),
                 Some('K') => out.extend_from_slice(sig.key.as_bytes()),
+                Some('F') => out.extend_from_slice(sig.fingerprint.as_bytes()),
                 Some('P') => out.extend_from_slice(sig.primary_key_fingerprint.as_bytes()),
                 // `gpg_trust_level_to_str()` (gpg-interface.c:963) over
                 // `sigcheck_gpg_trust_level[]`'s `display_key` column — printed even
                 // for an unsigned commit, whose level is the `TRUST_UNDEFINED` that
                 // `check_signature()` starts from.
                 Some('T') => out.extend_from_slice(trust_display(sig.trust).as_bytes()),
-                _ => unreachable!("check_format rejected this already"),
+                // `default: return 0;` (pretty.c:1707-1708): printed as typed.
+                _ => return Ok(false),
             }
             *i += 1;
         }
@@ -12313,24 +12233,31 @@ fn expand_person(
                 out.extend_from_slice(show_ident_date(who.time, mode, ctx.now).as_bytes());
             }
         }
-        _ => unreachable!("check_format rejected this already"),
+        // A letter `format_person_part()` does not know reaches `skip:` and its
+        // `return 0; /* unknown placeholder */` (pretty.c:856-866).
+        _ => return Ok(false),
     }
     Ok(true)
 }
 
-/// git's `%b`: the message body — everything after the blank line that ends the
-/// subject paragraph. An empty string when the message is a subject only.
+/// git's `%b`: the message from `c->body_off` on (pretty.c:1769-1770).
+///
+/// `parse_commit_message()` (pretty.c:1000-1010) skips the blank lines ahead of
+/// the subject, the subject paragraph, and then every blank line after it, where
+/// a blank line is one `is_blank_line()` trims to nothing, whitespace included.
 fn body(msg: &[u8]) -> Vec<u8> {
-    // Skip leading blank lines, then the subject paragraph, then the single blank
-    // line separating it from the body.
-    let mut rest = msg;
-    while let Some(stripped) = rest.strip_prefix(b"\n") {
-        rest = stripped;
+    use super::format_patch::skip_blank_lines;
+    let mut rest = skip_blank_lines(msg);
+    // `format_subject(NULL, msg, NULL)`: past each line up to the first blank one.
+    while !rest.is_empty() {
+        let linelen = rest.iter().position(|&b| b == b'\n').map_or(rest.len(), |p| p + 1);
+        let blank = trim_end_ws(&rest[..linelen]).is_empty();
+        rest = &rest[linelen..];
+        if blank {
+            break;
+        }
     }
-    match rest.windows(2).position(|w| w == b"\n\n") {
-        Some(pos) => rest[pos + 2..].to_vec(),
-        None => Vec::new(),
-    }
+    skip_blank_lines(rest).to_vec()
 }
 
 /// git's `%f`: the subject sanitised into a filename — `istitlechar` bytes
@@ -12531,7 +12458,7 @@ pub(crate) fn rev_list_pretty_body(
             // `pretty_print_commit()` adds the blank line, then `pp_remainder()`
             // indents the message four spaces with no tab expansion for `raw`.
             out.push(b'\n');
-            indent_message(&mut out, commit.message_raw()?, ctx.expand_tabs.unwrap_or(0));
+            indent_message(&mut out, 0, commit.message_raw()?, false, ctx.expand_tabs.unwrap_or(0));
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             let author = commit.author()?;
@@ -12579,13 +12506,11 @@ pub(crate) fn rev_list_pretty_body(
                 }
             }
             out.push(b'\n');
-            if matches!(pretty, Pretty::Short) {
-                out.extend_from_slice(b"    ");
-                out.extend_from_slice(&subject(commit.message_raw()?));
-                out.push(b'\n');
-            } else {
-                indent_message(&mut out, commit.message_raw()?, ctx.expand_tabs.unwrap_or(8));
-            }
+            // `short` stops at the first blank line; its table entry has no tab
+            // width, unlike `medium`, `full` and `fuller` (pretty.c:124-129).
+            let short = matches!(pretty, Pretty::Short);
+            let tabs = ctx.expand_tabs.unwrap_or(if short { 0 } else { 8 });
+            indent_message(&mut out, 0, commit.message_raw()?, short, tabs);
         }
     }
     abbrev.into_inner().flush();
@@ -13081,7 +13006,7 @@ fn render_entry(
             }
             out.push(b'\n');
             // `raw` prints the message as stored: its table entry has no tab width.
-            indent_message(out, commit.message_raw()?, ctx.expand_tabs.unwrap_or(0));
+            indent_message(out, msg_start, commit.message_raw()?, false, ctx.expand_tabs.unwrap_or(0));
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
@@ -13152,14 +13077,11 @@ fn render_entry(
             }
             out.push(b'\n');
 
-            if matches!(pretty, Pretty::Short) {
-                // `short` shows only the subject, indented four spaces.
-                out.extend_from_slice(b"    ");
-                out.extend_from_slice(&subject(commit.message_raw()?));
-                out.push(b'\n');
-            } else {
-                indent_message(out, commit.message_raw()?, ctx.expand_tabs.unwrap_or(8));
-            }
+            // `short` stops at the first blank line; its table entry has no tab
+            // width, unlike `medium`, `full` and `fuller` (pretty.c:124-129).
+            let short = matches!(pretty, Pretty::Short);
+            let tabs = ctx.expand_tabs.unwrap_or(if short { 0 } else { 8 });
+            indent_message(out, msg_start, commit.message_raw()?, short, tabs);
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
     }
@@ -13300,53 +13222,57 @@ fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRe
     Ok(())
 }
 
-/// Indent a commit message four spaces per line, exactly as git's `pp_remainder`:
-/// every line — blank ones included — is prefixed, and trailing blank lines are
-/// dropped.
+/// The message half of `pretty_print_commit()` for the indented formats
+/// (pretty.c:2351-2367): `skip_blank_lines()`, then `pp_remainder()` with a
+/// four-space indent, then `strbuf_rtrim()` of the whole buffer and one `'\n'`.
 ///
-/// `tab_width` is git's `expand_tabs_in_log`, which its format table sets to 8
-/// for the formats that indent (`medium`, `full`, `fuller`) and 0 for `raw`. A
-/// tab inside a commit message was written against the message's own left edge,
-/// so a four-space indent would shift every tab stop and misalign whatever the
-/// author lined up; git expands the tabs instead, and the columns survive.
-pub(super) fn indent_message(out: &mut Vec<u8>, msg: &[u8], tab_width: usize) {
-    let mut lines: Vec<&[u8]> = msg.split(|&b| b == b'\n').collect();
-    while lines.last() == Some(&&b""[..]) {
-        lines.pop();
-    }
-    for line in lines {
+/// `pp_remainder()` (pretty.c:2254-2296) has no notion of a subject: a subject
+/// paragraph of several lines keeps them, one per line. Each line goes through
+/// `is_blank_line()`, which leaves `linelen` right-trimmed, so trailing
+/// whitespace never reaches the output; `short` stops at the first blank line
+/// after the first one it printed. The final `strbuf_rtrim()` runs over `sb`,
+/// which begins with the `pp_header()` lines at `sb_start`, so an empty message
+/// also loses the blank line that separates it from the header.
+///
+/// `tab_width` is `pp->expand_tabs_in_log`; 0 copies tabs through (`raw`).
+pub(super) fn indent_message(
+    out: &mut Vec<u8>,
+    sb_start: usize,
+    msg: &[u8],
+    short: bool,
+    tab_width: usize,
+) {
+    let mut msg = super::format_patch::skip_blank_lines(msg);
+    let mut first = true;
+    while !msg.is_empty() {
+        let linelen = msg.iter().position(|&b| b == b'\n').map_or(msg.len(), |p| p + 1);
+        let line = trim_end_ws(&msg[..linelen]);
+        msg = &msg[linelen..];
+        if line.is_empty() {
+            if first {
+                continue;
+            }
+            if short {
+                break;
+            }
+        }
+        first = false;
+        // `pp_handle_indent()` (pretty.c:2228-2242).
         out.extend_from_slice(b"    ");
         if tab_width == 0 {
             out.extend_from_slice(line);
         } else {
-            expand_tabs(out, line, tab_width);
+            super::format_patch::add_tabexpand(out, line, tab_width);
         }
         out.push(b'\n');
     }
-}
-
-/// git's `strbuf_add_tabexpand`: replace each tab with spaces up to the next tab
-/// stop, measuring columns from the START OF THE LINE — the indent the caller
-/// already wrote does not count, which is what keeps a message's internal
-/// alignment intact.
-///
-/// Width is display width, so a wide character occupies two columns. A segment
-/// that is not valid UTF-8 cannot be measured, and git stops expanding that line
-/// and copies the rest verbatim rather than guessing.
-fn expand_tabs(out: &mut Vec<u8>, line: &[u8], tab_width: usize) {
-    let mut rest = line;
-    let mut column = 0usize;
-    while let Some(at) = memchr::memchr(b'\t', rest) {
-        let Ok(text) = std::str::from_utf8(&rest[..at]) else {
-            break;
-        };
-        column += unicode_width::UnicodeWidthStr::width(text);
-        out.extend_from_slice(&rest[..at]);
-        out.extend(std::iter::repeat_n(b' ', tab_width - (column % tab_width)));
-        column += tab_width - (column % tab_width);
-        rest = &rest[at + 1..];
+    // `strbuf_rtrim(sb)` and the EOLN for the non-oneline case (pretty.c:2363-2367).
+    let mut end = out.len();
+    while end > sb_start && matches!(out[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
     }
-    out.extend_from_slice(rest);
+    out.truncate(end);
+    out.push(b'\n');
 }
 
 // ---------------------------------------------------------------------------

@@ -1816,6 +1816,19 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     if !help_only && NEED_WORK_TREE.contains(&sub) {
         setup_work_tree()?;
     }
+    // `warn_on_auto_comment_char = true;` ahead of the first repository config
+    // read in `cmd_commit()`, `cmd_merge()` and `cmd_rebase()` (after their
+    // `show_usage_with_options_if_asked()`), and in `cmd_revert()` and
+    // `cmd_cherry_pick()` (before any option is parsed, so `-h` warns too):
+    // builtin/commit.c:1800-1804, builtin/merge.c:1380-1385,
+    // builtin/rebase.c:1252-1260, builtin/revert.c:289-291, :309-311.
+    if crate::comment_char_config::warns_on_auto_comment_char(sub)
+        && !(help_only && matches!(sub, "commit" | "merge" | "rebase"))
+    {
+        if let Ok(repo) = crate::setup::discover() {
+            crate::comment_char_config::check_auto_comment_char_config(&repo);
+        }
+    }
 
     // `prepare_repo_settings()` (repo-settings.c:30) — the per-repository settings
     // block git resolves before the command runs. It is a *gate* here because the

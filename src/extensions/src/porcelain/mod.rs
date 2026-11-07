@@ -737,7 +737,7 @@ mod ls_remote;
 mod ls_tree;
 pub(crate) mod mailinfo;
 mod mailsplit;
-mod maintenance;
+pub(crate) mod maintenance;
 mod merge;
 mod merge_base;
 mod merge_file;

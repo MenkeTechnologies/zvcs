@@ -1361,6 +1361,20 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         dry_run = true;
     }
 
+    // ```c
+    // if (trailer_args.nr)
+    //         trailer_config_init();
+    // ```
+    //
+    // (builtin/commit.c:1824-1825), straight after `parse_and_validate_options()`:
+    // a `trailer.*` value the callbacks refuse (`trailer.<x>.key` with no `=`)
+    // dies before anything is read or written, and the configuration's warnings
+    // print here, once.
+    let trailer_config = match trailer_args.is_empty() {
+        true => None,
+        false => Some(super::interpret_trailers::load_config()?),
+    };
+
     // `cleanup_mode = get_cleanup_mode(cleanup_config, use_editor);`
     // (builtin/commit.c:1830-1834), right after `parse_and_validate_options()`:
     // `--cleanup` replaces the `commit.cleanup` value, and the one that is left is
@@ -1622,6 +1636,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // by the whole original message and allows an empty change so a later
     // rebase can reword. `squash_fixup_seed`, when set, seeds the editor path.
     let mut squash_fixup_seed: Option<String> = None;
+    // `--squash`'s `squash! <subject>\n\n` alone, when no `-m`/`-F`/`-c`/`-C`/
+    // `--amend` message follows it in the buffer: the rest of the buffer then
+    // comes from `MERGE_MSG`, `SQUASH_MSG` or the template, as for any commit.
+    let mut squash_prefix: Option<String> = None;
     if let Some(spec) = &squash_arg {
         // `prepare_to_commit()` does the lookup, after `prepare_index()` has reported
         // unmatched pathspecs, so its death is deferred like an unreadable `-F`.
@@ -1676,17 +1694,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         } else {
             // `-c` and `--amend` reach the same `use_message` arm with the editor
             // still open.
-            let reused = match use_message {
-                Some(name) => match lookup_commit_reference_by_name(&repo, name) {
-                    Some(rc) => {
-                        let raw = rc.message_raw()?.to_owned();
-                        crate::rawarg::from_bytes(super::rebase_todo::skip_blank_lines(&raw)).into_owned()
-                    }
-                    None => String::new(),
-                },
-                None => String::new(),
-            };
-            squash_fixup_seed = Some(format!("{prefix}{reused}"));
+            //
+            // With no `use_message` either, the prefix is all `--squash` adds:
+            // the `else if` chain below it still runs, so a `MERGE_MSG`, a
+            // `SQUASH_MSG` or the template follows it (builtin/commit.c:855-887).
+            match use_message {
+                Some(name) => {
+                    let reused = match lookup_commit_reference_by_name(&repo, name) {
+                        Some(rc) => {
+                            let raw = rc.message_raw()?.to_owned();
+                            crate::rawarg::from_bytes(super::rebase_todo::skip_blank_lines(&raw)).into_owned()
+                        }
+                        None => String::new(),
+                    };
+                    squash_fixup_seed = Some(format!("{prefix}{reused}"));
+                }
+                None => squash_prefix = Some(prefix),
+            }
         }
         }
     }
@@ -1781,7 +1805,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         Some(d) => match crate::date::parse_date_basic(d) {
             Some(time) => Some(time),
             None => match crate::date::approxidate_careful(d) {
-                (seconds, false) => Some(gix::date::Time::new(seconds, 0)),
+                // `strbuf_addf(out, "%lu", t)` behind the `@`: a bare timestamp with
+                // no zone, which `fmt_ident()`'s own `parse_date()` then places at
+                // the local UTC offset of that moment (date.c:933-943), so
+                // `--date="1 day ago"` is stamped `-0500` in New York, not `+0000`.
+                (seconds, false) => crate::date::parse_date_basic(&format!("@{seconds}")),
                 (_, true) => {
                     deferred_fatal.get_or_insert_with(|| format!("invalid date format: {d}"));
                     date_fatal = Some(format!("invalid date format: {d}"));
@@ -2229,6 +2257,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     } else {
         String::new()
     };
+    if let Some(prefix) = &squash_prefix {
+        buf.insert_str(0, prefix);
+    }
     // The template text as git compares it in `template_untouched()`: the file's
     // contents cleaned with the same mode, and only when it actually seeded `buf`.
     let template_seed: Option<String> = match (&template_file, from_flags) {
@@ -2431,6 +2462,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             whence,
             &author,
             author_message || date_override.is_some(),
+            allow_empty_message,
         )?);
         // `run_status(s->fp, index_file, prefix, 1, s)` (builtin/commit.c:1025): the
         // whole `wt_status_print()` body, commented, uncolored and hintless. Its own
@@ -2479,11 +2511,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         super::status::diffcore_order_read(&repo, orderfile.as_deref(), differs)?;
     }
 
-    // `--trailer <token>[(=|:)<value>]`: git runs
-    // `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <args>`;
-    // we call the very same implementation in-process.
-    if !trailer_args.is_empty() {
-        apply_trailers(&repo, &msg_path, &trailer_args)?;
+    // `--trailer <token>[(=|:)<value>]`, against the configuration read right
+    // after option parsing.
+    if let Some(cfg) = &trailer_config {
+        apply_trailers(&msg_path, &trailer_args, cfg)?;
     }
 
     // --- nothing-to-commit guard -----------------------------------------
@@ -2582,7 +2613,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         } else if fixup_arg.is_some() {
             (Some("message"), None)
         } else if merge_msg.is_some() {
-            (Some("merge"), None)
+            // "prepend SQUASH_MSG here if it exists and a "merge --squash" was
+            // originally performed" (builtin/commit.c:858-867).
+            (Some(if squash_msg.is_some() { "squash" } else { "merge" }), None)
         } else if squash_msg.is_some() {
             (Some("squash"), None)
         } else if template_file.is_some() {
@@ -3966,6 +3999,10 @@ fn editor_status_block(
     // `author_date_is_interesting()` (builtin/commit.c:694): the author date is
     // shown when it was inherited or forced rather than taken from the clock.
     date_is_interesting: bool,
+    // `allow_empty_message` picks the hint pair without the "empty message
+    // aborts" clause (builtin/commit.c:946-959): with it, an empty message does
+    // not abort.
+    allow_empty_message: bool,
 ) -> Result<String> {
     let mut buf = String::new();
     // `prepare_to_commit()` warns above everything else when an operation is being
@@ -3996,9 +4033,11 @@ fn editor_status_block(
             buf.push_str(&format!(
                 "{comment} Please enter the commit message for your changes. Lines starting\n"
             ));
-            buf.push_str(&format!(
-                "{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n"
-            ));
+            buf.push_str(&if allow_empty_message {
+                format!("{comment} with '{comment}' will be ignored.\n")
+            } else {
+                format!("{comment} with '{comment}' will be ignored, and an empty message aborts the commit.\n")
+            });
         }
         // Already emitted above when an operation is being concluded.
         Cleanup::Scissors if whence == Whence::Commit => buf.push_str(&scissors_line(comment)),
@@ -4010,9 +4049,9 @@ fn editor_status_block(
             buf.push_str(&format!(
                 "{comment} with '{comment}' will be kept; you may remove them yourself if you want to.\n"
             ));
-            buf.push_str(&format!(
-                "{comment} An empty message aborts the commit.\n"
-            ));
+            if !allow_empty_message {
+                buf.push_str(&format!("{comment} An empty message aborts the commit.\n"));
+            }
         }
     }
     // The three conditional identity lines (builtin/commit.c:998-1019). Each is a
@@ -4071,40 +4110,27 @@ fn scissors_line(comment: &str) -> String {
         .collect()
 }
 
-/// `--trailer <token>[(=|:)<value>]` — git spawns
-/// `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <--trailer v>…`
-/// and we call that exact implementation, with that exact argument order.
+/// `--trailer <token>[(=|:)<value>]`:
+///
+/// ```c
+/// if (amend_file_with_trailers(git_path_commit_editmsg(), &trailer_args))
+///         die(_("unable to pass trailers to --trailers"));
+/// ```
+///
+/// (builtin/commit.c:1070-1072.) `amend_file_with_trailers()` weighs the
+/// arguments before the message file is even read, so a rejected `--trailer`
+/// records no commit at all. It runs in-process, not as the
+/// `interpret-trailers` builtin: the file is read without
+/// `strbuf_complete_line()`, so `-F` text with no final newline gets its trailer
+/// on the very next line.
 fn apply_trailers(
-    repo: &gix::Repository,
     msg_path: &std::path::Path,
     trailers: &[String],
+    cfg: &super::interpret_trailers::TrailerConfig,
 ) -> Result<()> {
-    // ```c
-    // if (validate_trailer_args(trailer_args)) {
-    //         ret = -1;
-    //         goto out;
-    // }
-    // ```
-    //
-    // (`amend_file_with_trailers()`, trailer.c.) The arguments are weighed before
-    // the message file is even read, and `cmd_commit()` answers any failure of the
-    // helper with `die(_("unable to pass trailers to --trailers"))`
-    // (builtin/commit.c:1070-1072) — the same pair `git tag` prints, from the same
-    // ported check, so a rejected `--trailer` records no commit at all.
-    if let Some(err) = super::tag::validate_trailer_args(repo, trailers) {
-        eprintln!("error: {err}");
+    if !super::interpret_trailers::amend_file_with_trailers(msg_path, trailers, cfg)? {
         crate::git_fatal!("unable to pass trailers to --trailers");
     }
-    let mut args: Vec<String> = vec![
-        "--in-place".to_string(),
-        "--no-divider".to_string(),
-        msg_path.to_string_lossy().into_owned(),
-    ];
-    for t in trailers {
-        args.push("--trailer".to_string());
-        args.push(t.clone());
-    }
-    super::interpret_trailers::interpret_trailers(&args)?;
     Ok(())
 }
 

@@ -307,9 +307,10 @@ fn token_matches_item(tok: &[u8], item: &ConfInfo, tok_len: usize) -> bool {
 pub(crate) fn load_config() -> Result<TrailerConfig> {
     // `setup_git_directory_gently()`: a repository is preferred, but the command
     // is legal outside one, where git reads the global set plus `GIT_CONFIG_*`.
-    let config = match crate::setup::discover() {
-        Ok(repo) => repo.config_snapshot().plumbing().clone(),
-        Err(_) => {
+    let repo = crate::setup::discover().ok();
+    let config = match &repo {
+        Some(repo) => repo.config_snapshot().plumbing().clone(),
+        None => {
             let mut file = ConfigFile::from_globals()?;
             file.append(ConfigFile::from_environment_overrides()?)?;
             file
@@ -338,23 +339,30 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
             continue;
         }
         let source = section.meta().source;
-        for (name, value) in ordered_values(&section) {
-            let shown = String::from_utf8_lossy(&value).into_owned();
-            if echoes.is_echo(source, &format!("trailer.{name}"), Some(&shown)) {
+        for (name, value) in ordered_entries(&section) {
+            let shown = value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
+            if echoes.is_echo(source, &format!("trailer.{name}"), shown.as_deref()) {
                 continue;
             }
+            // `trailer_set_*()` take git's `NULL` as "back to the default"
+            // (trailer.c:389-436); only `separators` refuses it, through
+            // `config_error_nonbool()` (trailer.c:510-513).
+            let value = value.as_deref();
             let ok = match name.as_str() {
-                "where" => set_where(&mut cfg.defaults.where_, Some(value.as_slice())),
-                "ifexists" => set_if_exists(&mut cfg.defaults.if_exists, Some(value.as_slice())),
-                "ifmissing" => set_if_missing(&mut cfg.defaults.if_missing, Some(value.as_slice())),
+                "where" => set_where(&mut cfg.defaults.where_, value),
+                "ifexists" => set_if_exists(&mut cfg.defaults.if_exists, value),
+                "ifmissing" => set_if_missing(&mut cfg.defaults.if_missing, value),
                 "separators" => {
-                    cfg.separators = value.clone();
+                    let Some(value) = value else {
+                        return Err(config_error_nonbool(repo.as_ref(), &format!("trailer.{name}")));
+                    };
+                    cfg.separators = value.to_vec();
                     true
                 }
                 _ => continue,
             };
             if !ok {
-                warn_unknown_value(&value, &format!("trailer.{name}"));
+                warn_unknown_value(value.unwrap_or_default(), &format!("trailer.{name}"));
             }
         }
     }
@@ -373,15 +381,15 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
         let alias_shown = alias.to_string();
         let alias = alias.to_string().into_bytes();
 
-        for (name, value) in ordered_values(&section) {
+        for (name, value) in ordered_entries(&section) {
             if !matches!(
                 name.as_str(),
                 "key" | "command" | "cmd" | "where" | "ifexists" | "ifmissing"
             ) {
                 continue;
             }
-            let shown = String::from_utf8_lossy(&value).into_owned();
-            if echoes.is_echo(source, &format!("trailer.{alias_shown}.{name}"), Some(&shown)) {
+            let shown = value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
+            if echoes.is_echo(source, &format!("trailer.{alias_shown}.{name}"), shown.as_deref()) {
                 continue;
             }
             let idx = get_conf_item(&mut cfg, &alias);
@@ -390,6 +398,24 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
 
             // Each arm names the variable it consumes, so the key it honours is
             // spelled out where it is read rather than reassembled from `name`.
+            //
+            // The three string variables warn `more than one` *before* refusing a
+            // `NULL` with `config_error_nonbool()` (trailer.c:553-573); the three
+            // enums take it as their default.
+            if matches!(name.as_str(), "key" | "command" | "cmd") && value.is_none() {
+                let conf_key = format!("trailer.{alias}.{name}");
+                let set = match name.as_str() {
+                    "key" => item.key.is_some(),
+                    "command" => item.command.is_some(),
+                    _ => item.cmd.is_some(),
+                };
+                if set {
+                    eprintln!("warning: more than one {conf_key}");
+                }
+                return Err(config_error_nonbool(repo.as_ref(), &conf_key));
+            }
+            let value_ref = value.as_deref();
+            let value = value.clone().unwrap_or_default();
             let (ok, conf_key) = match name.as_str() {
                 "key" => {
                     let k = format!("trailer.{alias}.key");
@@ -404,15 +430,15 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
                     (set_once(&mut item.cmd, value.clone(), &k), k)
                 }
                 "where" => (
-                    set_where(&mut item.where_, Some(value.as_slice())),
+                    set_where(&mut item.where_, value_ref),
                     format!("trailer.{alias}.where"),
                 ),
                 "ifexists" => (
-                    set_if_exists(&mut item.if_exists, Some(value.as_slice())),
+                    set_if_exists(&mut item.if_exists, value_ref),
                     format!("trailer.{alias}.ifexists"),
                 ),
                 "ifmissing" => (
-                    set_if_missing(&mut item.if_missing, Some(value.as_slice())),
+                    set_if_missing(&mut item.if_missing, value_ref),
                     format!("trailer.{alias}.ifmissing"),
                 ),
                 _ => unreachable!("filtered above"),
@@ -442,6 +468,22 @@ fn get_conf_item(cfg: &mut TrailerConfig, name: &[u8]) -> usize {
     cfg.items.len() - 1
 }
 
+/// `config_error_nonbool(conf_key)` returned from a `repo_config()` callback:
+/// `error: missing value for '<key>'`, then `configset_iter()`'s
+/// `git_die_config_linenr()` naming where the valueless entry sits
+/// (config.c:1666-1688).
+fn config_error_nonbool(repo: Option<&gix::Repository>, conf_key: &str) -> anyhow::Error {
+    let origin = crate::config::walk_config_gently(repo)
+        .into_iter()
+        .find(|v| v.value.is_none() && v.key.eq_ignore_ascii_case(conf_key))
+        .map_or(crate::config::ValueOrigin::CommandLine, |v| v.origin);
+    crate::default_config::Rejection::Reported {
+        errors: vec![format!("missing value for '{conf_key}'")],
+        fatal: origin.die_linenr(conf_key),
+    }
+    .into_error()
+}
+
 /// Assign a string-valued conf field, warning `more than one <key>` when it was
 /// already set — git keeps the later value in both cases.
 fn set_once(slot: &mut Option<Vec<u8>>, value: Vec<u8>, conf_key: &str) -> bool {
@@ -464,10 +506,21 @@ fn warn_unknown_value(value: &[u8], conf_key: &str) {
 ///
 /// `value_names()` yields names in order and `values(name)` yields that name's
 /// values in order, so advancing a per-name cursor while walking the names
-/// interleaves them back into the order they were written. Valueless entries have
-/// no value to hand back and are skipped, exactly as git's config callback never
-/// sees a value for them.
+/// interleaves them back into the order they were written. A valueless entry
+/// (`[trailer "x"]\n\tkey`) reads as the empty string here; [`ordered_entries`]
+/// keeps it apart as `None`, git's `NULL`.
 fn ordered_values(section: &gix::config::file::SectionRef<'_>) -> Vec<(String, Vec<u8>)> {
+    ordered_entries(section)
+        .into_iter()
+        .map(|(name, value)| (name, value.unwrap_or_default()))
+        .collect()
+}
+
+/// [`ordered_values`] with git's `NULL` value kept: `None` for a name written
+/// without `=`. gitoxide only tells the two spellings apart for the *last*
+/// occurrence of a name in a section (`value_implicit()`), so that is the one
+/// classified; [`crate::config::walk_config`] reads the same way.
+fn ordered_entries(section: &gix::config::file::SectionRef<'_>) -> Vec<(String, Option<Vec<u8>>)> {
     let body = section.body();
     let mut cursors: Vec<(String, usize)> = Vec::new();
     let mut out = Vec::new();
@@ -482,8 +535,10 @@ fn ordered_values(section: &gix::config::file::SectionRef<'_>) -> Vec<(String, V
                 cursors.len() - 1
             }
         };
-        if let Some(v) = values.get(cursors[at].1) {
-            out.push((lower, v.to_vec()));
+        let index = cursors[at].1;
+        if let Some(v) = values.get(index) {
+            let implicit = index + 1 == values.len() && body.value_implicit(&lower) == Some(None);
+            out.push((lower, if implicit { None } else { Some(v.to_vec()) }));
         }
         cursors[at].1 += 1;
     }
@@ -657,7 +712,7 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
         // git creates the temporary before processing, so a non-writable target
         // fails before any output is produced.
         let temp = if run.opts.in_place {
-            match prepare_temp(&target) {
+            match prepare_temp(&target, file) {
                 Ok(t) => Some(t),
                 Err(code) => return Ok(code),
             }
@@ -938,21 +993,27 @@ pub(crate) fn trailer_block_of(msg: &[u8]) -> Result<Vec<u8>> {
 /// standing permission to spell a trailer with `=` whatever the configuration
 /// says — the same `cl_separators` [`parse_command_line_args`] builds.
 pub(crate) fn validate_trailer_args(cli_args: &[String]) -> Result<bool> {
-    let cfg = load_config()?;
+    Ok(validate_trailer_args_with(cli_args, &load_config()?))
+}
+
+/// [`validate_trailer_args`] past its `trailer_config_init()`, for a caller that
+/// has read the configuration already — git reads it once per process
+/// (`configured`, trailer.c:592-604), so its warnings print once.
+fn validate_trailer_args_with(cli_args: &[String], cfg: &TrailerConfig) -> bool {
     let mut cl_separators = vec![b'='];
     cl_separators.extend_from_slice(&cfg.separators);
 
     for txt in cli_args {
         if txt.is_empty() {
             eprintln!("error: empty --trailer argument");
-            return Ok(false);
+            return false;
         }
         if find_separator(txt.as_bytes(), &cl_separators) == 0 {
             eprintln!("error: invalid trailer '{txt}': missing key before separator");
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
 /// `amend_strbuf_with_trailers()` (trailer.c:1286-1318) — run `buf` through
@@ -966,7 +1027,11 @@ pub(crate) fn validate_trailer_args(cli_args: &[String]) -> Result<bool> {
 /// repeats a trailer already at the end of the block is dropped rather than
 /// duplicated, and a message with no blank line before its trailers gains one.
 pub(crate) fn amend_with_trailers(buf: &[u8], trailer_args: &[String]) -> Result<Vec<u8>> {
-    let cfg = load_config()?;
+    Ok(amend_with_trailers_with(buf, trailer_args, &load_config()?))
+}
+
+/// [`amend_with_trailers`] over configuration the caller has read.
+fn amend_with_trailers_with(buf: &[u8], trailer_args: &[String], cfg: &TrailerConfig) -> Vec<u8> {
     let opts = Opts { no_divider: true, ..Default::default() };
     let mut new_trailers = Vec::with_capacity(trailer_args.len());
     for text in trailer_args {
@@ -974,7 +1039,7 @@ pub(crate) fn amend_with_trailers(buf: &[u8], trailer_args: &[String]) -> Result
             // `error(_("empty --trailer argument")); goto out;` — `buf` is left
             // as it was, so the caller keeps the unmodified message.
             eprintln!("error: empty --trailer argument");
-            return Ok(buf.to_vec());
+            return buf.to_vec();
         }
         new_trailers.push(NewTrailer {
             text: text.as_bytes().to_vec(),
@@ -985,7 +1050,50 @@ pub(crate) fn amend_with_trailers(buf: &[u8], trailer_args: &[String]) -> Result
             if_missing: IfMissing::Default,
         });
     }
-    Ok(process(buf, &opts, &new_trailers, &cfg))
+    process(buf, &opts, &new_trailers, cfg)
+}
+
+/// `amend_file_with_trailers()` (trailer.c:1339-1364): `validate_trailer_args()`,
+/// then the file read whole, run through [`amend_with_trailers`], and written
+/// back by `write_file_in_place()` (trailer.c:1323-1337). `cfg` is the
+/// configuration `trailer_config_init()` read, once per process.
+///
+/// The read is `strbuf_read_file()` with no `strbuf_complete_line()`, unlike the
+/// builtin's `read_input_file()` (builtin/interpret-trailers.c:96-106), so a
+/// message with no final newline keeps its last line open and the trailer is
+/// put straight under it. `false` is the `-1` the callers die over; the
+/// `error:` lines are already out.
+pub(crate) fn amend_file_with_trailers(
+    path: &std::path::Path,
+    trailer_args: &[String],
+    cfg: &TrailerConfig,
+) -> Result<bool> {
+    if !validate_trailer_args_with(trailer_args, cfg) {
+        return Ok(false);
+    }
+    let shown = path.to_string_lossy().into_owned();
+    let buf = match std::fs::read(path) {
+        Ok(buf) => buf,
+        Err(e) => {
+            eprintln!("error: could not read '{shown}': {}", errno(&e));
+            return Ok(false);
+        }
+    };
+    let out = amend_with_trailers_with(&buf, trailer_args, cfg);
+    let Ok((temp, mode)) = prepare_temp(&shown, &shown) else {
+        return Ok(false);
+    };
+    if let Err(e) = write_temp(&temp, &out, mode) {
+        let _ = std::fs::remove_file(&temp);
+        eprintln!("error: could not write to temporary file: {}", errno(&e));
+        return Ok(false);
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        eprintln!("error: could not rename temporary file to {shown}: {}", errno(&e));
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// `trailer_block_get()`: locate the block and fold its continuation lines.
@@ -1231,31 +1339,40 @@ fn apply_item_command(arg: &mut ArgItem, in_tok: Option<&Item>) {
 /// Port of `apply_command()` (trailer.c): run the configured program through the
 /// shell and take its trimmed output as the trailer's value.
 ///
-/// `cmd` is handed the value as an *argument* — `use_shell` with more than one
-/// argv entry becomes `sh -c '<cmd> "$@"' <cmd> <value>` — while the deprecated
-/// `command` substitutes the value for the first `$ARG` in the command text and
-/// runs that alone. A command that fails leaves the value empty and reports
-/// `error: running trailer command '<cmd>' failed`.
+/// `cmd` is handed the value as an *argument* (`strvec_push(&cp.args, arg)`),
+/// while the deprecated `command` substitutes the value for the first `$ARG` in
+/// the command text and runs that alone (trailer.c:225-235). Either way the
+/// child is `use_shell` (trailer.c:238), so it goes through
+/// [`crate::external::prepare_shell_cmd`]: a word with no shell metacharacter is
+/// executed directly, and one with any runs as `sh -c '<cmd>["$@"]' <cmd>
+/// [<value>]`, which puts the command text in `$0`. The environment loses
+/// `local_repo_env` (trailer.c:236), as every repository-agnostic child does.
+///
+/// A command that cannot start reports what `start_command()` reports — `error:
+/// cannot run <cmd>: <strerror>` when the `$PATH` lookup of a slash-free word
+/// fails (run-command.c:735-741), `fatal: cannot exec '<cmd>': <strerror>` from
+/// the forked child otherwise (run-command.c:403-405) — and then, like a command
+/// that fails, leaves the value empty with `error: running trailer command
+/// '<cmd>' failed` (trailer.c:240-243).
 fn run_trailer_command(command: Option<&[u8]>, cmd: Option<&[u8]>, arg: &[u8]) -> Vec<u8> {
-    use std::process::{Command, Stdio};
+    use gix::bstr::ByteSlice;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
 
-    let arg = String::from_utf8_lossy(arg).into_owned();
     let (shown, mut child) = match (cmd, command) {
-        (Some(cmd), _) => {
-            let text = String::from_utf8_lossy(cmd).into_owned();
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(format!("{text} \"$@\"")).arg(&text).arg(&arg);
-            (text, c)
-        }
+        (Some(cmd), _) => (cmd.to_vec(), crate::external::prepare_shell_cmd(OsStr::from_bytes(cmd), [OsStr::from_bytes(arg)])),
         (None, Some(command)) => {
-            let text = String::from_utf8_lossy(command).into_owned();
-            let text = text.replacen("$ARG", &arg, 1);
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&text);
-            (text, c)
+            let text = command.replacen("$ARG", arg, 1);
+            let child = crate::external::prepare_shell_cmd(OsStr::from_bytes(&text), crate::external::NO_ARGS);
+            (text, child)
         }
         (None, None) => return Vec::new(),
     };
+    let shown = String::from_utf8_lossy(&shown).into_owned();
+    for name in crate::alternate_refs::LOCAL_REPO_ENV {
+        child.env_remove(name);
+    }
 
     // `cp.no_stdin = 1`, and `capture_command()` captures *stdout only* — the
     // command's own diagnostics stay on the terminal.
@@ -1263,7 +1380,18 @@ fn run_trailer_command(command: Option<&[u8]>, cmd: Option<&[u8]>, arg: &[u8]) -
     let out = child.stdin(Stdio::null()).stderr(Stdio::inherit()).output();
     match out {
         Ok(out) if out.status.success() => trim(&out.stdout).to_vec(),
-        Ok(_) | Err(_) => {
+        Ok(_) => {
+            eprintln!("error: running trailer command '{shown}' failed");
+            Vec::new()
+        }
+        Err(e) => {
+            let program = child.get_program().to_string_lossy().into_owned();
+            let reason = crate::external::strerror(&e);
+            if program.contains('/') {
+                eprintln!("fatal: cannot exec '{program}': {reason}");
+            } else {
+                eprintln!("error: cannot run {program}: {reason}");
+            }
             eprintln!("error: running trailer command '{shown}' failed");
             Vec::new()
         }
@@ -1780,11 +1908,13 @@ fn split_keep_lf(data: &[u8]) -> Vec<Vec<u8>> {
 /// path beside it, returning the mode the temporary must carry.
 ///
 /// On failure git reports with `error:` and then calls `die(NULL)`, which prints
-/// nothing further and exits 128.
-fn prepare_temp(file: &str) -> Result<(std::path::PathBuf, u32), ExitCode> {
+/// nothing further and exits 128. `target` is the path opened; `file` is the
+/// operand as given, which is what the messages name — git opens it as given
+/// from the top of the work tree, where this port has to resolve it first.
+fn prepare_temp(target: &str, file: &str) -> Result<(std::path::PathBuf, u32), ExitCode> {
     use std::os::unix::fs::PermissionsExt;
 
-    let meta = match std::fs::metadata(file) {
+    let meta = match std::fs::metadata(target) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: could not stat {file}: {}", errno(&e));
@@ -1801,7 +1931,7 @@ fn prepare_temp(file: &str) -> Result<(std::path::PathBuf, u32), ExitCode> {
         return Err(ExitCode::from(FATAL));
     }
 
-    let path = std::path::Path::new(file);
+    let path = std::path::Path::new(target);
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let name = format!("git-interpret-trailers-{:06x}", std::process::id() & 0xff_ffff);
     let temp = match dir {

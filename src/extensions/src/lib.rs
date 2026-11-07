@@ -10,6 +10,7 @@ pub mod alias;
 pub mod alternate_refs;
 pub mod autocorrect;
 pub mod autostart;
+pub mod comment_char_config;
 pub mod config;
 pub mod config_store;
 pub mod crawler;

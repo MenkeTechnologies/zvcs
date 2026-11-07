@@ -1963,7 +1963,7 @@ fn origin_path(meta: &gix::config::file::Metadata) -> Option<PathBuf> {
 
 /// The path as git prints it: gitoxide reports the repository config as
 /// `./.git/config`, git as `.git/config`.
-fn shown_path(path: &std::path::Path) -> String {
+pub(crate) fn shown_path(path: &std::path::Path) -> String {
     let shown = path.to_string_lossy();
     shown.strip_prefix("./").unwrap_or(&shown).to_string()
 }
@@ -2856,7 +2856,7 @@ fn system_config_path(env: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>) -
 /// than probed: the gate then names no file, the command falls back to the port's
 /// own diagnostic, and nothing recurses. Naming nothing is a degradation; a
 /// process fan-out is a hang.
-fn system_path_etc_gitconfig() -> Option<PathBuf> {
+pub(crate) fn system_path_etc_gitconfig() -> Option<PathBuf> {
     if cfg!(windows) {
         None
     } else {

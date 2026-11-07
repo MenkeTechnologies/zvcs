@@ -146,6 +146,13 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         if a == "--help-all" {
             return Ok(super::show_usage(USAGE));
         }
+        // `else if (!strcmp(arg + 2, "end-of-options"))` (parse-options.c:1119-1124):
+        // consumed, and everything after it is an operand, as after `--`.
+        if a == "--end-of-options" {
+            no_more_opts = true;
+            i += 1;
+            continue;
+        }
 
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.

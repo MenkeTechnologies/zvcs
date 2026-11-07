@@ -1800,34 +1800,35 @@ fn amend_with_trailers(
     if trailers.is_empty() {
         return Ok(Some(message));
     }
+    // `trailer_config_init()` (builtin/tag.c:571-572): a `trailer.*` value its
+    // callbacks refuse dies here, as `repo_config()` dies over it, rather than
+    // being folded into `unable to pass trailers`.
+    let cfg = super::interpret_trailers::load_config()?;
     if let Some(err) = validate_trailer_args(repo, trailers) {
         eprintln!("error: {err}");
         eprintln!("fatal: unable to pass trailers to --trailers");
         return Ok(None);
     }
 
+    // `if (opt->message_given && buf->len) { strbuf_complete(buf, '\n'); ... }`
+    // (builtin/tag.c:330-333): the message is newline-terminated before
+    // `amend_file_with_trailers()` reads it back, which does not do so itself.
+    let mut message = message;
+    if message.last().is_some_and(|&b| b != b'\n') {
+        message.push(b'\n');
+    }
     let path = repo.git_dir().join("TAG_EDITMSG");
     std::fs::write(&path, &message)
         .map_err(|e| anyhow!("could not write '{}': {e}", path.display()))?;
 
-    let mut argv = vec![
-        "--in-place".to_string(),
-        "--no-divider".to_string(),
-        path.to_string_lossy().into_owned(),
-    ];
-    for t in trailers {
-        argv.push("--trailer".to_string());
-        argv.push(t.clone());
-    }
-    // The argument vector is built here and already validated, so the engine's
-    // remaining failure modes are unreadable `trailer.*` config and I/O on the
-    // file just written — both surface as `Err`.
-    let outcome = super::interpret_trailers::interpret_trailers(&argv);
+    // `amend_file_with_trailers(path, trailer_args)` (builtin/tag.c:352-353),
+    // in-process over the configuration read above; its own `error:` lines are
+    // out by the time it answers `false`.
+    let amended_ok = super::interpret_trailers::amend_file_with_trailers(&path, trailers, &cfg)?;
     let amended = std::fs::read(&path);
     let _ = std::fs::remove_file(&path);
 
-    if let Err(e) = outcome {
-        eprintln!("error: {e}");
+    if !amended_ok {
         eprintln!("fatal: unable to pass trailers to --trailers");
         return Ok(None);
     }

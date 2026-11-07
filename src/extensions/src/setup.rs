@@ -1639,7 +1639,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 ///         if (!isalnum(*p) && !strchr(ok_punct, *p)) { sq_quote_buf(dst, src); return; }
 /// strbuf_addstr(dst, src);
 /// ```
-fn sq_quote_pretty(text: &str) -> String {
+pub(crate) fn sq_quote_pretty(text: &str) -> String {
     const OK_PUNCT: &[u8] = b"+,-./:=@_^";
     if text.is_empty() {
         return "''".to_owned();

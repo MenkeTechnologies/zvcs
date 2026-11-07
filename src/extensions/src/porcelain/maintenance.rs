@@ -2231,7 +2231,7 @@ fn maintpath(repo: &gix::Repository) -> Result<BString> {
 /// git's `git_global_config()`: `$GIT_CONFIG_GLOBAL` wins outright; otherwise
 /// `~/.gitconfig`, except that the XDG file is preferred when it exists and
 /// `~/.gitconfig` does not.
-fn global_config_path() -> Result<PathBuf> {
+pub(crate) fn global_config_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("GIT_CONFIG_GLOBAL") {
         return Ok(PathBuf::from(path));
     }

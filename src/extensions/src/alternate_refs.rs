@@ -81,7 +81,7 @@ use gix::hash::ObjectId;
 
 /// `local_repo_env[]` (`environment.c:101-118`) — the repository-local
 /// environment `start_command` clears for this child. The order is the array's.
-const LOCAL_REPO_ENV: &[&str] = &[
+pub(crate) const LOCAL_REPO_ENV: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",

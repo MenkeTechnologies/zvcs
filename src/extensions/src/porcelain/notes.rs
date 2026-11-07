@@ -71,9 +71,11 @@ use crate::cstdio::println;
 /// A bare `add` on an object that already has a note re-enters `edit`, as
 /// git's `argv[0] = "edit"` redirect does.
 ///
-/// The manual merge strategy's conflict blob is written with
-/// whole-content conflict markers (git's `ll_merge` output for single-block
-/// notes); its stdout, exit code and staged-merge state match stock git.
+/// The manual merge strategy writes each conflict through a port of
+/// `ll_merge()`: the `merge` and `conflict-marker-size` attributes of the
+/// object's hex name pick the built-in text, union or binary driver or a
+/// `merge.<name>.driver` command; its stdout, exit code and staged-merge state
+/// match stock git.
 pub fn notes(args: &[String]) -> Result<ExitCode> {
     // `dispatch::run` hands us the arguments after the `notes` verb, so `args`
     // starts at the first top-level option.
@@ -1970,28 +1972,38 @@ fn copy_stdin(
     }
 
     if let Some(cfg) = rewrite {
-        cfg.copy(repo, &resolved, MSG)?;
-        return Ok(ExitCode::SUCCESS);
+        // `error(_("failed to copy notes from '%s' to '%s'"))` names the two
+        // operands as the line gave them (builtin/notes.c:399-403).
+        let failed = cfg.copy(repo, &resolved, MSG)?;
+        let mut code = ExitCode::SUCCESS;
+        for ((from_spec, to_spec), _) in pairs.iter().zip(failed).filter(|(_, f)| *f) {
+            eprintln!("error: failed to copy notes from '{from_spec}' to '{to_spec}'");
+            code = ExitCode::from(1);
+        }
+        return Ok(code);
     }
 
     let (mut notes, parent) = load(repo, notes_ref)?;
     let mut changed = false;
     let mut err = false;
 
-    for (from, to) in resolved {
-        let Some(src) = notes.map.get(&from).copied() else {
-            // No source note: nothing to copy, silently skip.
-            continue;
-        };
-        // Plain `--stdin` always combines by overwriting, and refuses to clobber
-        // an existing note without `-f`.
-        if notes.map.contains_key(&to) && !force {
-            eprintln!("error: failed to copy notes from '{from}' to '{to}'");
+    for ((from, to), (from_spec, to_spec)) in resolved.into_iter().zip(&pairs) {
+        // `copy_note(t, from, to, force, combine_notes_overwrite)`
+        // (notes.c:1353-1368): an existing target refuses without `-f`, whether
+        // or not the source has a note; with `-f` a source without one removes
+        // the target's. The error names the operands as the line gave them
+        // (builtin/notes.c:399-403).
+        let src = notes.map.get(&from).copied();
+        let existing = notes.map.contains_key(&to);
+        if existing && !force {
+            eprintln!("error: failed to copy notes from '{from_spec}' to '{to_spec}'");
             err = true;
             continue;
         }
-        notes.map.insert(to, src);
-        changed = true;
+        if src.is_some() || existing {
+            add_note(repo, &mut notes, to, src, Combine::Overwrite)?;
+            changed = true;
+        }
     }
 
     if changed {
@@ -2120,70 +2132,63 @@ impl RewriteCfg {
     /// Port of `copy_note_for_rewrite()` over every pair, followed by
     /// `finish_copy_notes_for_rewrite()`: each ref that `add_note()` touched
     /// gets a notes commit carrying `msg`, and an untouched one is left alone.
+    ///
+    /// Answers whether each pair's `copy_note_for_rewrite()` failed in any tree
+    /// (notes-utils.c:178-186), for the caller's own diagnostic.
     pub(crate) fn copy(
         &self,
         repo: &gix::Repository,
         pairs: &[(ObjectId, ObjectId)],
         msg: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<bool>> {
+        let mut failed = vec![false; pairs.len()];
         for notes_ref in &self.refs {
             let (mut notes, parent) = load(repo, notes_ref)?;
             let mut dirty = false;
-            for (from, to) in pairs {
-                // `copy_note()` with `force`: whenever it reaches `add_note()`
-                // the tree is marked dirty, even when the combine function then
-                // leaves the value alone — so `ignore` still writes a commit.
-                let Some(src) = notes.map.get(from).copied() else {
-                    if notes.map.contains_key(to) {
-                        dirty = true;
-                        if self.combine == Combine::Overwrite {
-                            notes.map.remove(to);
-                        }
-                    }
-                    continue;
+            for (n, (from, to)) in pairs.iter().enumerate() {
+                // `copy_note()` with `force` (notes.c:1353-1368): whenever it
+                // reaches `add_note()` the tree is marked dirty, even when the
+                // combine function then leaves the value alone — so `ignore`
+                // still writes a commit. With no source note, an existing target
+                // is combined with the null oid.
+                let src = match notes.map.get(from).copied() {
+                    Some(src) => Some(src),
+                    None if notes.map.contains_key(to) => None,
+                    None => continue,
                 };
                 dirty = true;
-                combine_into(repo, &mut notes, *to, src, self.combine)?;
+                failed[n] |= add_note(repo, &mut notes, *to, src, self.combine)?;
             }
             if dirty {
                 commit_notes(repo, notes_ref, &notes, parent, msg)?;
             }
         }
-        Ok(())
+        Ok(failed)
     }
-}
-
-/// One `add_note(t, to, src, combine)`: the combine function decides what the
-/// target ends up holding when it already has a note.
-fn combine_into(
-    repo: &gix::Repository,
-    notes: &mut Notes,
-    to: ObjectId,
-    src: ObjectId,
-    combine: Combine,
-) -> Result<()> {
-    add_note(repo, notes, to, Some(src), combine)
 }
 
 /// `notes.c:add_note()` through `note_tree_insert()` (notes.c:253-286): an empty
 /// slot takes the new note unless it is null; a slot already holding the same
 /// blob is left alone; otherwise the combine function decides, and a null result
 /// removes the note.
+///
+/// `Ok(true)` is the combine function's non-zero return, which
+/// `note_tree_insert()` hands back with the slot left as it was.
 fn add_note(
     repo: &gix::Repository,
     notes: &mut Notes,
     to: ObjectId,
     new: Option<ObjectId>,
     combine: Combine,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(cur) = notes.map.get(&to).copied() else {
         if let Some(new) = new {
             notes.map.insert(to, new);
         }
-        return Ok(());
+        return Ok(false);
     };
     if Some(cur) == new {
-        return Ok(());
+        return Ok(false);
     }
     // A note blob that cannot be read, or is no blob: `odb_read_object()` failing
     // or `type != OBJ_BLOB` in the combine functions.
@@ -2205,12 +2210,16 @@ fn add_note(
             },
         },
         // combine_notes_cat_sort_uniq() (notes.c:912-939): a null side adds no
-        // lines, and the sorted result is always written back as a new blob.
+        // lines, and the sorted result is always written back as a new blob. A
+        // side `string_list_add_note_lines()` cannot read, or that is no blob,
+        // fails the combine and leaves the note alone (notes.c:885-889, :920-923).
         Combine::CatSortUniq => {
-            let cur_msg = read(Some(cur)).unwrap_or_default();
-            let new_msg = match new {
-                Some(_) => read(new).unwrap_or_default(),
-                None => Vec::new(),
+            let lines = |id: Option<ObjectId>| match id {
+                None => Some(Vec::new()),
+                Some(_) => read(id),
+            };
+            let (Some(cur_msg), Some(new_msg)) = (lines(Some(cur)), lines(new)) else {
+                return Ok(true);
             };
             Some(repo.write_blob(combine_cat_sort_uniq(&cur_msg, &new_msg))?.detach())
         }
@@ -2219,7 +2228,7 @@ fn add_note(
         Some(id) => notes.map.insert(to, id),
         None => notes.map.remove(&to),
     };
-    Ok(())
+    Ok(false)
 }
 
 /// `notes.c:combine_notes_concatenate()` — one trailing newline is trimmed from
@@ -2785,14 +2794,8 @@ fn do_merge(
     keys.sort();
 
     let mut merged: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
-    let mut conflicts: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    let mut conflicts: Vec<ObjectId> = Vec::new();
     let mut worktree_checked = false;
-    let blob = |id: Option<ObjectId>| -> Result<Vec<u8>> {
-        Ok(match id {
-            Some(id) => repo.find_object(id)?.data.clone(),
-            None => Vec::new(),
-        })
-    };
 
     for obj in &keys {
         let b = base_notes.map.get(obj).copied();
@@ -2823,25 +2826,28 @@ fn do_merge(
                 // local tree (notes-merge.c:466-484): a side that deleted the
                 // note is a null oid, which the combine functions skip over.
                 Strategy::Union | Strategy::CatSortUniq => {
-                    let combine = match strat {
+                    let (combine, name) = match strat {
                         Strategy::Union => {
                             if verbosity >= 0 {
                                 println!("Concatenating local and remote notes for {obj}");
                             }
-                            Combine::Concatenate
+                            (Combine::Concatenate, "combine_notes_concatenate")
                         }
                         _ => {
                             if verbosity >= 0 {
                                 println!("Concatenating unique lines in local and remote notes for {obj}");
                             }
-                            Combine::CatSortUniq
+                            (Combine::CatSortUniq, "combine_notes_cat_sort_uniq")
                         }
                     };
                     let mut t = Notes {
                         map: lo.map(|lo| BTreeMap::from([(*obj, lo)])).unwrap_or_default(),
                         non_notes: Vec::new(),
                     };
-                    add_note(repo, &mut t, *obj, re, combine)?;
+                    if add_note(repo, &mut t, *obj, re, combine)? {
+                        eprintln!("fatal: failed to concatenate notes ({name})");
+                        return Ok(ExitCode::from(128));
+                    }
                     t.map.get(obj).copied()
                 }
                 Strategy::Manual => {
@@ -2873,7 +2879,19 @@ fn do_merge(
                                     "CONFLICT (delete/modify): Notes for object {obj} deleted in {deleted_in} and modified in {modified_in}. Version from {modified_in} left in tree."
                                 );
                             }
-                            blob(lo.or(re))?
+                            // `write_note_to_worktree()` (notes-merge.c:337-352).
+                            let note = lo.or(re).expect("one side holds the note");
+                            match repo.try_find_object(note).ok().flatten() {
+                                Some(o) if o.kind == gix::object::Kind::Blob => o.data.clone(),
+                                Some(_) => {
+                                    eprintln!("fatal: blob expected in note {note} for object {obj}");
+                                    return Ok(ExitCode::from(128));
+                                }
+                                None => {
+                                    eprintln!("fatal: cannot read note {note} for object {obj}");
+                                    return Ok(ExitCode::from(128));
+                                }
+                            }
                         }
                         (Some(_), Some(_)) => {
                             if verbosity >= -1 {
@@ -2882,10 +2900,33 @@ fn do_merge(
                                     "CONFLICT ({reason}): Merge conflict in notes for object {obj}"
                                 );
                             }
-                            ll_merge_note(local_ref, &remote_ref, &blob(b)?, &blob(lo)?, &blob(re)?)
+                            // `read_mmblob()` (xdiff-interface.c:179-195) of the
+                            // three sides, the null base reading as empty.
+                            let mut sides = Vec::with_capacity(3);
+                            for id in [b, lo, re] {
+                                let Some(id) = id else {
+                                    sides.push(Vec::new());
+                                    continue;
+                                };
+                                match repo.try_find_object(id).ok().flatten() {
+                                    Some(o) if o.kind == gix::object::Kind::Blob => sides.push(o.data.clone()),
+                                    _ => {
+                                        eprintln!("fatal: unable to read blob object {id}");
+                                        return Ok(ExitCode::from(128));
+                                    }
+                                }
+                            }
+                            let [base, local, remote] = <[Vec<u8>; 3]>::try_from(sides).expect("three sides");
+                            match ll_merge_in_worktree(repo, obj, local_ref, &remote_ref, &base, &local, &remote)? {
+                                Some(merged) => merged,
+                                None => return Ok(ExitCode::from(128)),
+                            }
                         }
                     };
-                    conflicts.push((*obj, content));
+                    // `write_buf_to_worktree()` (notes-merge.c:312-335) as each
+                    // conflict is met, so a later death leaves the earlier ones.
+                    std::fs::write(repo.git_dir().join("NOTES_MERGE_WORKTREE").join(obj.to_string()), &content)?;
+                    conflicts.push(*obj);
                     // Conflicted notes stay out of the partial tree.
                     None
                 }
@@ -2927,7 +2968,7 @@ fn do_merge(
     } else {
         // Manual strategy with conflicts: stage the partial merge on disk.
         let mut msg = format!("{reflog}\n\nConflicts:\n");
-        for (obj, _) in &conflicts {
+        for obj in &conflicts {
             msg.push('\t');
             msg.push_str(&obj.to_string());
             msg.push('\n');
@@ -2939,7 +2980,6 @@ fn do_merge(
         // `refs_update_symref(…, "NOTES_MERGE_REF", notes_ref, NULL)`
         // (builtin/notes.c:988-999): files in the files backend, records in
         // the worktree's stack in a reftable one.
-        let git_dir = repo.git_dir();
         crate::refstore::state_ref_write(
             repo,
             "NOTES_MERGE_PARTIAL",
@@ -2952,11 +2992,6 @@ fn do_merge(
             &crate::refstore::StateRef::Symbolic(local_ref.into()),
             "",
         )?;
-        let wt = git_dir.join("NOTES_MERGE_WORKTREE");
-        std::fs::create_dir_all(&wt)?;
-        for (obj, content) in &conflicts {
-            std::fs::write(wt.join(obj.to_string()), content)?;
-        }
         // git names the worktree with `git_path(NOTES_MERGE_WORKTREE)`.
         let wt_display = git_path_shown(repo, "NOTES_MERGE_WORKTREE");
         eprintln!(
@@ -2999,6 +3034,11 @@ fn check_merge_worktree(repo: &gix::Repository) -> Result<Option<ExitCode>> {
 /// it, with the `./` prefix `gix` can carry dropped and an absolute git dir
 /// under the cwd shortened back to a relative path.
 fn git_path_shown(repo: &gix::Repository, name: &str) -> String {
+    // `repo->gitdir` as setup left it, relative to the top of the work tree it
+    // moved to, whichever subdirectory the command was typed in.
+    if let Some(s) = crate::setup::after_setup(repo) {
+        return s.git_dir.join(name).display().to_string();
+    }
     let path = repo.git_dir().join(name);
     let shown = path.display().to_string();
     match shown.strip_prefix("./") {
@@ -3012,28 +3052,358 @@ fn git_path_shown(repo: &gix::Repository, name: &str) -> String {
 
 /// `ll_merge_in_worktree()` (notes-merge.c:355-384): `ll_merge()` of the three
 /// note blobs under the object's hex name, labelled with the two notes refs and
-/// no ancestor label. `builtin/notes.c` reads `git_default_config` only, never
-/// `git_xmerge_config()`, so the style is always plain `merge` with 7-wide
-/// markers, at `merge-ll.c`'s `XDL_MERGE_ZEALOUS`.
-fn ll_merge_note(local_ref: &str, remote_ref: &str, base: &[u8], local: &[u8], remote: &[u8]) -> Vec<u8> {
-    use gix::merge::blob::builtin_driver::text::{Labels, Options};
+/// no ancestor label, with `o->repo->index` — which `git notes` never reads — as
+/// the attribute index. A binary conflict is warned about; an error or a result
+/// the driver did not leave behind is `die("Failed to execute internal merge")`,
+/// reported here as `None` once printed.
+fn ll_merge_in_worktree(
+    repo: &gix::Repository,
+    obj: &ObjectId,
+    local_ref: &str,
+    remote_ref: &str,
+    base: &[u8],
+    local: &[u8],
+    remote: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let path = obj.to_string();
+    let (status, result) = ll_merge(repo, &path, base, local_ref, local, remote_ref, remote)?;
+    if status == LlMergeResult::BinaryConflict {
+        eprintln!("warning: Cannot merge binary files: {path} ({local_ref} vs. {remote_ref})");
+    }
+    match (status, result) {
+        (LlMergeResult::Error, _) | (_, None) => {
+            eprintln!("fatal: Failed to execute internal merge");
+            Ok(None)
+        }
+        (_, Some(merged)) => Ok(Some(merged)),
+    }
+}
+
+/// `enum ll_merge_result` (merge-ll.h).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LlMergeResult {
+    Ok,
+    Error,
+    Conflict,
+    BinaryConflict,
+}
+
+/// The low-level driver `find_ll_merge_driver()` picks (merge-ll.c:363-394).
+enum LlMergeDriver {
+    /// `ll_merge_drv[LL_BINARY_MERGE]`.
+    Binary,
+    /// `ll_merge_drv[LL_TEXT_MERGE]`.
+    Text,
+    /// `ll_merge_drv[LL_UNION_MERGE]`.
+    Union,
+    /// A `merge.<name>.*` driver run by `ll_ext_merge()`, with its last
+    /// `merge.<name>.driver` command line.
+    External { name: String, cmdline: Option<String> },
+}
+
+/// `ll_merge()` (merge-ll.c:409-451) with `LL_MERGE_OPTIONS_INIT`: no
+/// renormalization, no virtual ancestor, no extra marker size. Returns the status
+/// and the result buffer, `None` when the driver produced none.
+fn ll_merge(
+    repo: &gix::Repository,
+    path: &str,
+    ancestor: &[u8],
+    our_label: &str,
+    ours: &[u8],
+    their_label: &str,
+    theirs: &[u8],
+) -> Result<(LlMergeResult, Option<Vec<u8>>)> {
+    // `git_check_attr(istate, path, check)` over `merge` and
+    // `conflict-marker-size` (merge-ll.c:427-437).
+    let empty = gix::index::State::new(repo.object_hash());
+    let mut stack = repo.attributes_only(
+        &empty,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+    )?;
+    let mode = Some(gix::index::entry::Mode::FILE);
+    // The first descent loads the attribute files so the collection knows both
+    // names before the outcome is sized against it.
+    let _ = stack.at_entry(path, mode)?;
+    let mut outcome = gix::attrs::search::Outcome::default();
+    outcome.initialize_with_selection(stack.attributes_collection(), ["merge", "conflict-marker-size"]);
+    stack.at_entry(path, mode)?.matching_attributes(&mut outcome);
+    let mut merge_attr = gix::attrs::State::Unspecified;
+    let mut marker_attr = None;
+    for m in outcome.iter_selected() {
+        match m.assignment.name.as_str() {
+            "merge" => merge_attr = m.assignment.state.to_owned(),
+            _ => marker_attr = Some(m.assignment.state.to_owned()),
+        }
+    }
+    let marker_size = super::rerere::marker_size_from_attr(marker_attr.as_ref().map(|s| s.as_ref()));
+    let driver = find_ll_merge_driver(repo, &merge_attr);
+
+    match driver {
+        LlMergeDriver::Binary => Ok(ll_binary_merge(ours)),
+        LlMergeDriver::Text => Ok(ll_xdl_merge(ancestor, our_label, ours, their_label, theirs, marker_size, false)),
+        LlMergeDriver::Union => Ok(ll_xdl_merge(ancestor, our_label, ours, their_label, theirs, marker_size, true)),
+        LlMergeDriver::External { name, cmdline } => {
+            let Some(cmdline) = cmdline else {
+                crate::git_fatal!("custom merge driver {name} lacks command line.");
+            };
+            ll_ext_merge(repo, &cmdline, path, ancestor, our_label, ours, their_label, theirs, marker_size)
+        }
+    }
+}
+
+/// `find_ll_merge_driver()` (merge-ll.c:363-394) over `read_merge_config()`
+/// (merge-ll.c:282-355): `merge` set is text, `-merge` binary, unset falls back
+/// to `merge.default` (text when that is unset too), and a name is looked for
+/// among the `merge.<name>.*` drivers before the three built-ins, defaulting to
+/// text.
+fn find_ll_merge_driver(repo: &gix::Repository, merge_attr: &gix::attrs::State) -> LlMergeDriver {
+    let config = repo.config_snapshot();
+    let name: BString = match merge_attr {
+        gix::attrs::State::Set => return LlMergeDriver::Text,
+        gix::attrs::State::Unset => return LlMergeDriver::Binary,
+        gix::attrs::State::Unspecified => match config.string("merge.default") {
+            Some(name) => name,
+            None => return LlMergeDriver::Text,
+        },
+        gix::attrs::State::Value(v) => v.as_ref().as_bstr().to_owned(),
+    };
+    // Any `merge.<name>.<key>` defines a user driver, whose `cmdline` is the last
+    // `driver` value; the subsection name compares case-sensitively.
+    let mut user = false;
+    let mut cmdline = None;
+    if let Some(sections) = config.plumbing().sections_by_name("merge") {
+        for section in sections {
+            if section.header().subsection_name() != Some(name.as_bstr()) {
+                continue;
+            }
+            user = true;
+            if let Some(v) = section.values("driver").last() {
+                cmdline = Some(v.to_str_lossy().into_owned());
+            }
+        }
+    }
+    if user {
+        return LlMergeDriver::External {
+            name: name.to_str_lossy().into_owned(),
+            cmdline,
+        };
+    }
+    match name.as_bytes() {
+        b"binary" => LlMergeDriver::Binary,
+        b"union" => LlMergeDriver::Union,
+        // "text" and every unknown name: `/* default to the 3-way */`.
+        _ => LlMergeDriver::Text,
+    }
+}
+
+/// `ll_binary_merge()` (merge-ll.c:57-100) with the default variant: the result
+/// is ours, and a binary conflict.
+fn ll_binary_merge(ours: &[u8]) -> (LlMergeResult, Option<Vec<u8>>) {
+    (LlMergeResult::BinaryConflict, Some(ours.to_vec()))
+}
+
+/// `ll_xdl_merge()` (merge-ll.c:102-145), and `ll_union_merge()` (merge-ll.c:147-163)
+/// as the same merge under `XDL_MERGE_FAVOR_UNION`. A binary or oversized side
+/// goes to the binary driver. `git notes` never reads `merge.conflictStyle`
+/// (builtin/notes.c:1150 is `git_default_config`), so `git_xmerge_style` stays -1
+/// and the style is xdiff's default.
+fn ll_xdl_merge(
+    ancestor: &[u8],
+    our_label: &str,
+    ours: &[u8],
+    their_label: &str,
+    theirs: &[u8],
+    marker_size: usize,
+    union: bool,
+) -> (LlMergeResult, Option<Vec<u8>>) {
+    use gix::merge::blob::builtin_driver::text::{Conflict, ConflictStyle, Labels, Options};
+    // `MAX_XDIFF_SIZE` (xdiff-interface.h:14).
+    const MAX_XDIFF_SIZE: usize = 1024 * 1024 * 1023;
+    if [ancestor, ours, theirs]
+        .iter()
+        .any(|b| b.len() > MAX_XDIFF_SIZE || super::diffcore_rename::buffer_is_binary(b))
+    {
+        return ll_binary_merge(ours);
+    }
+    let conflict = if union {
+        Conflict::ResolveWithUnion
+    } else {
+        Conflict::Keep {
+            style: ConflictStyle::Merge,
+            // gix carries the marker width in a `NonZeroU8`.
+            marker_size: std::num::NonZeroU8::new(marker_size.min(u8::MAX as usize) as u8)
+                .expect("marker size is positive"),
+        }
+    };
     let mut out = Vec::new();
     let mut input = gix::diff::blob::InternedInput::default();
-    gix::merge::blob::builtin_driver::text(
+    let resolution = gix::merge::blob::builtin_driver::text(
         &mut out,
         &mut input,
         Labels {
             ancestor: None,
-            current: Some(local_ref.as_bytes().as_bstr()),
-            other: Some(remote_ref.as_bytes().as_bstr()),
+            current: Some(our_label.as_bytes().as_bstr()),
+            other: Some(their_label.as_bytes().as_bstr()),
         },
-        local,
-        base,
-        remote,
-        Options::default(),
+        ours,
+        ancestor,
+        theirs,
+        Options {
+            conflict,
+            ..Options::default()
+        },
     );
-    out
+    let status = match resolution {
+        gix::merge::blob::Resolution::Conflict => LlMergeResult::Conflict,
+        _ => LlMergeResult::Ok,
+    };
+    (status, Some(out))
 }
+
+/// `create_temp()` (merge-ll.c:177-186): `xmkstemp()` of `.merge_file_XXXXXX` in
+/// the current directory, holding `src`.
+fn ll_create_temp(dir: &std::path::Path, src: &[u8]) -> Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut attempt = 0u32;
+    loop {
+        let name = format!(".merge_file_{}", ll_temp_suffix(attempt));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(&name)) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(src) {
+                    crate::git_fatal!("unable to write temp-file: {}", crate::external::strerror(&e));
+                }
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(e) => crate::git_fatal!(
+                "Unable to create temporary file '{}': {}",
+                dir.join(&name).display(),
+                crate::external::strerror(&e)
+            ),
+        }
+    }
+}
+
+/// The six characters `mkstemp()` substitutes for `XXXXXX`, from the pid, the
+/// clock and the attempt number.
+fn ll_temp_suffix(attempt: u32) -> String {
+    const SET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut v = (u64::from(std::process::id()) << 32) ^ u64::from(nanos) ^ (u64::from(attempt) << 20);
+    (0..6)
+        .map(|_| {
+            let c = SET[(v % SET.len() as u64) as usize] as char;
+            v /= SET.len() as u64;
+            c
+        })
+        .collect()
+}
+
+/// `ll_ext_merge()` (merge-ll.c:191-272): the three sides go to temporary files,
+/// the command line is expanded (`%O %A %B %L %P %S %X %Y %%`) and run through
+/// the shell, and the result is whatever the driver left in the `%A` file. A
+/// zero exit is clean, one up to 128 a conflict, and above that (a signal) an
+/// error.
+#[allow(clippy::too_many_arguments)]
+fn ll_ext_merge(
+    repo: &gix::Repository,
+    cmdline: &str,
+    path: &str,
+    ancestor: &[u8],
+    our_label: &str,
+    ours: &[u8],
+    their_label: &str,
+    theirs: &[u8],
+    marker_size: usize,
+) -> Result<(LlMergeResult, Option<Vec<u8>>)> {
+    // The temporaries are named relative to where setup left git standing —
+    // the top of the work tree — which is also where the driver runs.
+    let setup = crate::setup::after_setup(repo);
+    let dir = match &setup {
+        Some(s) => s.cwd.clone(),
+        None => std::env::current_dir()?,
+    };
+    let temp = [
+        ll_create_temp(&dir, ancestor)?,
+        ll_create_temp(&dir, ours)?,
+        ll_create_temp(&dir, theirs)?,
+    ];
+    let sq = |s: &str| {
+        let mut out = Vec::new();
+        super::rev_parse::sq_quote_buf(&mut out, s.as_bytes());
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let mut cmd = String::new();
+    let mut chars = cmdline.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            cmd.push(c);
+            continue;
+        }
+        let mut rest = chars.clone();
+        match rest.next() {
+            Some('%') => cmd.push('%'),
+            Some('O') => cmd.push_str(&temp[0]),
+            Some('A') => cmd.push_str(&temp[1]),
+            Some('B') => cmd.push_str(&temp[2]),
+            Some('L') => cmd.push_str(&marker_size.to_string()),
+            Some('P') => cmd.push_str(&sq(path)),
+            // `orig_name` is NULL here.
+            Some('S') => cmd.push_str(&sq("")),
+            Some('X') => cmd.push_str(&sq(our_label)),
+            Some('Y') => cmd.push_str(&sq(their_label)),
+            _ => {
+                cmd.push('%');
+                continue;
+            }
+        }
+        chars = rest;
+    }
+
+    // `run_command()` with `use_shell`: `fflush(NULL)` before the fork
+    // (run-command.c:743), then `wait_or_whine()`'s status.
+    crate::cstdio::before_spawn();
+    let _ = std::io::stdout().flush();
+    let mut child = crate::external::prepare_shell_cmd_str(&cmd, crate::external::NO_ARGS);
+    crate::setup::export_to_child(repo, setup.as_ref(), &mut child);
+    let status: i32 = match child.status() {
+        Ok(st) => match st.code() {
+            Some(code) => code,
+            None => {
+                let sig = std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0);
+                if sig != libc::SIGINT && sig != libc::SIGQUIT && sig != libc::SIGPIPE {
+                    eprintln!("error: {cmd} died of signal {sig}");
+                }
+                sig + 128
+            }
+        },
+        Err(e) => {
+            eprintln!("error: cannot run {cmd}: {}", crate::external::strerror(&e));
+            -1
+        }
+    };
+    let result = std::fs::read(dir.join(&temp[1])).ok();
+    // `unlink_or_warn()` of the three temporaries.
+    for t in &temp {
+        if let Err(e) = std::fs::remove_file(dir.join(t)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("warning: unable to unlink '{t}': {}", crate::external::strerror(&e));
+            }
+        }
+    }
+    let status = if status == 0 {
+        LlMergeResult::Ok
+    } else if status <= 128 {
+        LlMergeResult::Conflict
+    } else {
+        LlMergeResult::Error
+    };
+    Ok((status, result))
+}
+
 
 /// `git notes merge --commit` — finalize a manual merge staged on disk.
 fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {

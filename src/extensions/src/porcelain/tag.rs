@@ -40,8 +40,9 @@
 //!   * `git tag -a|-m|-F …`            → create an annotated tag object.
 //!   * `git tag --cleanup=<mode>`      → `verbatim`/`whitespace`/`strip` message
 //!                                       cleanup for `-m`/`-F`.
-//!   * `git tag --trailer <tok>[(=|:)<val>]…` → append/merge trailers into the tag
-//!                                       message before `--cleanup` runs, through
+//!   * `git tag --trailer <tok>[(=|:)<val>]…` → append/merge trailers into
+//!                                       `TAG_EDITMSG` before the editor opens and
+//!                                       before `--cleanup` runs, through
 //!                                       the very engine `git interpret-trailers`
 //!                                       drives (with `--no-divider`, so a `---`
 //!                                       line in the body never ends it). Honors
@@ -101,7 +102,7 @@
 //! An editor-supplied message is ported: `-e`/`--edit` reopens a message that was
 //! given, and `-a`/`-s`/`tag.gpgSign` with neither `-m` nor `-F` writes
 //! `$GIT_DIR/TAG_EDITMSG` — the previous tag's body when `-f` replaces one, else
-//! git's commented prompt — runs the configured editor on it and cleans up what
+//! git's commented prompt, worded for the cleanup mode — runs the configured editor on it and cleans up what
 //! comes back, which is what makes an editor that saves nothing `fatal: no tag
 //! message?`.
 //!
@@ -766,6 +767,14 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         cmdmode = CmdMode::List;
     }
 
+    // `if (trailer_args.nr) trailer_config_init();` (builtin/tag.c:571-572): a
+    // `trailer.*` value its callbacks refuse dies here, as `repo_config()` dies
+    // over it, rather than being folded into `unable to pass trailers`.
+    let trailer_cfg = match trailers.is_empty() {
+        true => None,
+        false => Some(super::interpret_trailers::load_config()?),
+    };
+
     // ```c
     // if (opt.sign == -1)   opt.sign = cmdmode ? 0 : config_sign_tag > 0;
     // if (keyid) { opt.sign = 1; set_signing_key(keyid); }
@@ -916,6 +925,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         message_file.as_deref(),
         cleanup.as_deref(),
         &trailers,
+        trailer_cfg.as_ref(),
         create_reflog,
         signer.as_ref(),
         tagger_refusal.as_ref(),
@@ -1417,6 +1427,7 @@ fn create_tag(
     message_file: Option<&str>,
     cleanup: Option<&str>,
     trailers: &[String],
+    trailer_cfg: Option<&super::interpret_trailers::TrailerConfig>,
     create_reflog: bool,
     signer: Option<&crate::gitsig::Signer>,
     tagger_refusal: Option<&crate::IdentRefusal>,
@@ -1474,18 +1485,20 @@ fn create_tag(
         PreviousValue::MustNotExist
     };
 
+    if !messages.is_empty() && message_file.is_some() {
+        return fatal("options '-F' and '-m' cannot be used together");
+    }
+    // `cmd_tag()` parses `--cleanup` for every tag it creates, a lightweight one
+    // included, right after the `already exists` check (builtin/tag.c:672-679).
+    let mode = match cleanup {
+        None => CleanupMode::Strip,
+        Some("strip") => CleanupMode::Strip,
+        Some("whitespace") => CleanupMode::Whitespace,
+        Some("verbatim") => CleanupMode::Verbatim,
+        Some(other) => return fatal(&format!("Invalid cleanup mode {other}")),
+    };
+
     let new_id = if annotate {
-        if !messages.is_empty() && message_file.is_some() {
-            return fatal("options '-F' and '-m' cannot be used together");
-        }
-        // Validate `--cleanup` the way git does, before touching the object db.
-        let mode = match cleanup {
-            None => CleanupMode::Strip,
-            Some("strip" | "default") => CleanupMode::Strip,
-            Some("whitespace") => CleanupMode::Whitespace,
-            Some("verbatim") => CleanupMode::Verbatim,
-            Some(other) => return fatal(&format!("Invalid cleanup mode {other}")),
-        };
         // `create_tag()` opens with `odb_read_object_info()` and refuses anything
         // it cannot type, which is the first thing an absent full-length hex name
         // hits on the annotated path.
@@ -1501,80 +1514,107 @@ fn create_tag(
         let raw = match message_file {
             Some(path) => read_message_file(path)?,
             None if messages.is_empty() => Vec::new(),
-            None => match mode {
-                // git's `-m` under `verbatim` uses each chunk literally.
-                CleanupMode::Verbatim => join_verbatim(messages),
-                _ => join_messages(messages),
-            },
+            None => join_messages(messages),
         };
         // ```c
-        // if (!opt->message_given || opt->use_editor) {
-        //         ... write TAG_EDITMSG ...
-        //         if (launch_editor(path, buf, NULL)) { ...; exit(1); }
-        //         unlink_or_warn(path);
+        // should_edit = opt->use_editor || !opt->message_given;
+        // if (should_edit || trailer_args->nr) {
+        //         /* write the template message before editing: */
+        //         ...
+        //         if (trailer_args->nr && amend_file_with_trailers(path, trailer_args))
+        //                 die(_("unable to pass trailers to --trailers"));
+        //         if (should_edit) {
+        //                 if (launch_editor(path, buf, NULL)) { ...; exit(1); }
+        //         } else if (trailer_args->nr) {
+        //                 strbuf_reset(buf);
+        //                 if (strbuf_read_file(buf, path, 0) < 0)
+        //                         die_errno(_("failed to read '%s'"), path);
+        //         }
         // }
         // ```
         //
-        // (builtin/tag.c:create_tag.) `-e`/`--edit` opens the editor on a message
-        // that *was* given; no `-m`/`-F` at all opens it on a template — the body
-        // of the tag being replaced when there is one, otherwise a wholly
-        // commented prompt that the cleanup below reduces to nothing.
-        let raw = if !message_given || edit_flag {
+        // (builtin/tag.c:325-366.) `TAG_EDITMSG` is seeded with a given non-empty
+        // message, newline-terminated; else with the body of the tag the ref
+        // already names, when it names anything; else with the commented
+        // template. The trailers are added to that file before the editor sees
+        // it, so the editor is shown them, and they land above the template — an
+        // empty `-m ''` with `--trailer` keeps the template, which `--cleanup`
+        // then strips or, under `verbatim`, keeps. `--cleanup` runs after both.
+        let should_edit = edit_flag || !message_given;
+        let raw = if should_edit || !trailers.is_empty() {
             let path = repo.git_dir().join("TAG_EDITMSG");
-            let seed: Vec<u8> = if message_given {
+            let seed: Vec<u8> = if message_given && !raw.is_empty() {
+                // `strbuf_complete(buf, '\n')`.
+                let mut raw = raw;
+                if raw.last() != Some(&b'\n') {
+                    raw.push(b'\n');
+                }
                 raw
-            } else if let Some(prev) = previous_tag_body(repo, &format!("refs/tags/{name}"))? {
-                prev
+            } else if prev.is_some() {
+                // `write_tag_body(fd, prev)` (builtin/tag.c:237-263) writes
+                // nothing for a ref that names no tag object.
+                previous_tag_body(repo, &ref_name)?.unwrap_or_default()
             } else {
                 // ```c
                 // strbuf_addch(&buf, '\n');
-                // strbuf_commented_addf(&buf, comment_line_str,
-                //                       _(tag_template), tag, comment_line_str);
-                // ```
-                // with
-                // ```c
-                // static const char tag_template[] =
-                //         N_("\nWrite a message for tag:\n  %s\n"
-                //         "Lines starting with '%s' will be ignored.\n");
+                // if (opt->cleanup_mode == CLEANUP_ALL)
+                //         strbuf_commented_addf(&buf, comment_line_str,
+                //               _(tag_template), tag, comment_line_str);
+                // else
+                //         strbuf_commented_addf(&buf, comment_line_str,
+                //               _(tag_template_nocleanup), tag, comment_line_str);
                 // ```
                 //
-                // (builtin/tag.c:201-203, 340-344.) The template's own leading `\n`
+                // (builtin/tag.c:201-207, 337-345.) The template's own leading `\n`
                 // is inside what gets commented, so the blank line `strbuf_addch()`
                 // wrote is followed by a bare comment character on a line of its own
                 // — `strbuf_commented_addf()` comments empty lines as just the
                 // prefix, with no trailing space.
                 let mut b = vec![b'\n'];
                 let c = super::commit::comment_prefix(&repo.config_snapshot());
+                let fate = match matches!(mode, CleanupMode::Strip) {
+                    true => "will be ignored.",
+                    false => "will be kept; you may remove them yourself if you want to.",
+                };
                 b.extend_from_slice(
                     format!(
                         "{c}\n{c} Write a message for tag:\n{c}   {name}\n\
-                         {c} Lines starting with '{c}' will be ignored.\n"
+                         {c} Lines starting with '{c}' {fate}\n"
                     )
                     .as_bytes(),
                 );
                 b
             };
             std::fs::write(&path, &seed)?;
-            if crate::editor::launch_editor(Some(&repo), &path, &[]).is_err() {
-                eprintln!("Please supply the message using either -m or -F option.");
-                return Ok(ExitCode::from(1));
+            if let Some(cfg) = trailer_cfg {
+                // `amend_file_with_trailers()` (trailer.c:1339-1364), in-process
+                // over the configuration `trailer_config_init()` read; its own
+                // `error:` lines are out by the time it answers `false`.
+                if !super::interpret_trailers::amend_file_with_trailers(&path, trailers, cfg)? {
+                    return fatal("unable to pass trailers to --trailers");
+                }
+            }
+            if should_edit {
+                if crate::editor::launch_editor(Some(&repo), &path, &[]).is_err() {
+                    eprintln!("Please supply the message using either -m or -F option.");
+                    return Ok(ExitCode::from(1));
+                }
             }
             // git does *not* unlink here: `cmd_tag()` keeps `TAG_EDITMSG` until the
             // ref transaction has committed (`unlink_or_warn(path)`,
             // builtin/tag.c:704-707), which is what makes its `The tag message has
             // been left in %s` on a failed transaction point at a file that is
             // really still there.
-            std::fs::read(&path)?
+            match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => crate::git_fatal!(
+                    "failed to read '{}': {}",
+                    path.display(),
+                    crate::external::strerror(&e)
+                ),
+            }
         } else {
             raw
-        };
-        // git amends the message with `--trailer`s first and only then runs
-        // `--cleanup`, so a trailer's own trailing whitespace and the blank lines
-        // the trailer engine leaves behind are stripped exactly like body text —
-        // and `--cleanup=verbatim` (git's `CLEANUP_NONE`) keeps both verbatim.
-        let raw = match amend_with_trailers(repo, raw, trailers)? {
-            Some(amended) => amended,
-            None => return Ok(ExitCode::from(128)),
         };
         // ```c
         // if (opt->cleanup_mode != CLEANUP_NONE)
@@ -1751,97 +1791,6 @@ fn create_tag(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Port of `validate_trailer_args()` (trailer.c). Before any trailer is applied
-/// git checks each `--trailer` argument for two things: it must be non-empty, and
-/// `find_separator()` must not land on offset 0. The latter happens exactly when
-/// the argument's first byte is itself a separator (`find_separator` returns the
-/// index of the first separator byte it meets, so 0 is reachable only from byte
-/// 0), which leaves no key in front of it. git's separator set here is `=` plus
-/// `trailer.separators` (default `:`). Returns git's `error:` text for the first
-/// offending argument.
-pub(super) fn validate_trailer_args(repo: &gix::Repository, trailers: &[String]) -> Option<String> {
-    let configured = repo
-        .config_snapshot()
-        .string("trailer.separators")
-        .map(|v| v.to_vec());
-    let mut separators: Vec<u8> = vec![b'='];
-    separators.extend_from_slice(configured.as_deref().unwrap_or(b":"));
-
-    for t in trailers {
-        let Some(&first) = t.as_bytes().first() else {
-            return Some("empty --trailer argument".to_string());
-        };
-        if separators.contains(&first) {
-            return Some(format!(
-                "invalid trailer '{t}': missing key before separator"
-            ));
-        }
-    }
-    None
-}
-
-/// Port of `amend_file_with_trailers()` (trailer.c) — the helper `git tag` and
-/// `git commit` share for `--trailer`. git validates the arguments, then runs the
-/// finished message through the trailer engine with `--no-divider` set, so a
-/// `---` line in the body never ends the log message. A failure of either step is
-/// reported as `fatal: unable to pass trailers to --trailers` and no tag object
-/// is written.
-///
-/// The message round-trips through `$GIT_DIR/TAG_EDITMSG` — the same file git
-/// writes and unlinks — because that lets this port hand the work to its own
-/// [`super::interpret_trailers`] implementation unchanged: same engine, same
-/// `trailer.*` configuration, no second copy of the trailer rules. `Ok(None)`
-/// means the diagnostics were printed already.
-fn amend_with_trailers(
-    repo: &gix::Repository,
-    message: Vec<u8>,
-    trailers: &[String],
-) -> Result<Option<Vec<u8>>> {
-    if trailers.is_empty() {
-        return Ok(Some(message));
-    }
-    // `trailer_config_init()` (builtin/tag.c:571-572): a `trailer.*` value its
-    // callbacks refuse dies here, as `repo_config()` dies over it, rather than
-    // being folded into `unable to pass trailers`.
-    let cfg = super::interpret_trailers::load_config()?;
-    if let Some(err) = validate_trailer_args(repo, trailers) {
-        eprintln!("error: {err}");
-        eprintln!("fatal: unable to pass trailers to --trailers");
-        return Ok(None);
-    }
-
-    // `if (opt->message_given && buf->len) { strbuf_complete(buf, '\n'); ... }`
-    // (builtin/tag.c:330-333): the message is newline-terminated before
-    // `amend_file_with_trailers()` reads it back, which does not do so itself.
-    let mut message = message;
-    if message.last().is_some_and(|&b| b != b'\n') {
-        message.push(b'\n');
-    }
-    let path = repo.git_dir().join("TAG_EDITMSG");
-    std::fs::write(&path, &message)
-        .map_err(|e| anyhow!("could not write '{}': {e}", path.display()))?;
-
-    // `amend_file_with_trailers(path, trailer_args)` (builtin/tag.c:352-353),
-    // in-process over the configuration read above; its own `error:` lines are
-    // out by the time it answers `false`.
-    let amended_ok = super::interpret_trailers::amend_file_with_trailers(&path, trailers, &cfg)?;
-    let amended = std::fs::read(&path);
-    let _ = std::fs::remove_file(&path);
-
-    if !amended_ok {
-        eprintln!("fatal: unable to pass trailers to --trailers");
-        return Ok(None);
-    }
-    match amended {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) => {
-            eprintln!("error: could not read '{}': {e}", path.display());
-            eprintln!("fatal: unable to pass trailers to --trailers");
-            Ok(None)
-        }
-    }
-}
-
 /// Message cleanup modes accepted for `-m`/`-F`.
 enum CleanupMode {
     Verbatim,
@@ -1890,29 +1839,15 @@ fn previous_tag_body(repo: &gix::Repository, ref_name: &str) -> Result<Option<Ve
     Ok(Some(body[..end].to_vec()))
 }
 
-/// Port of git's `opt_parse_m`: each `-m` chunk is newline-terminated, and a
-/// further newline separates it from the previous one.
+/// `parse_msg_arg()` (builtin/tag.c:439-452) over every `-m`: each chunk is
+/// appended as given, after a blank line when the buffer already holds text, and
+/// no newline is added at the end. Every cleanup mode, `verbatim` included,
+/// starts from this buffer.
 fn join_messages(messages: &[Vec<u8>]) -> Vec<u8> {
     let mut buf = Vec::new();
     for chunk in messages {
         if !buf.is_empty() {
-            buf.push(b'\n');
-        }
-        buf.extend_from_slice(chunk);
-        if buf.last() != Some(&b'\n') {
-            buf.push(b'\n');
-        }
-    }
-    buf
-}
-
-/// Under `--cleanup=verbatim` git keeps `-m` chunks exactly, joining multiple with
-/// a single newline and adding no trailing newline.
-fn join_verbatim(messages: &[Vec<u8>]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    for (idx, chunk) in messages.iter().enumerate() {
-        if idx > 0 {
-            buf.push(b'\n');
+            buf.extend_from_slice(b"\n\n");
         }
         buf.extend_from_slice(chunk);
     }

@@ -164,6 +164,13 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
     };
     let rest = &args[1..];
 
+    // `{ "bisect", cmd_bisect, RUN_SETUP }` (git.c:540): `setup_git_directory()`
+    // moves the process to the top of the work tree before any subcommand runs,
+    // so `bisect run` starts its command there, a relative script path names a
+    // file at the top, and every `checkout` a step runs works from the top, even
+    // when the step removes the subdirectory the command was typed in.
+    enter_worktree_top();
+
     FIRST_BAD_FOUND.store(false, std::sync::atomic::Ordering::Relaxed);
     let code = dispatch(sub, args, rest)?;
 
@@ -195,6 +202,26 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         }
     }
     Ok(code)
+}
+
+/// The `chdir()` of `setup_discovered_git_dir()` (setup.c): a cwd inside the work
+/// tree, and not inside its git directory, moves to the top. A cwd in `.git`, a
+/// bare repository or no repository at all is left where it is, for the
+/// subcommand to report on as it already does.
+fn enter_worktree_top() {
+    let Ok(repo) = crate::setup::discover() else {
+        return;
+    };
+    let (Some(top), Ok(git_dir), Ok(cwd)) = (
+        repo.workdir().and_then(|w| w.canonicalize().ok()),
+        repo.git_dir().canonicalize(),
+        std::env::current_dir().and_then(|c| c.canonicalize()),
+    ) else {
+        return;
+    };
+    if cwd != top && cwd.starts_with(&top) && !cwd.starts_with(&git_dir) {
+        let _ = std::env::set_current_dir(top);
+    }
 }
 
 /// `cmd_bisect()`'s `OPT_SUBCOMMAND` table and its `!fn` fallback.
@@ -1278,10 +1305,11 @@ fn bisect_checkout(ctx: &Ctx, id: ObjectId, no_checkout: bool) -> Result<u8> {
     if no_checkout {
         ctx.state_write("BISECT_HEAD", id)?;
     } else {
-        // Through `run_command()` in git; see `crate::cstdio::run_command`.
-        let _child = crate::cstdio::run_command();
-        let code = super::checkout::checkout(&["-q".to_string(), id.to_hex().to_string()])?;
-        if code != ExitCode::SUCCESS {
+        // `strvec_pushl(&cmd.args, "checkout", "-q", oid_to_hex(bisect_rev), "--", NULL);`
+        // (bisect.c:753-754): a `git checkout` child, so [`run_checkout`] gives it the
+        // gates a fresh process passes, `NEED_WORK_TREE` among them, and a session
+        // driven from inside `.git` fails with the child's `fatal:` line.
+        if !run_checkout(&["-q", &id.to_hex().to_string(), "--"])? {
             return Ok(BISECT_FAILED);
         }
     }
@@ -1610,7 +1638,11 @@ fn bisect_reset(ctx: &Ctx, commit: Option<&str>, quiet: bool) -> Result<bool> {
     // commit-ish that fails to resolve.
     let target = match commit {
         Some(spec) => {
-            if resolve(&ctx.repo, spec).is_err() {
+            // `repo_get_oid_commit()` (builtin/bisect.c:256) only hints the
+            // disambiguation with GET_OID_COMMITTISH; it does not peel, so a tree or
+            // blob name passes here and is refused by the child `checkout` below.
+            die_on_branch_mark(&ctx.repo, spec);
+            if crate::objname::resolve_quiet_as(&ctx.repo, spec, Some("committish")).is_none() {
                 eprintln!("error: '{spec}' is not a valid commit");
                 return Ok(false);
             }
@@ -1965,7 +1997,18 @@ fn start(args: &[String]) -> Result<ExitCode> {
             // repository does not have warns and *then* becomes the head of the
             // pathspec list.
             crate::objname::warn_ambiguous_refname(&ctx.repo, arg);
-            match resolve(&ctx.repo, arg) {
+            let resolution = resolve(&ctx.repo, arg);
+            // `peel_onion()` raises its `error()` from inside that same
+            // `get_oidf()` (object-name.c), so a tree or blob operand reports
+            // `<arg>^{commit}: expected commit type, but the object dereferences
+            // to tree type` before it is refused (with `--`) or taken as the
+            // head of the pathspec (without).
+            if resolution.is_err() {
+                if let Some(message) = crate::objname::peel_type_error(&ctx.repo, &format!("{arg}^{{commit}}")) {
+                    eprintln!("error: {message}");
+                }
+            }
+            match resolution {
                 Ok(id) => resolved.push(id),
                 Err(_) if has_double_dash => {
                     eprintln!("fatal: '{arg}' does not appear to be a valid revision");
@@ -2578,7 +2621,9 @@ fn sq_dequote_argv(text: &str) -> Vec<String> {
 /// writes its ref/log without stepping — and a single `bisect_auto_next` runs at
 /// the end, so the terminal output is the start status plus the final step.
 fn replay_cmd(args: &[String]) -> Result<ExitCode> {
-    let Some(file) = args.first() else {
+    // `if (argc != 1) return error(_("no logfile given"));` (builtin/bisect.c:1548-1549):
+    // a second operand is refused like a missing one.
+    let [file] = args else {
         eprintln!("error: no logfile given");
         return Ok(ExitCode::from(1));
     };
@@ -2947,6 +2992,13 @@ fn auto_next(ctx: &Ctx, terms: &Terms, no_checkout: bool) -> Result<u8> {
     }
 
     let bad = bad.expect("checked above");
+    // `bisect_auto_next()` hands a session with both sides known to `bisect_next()`,
+    // which opens with `if (bisect_autostart(terms)) return BISECT_FAILED;`
+    // (builtin/bisect.c:771-777, :797-800): a replayed log with marks but no
+    // `start` line has refs and no `BISECT_START`, and stops there.
+    if !autostart(ctx) {
+        return Ok(BISECT_FAILED);
+    }
     take_step(ctx, terms, bad, goods, no_checkout)
 }
 
@@ -3018,7 +3070,7 @@ fn take_step(
     let Some(best) = best else {
         // `if (!revs.commits)`: nothing survived the filter, so every remaining
         // candidate was skipped.
-        if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates.list)? {
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, None, terms, &candidates.pruned)? {
             return Ok(code);
         }
         // `printf(_("%s was both '%s' and '%s'\n"), …)` (bisect.c:1093-1096) — the terms
@@ -3048,7 +3100,7 @@ fn take_step(
     if best == bad {
         // The bad end is all that is left, and skipped commits could still hide
         // the real culprit — git says so instead of naming one.
-        if let Some(code) = error_if_skipped_commits(ctx, &tried, Some(bad), terms, &candidates.list)? {
+        if let Some(code) = error_if_skipped_commits(ctx, &tried, Some(bad), terms, &candidates.pruned)? {
             return Ok(code);
         }
         return report_first_bad(ctx, bad, terms);
@@ -3112,6 +3164,25 @@ fn check_merge_bases(
             return Ok(Some(handle_bad_merge_base(ctx, bad, goods, terms)?));
         }
         if goods.contains(&mb) {
+            continue;
+        }
+        // `else if (0 <= oid_array_lookup(&skipped_revs, mb)) handle_skipped_merge_base(mb);`
+        // (bisect.c:875-876, :831-844): a skipped merge base is warned about and the
+        // loop goes on to the next one. `oid_array_lookup()` has sorted `good_revs`
+        // by then (the `good_revs` lookup just above), so the hexes are in oid order.
+        if ctx.skipped()?.contains(&mb) {
+            let mut sorted_goods = goods.to_vec();
+            sorted_goods.sort();
+            let good_hex: Vec<String> = sorted_goods.iter().map(|g| g.to_hex().to_string()).collect();
+            let bad_hex = bad.to_hex().to_string();
+            eprintln!(
+                "warning: the merge base between {bad_hex} and [{}] must be skipped.\n\
+                 So we cannot be sure the first '{}' commit is between {} and {bad_hex}.\n\
+                 We continue anyway.",
+                good_hex.join(" "),
+                terms.bad,
+                mb.to_hex()
+            );
             continue;
         }
         // A merge base that is neither the bad rev nor already good has to be
@@ -4076,7 +4147,7 @@ fn error_if_skipped_commits(
     tried: &[ObjectId],
     bad: Option<ObjectId>,
     terms: &Terms,
-    candidates: &[ObjectId],
+    pruned: &HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<Option<u8>> {
     if tried.is_empty() {
         return Ok(None);
@@ -4092,15 +4163,50 @@ fn error_if_skipped_commits(
     println!("We cannot bisect more!");
 
     ctx.append_log("# only skipped commits left to test\n")?;
-    for id in candidates {
+    for id in skipped_commits_walk(ctx, terms, pruned)? {
         ctx.append_log(&format!(
             "# possible first '{}' commit: [{}] {}\n",
             terms.bad,
             id.to_hex(),
-            subject(&ctx.repo, *id)?
+            subject(&ctx.repo, id)?
         ))?;
     }
     Ok(Some(BISECT_ONLY_SKIPPED_LEFT))
+}
+
+/// The walk `bisect_skipped_commits()` lists (builtin/bisect.c:701-741): `prepare_revs()`
+/// (:658-699) runs `setup_revisions(0, NULL, revs, NULL)` and adds every
+/// `refs/bisect/<bad>*` ref as a tip and every `refs/bisect/<good>-*` ref as
+/// UNINTERESTING, so `BISECT_FIRST_PARENT` does not narrow it: the `<bad> ^<good>…`
+/// range in `limit_list()` order.
+///
+/// The pathspec still shows through. The step that just failed ran in the same
+/// process, and `try_to_simplify_commit()` pruned each TREESAME commit's
+/// `commit->parents` in place (revision.c), which `reset_revision_walk()` does not
+/// undo; this walk follows those pruned parents, so the side of a merge the
+/// pathspec dropped is not listed.
+fn skipped_commits_walk(
+    ctx: &Ctx,
+    terms: &Terms,
+    pruned: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    let mut bad = ctx.bisect_refs(|name| name.starts_with(terms.bad.as_str()))?;
+    bad.sort_by(|a, b| a.0.cmp(&b.0));
+    let good_prefix = format!("{}-", terms.good);
+    let mut good = ctx.bisect_refs(|name| name.starts_with(&good_prefix))?;
+    good.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut model = ObjectFlags::default();
+    for (&id, parents) in pruned {
+        model.parse(&ctx.repo, id)?;
+        if let Some(entry) = model.commits.get_mut(&id) {
+            entry.0 = parents.clone();
+        }
+    }
+    let mut tips: Vec<(ObjectId, u32)> = bad.into_iter().map(|(_, id)| (id, 0)).collect();
+    tips.extend(good.into_iter().map(|(_, id)| (id, F_UNINTERESTING)));
+    let list = model.limit_list(&ctx.repo, &tips, false)?;
+    Ok(list.into_iter().filter(|c| model.get(*c) & F_UNINTERESTING == 0).collect())
 }
 
 /// git's `estimate_bisect_steps`.

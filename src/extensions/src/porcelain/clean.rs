@@ -335,9 +335,6 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     // worktree. A magic-parse failure is `fatal:` / exit 128 — not the exit 1
     // that `anyhow` would collapse a walk-time parse error to. Parse here with
     // the same defaults the walk uses so acceptance never diverges from it.
-    let pathspec_defaults = repo.pathspec_defaults_inherit_ignore_case(true)?;
-    // Whether every element is a bare `:(attr:…)` — attribute requirements and
-    // no path pattern at all. See [`attr_pathspec_matches`] for what that buys.
     // Both of `init_pathspec_item()`'s `die()`s, in git's order and with git's two
     // operands. The escape check used to be a private one that returned early for
     // *any* element starting with `:` (so `:(icase)../x` walked straight out of
@@ -348,37 +345,12 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(128));
     }
-    let mut attr_only_pathspec = !pathspecs.is_empty();
-    for spec in &pathspecs {
-        if let Ok(pattern) = gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
-            attr_only_pathspec &= !pattern.attributes.is_empty()
-                && pattern.path().is_empty()
-                && !pattern.is_excluded();
-        }
-    }
 
     // With a pathspec, git removes everything it matches, directories included.
     if !pathspecs.is_empty() {
         remove_directories = true;
     }
 
-    let index = repo.index_or_load_from_head_or_empty()?;
-
-    // Emission modes, chosen to mirror git's `dir.c` flags for each combination:
-    //   * `-X` keeps untracked entries un-collapsed so an untracked directory
-    //     never swallows the ignored files inside it (which are the targets).
-    //   * `for_deletion` is only set with `-d`; it is what stops a directory
-    //     from collapsing when it also holds files we would not delete, so that
-    //     `git clean -nd` reports `dir/file` instead of `dir/`.
-    //   * with `-x` and `-e` the only ignore patterns left are the command-line ones,
-    //     and everything they match is a file to *keep*. The walk is told so by making
-    //     those patterns *precious*, which is what stops a directory holding one of
-    //     them from collapsing over it — git reports `dir/deletable` there, never
-    //     `dir/`, because removing the directory would take the excluded file with it.
-    //
-    // `-X` keeps git's standard excludes (they are what it deletes); only `-x` drops
-    // them and leaves the `-e` patterns as the sole protection.
-    let cmdl_excludes_only = ignored_too && !ignored_only && !excludes.is_empty();
     // `setup_standard_excludes()` reads `core.excludesFile` before the walk and
     // dies on a path it cannot use, which is fatal for every mode `clean` has —
     // see [`crate::config::excludes_file_fatal`]. `-x` is the one exception in
@@ -389,104 +361,110 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     }
-    let mut options = repo
-        .dirwalk_options()?
-        .empty_patterns_match_prefix(true)
-        .emit_untracked(if ignored_only {
-            gix::dir::walk::EmissionMode::Matching
-        } else {
-            gix::dir::walk::EmissionMode::CollapseDirectory
-        })
-        .emit_ignored(
-            (ignored_too || ignored_only)
-                .then_some(gix::dir::walk::EmissionMode::CollapseDirectory),
-        )
-        .emit_empty_directories(remove_directories)
-        // `fill_directory()` has no notion of the working directory; the refusal to
-        // remove it is `remove_dirs()`'s (builtin/clean.c:252-265).
-        .current_dir_may_collapse(true);
-    options = options.for_deletion(
-        remove_directories
-            .then_some(gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories),
-    );
-    // See [`attr_pathspec_matches`]: the walk decides directory candidates for itself,
-    // so an attribute-only pathspec is applied to what it emitted instead of
-    // inside it.
-    let attr_only = attr_only_pathspec && ignored_too && !ignored_only && excludes.is_empty();
-    let mut attr_match = match attr_only {
-        false => None,
-        true => Some(
-            repo.pathspec(
-                true,
-                pathspecs.iter().map(|s| s.as_bytes()),
-                true,
-                &repo.index_or_load_from_head_or_empty()?.into_owned(),
-                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-            )?
-            .prefer_cwd()
-            .detach()?,
-        ),
-    };
-    let walk_pathspecs: &[String] = if attr_only { &[] } else { &pathspecs };
-    let entries = walk(&repo, index, walk_pathspecs, &excludes, cmdl_excludes_only, options)?;
 
-    // (sort key = repo-relative path with a trailing '/' for directories, repo-relative path, is_dir)
-    let mut targets: Vec<(BString, BString, bool)> = Vec::new();
-    for entry in entries {
-        match entry.status {
-            gix::dir::entry::Status::Pruned | gix::dir::entry::Status::Tracked => continue,
-            gix::dir::entry::Status::Untracked if ignored_only => continue,
-            // With `-x` and `-e` the stack holds nothing but the command-line patterns,
-            // so an ignored entry is one the caller asked to keep, not one to delete.
-            gix::dir::entry::Status::Ignored(_) if cmdl_excludes_only => continue,
-            gix::dir::entry::Status::Ignored(_) if !(ignored_too || ignored_only) => continue,
-            _ => {}
+    // The `dir.flags` `cmd_clean()` hands `fill_directory()` (builtin/clean.c:959-1011):
+    //
+    // ```c
+    // if (force > 1)
+    //         rm_flags = 0;
+    // else
+    //         dir.flags |= DIR_SKIP_NESTED_GIT;
+    //
+    // dir.flags |= DIR_SHOW_OTHER_DIRECTORIES;
+    // ...
+    // if (ignored_only)
+    //         dir.flags |= DIR_SHOW_IGNORED;
+    // ...
+    // if (remove_directories && !ignored_only) {
+    //         dir.flags |= DIR_SHOW_IGNORED_TOO;
+    //         if (!ignored)
+    //                 dir.flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+    //         dir.flags |= DIR_KEEP_UNTRACKED_CONTENTS;
+    // }
+    // ```
+    use gix::dir::read_directory::{
+        DIR_KEEP_UNTRACKED_CONTENTS, DIR_SHOW_IGNORED, DIR_SHOW_IGNORED_TOO,
+        DIR_SHOW_IGNORED_TOO_MODE_MATCHING, DIR_SHOW_OTHER_DIRECTORIES, DIR_SKIP_NESTED_GIT,
+    };
+    let mut dir_flags = DIR_SHOW_OTHER_DIRECTORIES;
+    if force < 2 {
+        dir_flags |= DIR_SKIP_NESTED_GIT;
+    }
+    if ignored_only {
+        dir_flags |= DIR_SHOW_IGNORED;
+    }
+    if remove_directories && !ignored_only {
+        dir_flags |= DIR_SHOW_IGNORED_TOO | DIR_KEEP_UNTRACKED_CONTENTS;
+        if !ignored_too {
+            dir_flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
         }
-        // `is_nonbare_repository_dir()` (setup.c:405) is the only repository test
-        // git's directory walk makes, and it looks at `<dir>/.git` alone:
-        //
+    }
+
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let state: &gix::index::State = &index;
+    let mut excluded = excludes_for_walk(&repo, state, &excludes, ignored_too)?;
+
+    // `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_CWD, prefix, argv)`
+    // (builtin/clean.c:1024-1026): with no element the pathspec is the current
+    // directory. `core.ignoreCase` plays no part in matching it; only `:(icase)` folds.
+    let mut ps = repo
+        .pathspec(
+            true,
+            pathspecs.iter().map(|s| s.as_bytes()),
+            false,
+            state,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )?
+        .prefer_cwd();
+
+    // `fill_directory(&dir, the_repository->index, &pathspec)` then
+    // `correct_untracked_entries(&dir)` (builtin/clean.c:1027-1028). A walk from
+    // the "/" a rooted `:(top)/` names dies in `prep_exclude()` there.
+    let walked = repo.fill_directory(
+        state,
+        &mut ps,
+        dir_flags,
+        &mut |path, is_dir| excluded(path, is_dir),
+        None,
+    )?;
+    let entries = correct_untracked_entries(walked.entries, &walked.ignored);
+
+    // (sort key = the entry's name, with git's trailing '/' for a directory; the
+    // repo-relative path; is_dir)
+    let mut targets: Vec<(BString, BString, bool)> = Vec::new();
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("this operation requires a work tree"))?;
+    for name in entries {
         // ```c
-        // strbuf_addstr(path, ".git");
-        // if (read_gitfile_gently(path->buf, &gitfile_error) || is_git_directory(path->buf))
-        //         ret = 1;
+        // if (!index_name_is_other(the_repository->index, ent->name, ent->len))
+        //         continue;
+        //
+        // if (lstat(ent->name, &st))
+        //         die_errno("Cannot lstat '%s'", ent->name);
+        //
+        // if (S_ISDIR(st.st_mode) && !remove_directories)
+        //         continue;
         // ```
         //
-        // gix additionally recognises a *bare* repository directory as
-        // `Kind::Repository` (`gix-dir/src/walk/classify.rs:318`), which git does
-        // not — a directory that merely looks like a git directory is ordinary
-        // untracked content to `git clean -dx`, removed without the second `-f`.
-        let is_repo_kind = entry.disk_kind == Some(gix::dir::entry::Kind::Repository);
-        let is_repo = is_repo_kind
-            && repo
-                .workdir_path(entry.rela_path.as_bstr())
-                .is_some_and(|p| p.join(".git").exists());
-        // Whether it counts as a repository or not, a directory is still removed
-        // as a directory — the two questions are separate, and conflating them
-        // sends a bare repository's path to `remove_file`.
-        let is_dir = is_repo_kind || entry.disk_kind == Some(gix::dir::entry::Kind::Directory);
+        // (builtin/clean.c:1030-1041.)
+        if !super::ls_files::index_name_is_other(state, name.as_bstr()) {
+            continue;
+        }
+        let rela_path = BString::from(name.strip_suffix(b"/").unwrap_or(&name));
+        let st = match workdir.join(gix::path::from_bstr(rela_path.as_bstr())).symlink_metadata() {
+            Ok(st) => st,
+            Err(err) => {
+                eprintln!("fatal: Cannot lstat '{name}': {}", errno_text(&err));
+                return Ok(ExitCode::from(128));
+            }
+        };
+        let is_dir = st.is_dir();
         if is_dir && !remove_directories {
             continue;
         }
-        // A nested repository is only removed with a second -f, as in git.
-        if is_repo && force < 2 {
-            continue;
-        }
-        // The attribute-only pathspec, asked about this candidate rather than
-        // about what is under it. See [`attr_pathspec_matches`].
-        if let Some(ps) = attr_match.as_mut() {
-            if !attr_pathspec_matches(ps, entry.rela_path.as_bstr(), is_dir) {
-                continue;
-            }
-        }
-
-        let mut key = entry.rela_path.clone();
-        if is_dir {
-            key.push(b'/');
-        }
-        targets.push((key, entry.rela_path, is_dir));
+        targets.push((name, rela_path, is_dir));
     }
-
-    targets.sort_by(|a, b| a.0.cmp(&b.0));
 
     // `-i` drives git's prompt loop over the sorted candidate set, narrowing it
     // to the survivors that the removal pass below then deletes (or, with `-n`,
@@ -798,289 +776,88 @@ impl RemoveDirs<'_> {
     }
 }
 
-/// Why a bare `:(attr:…)` pathspec is kept out of the walk and applied to what
-/// the walk emitted.
-///
-/// git decides a **directory** candidate's fate before it descends into it, in
-/// `treat_directory()` (dir.c:1966-2006):
-///
-/// ```c
-/// /* The "len-1" is to strip the final '/' */
-/// enum exist_status status = directory_exists_in_index(istate, dirname, len-1);
-///
-/// if (status == index_directory)
-///         return path_recurse;
-/// ...
-/// if (pathspec && !excluded) {
-///         matches_how = match_pathspec_with_flags(istate, pathspec,
-///                                                 dirname, len,
-///                                                 0 /* prefix */,
-///                                                 NULL /* seen */,
-///                                                 DO_MATCH_LEADING_PATHSPEC);
-///         if (!matches_how)
-///                 return path_none;
-/// }
-/// ```
-///
-/// and `match_pathspec_item()` evaluates the attribute half against that
-/// directory's own path, unconditionally and with no directory special case
-/// (dir.c:428-433, `match_pathspec_attrs()` at pathspec.c:767-803). `attr.c`
-/// trims the trailing `/` before matching (attr.c:1052-1065), so a directory has
-/// whatever attributes a `.gitattributes` rule gives its name — and nothing from
-/// the files inside it. So `git clean -ndx -- ':(attr:text)'` lists
-/// `sub/deep-ignored/` only if *that name* carries `text`, whatever
-/// `sub/deep-ignored/thing.txt` carries.
-///
-/// The walk here answers the opposite question. `gix_dir` matches the pathspec
-/// against files and collapses a directory whose contents all matched, so it
-/// reported `sub/deep-ignored/` on the strength of the `.txt` inside it and
-/// dropped a directory whose own name carries the attribute. Neither answer can
-/// be corrected from the emitted set alone while the pathspec is also what
-/// pruned the walk, so for the one shape where git's rule reduces to a test on
-/// the candidate's own path the walk is run **unfiltered** and the pathspec is
-/// applied afterwards, once per emitted entry, with the entry's own
-/// directory-ness.
-///
-/// That reduction needs three conditions, and each is checked:
-///
-/// * **every element is a bare `:(attr:…)`** — with `item->match` empty,
-///   `match_pathspec_item()` returns `MATCHED_RECURSIVELY` the moment the
-///   attribute test passes (dir.c:436-437), so the pathspec *is* the attribute
-///   predicate and `DO_MATCH_LEADING_PATHSPEC` has no prefix to recurse for;
-/// * **`-x`, and no `-e`** — `cmd_clean()` skips `setup_standard_excludes()`
-///   under `-x` (builtin/clean.c:968-969), so `dir->exclude_per_dir` stays NULL
-///   and no pattern list exists: `excluded` is 0 for every candidate and the
-///   `!excluded` guard above is always taken. Under `-X`, or by default, an
-///   ignored directory skips the pathspec test entirely and is reported
-///   unconditionally, which this does not reproduce;
-/// * **a pathspec is present**, which implies `-d` (see `remove_directories`
-///   above), so every untracked directory is emitted collapsed and an emitted
-///   entry's ancestors are all directories the index has entries under — the
-///   `index_directory` short-circuit at dir.c:1984-1985, which recurses without
-///   consulting the pathspec at all.
-///
-/// Outside those conditions nothing changes and the walk keeps the pathspec, so
-/// the `-X` and default-mode divergences above are left standing rather than
-/// half-corrected.
-fn attr_pathspec_matches(
-    ps: &mut gix::PathspecDetached,
-    rela_path: &BStr,
-    is_dir: bool,
-) -> bool {
-    let stack = &mut ps.stack;
-    let odb = &ps.odb;
-    // `match_pathspec_attrs()` (pathspec.c:767-803) asks the attribute stack
-    // about the candidate; `attr.c:1052-1065` trims a trailing `/` and matches
-    // the name, so a directory is asked about as a directory.
-    let mut attrs = |relative_path: &BStr,
-                     case: gix::pathspec::attributes::glob::pattern::Case,
-                     is_dir: bool,
-                     out: &mut gix::pathspec::attributes::search::Outcome|
-     -> bool {
-        let stack = stack.as_mut().expect("a pathspec that carries attributes");
-        let mode = if is_dir {
-            gix::index::entry::Mode::DIR
-        } else {
-            gix::index::entry::Mode::FILE
-        };
-        stack
-            .set_case(case)
-            .at_entry(relative_path, Some(mode), odb)
-            .is_ok_and(|platform| platform.matching_attributes(out))
-    };
-    ps.search
-        .pattern_matching_relative_path(rela_path, Some(is_dir), &mut attrs)
-        .is_some_and(|m| !m.is_excluded())
-}
-
-/// Run the directory walk and collect every emitted entry.
-///
-/// Without `-e` patterns this is `Repository::dirwalk_iter`. With them the walk
-/// has to be driven directly, because the convenience entry points hard-code an
-/// empty override group for the exclude stack; the overrides are consulted ahead
-/// of every `.gitignore`, which is where git puts its `EXC_CMDL` patterns.
-fn walk(
-    repo: &gix::Repository,
-    index: gix::worktree::IndexPersistedOrInMemory,
-    pathspecs: &[String],
+/// `is_excluded()` against the pattern lists `cmd_clean()` set up for its walk:
+/// `setup_standard_excludes()` unless `-x` (builtin/clean.c:968-969), and the
+/// `-e` patterns in their own `EXC_CMDL` list either way (builtin/clean.c:1020-1022),
+/// consulted ahead of every file. Under `-x` with no `-e` there is no list at all
+/// and nothing is excluded.
+fn excludes_for_walk<'r>(
+    repo: &'r gix::Repository,
+    state: &gix::index::State,
     excludes: &[String],
-    // `-x`: `cmd_clean()` skips `setup_standard_excludes()`, so no `.gitignore`, no
-    // `info/exclude` and no `core.excludesFile` is read — but the `EXC_CMDL` group the
-    // `-e` patterns live in is added either way, and it is the only thing left that can
-    // hold a file back from deletion.
-    cmdl_excludes_only: bool,
-    options: gix::dirwalk::Options,
-) -> Result<Vec<gix::dir::Entry>> {
-    let patterns: Vec<BString> = pathspecs
-        .iter()
-        .map(|s| BString::from(s.clone().into_bytes()))
-        .collect();
-
-    if excludes.is_empty() {
-        let mut iter = repo.dirwalk_iter(index, patterns, Default::default(), options)?;
-        let mut entries = Vec::new();
-        for item in iter.by_ref() {
-            entries.push(item?.entry);
-        }
-        return Ok(entries);
+    ignored_too: bool,
+) -> Result<Box<dyn FnMut(&BStr, bool) -> bool + 'r>> {
+    if ignored_too && excludes.is_empty() {
+        return Ok(Box::new(|_, _| false));
     }
-
-    let state: &gix::index::State = &index;
-    let mut parse = gix::ignore::search::Ignore {
+    let parse = gix::ignore::search::Ignore {
         support_precious: repo
             .config_snapshot()
             .boolean("gitoxide.parsePrecious")
             .unwrap_or(false),
     };
-    // Under `-x` a `-e` match is the one thing that keeps a file, so the patterns enter
-    // the walk as *precious* (gitoxide's `$` marker): a directory holding a precious
-    // entry never collapses while walking for deletion, and one that holds nothing else
-    // is reported as ignored rather than as a deletion target.
-    let overrides = if cmdl_excludes_only {
-        parse.support_precious = true;
-        // A negated pattern takes protection *away* again, so it stays a plain negation:
-        // `$` and `!` cannot be combined, and a `!`-line is only ever consulted to undo
-        // an earlier match.
-        gix::ignore::Search::from_overrides(
-            excludes.iter().map(|p| {
-                if p.starts_with('!') {
-                    p.clone()
-                } else {
-                    format!("${p}")
-                }
-            }),
-            parse,
-        )
-    } else {
-        gix::ignore::Search::from_overrides(excludes.iter().cloned(), parse)
-    };
+    let cmdl = gix::ignore::Search::from_overrides(excludes.iter().cloned(), parse);
     let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
-    let mut exclude_stack = if cmdl_excludes_only {
+    let mut stack = if ignored_too {
         // Command-line patterns only: empty globals stand in for the `info/exclude` and
         // `core.excludesFile` git does not read under `-x`, and an empty per-directory
-        // name stops the stack from looking for `.gitignore` (the same lever
-        // `--no-exclude-per-directory` pulls in `ls-files`).
-        //
-        // The case sensitivity is the repository's own, as `Repository::excludes()`
-        // resolves it — `core.ignoreCase` as probed for this filesystem.
+        // name stops the stack from looking for `.gitignore`.
         let case = if repo.filesystem_options()?.ignore_case {
             gix::glob::pattern::Case::Fold
         } else {
             gix::glob::pattern::Case::Sensitive
         };
-        let ignore = gix::worktree::stack::state::Ignore::new(
-            overrides,
-            Default::default(),
-            Some("".into()),
-            source,
-            parse,
-        );
+        let ignore = gix::worktree::stack::state::Ignore::new(cmdl, Default::default(), Some("".into()), source, parse);
         let state_stack = gix::worktree::stack::State::IgnoreStack(ignore);
         let id_mappings = state_stack.id_mappings_from_index(state, state.path_backing(), case);
-        gix::worktree::Stack::new(
+        let stack = gix::worktree::Stack::new(
             repo.workdir().unwrap_or_else(|| repo.git_dir()),
             state_stack,
             case,
             Vec::with_capacity(512),
             id_mappings,
-        )
+        );
+        gix::AttributeStack::new(stack, repo)
     } else {
-        repo.excludes(state, Some(overrides), source)?.detach()
+        repo.excludes(state, Some(cmdl), source)?
     };
-    let gix::PathspecDetached {
-        mut search,
-        mut stack,
-        odb,
-    } = repo
-        .pathspec(
-            true,
-            patterns.iter(),
-            true,
-            state,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-        )?
-        .prefer_cwd()
-        .detach()?;
-
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| anyhow::anyhow!("this operation requires a work tree"))?;
-    let git_dir_realpath = gix::path::realpath(repo.git_dir())?;
-    let fs_caps = repo.filesystem_options()?;
-    let accelerate = fs_caps.ignore_case.then(|| state.prepare_icase_backing());
-
-    let mut opts: gix::dir::walk::Options<'_> = options.into();
-    // Linked worktrees inside our own worktree are marked tracked so a deletion
-    // walk cannot wander into them, exactly as `Repository::dirwalk` does.
-    let worktree_dirs: std::collections::BTreeSet<BString> = if opts.for_deletion.is_some() {
-        let real_workdir = gix::path::realpath(workdir)?;
-        repo.worktrees()?
-            .into_iter()
-            .filter_map(|proxy| proxy.base().ok())
-            .filter_map(|base| base.strip_prefix(&real_workdir).map(ToOwned::to_owned).ok())
-            .map(|rela| {
-                gix::path::to_unix_separators_on_windows(gix::path::into_bstr(rela)).into_owned()
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-    } else {
-        std::collections::BTreeSet::new()
-    };
-    if !worktree_dirs.is_empty() {
-        opts.worktree_relative_worktree_dirs = Some(&worktree_dirs);
-    }
-
-    let mut pathspec_attributes = |relative_path: &BStr,
-                                   case: gix::pathspec::attributes::glob::pattern::Case,
-                                   is_dir: bool,
-                                   out: &mut gix::pathspec::attributes::search::Outcome|
-     -> bool {
-        let stack = stack
-            .as_mut()
-            .expect("only called when pathspecs use attributes");
-        let mode = if is_dir {
-            gix::index::entry::Mode::DIR
-        } else {
-            gix::index::entry::Mode::FILE
-        };
-        stack
-            .set_case(case)
-            .at_entry(relative_path, Some(mode), &odb)
-            .is_ok_and(|platform| platform.matching_attributes(out))
-    };
-
-    let mut collect = Collect(Vec::new());
-    gix::dir::walk(
-        workdir,
-        gix::dir::walk::Context {
-            should_interrupt: None,
-            git_dir_realpath: git_dir_realpath.as_ref(),
-            current_dir: repo.current_dir(),
-            index: state,
-            ignore_case_index_lookup: accelerate.as_ref(),
-            pathspec: &mut search,
-            pathspec_attributes: &mut pathspec_attributes,
-            excludes: Some(&mut exclude_stack),
-            objects: &repo.objects,
-            explicit_traversal_root: None,
-        },
-        opts,
-        &mut collect,
-    )?;
-    Ok(collect.0)
+    Ok(Box::new(move |path, is_dir| {
+        let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
+        stack.at_entry(path, mode).map(|p| p.is_excluded()).unwrap_or(false)
+    }))
 }
 
-/// Accumulates every entry the walk emits, in walk order.
-struct Collect(Vec<gix::dir::Entry>);
-
-impl gix::dir::walk::Delegate for Collect {
-    fn emit(
-        &mut self,
-        entry: gix::dir::EntryRef<'_>,
-        _collapsed_directory_status: Option<gix::dir::entry::Status>,
-    ) -> gix::dir::walk::Action {
-        self.0.push(entry.to_owned());
-        std::ops::ControlFlow::Continue(())
+/// `correct_untracked_entries()` (builtin/clean.c:887-917) over `dir->entries` and
+/// `dir->ignored`, both sorted by `cmp_dir_entry()`: an entry that contains an
+/// ignored path is dropped, as is every entry inside one that is kept.
+fn correct_untracked_entries(entries: Vec<BString>, ignored: &[BString]) -> Vec<BString> {
+    // `check_dir_entry_contains()` (dir.c:2809-2814): `out` lexically strictly contains `in`.
+    let contains = |out: &BString, inner: &BString| {
+        out.len() < inner.len() && out.last() == Some(&b'/') && inner.starts_with(out)
+    };
+    let mut kept: Vec<BString> = Vec::with_capacity(entries.len());
+    let mut ign = 0;
+    let mut src = 0;
+    while src < entries.len() {
+        // "skip paths in ignored[] that cannot be inside entries[src]"
+        while ign < ignored.len() && entries[src] >= ignored[ign] {
+            ign += 1;
+        }
+        if ign < ignored.len() && contains(&entries[src], &ignored[ign]) {
+            // "entries[src] contains an ignored path, so we drop it"
+            src += 1;
+            continue;
+        }
+        // "entries[src] does not contain an ignored path, so we keep it", "then
+        // discard paths in entries[] contained inside entries[src]"
+        let ent = entries[src].clone();
+        src += 1;
+        while src < entries.len() && contains(&ent, &entries[src]) {
+            src += 1;
+        }
+        kept.push(ent);
     }
+    kept
 }
 
 /// Render a repository-relative path as git does for display: relative to the

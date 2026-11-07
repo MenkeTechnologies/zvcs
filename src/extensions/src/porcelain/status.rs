@@ -1123,37 +1123,19 @@ fn status_report(
     let mut work_pairs: Vec<(RenameSide, RenameSide)> = Vec::new();
     let hash = repo.object_hash();
     let mut unmerged: Vec<(u8, BString)> = Vec::new();
-    let mut untracked_paths: Vec<BString> = Vec::new();
-    let mut ignored_paths: Vec<BString> = Vec::new();
+    let mut untracked_paths: Vec<BString>;
+    let mut ignored_paths: Vec<BString>;
 
     let mut platform = repo
         .status(gix::progress::Discard)?
         .index_worktree_options_mut(preload_index_threads(&repo))
-        .untracked_files(match untracked {
-            Untracked::No => gix::status::UntrackedFiles::None,
-            Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
-            Untracked::All => gix::status::UntrackedFiles::Files,
-        });
+        // The untracked walk is git's own, [`wt_status_collect_untracked`], run once the
+        // diffs are in.
+        .untracked_files(gix::status::UntrackedFiles::None);
     // `opt.def = s->is_initial ? empty_tree : s->reference` (wt-status.c:673): the
     // staged section is the index against whatever the reference resolved to.
     platform =
         platform.head_tree(reference_tree.unwrap_or_else(|| repo.object_hash().empty_tree()));
-    if show_ignored {
-        // git lists ignored entries at the same granularity as untracked ones.
-        // `--ignored=matching` reports whatever the ignore pattern matched, so it never
-        // collapses; the traditional mode follows the untracked granularity, and under
-        // `-uall` it additionally descends into an ignored directory to name the files
-        // in it.
-        let mode = if untracked == Untracked::All || ignored_matching {
-            gix::dir::walk::EmissionMode::Matching
-        } else {
-            gix::dir::walk::EmissionMode::CollapseDirectory
-        };
-        let descend = untracked == Untracked::All && !ignored_matching;
-        platform = platform.dirwalk_options(|opts| {
-            opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
-        });
-    }
     // Rename detection is git's own `diffcore_rename()` pass, run over the
     // collected pairs below — gix's tracker scores similarity differently and has
     // no worktree-side equivalent at all, so it stays off on both halves.
@@ -1373,15 +1355,7 @@ fn status_report(
                             unstaged.push((kind, rela_path, None, sub));
                         }
                     },
-                    Item::DirectoryContents { entry, .. } => match entry.status {
-                        gix::dir::entry::Status::Untracked => {
-                            untracked_paths.push(walk_path(&entry));
-                        }
-                        gix::dir::entry::Status::Ignored(_) => {
-                            ignored_paths.push(walk_path(&entry));
-                        }
-                        _ => {}
-                    },
+                    Item::DirectoryContents { .. } => {}
                     // Rename tracking is disabled for the index↔worktree pass in the
                     // default status platform, so this never fires; ignore defensively.
                     Item::Rewrite { .. } => {}
@@ -1430,11 +1404,8 @@ fn status_report(
     // lists through `index_name_is_other()`.
     {
         let index = repo.index_or_empty()?;
-        untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
-        ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
-        if ignored_matching {
-            collapse_to_matching_ignore(&repo, &index, &mut ignored_paths)?;
-        }
+        (untracked_paths, ignored_paths) =
+            wt_status_collect_untracked(&repo, &index, untracked, show_ignored, ignored_matching, &pathspecs)?;
         // The long and short formats print no `u` line, but `run_diff_files()` compares an
         // unmerged path's stage 2 for them all the same, so a gitlink there whose
         // `<path>/.git` is unusable dies in `is_submodule_modified()` as it does for
@@ -2275,96 +2246,84 @@ fn parse_git_int(value: &str) -> Option<i64> {
     Some(val * factor)
 }
 
-/// `--ignored=matching` (`SHOW_MATCHING_IGNORED`) names the entity an ignore rule
-/// matched, and for anything inside an ignored *directory* that entity is the
-/// directory: stock answers `!! build/` for
-/// `status --porcelain --ignored=matching -- build/output.o` and
-/// `!! sub/deep-ignored/` for a pathspec naming the file inside it. The depth of
-/// the pathspec never changes the answer — the collapse is a property of the
-/// mode, not of what was asked for.
+/// `wt_status_collect_untracked()` (wt-status.c:806-850): `s->untracked` and
+/// `s->ignored` as `fill_directory()` collects them over `s->pathspec`, each name
+/// kept only when `index_name_is_other()` says the index does not hold it. A
+/// directory's name ends in `/`.
 ///
-/// This runs as a pass over the walk's output rather than inside it because the
-/// walk stops collapsing as soon as a pathspec is present: `Status::can_recurse()`
-/// (gix-dir entry.rs) lets an ignored directory be descended when it carries a
-/// `pathspec_match`, which is what `git clean <pathspec>` needs and what made
-/// `status --ignored=matching -- sub` report `sub/deep-ignored/thing.txt` where
-/// stock reports the directory. Deciding it here is the same decision either way:
-/// the shallowest ancestor directory that an ignore rule matches *is* the entity
-/// git names, and an entry with no such ancestor is already it.
+/// ```c
+/// if (!s->show_untracked_files)
+///         return;
 ///
-/// A negated pattern (`!important.log`) is a match that does not ignore, so the
-/// ancestor scan skips it exactly as `last_matching_pattern()`'s callers do.
-fn collapse_to_matching_ignore(
+/// if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
+///         dir.flags |=
+///                 DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+/// if (s->show_ignored_mode) {
+///         dir.flags |= DIR_SHOW_IGNORED_TOO;
+///
+///         if (s->show_ignored_mode == SHOW_MATCHING_IGNORED)
+///                 dir.flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+/// } else {
+///         dir.untracked = istate->untracked;
+/// }
+///
+/// setup_standard_excludes(&dir);
+///
+/// fill_directory(&dir, istate, &s->pathspec);
+/// ```
+///
+/// `s->pathspec` is `parse_pathspec(&s.pathspec, 0, PATHSPEC_PREFER_FULL, prefix,
+/// argv)` (builtin/commit.c:1622-1624): with no element it is the whole tree, and
+/// `core.ignoreCase` plays no part in matching it. A walk from the "/" a rooted
+/// `:(top)/` names dies in `prep_exclude()`. The untracked cache this walk would read
+/// and fill is maintained by [`crate::untracked_cache::collect`] under the index lock;
+/// what it lists is what this walk lists.
+fn wt_status_collect_untracked(
     repo: &gix::Repository,
     index: &gix::index::State,
-    paths: &mut Vec<BString>,
-) -> Result<()> {
-    if paths.is_empty() {
-        return Ok(());
+    untracked: Untracked,
+    show_ignored: bool,
+    ignored_matching: bool,
+    pathspecs: &[BString],
+) -> Result<(Vec<BString>, Vec<BString>)> {
+    use gix::dir::read_directory::{DIR_SHOW_IGNORED_TOO, DIR_SHOW_IGNORED_TOO_MODE_MATCHING};
+    if untracked == Untracked::No {
+        return Ok((Vec::new(), Vec::new()));
     }
-    let mut stack = repo.excludes(
+    let mut dir_flags = crate::untracked_cache::status_dir_flags(untracked == Untracked::All);
+    if show_ignored {
+        dir_flags |= DIR_SHOW_IGNORED_TOO;
+        if ignored_matching {
+            dir_flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+        }
+    }
+    let mut excludes = repo.excludes(
         index,
         None,
         gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
     )?;
-    let mut out: Vec<BString> = Vec::with_capacity(paths.len());
-    for p in paths.iter() {
-        // A directory the walk emitted already carries the trailing separator
-        // [`walk_path`] adds; the scan below works on the bare name.
-        let core = match p.last() {
-            Some(b'/') => &p[..p.len() - 1],
-            _ => p.as_slice(),
-        };
-        let mut collapsed = None;
-        for (i, b) in core.iter().enumerate() {
-            if *b != b'/' {
-                continue;
-            }
-            let dir = &core[..i];
-            // `treat_directory()` never calls a directory ignored while the index
-            // holds something under it — `directory_exists_in_index()` sends it
-            // down the recursing arm first, which is why a `[Ll]ogs/` rule does not
-            // collapse a `logs/` that also carries a tracked `logs/keep.log`.
-            let mut with_sep = BString::from(dir);
-            with_sep.push(b'/');
-            if index.prefixed_entries(with_sep.as_ref()).is_some() {
-                continue;
-            }
-            let ignored = stack
-                .at_entry(gix::bstr::BStr::new(dir), Some(gix::index::entry::Mode::DIR))
-                .map(|plat| {
-                    plat.matching_exclude_pattern()
-                        .is_some_and(|m| !m.pattern.is_negative())
-                })
-                .unwrap_or(false);
-            if ignored {
-                let mut named = BString::from(dir);
-                named.push(b'/');
-                collapsed = Some(named);
-                break;
-            }
-        }
-        out.push(collapsed.unwrap_or_else(|| p.clone()));
-    }
-    // Several files under one ignored directory collapse onto the same name; git
-    // lists that directory once.
-    out.sort();
-    out.dedup();
-    *paths = out;
-    Ok(())
-}
-
-/// The repo-relative path a dirwalk entry should be displayed as: git suffixes a
-/// `/` on directories (and nested repositories) it reports as a single entry.
-fn walk_path(entry: &gix::dir::Entry) -> BString {
-    let mut path = entry.rela_path.clone();
-    if matches!(
-        entry.disk_kind,
-        Some(gix::dir::entry::Kind::Directory) | Some(gix::dir::entry::Kind::Repository)
-    ) {
-        path.push(b'/');
-    }
-    path
+    let mut ps = repo.pathspec(
+        false,
+        pathspecs,
+        false,
+        index,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+    )?;
+    let walked = repo.fill_directory(
+        index,
+        &mut ps,
+        dir_flags,
+        &mut |path, is_dir| {
+            let mode = is_dir.then_some(gix::index::entry::Mode::DIR);
+            excludes.at_entry(path, mode).map(|p| p.is_excluded()).unwrap_or(false)
+        },
+        None,
+    )?;
+    let is_other = |name: &BString| index_name_is_other(index, name.as_ref());
+    Ok((
+        walked.entries.into_iter().filter(is_other).collect(),
+        walked.ignored.into_iter().filter(is_other).collect(),
+    ))
 }
 
 enum HeadState {
@@ -3013,8 +2972,8 @@ fn porcelain_v2_output(
     // --------------------------------------------------------------- collect
     let mut recs: BTreeMap<BString, V2Rec> = BTreeMap::new();
     let mut unmerged: Vec<(u8, BString)> = Vec::new();
-    let mut untracked_paths: Vec<BString> = Vec::new();
-    let mut ignored_paths: Vec<BString> = Vec::new();
+    let mut untracked_paths: Vec<BString>;
+    let mut ignored_paths: Vec<BString>;
 
     let new_rec = || V2Rec {
         x: b'.',
@@ -3040,26 +2999,9 @@ fn porcelain_v2_output(
         .status(gix::progress::Discard)?
         .index_worktree_options_mut(preload_index_threads(repo))
         .head_tree(head_tree)
-        .untracked_files(match untracked {
-            Untracked::No => gix::status::UntrackedFiles::None,
-            Untracked::Normal => gix::status::UntrackedFiles::Collapsed,
-            Untracked::All => gix::status::UntrackedFiles::Files,
-        });
-    if show_ignored {
-        // `--ignored=matching` reports whatever the ignore pattern matched, so it never
-        // collapses; the traditional mode follows the untracked granularity, and under
-        // `-uall` it additionally descends into an ignored directory to name the files
-        // in it.
-        let mode = if untracked == Untracked::All || ignored_matching {
-            gix::dir::walk::EmissionMode::Matching
-        } else {
-            gix::dir::walk::EmissionMode::CollapseDirectory
-        };
-        let descend = untracked == Untracked::All && !ignored_matching;
-        platform = platform.dirwalk_options(|opts| {
-            opts.emit_ignored(Some(mode)).recurse_ignored_directories(descend)
-        });
-    }
+        // The untracked walk is git's own, [`wt_status_collect_untracked`], run once the
+        // diffs are in.
+        .untracked_files(gix::status::UntrackedFiles::None);
     // Rename detection runs as git's own `diffcore_rename()` pass below, over
     // both halves of the report; gix's tracker stays off.
     platform = platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
@@ -3281,11 +3223,7 @@ fn porcelain_v2_output(
                             r.sub = sub;
                         }
                     },
-                    Item::DirectoryContents { entry, .. } => match entry.status {
-                        gix::dir::entry::Status::Untracked => untracked_paths.push(walk_path(&entry)),
-                        gix::dir::entry::Status::Ignored(_) => ignored_paths.push(walk_path(&entry)),
-                        _ => {}
-                    },
+                    Item::DirectoryContents { .. } => {}
                     Item::Rewrite { .. } => {}
                 }
             }
@@ -3348,13 +3286,8 @@ fn porcelain_v2_output(
     let index = repo.index_or_empty()?;
     // The `u` lines' own `run_diff_files()` comparison, see [`unmerged_change`].
     let submodules = submodule_mode(repo, ignore_submodules, untracked);
-    // `wt_status_collect_untracked()` (wt-status.c:834, :840): a dirwalk entry whose
-    // name the index already holds is not untracked content.
-    untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
-    ignored_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
-    if ignored_matching {
-        collapse_to_matching_ignore(repo, &index, &mut ignored_paths)?;
-    }
+    (untracked_paths, ignored_paths) =
+        wt_status_collect_untracked(repo, &index, untracked, show_ignored, ignored_matching, pathspecs)?;
     for (path, r) in recs.iter_mut() {
         if !r.staged && !r.ita {
             // No staged change: HEAD == index for this path, so pull both from

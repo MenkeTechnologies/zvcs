@@ -1769,7 +1769,7 @@ fn index_name_pos(index: &gix::index::State, name: &[u8]) -> Result<usize, usize
 /// entry's trailing `/` is dropped before the lookup, which is what keeps
 /// `git ls-files -o --directory` from printing an untracked directory shadowing a
 /// tracked file of the same name — while `-k` still reports it as killed.
-fn index_name_is_other(index: &gix::index::State, name: &BStr) -> bool {
+pub(super) fn index_name_is_other(index: &gix::index::State, name: &BStr) -> bool {
     let bytes = name.as_bytes();
     let bytes = bytes.strip_suffix(b"/").unwrap_or(bytes);
     let Err(pos) = index_name_pos(index, bytes) else {

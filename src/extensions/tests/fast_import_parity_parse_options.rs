@@ -15,6 +15,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+#[path = "support/crash_report.rs"]
+mod crash_report;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// `git fast-import -h` on stock git 2.56.0, which `usage_with_options()`
@@ -56,10 +61,15 @@ Signing
 
 /// A fresh repository under a directory unique to this test.
 fn fixture(tag: &str) -> PathBuf {
+    fixture_as(BIN, tag)
+}
+
+/// [`fixture`], initialised by `bin`.
+fn fixture_as(bin: &str, tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("zvcs-fi-parseopt-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let status = Command::new(BIN)
+    let status = Command::new(bin)
         .args(["init", "-q", "-b", "main"])
         .current_dir(&root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -72,7 +82,12 @@ fn fixture(tag: &str) -> PathBuf {
 
 /// `git fast-import <args>` with `stream` on stdin: (stdout, stderr, status).
 fn fast_import(repo: &Path, args: &[&str], stream: &str) -> (String, String, i32) {
-    let mut child = Command::new(BIN)
+    fast_import_as(BIN, repo, args, stream)
+}
+
+/// [`fast_import`] run by `bin`.
+fn fast_import_as(bin: &str, repo: &Path, args: &[&str], stream: &str) -> (String, String, i32) {
+    let mut child = Command::new(bin)
         .arg("fast-import")
         .args(args)
         .current_dir(repo)
@@ -90,6 +105,29 @@ fn fast_import(repo: &Path, args: &[&str], stream: &str) -> (String, String, i32
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code().unwrap_or(-1),
     )
+}
+
+/// Stock git and a repository of its own for a test to compare against, or
+/// `None` when no stock git is installed.
+fn stock_fixture(tag: &str) -> Option<(&'static str, PathBuf)> {
+    stock_git::stock_git().map(|bin| (bin, fixture_as(bin, &format!("stock-{tag}"))))
+}
+
+/// Assert that zvcs's `got` for `args` and `stream` is what `stock` prints,
+/// crash-report pid aside.
+fn assert_matches_stock(
+    stock: &Option<(&str, PathBuf)>,
+    args: &[&str],
+    stream: &str,
+    got: &(String, String, i32),
+) {
+    let Some((bin, repo)) = stock else { return };
+    let (stdout, stderr, code) = fast_import_as(bin, repo, args, stream);
+    assert_eq!(
+        (got.2, got.0.as_str(), crash_report::without_pid(&got.1)),
+        (code, stdout.as_str(), crash_report::without_pid(&stderr)),
+        "{args:?} {stream:?}: zvcs and stock git differ"
+    );
 }
 
 const BLOB: &str = "blob\nmark :1\ndata 1\nx\n";
@@ -147,14 +185,16 @@ fn dashdash_and_detached_values_are_accepted() {
 #[test]
 fn callbacks_die_in_argv_order() {
     let repo = fixture("callbacks");
+    let stock = stock_fixture("callbacks");
     for (args, stream, want) in [
         (&["--quiet", "foo", "--depth=x"][..], "", "fatal: --depth: argument must be a non-negative integer\n"),
         (&["--quiet", "--max-pack-size=abc"], "", "fatal: --max-pack-size: argument must be a non-negative integer\n"),
         (&["--quiet"], "option git max-pack-size=zz\n", "fatal: --max-pack-size: argument must be a non-negative integer\n"),
         (&["--quiet"], "option git depth=99999\n", "fatal: --depth cannot exceed 8191\n"),
     ] {
-        let (_, stderr, code) = fast_import(&repo, args, stream);
-        assert_eq!((code, stderr.as_str()), (128, want), "{args:?} {stream:?}");
+        let got = fast_import(&repo, args, stream);
+        assert_eq!((got.2, got.1.lines().next()), (128, want.lines().next()), "{args:?} {stream:?}");
+        assert_matches_stock(&stock, args, stream, &got);
     }
 }
 
@@ -163,6 +203,7 @@ fn callbacks_die_in_argv_order() {
 #[test]
 fn stream_features_come_first_and_match_exactly() {
     let repo = fixture("features");
+    let stock = stock_fixture("features");
     for (args, stream, want) in [
         (
             &["--quiet", "--no-such-flag"][..],
@@ -191,8 +232,9 @@ fn stream_features_come_first_and_match_exactly() {
             "fatal: cannot read 'nope': No such file or directory\n",
         ),
     ] {
-        let (_, stderr, code) = fast_import(&repo, args, stream);
-        assert_eq!((code, stderr.as_str()), (128, want), "{args:?} {stream:?}");
+        let got = fast_import(&repo, args, stream);
+        assert_eq!((got.2, got.1.lines().next()), (128, want.lines().next()), "{args:?} {stream:?}");
+        assert_matches_stock(&stock, args, stream, &got);
     }
 
     // The command line's marks file replaces the stream's unread.

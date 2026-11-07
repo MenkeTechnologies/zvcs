@@ -56,10 +56,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+#[path = "support/crash_report.rs"]
+mod crash_report;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// A fresh repository, one per stream, so no run sees another's marks or refs.
-fn repo(tag: &str) -> PathBuf {
+fn repo(bin: &str, tag: &str) -> PathBuf {
     let root = std::env::temp_dir()
         .join(format!("zvcs-fi-diag-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -68,7 +73,7 @@ fn repo(tag: &str) -> PathBuf {
     let dir = root.join("repo");
     std::fs::create_dir_all(&dir).unwrap();
     assert!(
-        Command::new(BIN)
+        Command::new(bin)
             .args(["init", "-q", "-b", "main"])
             .current_dir(&dir)
             .env("ZVCS_HOME", root.join("home"))
@@ -90,10 +95,15 @@ struct Run {
 /// Feed `stream` to `git fast-import --quiet` (quiet only suppresses the stats
 /// block, never a `warning:`) plus `extra`, and collect everything it said.
 fn import(tag: &str, stream: &str, extra: &[&str]) -> Run {
-    let dir = repo(tag);
+    import_as(BIN, tag, stream, extra)
+}
+
+/// [`import`] run by `bin`.
+fn import_as(bin: &str, tag: &str, stream: &str, extra: &[&str]) -> Run {
+    let dir = repo(bin, tag);
     let mut args = vec!["fast-import", "--quiet"];
     args.extend_from_slice(extra);
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(bin)
         .args(&args)
         .current_dir(&dir)
         .env("ZVCS_HOME", dir.parent().unwrap().join("home"))
@@ -234,13 +244,25 @@ fn cat_blob_answers_a_missing_object_on_its_channel() {
     assert_eq!(r.err, "");
     assert_eq!(r.code, 0, "a missing object is not a fatal error");
 
-    let r = import("cattree", &format!("{PRELUDE}\ncat-blob :5\n"), &[]);
+    // The wrong type is a `die()`, so stock git follows it with its crash
+    // report; the whole of stderr is compared against stock when it is installed.
+    let stream = format!("{PRELUDE}\ncat-blob :5\n");
+    let r = import("cattree", &stream, &[]);
+    let first = r.err.lines().next().unwrap_or("");
     assert!(
-        r.err.starts_with("fatal: object ") && r.err.trim_end().ends_with(" is a commit but a blob was expected."),
+        first.starts_with("fatal: object ") && first.ends_with(" is a commit but a blob was expected."),
         "wrong-type message: {:?}",
         r.err
     );
     assert_eq!(r.code, 128);
+    if let Some(stock) = stock_git::stock_git() {
+        let want = import_as(stock, "stock-cattree", &stream, &[]);
+        assert_eq!(
+            (r.code, r.out.as_str(), crash_report::without_pid(&r.err)),
+            (want.code, want.out.as_str(), crash_report::without_pid(&want.err)),
+            "zvcs and stock git differ"
+        );
+    }
 }
 
 #[test]

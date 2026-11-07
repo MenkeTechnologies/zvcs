@@ -14,10 +14,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+#[path = "support/crash_report.rs"]
+mod crash_report;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// A fresh repository under a unique temp dir, with its own `ZVCS_HOME`.
 fn fixture(tag: &str) -> (PathBuf, PathBuf) {
+    fixture_as(BIN, tag)
+}
+
+/// [`fixture`], initialised by `bin`.
+fn fixture_as(bin: &str, tag: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("zvcs-fi-pack-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let repo = root.join("repo");
@@ -25,7 +35,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     let root = root.canonicalize().unwrap();
     let repo = repo.canonicalize().unwrap();
     assert!(
-        Command::new(BIN)
+        Command::new(bin)
             .args(["init", "-q", "-b", "main"])
             .current_dir(&repo)
             .env("ZVCS_HOME", root.join("home"))
@@ -40,7 +50,18 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 /// Run `git fast-import <args>` with `stream` on stdin, returning stdout, stderr
 /// and the exit code.
 fn fast_import(repo: &Path, home: &Path, args: &[&str], stream: &str) -> (String, String, i32) {
-    let mut child = Command::new(BIN)
+    fast_import_as(BIN, repo, home, args, stream)
+}
+
+/// [`fast_import`] run by `bin`.
+fn fast_import_as(
+    bin: &str,
+    repo: &Path,
+    home: &Path,
+    args: &[&str],
+    stream: &str,
+) -> (String, String, i32) {
+    let mut child = Command::new(bin)
         .arg("fast-import")
         .args(args)
         .current_dir(repo)
@@ -57,6 +78,21 @@ fn fast_import(repo: &Path, home: &Path, args: &[&str], stream: &str) -> (String
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code().unwrap_or(-1),
     )
+}
+
+/// Assert that zvcs's `got` for `args` and `stream` is what stock git prints on
+/// a repository of its own, crash-report pid aside. Nothing to compare against
+/// when no stock git is installed.
+fn assert_matches_stock(tag: &str, args: &[&str], stream: &str, got: &(String, String, i32)) {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let (root, repo) = fixture_as(stock, &format!("stock-{tag}"));
+    let (stdout, stderr, code) = fast_import_as(stock, &repo, &root.join("home"), args, stream);
+    assert_eq!(
+        (got.2, got.0.as_str(), crash_report::without_pid(&got.1)),
+        (code, stdout.as_str(), crash_report::without_pid(&stderr)),
+        "{args:?}: zvcs and stock git differ"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The `tmp_pack_*` entries currently in the object store.
@@ -120,11 +156,13 @@ fn fatal_error_removes_the_temporary_packfile() {
     let (root, repo) = fixture("fatal-date-format");
     let home = root.join("home");
 
-    let (_, stderr, code) = fast_import(&repo, &home, &["--date-format=bogus"], "");
+    let got = fast_import(&repo, &home, &["--date-format=bogus"], "");
+    let (_, stderr, code) = &got;
 
-    assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: unknown --date-format argument bogus\n");
+    assert_eq!(*code, 128, "stderr: {stderr}");
+    assert_eq!(stderr.lines().next(), Some("fatal: unknown --date-format argument bogus"));
     assert_eq!(temp_packs(&repo), Vec::<String>::new());
+    assert_matches_stock("fatal-date-format", &["--date-format=bogus"], "", &got);
 }
 
 /// `option_depth` holds `--depth` to `MAX_DEPTH`, `(1 << 13) - 1`, because the
@@ -137,25 +175,29 @@ fn depth_ceiling_is_a_fatal_and_the_radix_is_gits() {
     let (root, repo) = fixture("depth");
     let home = root.join("home");
 
-    let (_, stderr, code) = fast_import(&repo, &home, &["--depth=8192"], "");
-    assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: --depth cannot exceed 8191\n");
-    assert_eq!(temp_packs(&repo), Vec::<String>::new());
-
-    // `strtoul` saturates rather than failing, so an absurd value still reports
-    // the ceiling instead of a parse error.
-    let (_, stderr, code) = fast_import(&repo, &home, &["--depth=99999999999999999999999"], "");
-    assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: --depth cannot exceed 8191\n");
-
-    // Base 0: `0x1fff` is 8191, the largest depth git accepts.
-    let (_, stderr, code) = fast_import(&repo, &home, &["--depth=0x1fff"], "");
-    assert_eq!(code, 0, "stderr: {stderr}");
-
-    // A `-` anywhere in the argument is rejected outright by `ulong_arg`.
-    let (_, stderr, code) = fast_import(&repo, &home, &["--depth=-1"], "");
-    assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: --depth: argument must be a non-negative integer\n");
+    for (args, want) in [
+        (&["--depth=8192"][..], Some("fatal: --depth cannot exceed 8191")),
+        // `strtoul` saturates rather than failing, so an absurd value still
+        // reports the ceiling instead of a parse error.
+        (&["--depth=99999999999999999999999"], Some("fatal: --depth cannot exceed 8191")),
+        // Base 0: `0x1fff` is 8191, the largest depth git accepts.
+        (&["--depth=0x1fff"], None),
+        // A `-` anywhere in the argument is rejected outright by `ulong_arg`.
+        (&["--depth=-1"], Some("fatal: --depth: argument must be a non-negative integer")),
+    ] {
+        let got = fast_import(&repo, &home, args, "");
+        let (_, stderr, code) = &got;
+        // A clean run prints the statistics block, whose memory figures are
+        // this process's own, so only the fatal runs are compared as text.
+        let Some(want) = want else {
+            assert_eq!(*code, 0, "{args:?}: stderr: {stderr}");
+            continue;
+        };
+        assert_eq!(*code, 128, "{args:?}: stderr: {stderr}");
+        assert_eq!(stderr.lines().next(), Some(want), "{args:?}");
+        assert_eq!(temp_packs(&repo), Vec::<String>::new(), "{args:?}");
+        assert_matches_stock("depth", args, "", &got);
+    }
 }
 
 /// A run that succeeds must leave the object store as clean as it found it: an

@@ -29,10 +29,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+#[path = "support/crash_report.rs"]
+mod crash_report;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// A fresh repository under a unique temp dir, with its own `ZVCS_HOME`.
 fn fixture(tag: &str) -> (PathBuf, PathBuf) {
+    fixture_as(BIN, tag)
+}
+
+/// [`fixture`], initialised by `bin`.
+fn fixture_as(bin: &str, tag: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("zvcs-fi-onelevel-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let repo = root.join("repo");
@@ -40,7 +50,7 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     let root = root.canonicalize().unwrap();
     let repo = repo.canonicalize().unwrap();
     assert!(
-        Command::new(BIN)
+        Command::new(bin)
             .args(["init", "-q", "-b", "main"])
             .current_dir(&repo)
             .env("ZVCS_HOME", root.join("home"))
@@ -54,7 +64,12 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf) {
 
 /// Run `git fast-import --quiet --done` with `stream` on stdin.
 fn fast_import(repo: &Path, home: &Path, stream: &str) -> (String, i32) {
-    let mut child = Command::new(BIN)
+    fast_import_as(BIN, repo, home, stream)
+}
+
+/// [`fast_import`] run by `bin`.
+fn fast_import_as(bin: &str, repo: &Path, home: &Path, stream: &str) -> (String, i32) {
+    let mut child = Command::new(bin)
         .args(["fast-import", "--quiet", "--done"])
         .current_dir(repo)
         .env("ZVCS_HOME", home)
@@ -226,8 +241,11 @@ fn deleting_an_uppercase_one_level_ref_goes_through() {
 
 /// Accepting one-level names does not accept malformed ones: every name git's
 /// `check_refname_component()` rejects is still fatal, with git's own message.
+/// The whole of stderr — the `die()` and the crash report `die_nicely` adds —
+/// is stock git's, compared on a repository of its own when one is installed.
 #[test]
 fn malformed_names_are_still_fatal() {
+    let stock = stock_git::stock_git();
     for (tag, name) in [
         ("tilde", "bad~name"),
         ("dotdot", "a..b"),
@@ -244,14 +262,26 @@ fn malformed_names_are_still_fatal() {
     ] {
         let (root, repo) = fixture(tag);
         let home = root.join("home");
-        let (err, code) = fast_import(&repo, &home, &stream(name, "hello", 1700000000));
+        let s = stream(name, "hello", 1700000000);
+        let (err, code) = fast_import(&repo, &home, &s);
         assert_eq!(code, 128, "{name} should be fatal; stderr: {err}");
         assert_eq!(
-            err.trim_end(),
+            err.lines().next().unwrap_or(""),
             format!("fatal: branch name doesn't conform to Git standards: {name}"),
             "unexpected message for {name}"
         );
         let _ = std::fs::remove_dir_all(&root);
+
+        if let Some(stock) = stock {
+            let (root, repo) = fixture_as(stock, &format!("stock-{tag}"));
+            let (want, want_code) = fast_import_as(stock, &repo, &root.join("home"), &s);
+            assert_eq!(
+                (code, crash_report::without_pid(&err)),
+                (want_code, crash_report::without_pid(&want)),
+                "{name}: zvcs and stock git differ"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
 

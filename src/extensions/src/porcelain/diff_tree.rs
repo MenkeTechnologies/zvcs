@@ -2712,11 +2712,10 @@ fn combined_commit(
             out.extend_from_slice(&opts.line_prefix);
             out.push(term);
         }
-        if opts.line_prefix.is_empty() {
-            out.extend_from_slice(&patch);
-        } else {
-            prefix_lines(out, &patch, &opts.line_prefix);
-        }
+        // `diff_line_prefix(opt)` heads every line but the two `show_patch_diff()`
+        // writes with a bare `printf()` (combine-diff.c:971, :1150).
+        let bare = super::diff::combined_bare_spans(&patch);
+        out.extend_from_slice(&super::diff::apply_line_prefix_except(patch, &opts.line_prefix, &bare));
     }
     Ok(0)
 }
@@ -2797,16 +2796,6 @@ fn unified_context(diff_args: &[String]) -> u32 {
         }
     }
     ctx
-}
-
-/// Put `prefix` in front of every line of `body`, which is what `--line-prefix=<s>`
-/// asks for and what the combined patch engine — shared with `show`/`log`, neither of
-/// which prefixes — leaves to its caller.
-fn prefix_lines(out: &mut Vec<u8>, body: &[u8], prefix: &[u8]) {
-    for line in body.split_inclusive(|b| *b == b'\n') {
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(line);
-    }
 }
 
 /// `--merge-base <a> <b>`: resolve the two revisions to commits, compute their single

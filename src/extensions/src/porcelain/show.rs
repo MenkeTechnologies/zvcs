@@ -4207,6 +4207,14 @@ fn show_commit_record(
             None => pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
         };
         let combined_empty = survivors.as_ref().is_some_and(Vec::is_empty);
+        // `-R` turns the combined pairs around only under `find_paths_generic()`;
+        // `-S`/`-G` are part of what selects it (combine-diff.c:1542-1548).
+        let combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
+            repo,
+            &disp.patch,
+            disp.combined_all_paths,
+            pickaxe.active(),
+        );
         // git shows a blank line after a merge's message regardless of format,
         // then the combined diff against all parents, plus `--stat` (against the
         // first parent) when requested. The empty user format prints neither the
@@ -4240,6 +4248,7 @@ fn show_commit_record(
                     commit.id().detach(),
                     &parent_ids,
                     &combined_paths,
+                    combined_hdr.reversed_pairs,
                 )?,
             };
             for (path, letters) in rows {
@@ -4336,6 +4345,7 @@ fn show_commit_record(
                         disp.z,
                         true,
                         disp.combined_all_paths,
+                        combined_hdr.reversed_pairs,
                     )?);
                 }
                 needsep = true;
@@ -4369,10 +4379,7 @@ fn show_commit_record(
                         // `show_combined_header()` (combine-diff.c:931-933) takes
                         // `--full-index` and the two path prefixes off the same
                         // `diff_options` the two-way patch reads them from.
-                        &super::diff::CombinedHeaderOpts::from_patch_opts(
-                            &disp.patch,
-                            disp.combined_all_paths,
-                        ),
+                        &combined_hdr,
                     )?,
                 };
                 // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`
@@ -4385,6 +4392,11 @@ fn show_commit_record(
                 if wrote && !cc.is_empty() {
                     out.push(if disp.z { b'\0' } else { b'\n' });
                 }
+                // The bare `printf()` lines take no `diff_line_prefix()`
+                // (combine-diff.c:971, :1150).
+                let at = out.len();
+                let bare = super::diff::combined_bare_spans(&cc);
+                disp.no_prefix.borrow_mut().extend(bare.into_iter().map(|(s, e)| (at + s, at + e)));
                 out.extend_from_slice(&cc);
             }
         }

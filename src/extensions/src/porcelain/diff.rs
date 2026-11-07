@@ -6928,6 +6928,45 @@ impl Default for PatchOpts {
     }
 }
 
+impl PatchOpts {
+    /// `-R` reaches a merge's combined path set only through
+    /// `find_paths_generic()` (combine-diff.c:1378-1420), whose
+    /// `diff_tree_oid(parent_i, result)` queues pairs `diff_change()` and
+    /// `diff_addremove()` have swapped (diff.c:7605-7607, 7647-7652) before
+    /// `intersect_paths()` records them. The all-trees-at-once
+    /// `find_paths_multitree()` reports the trees as they are, so `-R` leaves
+    /// the combined diff alone there. The generic scan runs when
+    /// `need_generic_pathscan` holds (combine-diff.c:1542-1548):
+    ///
+    /// ```c
+    /// need_generic_pathscan = opt->skip_stat_unmatch ||
+    ///         opt->flags.follow_renames ||
+    ///         opt->break_opt != -1 ||
+    ///         opt->detect_rename ||
+    ///         (opt->pickaxe_opts &
+    ///          (DIFF_PICKAXE_KINDS_MASK & ~DIFF_PICKAXE_KIND_OBJFIND)) ||
+    ///         opt->filter;
+    /// ```
+    ///
+    /// `log` and `show` never raise `skip_stat_unmatch`, and `detect_rename` is
+    /// `diff.renames` (porcelain default on) unless `-M`/`-C`/`--no-renames` said
+    /// otherwise, with `--find-copies-harder` forcing copies (diff.c:5267-5268).
+    /// `generic_filter` is the `-S`/`-G`/`--follow` part, which these options do
+    /// not carry.
+    pub(crate) fn combined_pairs_reversed(&self, repo: &gix::Repository, generic_filter: bool) -> bool {
+        if !self.reverse {
+            return false;
+        }
+        let detect_rename = self.find_copies_harder
+            || self.renames.unwrap_or_else(|| {
+                diffcore_rename::config_rename(
+                    repo.config_snapshot().string("diff.renames").as_deref().map(|v| v.as_bstr()),
+                )
+            }) != 0;
+        generic_filter || detect_rename || self.break_opt != -1 || self.diff_filter.is_some()
+    }
+}
+
 /// The `a/` and `b/` a history command starts from before its own options are
 /// read: `diff_setup()`'s prefix decision (diff.c:5149-5153) over the values
 /// `git_diff_ui_config()` loaded, which `git log`, `git show` and
@@ -10549,13 +10588,18 @@ pub(crate) fn merge_combined_raw(
     z: bool,
     raw: bool,
     combined_all_paths: bool,
+    reversed_pairs: bool,
 ) -> Result<Vec<u8>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
-    let set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
+    let mut set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
+    // `-R` under the generic scan: see [`PatchOpts::combined_pairs_reversed`].
+    if reversed_pairs {
+        reverse_combined(&mut set);
+    }
     let fmt = if raw { F_RAW } else { F_NAME_STATUS };
     let mut out = Vec::new();
     for cp in &set {
@@ -11159,6 +11203,7 @@ pub(crate) fn merge_combined_names(
     commit: ObjectId,
     parents: &[ObjectId],
     paths: &[String],
+    reversed_pairs: bool,
 ) -> Result<Vec<(BString, String)>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
@@ -11166,7 +11211,12 @@ pub(crate) fn merge_combined_names(
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
 
-    Ok(combined_path_set(repo, &result_tree, &parent_trees, paths)?
+    let mut set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
+    // `-R` under the generic scan: see [`PatchOpts::combined_pairs_reversed`].
+    if reversed_pairs {
+        reverse_combined(&mut set);
+    }
+    Ok(set
         .into_iter()
         .map(|cp| {
             let letters = cp.parents.iter().map(|p| char::from(p.status)).collect();
@@ -11195,6 +11245,9 @@ pub(crate) struct CombinedHeaderOpts {
     pub(crate) b_prefix: Vec<u8>,
     /// `rev->combined_all_paths`: one `--- <prefix><path>` per parent.
     pub(crate) all_paths: bool,
+    /// The path set was gathered from `-R`-swapped pairs: see
+    /// [`PatchOpts::combined_pairs_reversed`].
+    pub(crate) reversed_pairs: bool,
 }
 
 impl Default for CombinedHeaderOpts {
@@ -11204,20 +11257,38 @@ impl Default for CombinedHeaderOpts {
             a_prefix: b"a/".to_vec(),
             b_prefix: b"b/".to_vec(),
             all_paths: false,
+            reversed_pairs: false,
         }
     }
 }
 
 impl CombinedHeaderOpts {
-    /// The same four fields as a caller that already parsed the diff options holds
+    /// The same fields as a caller that already parsed the diff options holds
     /// them. `--no-prefix` leaves the two prefixes empty, which is what git's null
     /// `a_prefix`/`b_prefix` fall back from.
-    pub(crate) fn from_patch_opts(o: &PatchOpts, all_paths: bool) -> Self {
+    ///
+    /// `log`/`show` swap `src_prefix`/`dst_prefix` under `-R` for the two-way
+    /// patch, whose `builtin_diff()` hands the names over the other way round
+    /// (diff.c:3841-3847). `show_combined_header()` reads `opt->a_prefix` and
+    /// `opt->b_prefix` as configured (combine-diff.c:931-932), so the swap is
+    /// undone here. `generic_filter` is the `-S`/`-G`/`--follow` part of
+    /// `need_generic_pathscan`, which the patch options do not carry.
+    pub(crate) fn from_patch_opts(
+        repo: &gix::Repository,
+        o: &PatchOpts,
+        all_paths: bool,
+        generic_filter: bool,
+    ) -> Self {
+        let (a_prefix, b_prefix) = match o.reverse {
+            true => (o.dst_prefix.clone(), o.src_prefix.clone()),
+            false => (o.src_prefix.clone(), o.dst_prefix.clone()),
+        };
         CombinedHeaderOpts {
             full_index: o.full_index,
-            a_prefix: o.src_prefix.clone(),
-            b_prefix: o.dst_prefix.clone(),
+            a_prefix,
+            b_prefix,
             all_paths,
+            reversed_pairs: o.combined_pairs_reversed(repo, generic_filter),
         }
     }
 }
@@ -11303,7 +11374,10 @@ pub(crate) fn combined_trees_patch_painted(
     colors: &diff_color::DiffColors,
     hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
-    let set = combined_path_set(repo, result_tree, parent_trees, paths)?;
+    let mut set = combined_path_set(repo, result_tree, parent_trees, paths)?;
+    if hdr.reversed_pairs {
+        reverse_combined(&mut set);
+    }
     // `show_combined_header()` (combine-diff.c:933): `opt->flags.full_index` picks
     // the whole hex, everything else `DEFAULT_ABBREV` — which `core.abbrev` moves.
     let hexsz = repo.object_hash().len_in_hex();
@@ -11483,6 +11557,30 @@ fn combined_patch(
     // Every path of one set has the same parents, so one count paints them all.
     let num_parent = set.first().map_or(0, |cp| cp.parents.len());
     Ok(colorize_combined(out, colors, line_prefix, num_parent))
+}
+
+/// The lines of an unprefixed combined patch (as [`combined_patch`] renders it for
+/// a caller that prefixes afterwards) that git writes with a bare `printf()`, so
+/// that neither `--line-prefix` nor a `--graph` padding row reaches them:
+/// `show_combined_header()`'s `printf("mode ")` continuation (combine-diff.c:971;
+/// a deletion's line opens with the prefixed `deleted file ` and is not one of
+/// these) and `show_patch_diff()`'s `printf("Binary files differ\n")`
+/// (combine-diff.c:1150). Half-open byte ranges into `patch`, ascending.
+///
+/// Only a buffer holding nothing but a combined patch may be scanned: there every
+/// other line opens with a header keyword, an `@`, an escape sequence, or
+/// `num_parent` sign columns of `' '`/`-`/`+`, so neither shape can be mistaken.
+/// The record assembly offsets these to wherever it places the patch.
+pub(crate) fn combined_bare_spans(patch: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for line in patch.split_inclusive(|&b| b == b'\n') {
+        if line.starts_with(b"mode ") || line == b"Binary files differ\n" {
+            spans.push((at, at + line.len()));
+        }
+        at += line.len();
+    }
+    spans
 }
 
 /// The palette `show_patch_diff()` and `dump_sline()` paint a combined section

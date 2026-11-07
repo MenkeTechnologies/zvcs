@@ -4249,6 +4249,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             &interest,
             graph_max_lanes,
             no_graph_indent,
+            // A message-only record holds no combined patch.
+            &mut Vec::new(),
         )?;
         out.extend_from_slice(&drawn);
     }

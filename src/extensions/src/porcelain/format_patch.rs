@@ -5768,6 +5768,7 @@ fn emit_combined_diff(
             a_prefix: opts.src_prefix.clone().into_bytes(),
             b_prefix: opts.dst_prefix.clone().into_bytes(),
             all_paths: false,
+            reversed_pairs: false,
         },
     )?;
     if patch.is_empty() {
@@ -5784,6 +5785,7 @@ fn emit_combined_diff(
             abbrev,
             false,
             true,
+            false,
             false,
         )?);
     }

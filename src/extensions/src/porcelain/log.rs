@@ -5241,6 +5241,22 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     };
     let has_pickaxe =
         pickaxe.is_some() || pickaxe_g_re.is_some() || pickaxe_regex_error.is_some();
+    // A merge's combined diff under `-c`/`--cc`: `show_combined_header()`'s view of
+    // the options (combine-diff.c:931-933), and whether `-R` reached its path set,
+    // which only `find_paths_generic()` lets it do. `-S`/`-G` and `--follow` select
+    // that scan, `--find-object` does not (combine-diff.c:1542-1548).
+    let combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
+        &repo,
+        &patch_opts,
+        false,
+        follow
+            || pickaxe_g_re.is_some()
+            || pickaxe_regex_error.is_some()
+            || matches!(
+                pickaxe.as_ref().map(|p| &p.kind),
+                Some(super::diff_pairs::PickaxeKind::Occurrences(_))
+            ),
+    );
 
     // `--graph`: the commits `get_commit_action()` would show, which is what
     // `graph_is_interesting()` asks about each parent. Taken before `-S`/`-G`,
@@ -5930,8 +5946,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         Some(Err(e)) => order_failure = Some(e),
         None => {}
     }
-    let mut patches =
-        PatchWindow::new(emit_patch, show_root, diff_merges, all_need_diff, patch_opts.clone());
+    let mut patches = PatchWindow::new(
+        emit_patch,
+        show_root,
+        diff_merges,
+        all_need_diff,
+        patch_opts.clone(),
+        combined_hdr.clone(),
+    );
     // Each record's text comes out of its own commit object, and reading 6000 of
     // them is the whole cost of a format like `--oneline` or `%s`. The window
     // renders a batch of records at a time across the thread pool; the loop below
@@ -6214,6 +6236,10 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // `--no-commit-id`) holding a two-way patch the painter already prefixed:
         // see [`super::diff::PatchOpts::line_prefix`].
         let mut painted: Option<(usize, usize)> = None;
+        // The spans of the same buffer holding a combined patch's bare `printf()`
+        // lines, which take neither `--line-prefix` nor a `--graph` row: see
+        // [`super::diff::combined_bare_spans`].
+        let mut bare: Vec<(usize, usize)> = Vec::new();
         // `--no-commit-id`: whether this record ends in `log_tree_commit()`'s
         // header. A per-parent `-m` record owes it only after the last parent.
         let mut header_owed = true;
@@ -6429,6 +6455,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             let mut separator = false;
             // Where in `diff` the painter-prefixed patch sits.
             let mut painted_diff: Option<(usize, usize)> = None;
+            // Where in `diff` a combined patch's bare `printf()` lines sit.
+            let mut bare_diff: Vec<(usize, usize)> = Vec::new();
             // `log_tree_diff_flush()` separates the message from the diff whenever the
             // pair queue is non-empty, even for a format that has nothing to say about
             // those pairs (`--summary` over a plain content change).
@@ -6782,6 +6810,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                             z,
                             true,
                             false,
+                            combined_hdr.reversed_pairs,
                         )?);
                         separator = true;
                     } else if name_only || name_status {
@@ -6790,6 +6819,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                             node.id,
                             &node.parents,
                             combined_paths.as_deref().unwrap_or(&diff_pathspecs),
+                            combined_hdr.reversed_pairs,
                         )? {
                             if name_status {
                                 diff.extend_from_slice(letters.as_bytes());
@@ -6982,8 +7012,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                         patch_opts.ctx,
                         diff_merges == DiffMerges::DenseCombined,
                         &patch_opts.colors,
-                        // `show_combined_header()` (combine-diff.c:931-933).
-                        &super::diff::CombinedHeaderOpts::from_patch_opts(&patch_opts, false),
+                        &combined_hdr,
                     )?,
                 };
                 // A remerge record diffs the re-merged tree against the recorded one,
@@ -7048,6 +7077,15 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     if !combined_record && remerge_here.is_none() {
                         painted_diff = Some((at, diff.len()));
                     }
+                    // `show_combined_header()`'s `printf("mode ")` and
+                    // `show_patch_diff()`'s `printf("Binary files differ\n")`
+                    // (combine-diff.c:971, :1150) bypass `diff_line_prefix()`.
+                    if combined_record && node.follow_path.is_none() {
+                        bare_diff = super::diff::combined_bare_spans(p)
+                            .into_iter()
+                            .map(|(s, e)| (at + s, at + e))
+                            .collect();
+                    }
                 }
             }
             // A merge's combined diff is separated from the header even under
@@ -7100,6 +7138,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 if !probe_queue && (want_names || emit_patch || check) {
                     diff_before_header = std::mem::take(&mut diff);
                     painted = painted_diff;
+                    bare = bare_diff.clone();
                 }
             } else if (!diff.is_empty() || queue_nonempty || combined_here)
                 && !probe_queue
@@ -7134,6 +7173,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 }
                 let at = block.len();
                 painted = painted_diff.map(|(s, e)| (at + s, at + e));
+                bare = bare_diff.iter().map(|(s, e)| (at + s, at + e)).collect();
                 block.extend_from_slice(&diff);
             }
             record_has_diff =
@@ -7215,6 +7255,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 )?;
                 msg_len = block.len();
                 painted = None;
+                bare.clear();
             }
         }
         // `cmd_whatchanged()` leaves `always_show_header` off, so `log_tree_commit()`
@@ -7247,7 +7288,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         }
         if graph {
             // Buffer for the column layout, which spans all commits at once.
-            let block = GraphBlock { text: block, msg_len, more: Vec::new(), lead: Vec::new() };
+            let block = GraphBlock { text: block, msg_len, bare, more: Vec::new(), lead: Vec::new() };
             push_graph_block(&mut blocks, ni, Some(block), &line_prefix);
             continue;
         }
@@ -7276,6 +7317,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 piece.push(rec_term);
             }
             painted = painted.map(|(s, e)| (piece.len() + s, piece.len() + e));
+            bare = bare.iter().map(|(s, e)| (piece.len() + s, piece.len() + e)).collect();
             piece.extend_from_slice(&block);
             first = false;
         }
@@ -7284,7 +7326,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // `show_log()` wrote. Applied per record because the records stream; a
         // record ends in its terminator, so the next record's leading prefix lands
         // exactly where an interior newline would have put it.
-        let piece = super::diff::apply_line_prefix_except(piece, &line_prefix, painted.as_slice());
+        let mut verbatim: Vec<(usize, usize)> = painted.into_iter().chain(bare).collect();
+        verbatim.sort_unstable();
+        let piece = super::diff::apply_line_prefix_except(piece, &line_prefix, &verbatim);
         // Each block ends in a newline, so the line-buffered stdout flushes it here;
         // a closed downstream pipe (`| head`) surfaces as a BrokenPipe on this write,
         // which is a normal stop rather than an error. No per-commit flush is needed.
@@ -7322,6 +7366,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // nothing once the cap is spent, so the commits past it were never walked
         // and never reached `graph_update()`.
         nodes.truncate(blocks.len());
+        let mut graph_bare: Vec<(usize, usize)> = Vec::new();
         let out = render_graph(
             &nodes,
             &blocks,
@@ -7334,8 +7379,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             &interest,
             graph_max_lanes,
             no_graph_indent,
+            &mut graph_bare,
         )?;
-        let out = super::diff::apply_line_prefix(out, &line_prefix);
+        let out = super::diff::apply_line_prefix_except(out, &line_prefix, &graph_bare);
         let rc = match stdout.write_all(&out) {
             Ok(()) => Ok(ExitCode::from(result_code)),
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -8213,6 +8259,8 @@ struct PatchWindow {
     all_need_diff: bool,
     /// The diff options the patch bodies are rendered with (`-U<n>`, `-w`, …).
     patch_opts: super::diff::PatchOpts,
+    /// `show_combined_header()`'s options for a merge under `-c`/`--cc`.
+    combined_hdr: super::diff::CombinedHeaderOpts,
     /// Index of `slots[0]` within the caller's node list.
     start: usize,
     /// Each commit's patch, or how its diff ended, with the `error()` lines its reads printed.
@@ -8231,8 +8279,18 @@ impl PatchWindow {
         merges: DiffMerges,
         all_need_diff: bool,
         patch_opts: super::diff::PatchOpts,
+        combined_hdr: super::diff::CombinedHeaderOpts,
     ) -> Self {
-        PatchWindow { active, show_root, merges, all_need_diff, patch_opts, start: 0, slots: Vec::new() }
+        PatchWindow {
+            active,
+            show_root,
+            merges,
+            all_need_diff,
+            patch_opts,
+            combined_hdr,
+            start: 0,
+            slots: Vec::new(),
+        }
     }
 
     /// `log_tree_diff()`'s three early returns (log-tree.c:1119-1152): a merge is
@@ -8291,11 +8349,7 @@ impl PatchWindow {
                                         ctx,
                                         self.merges == DiffMerges::DenseCombined,
                                         &self.patch_opts.colors,
-                                        // `show_combined_header()` (combine-diff.c:931-933).
-                                        &super::diff::CombinedHeaderOpts::from_patch_opts(
-                                            &self.patch_opts,
-                                            false,
-                                        ),
+                                        &self.combined_hdr,
                                     )
                                 }),
                             ));
@@ -15671,6 +15725,10 @@ pub(super) fn render_graph(
     interest: &GraphInterest,
     max_lanes: i64,
     no_graph_indent: bool,
+    // Filled with the spans of the result that are a combined patch's bare
+    // `printf()` lines ([`GraphBlock::bare`]), which the caller's `--line-prefix`
+    // pass must skip as well.
+    bare_out: &mut Vec<(usize, usize)>,
 ) -> Result<Vec<u8>> {
     let mut graph = Graph::new(colors, want_color, max_lanes, no_graph_indent);
     let mut out: Vec<u8> = Vec::new();
@@ -15759,7 +15817,7 @@ pub(super) fn render_graph(
             if !msg.is_empty() {
                 out.extend_from_slice(&record.lead);
             }
-            graph_write_lines(&mut out, &mut graph, msg);
+            graph_write_lines(&mut out, &mut graph, msg, &[], bare_out);
 
             // Rows the commit's message did not consume: the `|\` of a merge and the
             // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
@@ -15790,7 +15848,9 @@ pub(super) fn render_graph(
             }
 
             if !diff.is_empty() {
-                graph_write_lines(&mut out, &mut graph, diff);
+                let bare: Vec<(usize, usize)> =
+                    record.bare.iter().map(|&(s, e)| (s - split, e - split)).collect();
+                graph_write_lines(&mut out, &mut graph, diff, &bare, bare_out);
             }
 
             // `show_log()` closes a terminator format's record last of all, and puts a
@@ -15819,6 +15879,11 @@ pub(super) struct GraphBlock {
     /// receives, and after which the graph's remaining rows are drained. The rest
     /// is diff output, which git prefixes with `graph_padding_line()` instead.
     msg_len: usize,
+    /// The spans of `text`, all past `msg_len`, holding a combined patch's bare
+    /// `printf()` lines (combine-diff.c:971, :1150): git writes them without
+    /// `diff_line_prefix()`, so no padding row is drawn in front of them and the
+    /// graph does not advance.
+    bare: Vec<(usize, usize)>,
     /// The per-parent records `-m` prints after this one for the same merge
     /// (log-tree.c:1146-1172), drawn under the one `graph_update()` the commit got.
     more: Vec<GraphBlock>,
@@ -15831,7 +15896,7 @@ pub(super) struct GraphBlock {
 impl GraphBlock {
     /// A record with no diff, so nothing follows the message.
     pub(super) fn message_only(text: Vec<u8>) -> Self {
-        GraphBlock { msg_len: text.len(), text, more: Vec::new(), lead: Vec::new() }
+        GraphBlock { msg_len: text.len(), text, bare: Vec::new(), more: Vec::new(), lead: Vec::new() }
     }
 }
 
@@ -15865,18 +15930,36 @@ fn push_graph_block(
 /// of it — `graph_show_strbuf()` (graph.c:1622) for a message, the diff prefix
 /// callback for everything after it. Both draw one row per line and neither adds a
 /// newline the buffer did not already carry.
-fn graph_write_lines(out: &mut Vec<u8>, graph: &mut Graph, buf: &[u8]) {
+///
+/// A line that opens one of the `bare` spans of `buf` gets no row: the diff
+/// prefix callback is never asked for it. Its span in `out` goes to `bare_out`.
+fn graph_write_lines(
+    out: &mut Vec<u8>,
+    graph: &mut Graph,
+    buf: &[u8],
+    bare: &[(usize, usize)],
+    bare_out: &mut Vec<(usize, usize)>,
+) {
     let ends_nl = buf.ends_with(b"\n");
     let mut lines: Vec<&[u8]> = buf.split(|&b| b == b'\n').collect();
     if ends_nl {
         lines.pop();
     }
+    let mut at = 0;
     for (j, line) in lines.iter().enumerate() {
-        out.extend_from_slice(&graph.next_line());
+        let is_bare = bare.iter().any(|&(s, _)| s == at);
+        let start = out.len();
+        if !is_bare {
+            out.extend_from_slice(&graph.next_line());
+        }
         out.extend_from_slice(line);
         if ends_nl || j + 1 < lines.len() {
             out.push(b'\n');
         }
+        if is_bare {
+            bare_out.push((start, out.len()));
+        }
+        at += line.len() + 1;
     }
 }
 

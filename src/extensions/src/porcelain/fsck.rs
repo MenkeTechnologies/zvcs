@@ -1437,13 +1437,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             };
             // The type a `struct object` holds is no read of git's: the lookup that learns it
             // here reports what its read printed only when it fails, which is where git's
-            // own parse reads and gives up.
+            // own parse reads and gives up, or below, where the walk's parse reads the object
+            // (`header_lines`): that read's `packed_object_info()` prints what it cannot use, as
+            // `packed_to_object_type()`'s `unknown object type`, before a loose copy answers
+            // (packfile.c:1124-1129, :1380-1385).
+            let mut header_lines: Vec<String> = Vec::new();
             let header = match scan_parse {
                 Some((kind, _)) => Ok(*kind),
                 None => {
                     let (header, lines) = gix::odb::store::capture_errors(|| repo.find_header(id));
-                    if header.is_err() {
-                        lines.iter().for_each(|line| eprintln!("{line}"));
+                    match header.is_err() {
+                        true => lines.iter().for_each(|line| eprintln!("{line}")),
+                        false => header_lines = lines,
                     }
                     header.map(|h| h.kind())
                 }
@@ -1503,6 +1508,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // whose buffer is not held and refuses an object of another type with
             // `error("Object %s not a tree")` (tree.c:185-204); the walk then stops there.
             if expected == Some(Kind::Tree) && kind != Kind::Tree && !state.parsed_trees.contains(&id) {
+                header_lines.iter().for_each(|line| eprintln!("{line}"));
                 eprintln!("error: Object {id} not a tree");
                 break 'traverse;
             }
@@ -1552,18 +1558,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // scan keeps its buffer (object.c:270-283), so `parse_tree()` returns at once
             // for it (tree.c:185-189).
             let held = kind == Kind::Tree && state.parsed_trees.contains(&id);
-            {
-                let reads = match kind {
-                    Kind::Tree => !state.parsed_trees.remove(&id),
-                    Kind::Commit if from_graph.is_some() => {
-                        crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false)
-                    }
-                    Kind::Commit | Kind::Tag => !parsed_already,
-                    Kind::Blob => false,
-                };
-                if reads {
-                    state.pack_reads.push((Some(id), None));
+            let reads = match kind {
+                Kind::Tree => !state.parsed_trees.remove(&id),
+                Kind::Commit if from_graph.is_some() => {
+                    crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false)
                 }
+                Kind::Commit | Kind::Tag => !parsed_already,
+                Kind::Blob => false,
+            };
+            if reads {
+                header_lines.iter().for_each(|line| eprintln!("{line}"));
+                state.pack_reads.push((Some(id), None));
             }
             // Under `--connectivity-only` nothing but a head was parsed before the walk, so a
             // commit the graph did not answer is parsed here from its buffer:
@@ -1583,6 +1588,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 (None, Some(d)) => Ok(Ok(d)),
                 // The buffer a held tree's walk follows is no read of git's.
                 (None, None) if held => gix::odb::store::capture_errors(|| decode(&repo, id)).0,
+                // Nor is a second read of what the type lookup above read for git's one: a
+                // pack entry it marked bad is passed over now, and a refused pack is
+                // refused again, so the lookup's lines are that read's.
+                (None, None) if reads && !header_lines.is_empty() => {
+                    gix::odb::store::capture_errors(|| decode(&repo, id)).0
+                }
                 (None, None) => decode(&repo, id),
             };
             let decoded = match walked {
@@ -3314,10 +3325,16 @@ fn collect_cache_tree(
         state.note(tree.id);
         // `parse_object()` reads a tree whose buffer is not held, and keeps it. That read is
         // `odb_read_object()`'s, which dies where the data cannot be unpacked, as at an offset
-        // beyond the end of the pack (object.c:368, packfile.c:620-660); what it reports
-        // otherwise the lookup above printed.
+        // beyond the end of the pack (object.c:368, packfile.c:620-660). A refused pack the
+        // lookup above reported is refused again here; with none, what this read prints is
+        // `odb_read_object_info()`'s, as the `unknown object type` of an entry
+        // `packed_to_object_type()` cannot use before a loose copy answers (object.c:345-346,
+        // packfile.c:1124-1129), and the entry it marked bad is passed over after.
         if !state.parsed_trees.contains(&tree.id) {
-            let _ = gix::odb::store::capture_errors(|| repo.find_object(tree.id));
+            let (_, lines) = gix::odb::store::capture_errors(|| repo.find_object(tree.id));
+            if refused.is_empty() {
+                lines.iter().for_each(|line| eprintln!("{line}"));
+            }
         }
         if state.parsed_trees.insert(tree.id) {
             state.pack_reads.push((Some(tree.id), None));

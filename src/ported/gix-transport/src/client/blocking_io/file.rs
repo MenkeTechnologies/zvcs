@@ -115,7 +115,17 @@ impl SpawnProcessOnDemand {
             ssh_cmd: None,
             upload_pack,
             receive_pack,
-            envs: if version != Protocol::V1 {
+            // ```c
+            // if (version > 0) {
+            //         strvec_pushf(&conn->env,
+            //                      GIT_PROTOCOL_ENVIRONMENT "=version=%d",
+            //                      version);
+            // }
+            // ```
+            //
+            // (`git_connect()`, connect.c:1525-1529.) v0 is the dialect that predates the
+            // variable, so it is the one version that does not set it.
+            envs: if version != Protocol::V0 {
                 vec![("GIT_PROTOCOL", format!("version={}", version as usize))]
             } else {
                 Default::default()

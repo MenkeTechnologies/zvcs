@@ -69,6 +69,7 @@ where
         fail_on_err_lines: bool,
         buf_resize: bool,
         trace: bool,
+        defer_data_trace: bool,
     ) -> ExhaustiveOutcome<'a> {
         (
             false,
@@ -76,12 +77,16 @@ where
             Some(match Self::read_line_inner(reader, buf) {
                 Ok(Ok(line)) => {
                     // `packet_read_with_status()` traces every packet it reads
-                    // (pkt-line.c:434-445, :502-505).
-                    match line {
-                        PacketLineRef::Data(d) => crate::trace::packet_trace(d, false),
-                        PacketLineRef::Flush => crate::trace::packet_trace(b"0000", false),
-                        PacketLineRef::Delimiter => crate::trace::packet_trace(b"0001", false),
-                        PacketLineRef::ResponseEnd => crate::trace::packet_trace(b"0002", false),
+                    // (pkt-line.c:434-445, :502-505); a peeked data line waits for its
+                    // consumer, see `StreamingPeekableIterState::peek_trace_pending`.
+                    let deferred = defer_data_trace && matches!(line, PacketLineRef::Data(_));
+                    if !deferred {
+                        match line {
+                            PacketLineRef::Data(d) => crate::trace::packet_trace(d, false),
+                            PacketLineRef::Flush => crate::trace::packet_trace(b"0000", false),
+                            PacketLineRef::Delimiter => crate::trace::packet_trace(b"0001", false),
+                            PacketLineRef::ResponseEnd => crate::trace::packet_trace(b"0002", false),
+                        }
                     }
                     if trace {
                         match line {
@@ -106,6 +111,12 @@ where
                         return (true, stopped_at, None);
                     } else if fail_on_err_lines {
                         if let Some(err) = line.check_error() {
+                            // `PACKET_READ_DIE_ON_ERR_PACKET` consumes the line (pkt-line.c:508-510).
+                            if deferred {
+                                if let PacketLineRef::Data(d) = line {
+                                    crate::trace::packet_trace(d, false);
+                                }
+                            }
                             let err = err.0.as_bstr().to_owned();
                             buf.clear();
                             return (
@@ -147,6 +158,8 @@ where
             return None;
         }
         if !state.peek_buf.is_empty() {
+            // The peeked line is consumed here, so this is where git would have traced it.
+            state.trace_pending_peek();
             std::mem::swap(&mut state.peek_buf, &mut state.buf);
             state.peek_buf.clear();
             Some(Ok(Ok(crate::decode(&state.buf).expect("only valid data in peek buf"))))
@@ -161,6 +174,7 @@ where
                 state.fail_on_err_lines,
                 false,
                 state.trace,
+                false,
             );
             state.is_done = is_done;
             state.stopped_at = stopped_at;
@@ -186,9 +200,11 @@ where
                 state.fail_on_err_lines,
                 true,
                 state.trace,
+                true,
             );
             state.is_done = is_done;
             state.stopped_at = stopped_at;
+            state.peek_trace_pending = matches!(res, Some(Ok(Ok(PacketLineRef::Data(_)))));
             res
         } else {
             Some(Ok(Ok(crate::decode(&state.peek_buf).expect("only valid data here"))))

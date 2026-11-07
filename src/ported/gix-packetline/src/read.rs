@@ -41,6 +41,14 @@ pub use error::Error;
 pub struct StreamingPeekableIterState<T> {
     pub(crate) read: T,
     pub(crate) peek_buf: Vec<u8>,
+    /// Whether the data line held in `peek_buf` is still to be reported to `GIT_TRACE_PACKET`.
+    ///
+    /// git reads each packet once, through `packet_read_with_status()`, and traces it there
+    /// (pkt-line.c:434-445, :502-505) under the identity of the reader that consumed it. A peek is
+    /// this reader looking ahead where git does not, so a peeked data line is traced when it is
+    /// consumed: after `find_common()`'s last `NAK` the first pack packet is read by
+    /// `sideband_demux()`'s async, as `sideband<` (fetch-pack.c:991-1000, pkt-line.c:20-23).
+    pub(crate) peek_trace_pending: bool,
     #[cfg(any(feature = "blocking-io", feature = "async-io"))]
     pub(crate) buf: Vec<u8>,
     pub(crate) fail_on_err_lines: bool,
@@ -61,6 +69,7 @@ impl<T> StreamingPeekableIterState<T> {
             #[cfg(any(feature = "blocking-io", feature = "async-io"))]
             buf: vec![0; MAX_LINE_LEN],
             peek_buf: Vec::new(),
+            peek_trace_pending: false,
             delimiters,
             fail_on_err_lines: false,
             is_done: false,
@@ -77,12 +86,25 @@ impl<T> StreamingPeekableIterState<T> {
     ///
     /// **Note** that `position` does not include the 4 bytes prefix (they are invisible outside the reader)
     pub fn peek_buffer_replace_and_truncate(&mut self, position: usize, replace_with: u8) {
+        // The line is traced as it arrived, capabilities included, before the cut.
+        self.trace_pending_peek();
         let position = position + U16_HEX_BYTES;
         self.peek_buf[position] = replace_with;
 
         let new_len = position + 1;
         self.peek_buf.truncate(new_len);
         self.peek_buf[..4].copy_from_slice(&crate::encode::u16_to_hex((new_len) as u16));
+    }
+
+    /// Report the peeked data line to `GIT_TRACE_PACKET` now, if it has not been yet: see
+    /// `peek_trace_pending`.
+    pub(crate) fn trace_pending_peek(&mut self) {
+        if !std::mem::take(&mut self.peek_trace_pending) {
+            return;
+        }
+        if let Some(data) = self.peek_buf.get(U16_HEX_BYTES..) {
+            crate::trace::packet_trace(data, false);
+        }
     }
 
     /// Returns the packet line that stopped the iteration, or

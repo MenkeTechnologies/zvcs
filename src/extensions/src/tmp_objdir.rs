@@ -60,10 +60,10 @@
 //!   (tmp-objdir.c:167-170). Here that is [`Drop`], which runs on the error path
 //!   because `?` unwinds through it.
 //!
-//! `tmp_objdir_migrate()`, `tmp_objdir_env()` and `tmp_objdir_add_as_alternate()`
-//! — the quarantine half of the file, used by `receive-pack` to *keep* what a
-//! scratch directory collected — are not ported: nothing in this tree has a
-//! quarantine yet, and a migrate with no caller would be untested code.
+//! The quarantine half of the file, `tmp_objdir_env()` and `tmp_objdir_migrate()`,
+//! is [`Quarantine`]: the scratch directory `receive-pack` takes a push into and
+//! either moves into the real store once `pre-receive` has passed, or throws away.
+//! `tmp_objdir_add_as_alternate()` has no caller here and is not ported.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -172,6 +172,294 @@ impl Drop for TmpObjdir {
     /// `?` does the same job.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The scratch object directory `odb_transaction_files_begin()` creates eagerly for
+/// `ODB_TRANSACTION_RECEIVE` (object-file.c:1483-1517): `receive-pack` writes the
+/// pushed objects into it, hands its [`env`](Self::env) to `pre-receive`, and
+/// [`migrate`](Self::migrate)s it into the real store only once a ref is about to
+/// move (`odb_transaction_commit()`, builtin/receive-pack.c:2097-2108).
+///
+/// Unlike [`TmpObjdir`] it is not made the primary store of a repository handle:
+/// `index-pack` and `unpack-objects` are handed the directory through
+/// `GIT_OBJECT_DIRECTORY`, and this port's in-process stand-ins are handed the
+/// [`path`](Self::path), so nothing has to be written inside it to point back at the
+/// real store — which a hook listing `$GIT_QUARANTINE_PATH` would see, and a migrate
+/// would carry into `objects/info`.
+///
+/// Dropping it without a migrate is `tmp_objdir_destroy()` from git's `atexit()`
+/// handler (tmp-objdir.c:55-74, :167-170): the push leaves nothing behind.
+pub struct Quarantine {
+    /// `t->path`: `<objects>/tmp_objdir-<prefix>-XXXXXX`, absolute.
+    path: PathBuf,
+    /// `repo_get_object_directory()` as `absolute_path()` spells it.
+    objects: PathBuf,
+    /// `t->env`.
+    env: Vec<(String, std::ffi::OsString)>,
+    /// Gone already, by migrate or destroy.
+    done: bool,
+}
+
+impl Quarantine {
+    /// `tmp_objdir_create(r, prefix)` (tmp-objdir.c:135-184). `objects` is the object
+    /// directory spelled as `absolute_path(repo_get_object_directory(r))` spells it,
+    /// which inside `receive-pack` is `<cwd>/./objects`: `enter_repo()` set the git
+    /// directory to `.`.
+    pub fn create(objects: &Path, prefix: &str) -> Result<Quarantine> {
+        let path = mkdtemp(objects, prefix)?;
+        let mut quarantine = Quarantine {
+            path,
+            objects: objects.to_owned(),
+            env: Vec::new(),
+            done: false,
+        };
+        // `setup_tmp_objdir()` (tmp-objdir.c:123-133).
+        std::fs::create_dir(quarantine.path.join("pack"))
+            .with_context(|| format!("creating {}/pack", quarantine.path.display()))?;
+
+        quarantine.env_append("GIT_ALTERNATE_OBJECT_DIRECTORIES", quarantine.objects.clone().into_os_string());
+        let own = quarantine.path.clone().into_os_string();
+        quarantine.env.push(("GIT_OBJECT_DIRECTORY".into(), own.clone()));
+        quarantine.env.push(("GIT_QUARANTINE_PATH".into(), own));
+        Ok(quarantine)
+    }
+
+    /// `t->path`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `tmp_objdir_env()` (tmp-objdir.c:316-321): what a child that is to write into, or
+    /// read from, the quarantine is started with.
+    pub fn env(&self) -> &[(String, std::ffi::OsString)] {
+        &self.env
+    }
+
+    /// `env_append()` (tmp-objdir.c:96-115): `val` goes to the end of the list the
+    /// variable already holds, C-quoted if it starts with `"` or contains the
+    /// separator.
+    fn env_append(&mut self, key: &str, val: std::ffi::OsString) {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut val = val.into_vec();
+        // Avoid quoting if it's not necessary, for maximum compatibility
+        // with older parsers which don't understand the quoting.
+        if val.first() == Some(&b'"') || val.contains(&b':') {
+            let mut quoted = vec![b'"'];
+            crate::quote::cq_body(&val, &mut quoted);
+            quoted.push(b'"');
+            val = quoted;
+        }
+        let value = match std::env::var_os(key) {
+            None => val,
+            Some(old) => {
+                let mut out = old.as_bytes().to_vec();
+                out.push(b':');
+                out.extend_from_slice(&val);
+                out
+            }
+        };
+        self.env.push((key.to_owned(), std::ffi::OsString::from_vec(value)));
+    }
+
+    /// `tmp_objdir_migrate()` (tmp-objdir.c:291-314): move everything into the real
+    /// object directory, then destroy the quarantine. `false` when anything failed to
+    /// move, each failure having said why on stderr as `finalize_object_file()` does.
+    ///
+    /// `adjust_shared_perm` is `adjust_shared_perm()` (path.c) under the repository's
+    /// `core.sharedRepository`, `true` on success.
+    pub fn migrate(mut self, adjust_shared_perm: &dyn Fn(&Path) -> bool) -> bool {
+        let ok = migrate_paths(&self.path, &self.objects, adjust_shared_perm);
+        self.destroy();
+        ok
+    }
+
+    /// `tmp_objdir_destroy()` (tmp-objdir.c:55-74).
+    fn destroy(&mut self) {
+        if !std::mem::replace(&mut self.done, true) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+impl Drop for Quarantine {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+/// `pack_copy_priority()` (tmp-objdir.c:186-206): a pack's `.keep` moves first, its
+/// index last, so no reader can see an index whose pack is not there yet, nor a pack
+/// a concurrent `repack` may delete before its `.keep` arrives.
+fn pack_copy_priority(name: &[u8]) -> u8 {
+    if !name.starts_with(b"pack") {
+        return 0;
+    }
+    if name.ends_with(b".keep") {
+        1
+    } else if name.ends_with(b".pack") {
+        2
+    } else if name.ends_with(b".rev") {
+        3
+    } else if name.ends_with(b".idx") {
+        4
+    } else {
+        5
+    }
+}
+
+/// `migrate_paths()` (tmp-objdir.c:250-289) with `migrate_one()` (:226-243) folded in.
+fn migrate_paths(src: &Path, dst: &Path, adjust_shared_perm: &dyn Fn(&Path) -> bool) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // `read_dir_paths()` (:216-224): everything but dot-files.
+    let Ok(dir) = std::fs::read_dir(src) else {
+        return false;
+    };
+    let mut names: Vec<std::ffi::OsString> = dir
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.as_bytes().first() != Some(&b'.'))
+        .collect();
+    names.sort_by_key(|n| pack_copy_priority(n.as_bytes()));
+
+    let mut ok = true;
+    for name in names {
+        let (from, to) = (src.join(&name), dst.join(&name));
+        // `is_loose_object_shard()` (:245-248): a loose object's name is its hash, so
+        // two files under one name are the same object and need no comparison.
+        let bytes = name.as_bytes();
+        let skip_collision_check = bytes.len() == 2 && bytes.iter().all(u8::is_ascii_hexdigit);
+        let Ok(meta) = std::fs::metadata(&from) else {
+            ok = false;
+            continue;
+        };
+        if meta.is_dir() {
+            match std::fs::create_dir(&to) {
+                Ok(()) => {
+                    if !adjust_shared_perm(&to) {
+                        ok = false;
+                        continue;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    ok = false;
+                    continue;
+                }
+            }
+            ok &= migrate_paths(&from, &to, adjust_shared_perm);
+        } else {
+            ok &= finalize_object_file(&from, &to, skip_collision_check, adjust_shared_perm);
+        }
+    }
+    ok
+}
+
+/// `finalize_object_file_flags()` (object-file.c:392-457) under the default
+/// `core.createObject=link`: hard-link the file into place and unlink the
+/// temporary; a name that is already taken is checked to hold the same bytes
+/// (`check_collision()`, :329-390) unless `skip_collision_check`.
+fn finalize_object_file(
+    tmpfile: &Path,
+    filename: &Path,
+    skip_collision_check: bool,
+    adjust_shared_perm: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let mut retries = 0;
+    loop {
+        let ret = match std::fs::hard_link(tmpfile, filename) {
+            Ok(()) => {
+                unlink_or_warn(tmpfile);
+                None
+            }
+            Err(e) => Some(e),
+        };
+        // Coda hack - coda doesn't like cross-directory links,
+        // so we fall back to a rename.
+        let ret = match ret {
+            Some(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                if std::fs::metadata(filename).is_ok() {
+                    Some(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                } else {
+                    match std::fs::rename(tmpfile, filename) {
+                        Ok(()) => None,
+                        Err(e) => Some(e),
+                    }
+                }
+            }
+            other => other,
+        };
+        if let Some(e) = ret {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                unlink_or_warn(tmpfile);
+                eprintln!(
+                    "error: unable to write file {}: {}",
+                    filename.display(),
+                    crate::external::strerror(&e)
+                );
+                return false;
+            }
+            if !skip_collision_check {
+                match check_collision(tmpfile, filename) {
+                    Collision::DestVanished => {
+                        retries += 1;
+                        if retries > 6 {
+                            eprintln!("error: unable to write repeatedly vanishing file {}", filename.display());
+                            return false;
+                        }
+                        continue;
+                    }
+                    Collision::Error => return false,
+                    Collision::Same => {}
+                }
+            }
+            unlink_or_warn(tmpfile);
+        }
+        break;
+    }
+    if !adjust_shared_perm(filename) {
+        eprintln!("error: unable to set permission to '{}'", filename.display());
+        return false;
+    }
+    true
+}
+
+/// `check_collision()`'s three answers.
+enum Collision {
+    Same,
+    DestVanished,
+    Error,
+}
+
+/// `check_collision()` (object-file.c:329-390).
+fn check_collision(source: &Path, dest: &Path) -> Collision {
+    let a = match std::fs::read(source) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: unable to open {}: {}", source.display(), crate::external::strerror(&e));
+            return Collision::Error;
+        }
+    };
+    let b = match std::fs::read(dest) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Collision::DestVanished,
+        Err(e) => {
+            eprintln!("error: unable to open {}: {}", dest.display(), crate::external::strerror(&e));
+            return Collision::Error;
+        }
+    };
+    if a != b {
+        eprintln!("error: files '{}' and '{}' differ in contents", source.display(), dest.display());
+        return Collision::Error;
+    }
+    Collision::Same
+}
+
+/// `unlink_or_warn()` (wrapper.c).
+fn unlink_or_warn(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("warning: unable to unlink '{}': {}", path.display(), crate::external::strerror(&e));
+        }
     }
 }
 

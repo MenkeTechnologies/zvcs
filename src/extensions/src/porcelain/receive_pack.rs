@@ -6,8 +6,7 @@
 //! (`receive`: command list → pack ingest via `gix_pack::Bundle` → hooks → ref
 //! compare-and-swap → `report-status`) are both implemented — enough for a local
 //! (`file://`) or ssh push served by this binary, and for the split
-//! advertise-then-`--stateless-rpc` session an HTTP backend drives. The quarantine
-//! is not modelled (see the notes below). The advertisement is byte-verified
+//! advertise-then-`--stateless-rpc` session an HTTP backend drives. The advertisement is byte-verified
 //! against git 2.55.0:
 //!
 //!   * **The ref advertisement** — `<oid> SP <ref>` pkt-lines in refname order,
@@ -136,16 +135,19 @@
 //! `forced-update` answers become the `report-status-v2` reply and the refs
 //! `post-receive` is told about.
 //!
+//! ### The quarantine
+//!
+//! The pack is ingested into `objects/tmp_objdir-incoming-XXXXXX`
+//! ([`crate::tmp_objdir::Quarantine`]), whose `GIT_QUARANTINE_PATH`,
+//! `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` only `pre-receive`
+//! is handed. It is migrated into the object store once a ref is about to move,
+//! before `update`, `proc-receive` and the ref updates, and the kept pack's
+//! `.keep` is deleted after the commands ran; a push that is declined, refused in
+//! full or rejected by `--strict` leaves nothing behind.
+//!
 //! ### Not ported (bailed on with a precise message, never silently ignored)
 //!
-//!   1. **The quarantine.** git ingests a push into a temporary object
-//!      directory, exports it to the hooks as `GIT_QUARANTINE_PATH`, and
-//!      migrates it only once `pre-receive` has passed; this port writes
-//!      straight into the object store, so a push a hook declines leaves its
-//!      objects behind for the next `gc` rather than discarding them at once.
-//!      A pack the unpack step itself rejects (`--strict`) is removed again,
-//!      which is all a failed child leaves in git either.
-//!   2. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
+//!   1. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
 //!      consumed and dropped, and the shallow-update switch that governs them is
 //!      deliberately left unread rather than named here: grafting
 //!      the pushed history onto the receiving repository's shallow boundary is
@@ -1213,14 +1215,27 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
 
     // --- ingest the pack (skipped when every command is a delete) -----------
     let mut unpack: Result<(), String> = Ok(());
+    // The object transaction (builtin/receive-pack.c:2502, :2587-2597): the
+    // quarantine the pack goes into, and the `.keep` that `index-pack` left for it,
+    // which `odb_transaction_finalize()` deletes from wherever the migrate put it
+    // once the commands have run (object-file.c:1452-1464). An unmigrated
+    // quarantine lives as long as git's process does, so it is dropped only on the
+    // way out of this function.
+    let mut transaction: Option<Transaction> = None;
     if cmds.iter().any(|c| c.new != zero) {
-        // git reports the *child*'s failure rather than the reason; the reason
-        // itself has already gone back on band 2, printed by that child.
-        // `-q`, or the `quiet` capability the client asked for (builtin/receive-pack.c:2225-2226),
-        // keeps `index-pack` from drawing its delta meter.
-        let quiet = quiet || cap_present(&caps, b"quiet");
-        if let Err(status) = ingest_pack(repo, &mut stdin, config, &mut band, quiet) {
-            unpack = Err(status);
+        match Transaction::begin(repo) {
+            None => unpack = Err("unable to start object transaction".into()),
+            Some(mut t) => {
+                // git reports the *child*'s failure rather than the reason; the reason
+                // itself has already gone back on band 2, printed by that child.
+                // `-q`, or the `quiet` capability the client asked for (builtin/receive-pack.c:2225-2226),
+                // keeps `index-pack` from drawing its delta meter.
+                let quiet = quiet || cap_present(&caps, b"quiet");
+                if let Err(status) = ingest_pack(repo, &mut t, &mut stdin, config, &mut band, quiet) {
+                    unpack = Err(status);
+                }
+                transaction = Some(t);
+            }
         }
     }
 
@@ -1239,8 +1254,13 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
         use_atomic,
         use_push_options.then_some(&push_options[..]),
         cert.as_ref(),
+        transaction.as_mut(),
         &mut band,
     );
+    // `odb_transaction_finalize()` (object-file.c:1452-1464).
+    if let Some(t) = &mut transaction {
+        t.finalize();
+    }
 
     // --- report-status ------------------------------------------------------
     if cap_present(&caps, b"report-status") || report_v2 {
@@ -1365,6 +1385,7 @@ fn execute_commands(
     use_atomic: bool,
     push_options: Option<&[String]>,
     cert: Option<&PushCert>,
+    transaction: Option<&mut Transaction>,
     band: &mut Band,
 ) {
     if unpack.is_err() {
@@ -1406,7 +1427,19 @@ fn execute_commands(
         }
     }
 
-    let env = hook_env(repo, push_options.unwrap_or_default(), cert);
+    // `run_receive_hook(commands, "pre-receive", 0, transaction, push_options)`: the
+    // only hook that runs inside the quarantine, and so the only one handed
+    // `odb_transaction_env()` (builtin/receive-pack.c:944-945, :2081).
+    let mut env = hook_env(repo, push_options.unwrap_or_default(), cert);
+    if let Some(t) = &transaction {
+        env.set.extend(
+            t.quarantine
+                .as_ref()
+                .into_iter()
+                .flat_map(|q| q.env())
+                .map(|(k, v)| (k.clone(), v.to_string_lossy().into_owned())),
+        );
+    }
     if run_receive_hook(repo, "pre-receive", cmds, false, &env, band) {
         for cmd in cmds.iter_mut() {
             if cmd.error.is_none() {
@@ -1415,8 +1448,24 @@ fn execute_commands(
         }
         return;
     }
+    // If there is no command ready to run, should return directly to destroy
+    // temporary data in the quarantine area.
     if cmds.iter().all(|c| c.error.is_some()) {
         return;
+    }
+
+    // Now we'll start writing out refs, which means the objects need
+    // to be in their final positions so that other processes can see them
+    // (`odb_transaction_commit()`, builtin/receive-pack.c:2097-2108).
+    if let Some(t) = transaction {
+        if !t.commit(repo) {
+            for cmd in cmds.iter_mut() {
+                if cmd.error.is_none() {
+                    cmd.error = Some("unable to migrate objects to permanent storage".into());
+                }
+            }
+            return;
+        }
     }
 
     let head = head_name(repo);
@@ -1788,6 +1837,119 @@ fn cap_present(caps: &[u8], want: &[u8]) -> bool {
     caps.split(|&b| b == b' ' || b == b'\n' || b == 0).any(|tok| tok == want)
 }
 
+/// `struct odb_transaction_files` as `ODB_TRANSACTION_RECEIVE` sets it up
+/// (object-file.c:485-497, :1483-1517): the quarantine every pushed object is
+/// written into, and the `.keep` files `index-pack` left there.
+struct Transaction {
+    /// `transaction->objdir`, `None` once migrated.
+    quarantine: Option<crate::tmp_objdir::Quarantine>,
+    /// `transaction->pack_lockfiles`: each `.keep` by the name it has once
+    /// migrated (object-file.c:1426-1440).
+    pack_lockfiles: Vec<std::path::PathBuf>,
+}
+
+impl Transaction {
+    /// `odb_transaction_begin(..., ODB_TRANSACTION_RECEIVE)`, which creates the
+    /// quarantine eagerly (`odb_transaction_files_prepare()`, object-file.c:500-520).
+    fn begin(repo: &gix::Repository) -> Option<Transaction> {
+        match crate::tmp_objdir::Quarantine::create(&object_directory(repo), "incoming") {
+            Ok(quarantine) => Some(Transaction {
+                quarantine: Some(quarantine),
+                pack_lockfiles: Vec::new(),
+            }),
+            Err(_) => {
+                eprintln!("error: unable to create temporary object directory");
+                None
+            }
+        }
+    }
+
+    /// The quarantine's path. Only called while one is open: between `begin()` and
+    /// `commit()` nothing else takes it.
+    fn path(&self) -> &std::path::Path {
+        self.quarantine.as_ref().expect("the pack is ingested before the commit").path()
+    }
+
+    /// `odb_transaction_files_commit()` (object-file.c:1259-1296): migrate the
+    /// quarantine into the real store. The hardware flush git issues first has no
+    /// observable effect and is not reproduced.
+    fn commit(&mut self, repo: &gix::Repository) -> bool {
+        let Some(quarantine) = self.quarantine.take() else {
+            return true;
+        };
+        let shared = repo
+            .config_snapshot()
+            .string("core.sharedRepository")
+            .and_then(|v| super::init::parse_shared_value(&v.to_string()).ok())
+            .unwrap_or(0);
+        let adjust = |path: &std::path::Path| {
+            shared == 0 || super::init::adjust_shared_perm_recursive(path, shared).is_ok()
+        };
+        if !quarantine.migrate(&adjust) {
+            eprintln!("error: unable to migrate temporary objects");
+            return false;
+        }
+        true
+    }
+
+    /// `odb_transaction_files_finalize()` (object-file.c:1452-1464): delete the
+    /// `.keep` files from where the migrate put them.
+    fn finalize(&mut self) {
+        for keep in self.pack_lockfiles.drain(..) {
+            let _ = std::fs::remove_file(keep);
+        }
+    }
+}
+
+/// `absolute_path(repo_get_object_directory(r))` inside `receive-pack`, where
+/// `enter_repo()` has `chdir()`ed into the git directory and set it to `.`
+/// (setup.c:1868-1893), so the object directory is `./objects` and its absolute
+/// spelling `<git-dir>/./objects`, with the git directory as `getcwd()` reports it.
+/// A store kept anywhere else is spelled as itself.
+fn object_directory(repo: &gix::Repository) -> std::path::PathBuf {
+    let objects = crate::hooks::absolutize(repo.objects.store_ref().path());
+    match std::fs::canonicalize(repo.git_dir()) {
+        Ok(git_dir) if std::fs::canonicalize(&objects).ok() == Some(git_dir.join("objects")) => {
+            git_dir.join("./objects")
+        }
+        _ => objects,
+    }
+}
+
+/// The objects the push brought in as the child that took them sees them: the
+/// quarantine, its `GIT_OBJECT_DIRECTORY`, with the real store behind it as
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` (tmp-objdir.c:174-180).
+struct Incoming<'a> {
+    quarantine: gix::odb::Handle,
+    repo: &'a gix::Repository,
+}
+
+impl<'a> Incoming<'a> {
+    fn open(repo: &'a gix::Repository, path: &std::path::Path) -> std::io::Result<Self> {
+        let quarantine = gix::odb::at_opts(
+            path,
+            Vec::new(),
+            gix::odb::store::init::Options {
+                object_hash: repo.object_hash(),
+                loose_compression: repo.loose_compression(),
+                ..Default::default()
+            },
+        )?;
+        Ok(Incoming { quarantine, repo })
+    }
+
+    /// The object's type and contents, from the quarantine or the real store.
+    fn find(&self, id: gix::ObjectId) -> Option<(gix::object::Kind, Vec<u8>)> {
+        use gix::objs::Find;
+        let mut buf = Vec::new();
+        if let Ok(Some(data)) = self.quarantine.try_find(&id, &mut buf) {
+            return Some((data.kind, data.data.to_vec()));
+        }
+        let object = self.repo.find_object(id).ok()?;
+        Some((object.kind, object.data.clone()))
+    }
+}
+
 /// Index the packfile streaming off `input`, then either explode it into loose
 /// objects or keep it — `receive-pack.c::unpack()`'s `unpack-objects` versus
 /// `index-pack` choice, decided by the object count in the pack header against
@@ -1801,6 +1963,7 @@ fn cap_present(caps: &[u8], want: &[u8]) -> bool {
 /// whichever child git would have run.
 fn ingest_pack(
     repo: &gix::Repository,
+    transaction: &mut Transaction,
     input: &mut impl BufRead,
     config: &Config,
     band: &mut Band,
@@ -1849,11 +2012,10 @@ fn ingest_pack(
     };
     let mut counted = std::io::BufReader::new(counted);
 
-    let pack_dir = repo.objects.store_ref().path().join("pack");
-    if std::fs::create_dir_all(&pack_dir).is_err() {
-        band.fatal("cannot create pack directory");
-        return Err(child);
-    }
+    // Both children write into the quarantine: `odb_transaction_env()` hands them its
+    // `GIT_OBJECT_DIRECTORY` (object-file.c:1365), whose `pack` directory
+    // `setup_tmp_objdir()` made.
+    let pack_dir = transaction.path().join("pack");
     // ```c
     // if (!opts->quiet && err_fd)
     //         strvec_push(&child.args, "--show-resolving-progress");
@@ -1895,25 +2057,20 @@ fn ingest_pack(
             return Err(child);
         }
     };
-    // `write_to_directory` always drops a `.keep`; a received push keeps none.
-    // It only drops one when it moved a pack of its own into place, rather than
-    // finding the very same pack there already.
-    let created = outcome.keep_path.is_some();
-    if let Some(kp) = &outcome.keep_path {
-        let _ = std::fs::remove_file(kp);
-    }
+    // The quarantine starts empty, so the writer always moved a pack of its own
+    // into place, and dropped a `.keep` beside it.
     let (index_path, data_path) = match (&outcome.index_path, &outcome.data_path) {
         (Some(index), Some(data)) => (index.clone(), data.clone()),
         _ => return Ok(()),
     };
-    // A child that dies leaves no object behind: `index-pack --strict` checks
-    // every object before `write_idx_file()` runs, and both children write into
-    // the transaction's quarantine, which is discarded when they fail
+    // A child that dies leaves no object behind: both children write into the
+    // transaction's quarantine, which is discarded unless a ref is about to move
     // (object-file.c:1366-1445, tmp-objdir.c:54-77).
-    let discard = || {
-        if created {
-            let _ = std::fs::remove_file(&index_path);
-            let _ = std::fs::remove_file(&data_path);
+    let incoming = match Incoming::open(repo, transaction.path()) {
+        Ok(incoming) => incoming,
+        Err(e) => {
+            band.fatal(&e.to_string());
+            return Err(child);
         }
     };
 
@@ -1923,33 +2080,45 @@ fn ingest_pack(
         Ok(ids) => ids,
         Err(e) => {
             band.fatal(&e.to_string());
-            discard();
             return Err(child);
         }
     };
     if config.fsck_objects {
-        if let Err(message) = fsck_received(repo, &received, config, band, to_loose) {
+        if let Err(message) = fsck_received(repo, &incoming, &received, config, band, to_loose) {
             band.fatal(&message);
-            discard();
             return Err(child);
         }
     }
 
     // `unpack-objects` stores a small push loose and leaves no pack behind.
     if to_loose {
-        if let Err(e) = explode_pack(repo, &received) {
+        if let Err(e) = explode_pack(&incoming, &received) {
             band.fatal(&e.to_string());
-            discard();
             return Err(child);
         }
-        let _ = std::fs::remove_file(&index_path);
-        let _ = std::fs::remove_file(&data_path);
+        for path in [Some(&index_path), Some(&data_path), outcome.keep_path.as_ref()].into_iter().flatten() {
+            let _ = std::fs::remove_file(path);
+        }
         return Ok(());
+    }
+    // `index-pack --keep="receive-pack <pid> on <host>"` (object-file.c:1408-1416):
+    // `write_special_file()` writes the message and a newline (builtin/index-pack.c:1558-1588)
+    // into the file `odb_pack_keep()` created 0600. It is registered under the
+    // name the migrate will give it, for `odb_transaction_finalize()` to delete.
+    if let Some(keep_path) = &outcome.keep_path {
+        use std::os::unix::fs::PermissionsExt;
+        let msg = format!("receive-pack {} on {}\n", std::process::id(), super::send_email::hostname());
+        let _ = std::fs::write(keep_path, msg);
+        let _ = std::fs::set_permissions(keep_path, std::fs::Permissions::from_mode(0o600));
+        if let Some(name) = keep_path.file_name() {
+            let objects = repo.objects.store_ref().path();
+            transaction.pack_lockfiles.push(objects.join("pack").join(name));
+        }
     }
     // `index-pack` writes the reverse index unless `pack.writeReverseIndex` is
     // false (builtin/index-pack.c:1687-1692, 1922-1930, 2104-2108) and leaves
     // the files it renames into place read-only (`rename_tmp_packfile()`, :1590-1606).
-    if created {
+    {
         let snapshot = repo.config_snapshot();
         if snapshot.boolean("pack.writeReverseIndex").unwrap_or(true) {
             let _ = super::index_pack::write_rev_index(&index_path, &outcome.index.data_hash, repo.object_hash());
@@ -2012,6 +2181,7 @@ fn pack_object_ids(
 /// object rather than its type.
 fn fsck_received(
     repo: &gix::Repository,
+    incoming: &Incoming<'_>,
     received: &[gix::ObjectId],
     config: &Config,
     band: &mut Band,
@@ -2057,7 +2227,7 @@ fn fsck_received(
     }
 
     for id in received {
-        let Ok(object) = repo.find_object(*id) else { continue };
+        let Some((kind, data)) = incoming.find(*id) else { continue };
         // `parse_pack_objects()` (`builtin/index-pack.c:1284`) hands every
         // non-delta object to `sha1_object()` as it comes off the wire, so a blob
         // some *earlier* object in the pack already named is linted right here
@@ -2082,11 +2252,11 @@ fn fsck_received(
         // (`builtin/unpack-objects.c:559`) — so a small push, which git unpacks
         // loose, can never report `gitmodulesLarge`. Confirmed on the same pack:
         // `unpack-objects --strict` is silent.
-        if object.kind == gix::object::Kind::Blob {
+        if kind == gix::object::Kind::Blob {
             if to_loose {
                 continue;
             }
-            if object.data.len() as u64 > threshold {
+            if data.len() as u64 > threshold {
                 delayed.push(*id);
                 continue;
             }
@@ -2094,13 +2264,13 @@ fn fsck_received(
             let as_attrs = gitattributes.contains(id);
             if as_modules || as_attrs {
                 done.insert(*id);
-                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
+                for finding in check_blob(Some(&data), as_modules, as_attrs) {
                     report(config, band, &finding, id, &mut failed);
                 }
             }
             continue;
         }
-        let checked = check_object(object.kind, &object.data, true, repo.object_hash().len_in_hex());
+        let checked = check_object(kind, &data, true, repo.object_hash().len_in_hex());
         // The tree-entry decoder's own `error:` lines, already prefixed.
         for line in &checked.raw {
             band.write(&format!("{line}\n"));
@@ -2151,18 +2321,18 @@ fn fsck_received(
         let as_attrs = gitattributes.contains(&id);
         // `fsck_blobs()` reports the failure to read the blob, or its being
         // some other type, once per sweep that named it.
-        let (missing, non_blob) = match repo.find_object(id) {
-            Ok(object) if object.kind == gix::object::Kind::Blob => {
+        let (missing, non_blob) = match incoming.find(id) {
+            Some((gix::object::Kind::Blob, data)) => {
                 // `fsck_blobs()` always reads the whole object
                 // (`fsck.c:1337`'s `odb_read_object()`), so nothing is streamed
                 // here however large it is.
-                for finding in check_blob(Some(&object.data), as_modules, as_attrs) {
+                for finding in check_blob(Some(&data), as_modules, as_attrs) {
                     report(config, band, &finding, &id, &mut failed);
                 }
                 continue;
             }
-            Ok(_) => (false, true),
-            Err(_) => (true, false),
+            Some(_) => (false, true),
+            None => (true, false),
         };
         for (present, missing_msg, blob_msg, label) in [
             (as_modules, &GITMODULES_MISSING, &GITMODULES_BLOB, ".gitmodules"),
@@ -2192,15 +2362,22 @@ fn fsck_received(
 }
 
 /// `unpack-objects`: write every object of the received pack into the loose
-/// object store, so nothing of the pack survives.
-fn explode_pack(repo: &gix::Repository, received: &[gix::ObjectId]) -> Result<()> {
+/// object store of the quarantine, so nothing of the pack survives.
+fn explode_pack(incoming: &Incoming<'_>, received: &[gix::ObjectId]) -> Result<()> {
     use gix::objs::Write;
     for id in received {
-        let object = repo.find_object(*id)?;
+        // Writing an object some source already has only freshens it
+        // (`odb_freshen_object()`, odb.c:824-832, odb/source-loose.c:949), and the
+        // real store is one of the quarantine's sources.
+        if incoming.repo.has_object(*id) {
+            continue;
+        }
+        let (kind, data) = incoming.find(*id).ok_or_else(|| anyhow!("unable to read {id}"))?;
         // The id is already known and the object still exists *in the pack*, so
         // the write has to bypass the usual "already present" short-circuit.
-        repo.objects
-            .write_buf_with_known_id(object.kind, &object.data, *id)
+        incoming
+            .quarantine
+            .write_buf_with_known_id(kind, &data, *id)
             .map_err(|e| anyhow!("unable to write loose object {id}: {e}"))?;
     }
     Ok(())

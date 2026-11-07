@@ -170,7 +170,7 @@ impl Capabilities {
 pub mod blocking_recv {
     use std::io;
 
-    use bstr::ByteVec;
+    use bstr::{ByteSlice, ByteVec};
 
     use crate::{
         Protocol,
@@ -204,6 +204,20 @@ pub mod blocking_recv {
             // We are sure this can't clash with binary data when sent due to the way the PACK
             // format looks like, thus there is no binary blob that could ever look like an ERR line by accident.
             rd.fail_on_err_lines(true);
+
+            // `discover_version()` (connect.c:143-181): a `version 1` line is read and dropped
+            // (`packet_reader_read()`, :168-171), and what follows it is the v0 advertisement.
+            let version_one = match rd.peek_line() {
+                Some(line) => {
+                    let line = client::initial_contact(line)??.as_text().ok_or(client::Error::ExpectedLine("text"))?;
+                    line.as_bstr().starts_with_str("version ")
+                        && Capabilities::extract_protocol(line)? == Protocol::V1
+                }
+                None => false,
+            };
+            if version_one {
+                let _ = rd.read_line();
+            }
 
             Ok(match rd.peek_line() {
                 Some(line) => {

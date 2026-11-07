@@ -1429,6 +1429,9 @@ pub(crate) struct WriteOptions {
     /// Stated in the negative so `Default` keeps git's default, which is to
     /// reuse.
     pub(crate) no_reuse_delta: bool,
+    /// `--no-reuse-object`, which `repack -F` passes: no entry is copied out
+    /// of an existing pack byte for byte.
+    pub(crate) no_reuse_object: bool,
     /// How many objects the caller's walk showed, when the writer is to draw
     /// `Enumerating objects` itself: a thin pack counts its preferred bases
     /// there too, and only the writer knows them.
@@ -1466,6 +1469,9 @@ pub(crate) fn packed_for_thin(
     delta.allow_ofs_delta = options.allow_ofs_delta;
     delta.use_islands = options.use_delta_islands;
     delta.reuse_delta &= !options.no_reuse_delta;
+    delta.reuse_object &= !options.no_reuse_object;
+    // `if (!reuse_object) reuse_delta = 0;` (builtin/pack-objects.c:5370-5371).
+    delta.reuse_delta &= delta.reuse_object;
     if let Some(window) = options.window {
         delta.search.window = window;
     }
@@ -1673,6 +1679,10 @@ impl DeltaConfig {
         if let Some(v) = st.reuse_delta {
             self.reuse_delta = v;
         }
+        // `if (!reuse_object) reuse_delta = 0;` (builtin/pack-objects.c:5370-5371),
+        // after parse-options: `--no-reuse-object` takes delta reuse with it
+        // whatever `--reuse-delta` said.
+        self.reuse_delta &= self.reuse_object;
         self.use_islands |= st.delta_islands;
 
         // `depth >= 1 << OE_DEPTH_BITS` and `cache_max_small_delta_size >= 1 <<
@@ -1943,7 +1953,8 @@ fn write_pack(
     // object's base first, so the meter counts positions reached rather than
     // entries appended — the same total, and monotone, which is what the display
     // needs.
-    let write_order = compute_write_order(&objects, &deltas, &tag_tips(repo));
+    let kept_delta: Vec<bool> = reused.iter().map(Option::is_some).collect();
+    let write_order = compute_write_order(&objects, &deltas, &kept_delta, &tag_tips(repo));
     // `if (progress > pack_to_stdout)` (builtin/pack-objects.c:1340).
     let mut writing = Meter::counted("Writing objects", to_write, writing_progress);
     let mut body: Vec<u8> = Vec::new();
@@ -2430,6 +2441,7 @@ fn tag_tips(repo: &gix::Repository) -> HashSet<ObjectId> {
 fn compute_write_order(
     objects: &[pack::data::output::delta::Object],
     deltas: &[Option<pack::data::output::delta::Delta>],
+    kept_delta: &[bool],
     tagged: &HashSet<ObjectId>,
 ) -> Vec<usize> {
     let n = objects.len();
@@ -2523,15 +2535,20 @@ fn compute_write_order(
             add(&mut wo, &mut filled, i);
         }
     }
+    // `oe_type()` of an entry `check_object()` kept a stored delta for is that
+    // delta's in-pack type, `OBJ_OFS_DELTA` or `OBJ_REF_DELTA` —
+    // `oe_set_type(entry, entry->in_pack_type)` (builtin/pack-objects.c:2351) —
+    // so steps 3 and 4 pass over it and it is written with its family in step 5.
+    let kind = |i: usize| (!kept_delta[i]).then_some(objects[i].kind);
     // 3. The remaining commits and tags.
     for i in last_untagged..n {
-        if matches!(objects[i].kind, gix::object::Kind::Commit | gix::object::Kind::Tag) {
+        if matches!(kind(i), Some(gix::object::Kind::Commit | gix::object::Kind::Tag)) {
             add(&mut wo, &mut filled, i);
         }
     }
     // 4. The trees.
     for i in last_untagged..n {
-        if objects[i].kind == gix::object::Kind::Tree {
+        if kind(i) == Some(gix::object::Kind::Tree) {
             add(&mut wo, &mut filled, i);
         }
     }

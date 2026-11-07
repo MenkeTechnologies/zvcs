@@ -47,6 +47,9 @@ pub struct Options {
 /// objects selected from that pack (and not another pack containing a
 /// duplicate)" (midx-write.c:1458-1497, v2.55.0). `None` is git's
 /// `NO_PREFERRED_PACK`, which leaves every entry demoted equally.
+///
+/// The same pack wins a tie between two copies of one object
+/// (`midx_oid_compare()`, midx-write.c:203-224).
 pub struct BitmapOrder {
     /// The `.idx` file name of the preferred pack, matched against the sorted
     /// index names this writer builds the `PNAM` chunk from.
@@ -242,8 +245,23 @@ pub(super) mod function {
             let start = Instant::now();
             progress.set_name("Deduplicate".into());
             progress.init(Some(entries.len()), gix_features::progress::count("entries"));
+            // `midx_oid_compare()` (midx-write.c:203-224): of several copies of
+            // one object, the preferred pack's comes first ("Sort objects in a
+            // preferred pack first when multiple copies exist"), then the newest
+            // pack's, then the lowest pack id's — and dedup keeps the first.
+            let preferred: Option<u32> = bitmap_order
+                .as_ref()
+                .and_then(|order| order.preferred_index_name.as_ref())
+                .and_then(|name| {
+                    index_filenames_sorted
+                        .iter()
+                        .position(|candidate| candidate.as_os_str() == name.as_os_str())
+                })
+                .map(|at| at as u32);
+            let is_preferred = |e: &Entry| Some(e.pack_index) == preferred;
             entries.sort_by(|l, r| {
                 l.id.cmp(&r.id)
+                    .then_with(|| is_preferred(r).cmp(&is_preferred(l)))
                     .then_with(|| l.index_mtime.cmp(&r.index_mtime).reverse())
                     .then_with(|| l.pack_index.cmp(&r.pack_index))
             });

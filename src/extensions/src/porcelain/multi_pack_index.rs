@@ -83,7 +83,8 @@
 //! index) — exactly what `write_from_index_paths` already does — so that path is
 //! reproduced warning-for-warning and byte-for-byte. A *known* preferred pack
 //! only changes the winner when an object id is shared across the indexed packs;
-//! that single case bails (see below).
+//! with `--bitmap` the writer puts that pack's copy first, as
+//! `midx_oid_compare()` does, and without it that single case bails (see below).
 //!
 //! git's two `write` cross-flag validations run before any artifact is produced
 //! and are reproduced as usage errors (exit 129): `--no-write-chain-file`
@@ -95,12 +96,11 @@
 //!
 //! Not covered — these `bail!` rather than producing a diverging artifact:
 //!
-//!   * `write --preferred-pack=<name>` when the named pack is present *and* the
-//!     indexed packs share an object id — the only case the value changes which
-//!     copy of the object the MIDX names. `write_from_index_paths` resolves
-//!     duplicates by mtime/index, with no hook for the preferred-pack
-//!     tie-break. `--bitmap` picks a preferred pack of its own (the oldest by
-//!     mtime), so it bails on the same condition.
+//!   * `write --preferred-pack=<name>` without `--bitmap` when the named pack is
+//!     present *and* the indexed packs share an object id — the only case the
+//!     value changes which copy of the object the MIDX names.
+//!     `write_from_index_paths` takes the preferred pack only through its
+//!     `--bitmap` order, so without one it has no hook for that tie-break.
 //!   * `write --incremental` (with or without `--base=` /
 //!     `--no-write-chain-file`), and the actual collapsing step of `compact`
 //!     once both endpoints resolve — these read and write MIDX chain layers
@@ -297,8 +297,8 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///
 /// `write` also honours `--bitmap`, `--stdin-packs`, `--preferred-pack=` and
 /// `--refs-snapshot=` (see the module docs), and reproduces git's two cross-flag
-/// usage errors. `write --incremental`, and a `--preferred-pack` or `--bitmap`
-/// that would break a cross-pack duplicate tie, `bail!` — see the module docs
+/// usage errors. `write --incremental`, and a `--preferred-pack` without
+/// `--bitmap` that would break a cross-pack duplicate tie, `bail!` — see the module docs
 /// for the specific missing substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
@@ -391,7 +391,25 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `write`: index every pack in the object directory into a fresh MIDX.
-fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+fn write(rest: &[&str], object_dir: Option<PathBuf>) -> Result<ExitCode> {
+    write_with(rest, object_dir, None)
+}
+
+/// The `multi-pack-index write` child `repack --write-midx` runs, handed the
+/// `--stdin-packs` list `repack_fill_midx_stdin_packs()` would have written
+/// down the child's stdin (repack-midx.c:304-324). `rest` is the child's argv
+/// after `write`.
+pub(crate) fn write_child(rest: &[&str], stdin_packs: &[String]) -> Result<ExitCode> {
+    write_with(rest, None, Some(stdin_packs.iter().cloned().collect()))
+}
+
+/// [`write`], taking the `--stdin-packs` names from `stdin_input` when the
+/// caller already holds them rather than from the process's stdin.
+fn write_with(
+    rest: &[&str],
+    mut object_dir: Option<PathBuf>,
+    stdin_input: Option<std::collections::HashSet<String>>,
+) -> Result<ExitCode> {
     let mut after_dd = false;
     // git's write option array is all last-wins booleans plus three string
     // options; only the flags that reach the flat-write path or a validation
@@ -582,7 +600,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // ignored, matching `write_midx_file_only`).
     let mut index_paths = pack_indices(&pack_dir);
     if stdin_packs {
-        let wanted = read_stdin_pack_names();
+        let wanted = stdin_input.unwrap_or_else(read_stdin_pack_names);
         index_paths.retain(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -603,12 +621,14 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // `write_from_index_paths` tie-break (newest `.idx` mtime, then lowest pack
     // index), so an unknown preferred pack stays byte-identical. A *known*
     // preferred pack changes the winner only when the same object id appears in
-    // more than one of the indexed packs — the one case gix-pack's writer cannot
-    // reproduce, so it bails there and nowhere else.
+    // more than one of the indexed packs. gix-pack's writer applies
+    // `midx_oid_compare()`'s preferred-first rule only when the pack reaches it
+    // through the `--bitmap` order, so a duplicate without `--bitmap` is the one
+    // case it cannot reproduce, and it bails there and nowhere else.
     let mut preferred_index_name: Option<std::ffi::OsString> = None;
     if let Some(name) = &preferred {
         if preferred_pack_present(name, &index_paths) {
-            if has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
+            if !bitmap && has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
                 anyhow::bail!(
                     "multi-pack-index write --preferred-pack={name} cannot be reproduced here — the indexed packs share at least one object id and gix_pack::multi_index::write_from_index_paths does not expose the preferred-pack tie-break git uses to resolve the duplicate"
                 );
@@ -629,11 +649,6 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // pack, so that "the pack from which the first object is selected in
         // pseudo pack-order has all of its objects selected from that pack".
         preferred_index_name = default_preferred_pack(&pack_dir, &index_paths);
-        if preferred_index_name.is_some() && has_cross_pack_duplicates(&index_paths, repo.object_hash())? {
-            anyhow::bail!(
-                "multi-pack-index write --bitmap cannot be reproduced here — the indexed packs share at least one object id, and the preferred pack git picks for a bitmap write resolves that duplicate by a rule gix_pack::multi_index::write_from_index_paths does not expose"
-            );
-        }
     }
 
     // `--bitmap` is `OPT_BIT(0, "bitmap", &opts.flags, ..., MIDX_WRITE_BITMAP |
@@ -1228,33 +1243,22 @@ pub(crate) fn write_midx(pack_dir: &Path, object_hash: gix::hash::Kind) -> Resul
     }
 }
 
-/// [`write_midx`] over the non-cruft packs only — the set `repack-midx.c:199-235`
-/// builds when `repack.midxMustContainCruft` is false and the pre-existing MIDX
-/// held no pack the new one would drop.
-///
-/// A cruft pack is one carrying a `.mtimes` sidecar; that is exactly what
-/// `packed_git.is_cruft` records (`packfile.c`, set from the `.mtimes` the pack
-/// was opened with), and it is the same test `existing_packs_populate()` uses to
-/// sort a pack into `cruft_packs` rather than `non_kept_packs`.
-pub(crate) fn write_midx_without_cruft(
+/// [`write_midx`] over an explicit set of `.idx` paths — the include list
+/// `midx_included_packs()` (repack-midx.c:140-251) hands the `multi-pack-index
+/// write --stdin-packs` child of `repack --write-midx`, rather than every pack
+/// in the directory.
+pub(crate) fn write_midx_of(
     pack_dir: &Path,
     object_hash: gix::hash::Kind,
+    index_paths: Vec<PathBuf>,
 ) -> Result<bool> {
-    match write_midx_from(pack_dir, object_hash, non_cruft_pack_indices(pack_dir), None)? {
+    match write_midx_from(pack_dir, object_hash, index_paths, None)? {
         Some(staged) => {
             staged.commit(pack_dir)?;
             Ok(true)
         }
         None => Ok(false),
     }
-}
-
-/// [`pack_indices`] minus every pack with a `.mtimes` beside it.
-fn non_cruft_pack_indices(dir: &Path) -> Vec<PathBuf> {
-    pack_indices(dir)
-        .into_iter()
-        .filter(|idx| !idx.with_extension("mtimes").is_file())
-        .collect()
 }
 
 /// The `.idx` names an already-written `<pack_dir>/multi-pack-index` lists, or

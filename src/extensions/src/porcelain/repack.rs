@@ -22,8 +22,9 @@
 //! order instead left every pack under a name stock git never produced. `-f`
 //! *is* honoured — it becomes `pack-objects --no-reuse-delta`, which the writer
 //! acts on, because deltas are otherwise kept from the pack they are already in.
-//! `-F` controls reuse of a stored entry's *bytes*, which this writer never
-//! does, so it is accepted as a no-op.
+//! `-F` is honoured too, as `pack-objects --no-reuse-object`: no stored entry
+//! is copied out byte for byte, and no stored delta is kept either. Neither
+//! reaches the cruft pack, whose `pack-objects` git starts without them.
 //!
 //! # Argument surface
 //!
@@ -211,17 +212,21 @@
 //!     the arithmetic here is 64-bit and saturating, so those packs are simply
 //!     weighed.
 //!   * **`--write-midx`** writes `objects/pack/multi-pack-index` over the packs
-//!     the run leaves behind, through the same writer `git multi-pack-index
-//!     write` uses. `--write-midx=incremental` asks for a MIDX *chain* instead
-//!     and is refused. A MIDX written together with `-b` carries no
-//!     `multi-pack-index-<hash>.bitmap`: that is a different format from the
-//!     pack bitmap this port writes, and `gix-pack` has no writer for it. The
-//!     pack `.bitmap` is not written in its place either, git putting none there
-//!     under `--write-midx`, so the run is a MIDX with no bitmap at all.
-//!   * **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
-//!     parts of git's search that have no counterpart here, and stay no-ops.
-//!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
-//!     `-b` on by itself; `--no-write-bitmap-index` overrides either.
+//!     `midx_included_packs()` picks, before `-d` removes anything, through the
+//!     same writer `git multi-pack-index write` uses. `--write-midx=incremental`
+//!     asks for a MIDX *chain* instead and is refused. With `-b` the MIDX is
+//!     written by the `multi-pack-index write --bitmap --stdin-packs` port
+//!     itself, with git's `--preferred-pack` and `--refs-snapshot`, so it carries
+//!     its `multi-pack-index-<hash>.bitmap`; a bitmap that cannot be built is
+//!     that child's exit 255, and `-d`, `prune-packed` and `update-server-info`
+//!     are skipped as `goto cleanup` skips them.
+//!   * **`--path-walk`/`--name-hash-version`** tune parts of git's search that
+//!     have no counterpart here, and stay no-ops. `-i`/`--delta-islands` reaches
+//!     the main pack's delta search, as `pack-objects --delta-islands` does.
+//!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps` (the
+//!     last of the two wins), turns `-b` on by itself, so an incremental repack
+//!     under it dies; `--no-write-bitmap-index` overrides either. `-l` in a
+//!     repository with alternates turns bitmaps off with git's warning.
 //!   * `repack.useDeltaBaseOffset` *is* read, and picks `OBJ_OFS_DELTA` over
 //!     `OBJ_REF_DELTA`. `repack.cruftWindow` / `repack.cruftWindowMemory` /
 //!     `repack.cruftDepth` / `repack.cruftThreads` are read too, and steer the
@@ -241,7 +246,7 @@
 //!     (`builtin/repack.c:291-296`), so the refusals are reproduced and the
 //!     values themselves steer nothing. `repack.midxMustContainCruft` *is*
 //!     honoured: it decides whether the `multi-pack-index` covers the cruft
-//!     packs, through [`resolve_midx_cruft`].
+//!     packs, through [`midx_included_packs`].
 //!   * `pack.useBitmaps` and `pack.allowPackReuse` are read where git's
 //!     `pack-objects` child would have read them — in [`execute`], so `repack -h`
 //!     still prints usage — and validated, but neither bitmap-accelerated
@@ -474,12 +479,25 @@ struct State {
     /// finally falls back to "only when everything goes into one pack in a bare
     /// repository".
     write_bitmap: Option<bool>,
+    /// `repack.writeBitmaps` / `pack.writeBitmaps`, whichever `repack_config()`
+    /// saw last (builtin/repack.c:77-81), which seeds `write_bitmaps` before
+    /// parse-options can override it.
+    bitmap_cfg: Option<bool>,
+    /// `write_bitmaps` once `cmd_repack()` has resolved it
+    /// (builtin/repack.c:407-431): `1` asked for, `0` off, `-1` the unasked
+    /// default that survives only for a MIDX write or an all-into-one repack of
+    /// a bare repository. Set by [`preflight`].
+    write_bitmaps: i32,
     /// git's tri-state `po_args.pack_kept_objects`, which decides whether
     /// `prepare_pack_objects()` pushes `--honor-pack-keep` (repack.c:41-42).
     /// `None` is its `-1`, resolved in [`honor_pack_keep`].
     pack_kept_objects: Option<bool>,
     /// `-f`: `po_args.no_reuse_delta`, passed on as `--no-reuse-delta`.
     no_reuse_delta: bool,
+    /// `-F`: `po_args.no_reuse_object`, passed on as `--no-reuse-object`.
+    no_reuse_object: bool,
+    /// `-i` / `--[no-]delta-islands`, which overrides `repack.useDeltaIslands`.
+    delta_islands: Option<bool>,
     write_midx: bool,
     /// `--write-midx=incremental`, which asks for a MIDX *chain* rather than a
     /// single `multi-pack-index`. Tracked separately so it can be refused.
@@ -557,8 +575,25 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
     // keys `repack_config()` reads (`builtin/repack.c:97-110`), which is why they
     // are loaded here rather than next to the MIDX write they steer.
     let mut midx_cfg = MidxConfig::DEFAULT;
+    let mut bitmap_cfg = None;
+    let mut facts = RepoFacts::default();
     let pack_size_limit_cfg = match crate::setup::discover() {
         Ok(repo) => {
+            bitmap_cfg = match write_bitmaps_config(&repo) {
+                Ok(v) => v,
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            facts = RepoFacts {
+                bare: repo.is_bare(),
+                has_alternates: repo
+                    .objects
+                    .store_ref()
+                    .alternate_db_paths()
+                    .is_ok_and(|alternates| !alternates.is_empty()),
+            };
             let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
                 Ok(limit) => limit,
                 Err(message) => {
@@ -582,12 +617,13 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         Parsed::Exit(code) => return Ok(code),
         Parsed::Ok(state) => state,
     };
+    state.bitmap_cfg = bitmap_cfg;
 
     if let Some(code) = drop_filtered_setup(&mut state)? {
         return Ok(code);
     }
 
-    if let Some(code) = preflight(&state, &midx_cfg) {
+    if let Some(code) = preflight(&mut state, &midx_cfg, &facts) {
         return Ok(code);
     }
 
@@ -734,7 +770,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     }
 
     // `existing->midx_packs`, read before `-d` can delete a pack out from under
-    // the MIDX; see [`resolve_midx_cruft`].
+    // the MIDX; see [`midx_included_packs`].
     let existing_midx_packs = super::multi_pack_index::midx_pack_names(&pack_dir);
     // git's `packdir` *string*, which is the only thing the locality rule looks
     // at; see [`git_packdir`].
@@ -887,8 +923,14 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // `--unpacked` adds `add_unreachable_loose_objects()` on top —
         // *every* loose object, reachable or not
         // (builtin/pack-objects.c:4465-4470, :3826-3834).
+        // No `--all`, so no traversal decides membership: the walk
+        // `read_stdin_packs()` runs only names what the included packs hold, and
+        // `add_unreachable_loose_objects()` reads the local source alone
+        // (builtin/pack-objects.c:4093-4136, :4577-4581). A loose object an
+        // alternate holds is not packed, however reachable.
+        to_pack.clear();
         let survivors = geo.surviving_objects(&existing);
-        let mut packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
+        let mut packed: HashSet<ObjectId> = HashSet::new();
         let rolled = geo.rolled_up_objects(&existing);
         for id in rolled
             .into_iter()
@@ -1133,6 +1175,21 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     if st.delete_redundant && st.all_into_one && !st.cruft && st.loosen_unreachable {
         loosen_unreachable(&repo, st, &existing, &pack_dir, &objdir, &in_new_pack)?;
     }
+    // What `repack_write_midx()` reads of the packs that were here before the
+    // run, taken before that list is let go: the local ones, and the
+    // geometric split's survivors, roll-ups and preferred pack.
+    let local_packs: Vec<PathBuf> = existing
+        .iter()
+        .map(|f| f.path().to_path_buf())
+        .filter(|p| is_existing_local(&pack_dir, p))
+        .collect();
+    let geometry_midx = geometry.as_ref().map(|geo| {
+        (
+            geo.surviving_paths(&existing),
+            geo.rolled_up_paths(&existing, &pack_dir),
+            geo.preferred_pack(&existing),
+        )
+    });
     drop(existing);
 
     fs::create_dir_all(&pack_dir)?;
@@ -1204,7 +1261,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         warn_min_pack_size(po_pack_size_limit(st, pack_size_limit_cfg));
         let mut ids = promisor_kept;
         ids.sort();
-        let path = write_pack(&repo, st, &ids, &packtmp, write_rev, progress, false)?;
+        let path = write_pack(&repo, st, &ids, &packtmp, write_rev, progress, false, false)?;
         let hash = pack_hash(&pack_base_name(&path));
         // `write_promisor_file(promisor_name, NULL, 0)`: an empty file, named
         // for the pack it marks.
@@ -1230,7 +1287,10 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
             // MIDX is being written (`if (write_midx == REPACK_WRITE_MIDX_NONE)`
             // around both `--write-bitmap-index` pushes): with `--write-midx` the
             // bitmap belongs to the MIDX instead, and git leaves the packs bare.
-            write_bitmaps(st, &repo) && !st.write_midx,
+            st.write_bitmaps != 0 && !st.write_midx,
+            // `--delta-islands` is pushed onto this child alone
+            // (builtin/repack.c:503-504).
+            true,
         )?;
         new_packs.push((pack_hash(&pack_base_name(&path)), to_pack.len()));
     }
@@ -1252,6 +1312,9 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // The gate is `names` rather than `to_pack`, which are the same set
     // everywhere but a partial clone: there the promisor pack is a name the run
     // wrote, so a main pack-objects that found nothing left to do is silent.
+    // `if (!names.nr)` also decides whether the MIDX must cover the cruft packs
+    // (builtin/repack.c:597-614); see [`midx_included_packs`].
+    let no_new_main_pack = new_packs.is_empty();
     if new_packs.is_empty() && !st.quiet {
         println!("Nothing new to pack.");
     }
@@ -1369,7 +1432,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // the ordinary case for a repository whose objects are all reachable.
         if !cruft.is_empty() {
             let path = write_pack_with(
-                &repo, st, &cruft, &packtmp, write_rev, progress, false, true,
+                &repo, st, &cruft, &packtmp, write_rev, progress, false, false, true,
             )?;
             let hash = pack_hash(&pack_base_name(&path));
             write_mtimes(&repo, &path, &suffixed(&packtmp, &format!("-{hash}.mtimes")), &stamps)?;
@@ -1416,7 +1479,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         } else {
             // No bitmap: a bitmap describes a reachability closure, and this pack
             // is deliberately a fragment of one.
-            write_pack(&repo, st, &filtered_out, &prefix, write_rev, progress, false)
+            write_pack(&repo, st, &filtered_out, &prefix, write_rev, progress, false, false)
                 .map(|path| pack_base_name(&path))
         };
         let stem = match outcome {
@@ -1490,6 +1553,51 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         }
     }
 
+    // `repack_write_midx()` (builtin/repack.c:725-742), which runs before `-d`
+    // removes anything and works from the packs `existing_packs_mark_for_deletion()`
+    // has marked: `-a -d` marks every local pack that is neither kept nor one of
+    // the names this run wrote (repack.c:246-255), and a geometric run marks none.
+    if st.write_midx_incremental {
+        bail!(
+            "unsupported flag \"--write-midx=incremental\" \
+             (the MIDX chain protocol is not modelled by the vendored gix-pack multi-index writer)"
+        );
+    }
+    if st.write_midx {
+        let marked: Vec<PathBuf> = match st.delete_redundant && st.all_into_one {
+            true => superseded.iter().filter(|p| !installed.contains(p)).cloned().collect(),
+            false => Vec::new(),
+        };
+        let local: Vec<&Path> = local_packs.iter().map(PathBuf::as_path).collect();
+        let (surviving, rolled_up, preferred) = match geometry_midx {
+            Some((surviving, rolled_up, preferred)) => (Some(surviving), Some(rolled_up), preferred),
+            None => (None, None, None),
+        };
+        let include = midx_included_packs(
+            st,
+            &local,
+            &new_packs,
+            surviving,
+            rolled_up,
+            &marked,
+            midx.must_contain_cruft,
+            no_new_main_pack,
+            existing_midx_packs.as_deref(),
+        );
+        if let Some(code) = write_midx_included_packs(
+            st,
+            &repo,
+            &objdir,
+            &pack_dir,
+            &include,
+            &new_packs,
+            preferred,
+            progress,
+        )? {
+            return Ok(code);
+        }
+    }
+
     if st.delete_redundant {
         for index_path in superseded {
             // An identical object set hashes to the same name, in which case the
@@ -1508,24 +1616,6 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         let _ = super::prune_packed::prune_packed(&["prune-packed".to_string(), "-q".to_string()])?;
     }
 
-    // `repack_write_midx()`. git writes the index before it deletes the packs
-    // `-d` supersedes, working from the set it has already marked for removal;
-    // writing it here instead, from the packs actually left in the directory,
-    // reaches the same set without having to model the marks.
-    if st.write_midx_incremental {
-        bail!(
-            "unsupported flag \"--write-midx=incremental\" \
-             (the MIDX chain protocol is not modelled by the vendored gix-pack multi-index writer)"
-        );
-    }
-    if st.write_midx {
-        if resolve_midx_cruft(midx.must_contain_cruft, &new_packs, existing_midx_packs.as_deref(), &pack_dir) {
-            super::multi_pack_index::write_midx(&pack_dir, repo.object_hash())?;
-        } else {
-            super::multi_pack_index::write_midx_without_cruft(&pack_dir, repo.object_hash())?;
-        }
-    }
-
     if run_server_info {
         let _ = super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
     }
@@ -1533,51 +1623,227 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     Ok(ExitCode::SUCCESS)
 }
 
-/// Whether the `multi-pack-index` about to be written must include the cruft
-/// packs — `repack.midxMustContainCruft` after the two overrides git applies.
+/// `midx_included_packs()` (repack-midx.c:140-251): the `.idx` names the
+/// `multi-pack-index write --stdin-packs` child of `repack --write-midx` is
+/// handed, sorted as the `string_list` holding them is.
 ///
-/// The key is a *permission to omit*, not an instruction to omit, and git takes
-/// that permission away twice:
+/// Every kept local pack, every pack this run wrote, and then either the packs
+/// at or above the geometric split or — without `--geometric` — every other
+/// local non-cruft pack `-a -d` has not marked for deletion. The cruft packs
+/// that survive join them unless `repack.midxMustContainCruft` is false, which
+/// is a *permission to omit* git takes away twice:
 ///
-/// 1. `builtin/repack.c:460-478`. When the run wrote no new pack, the surviving
-///    non-cruft packs may still reference objects that only the cruft pack now
-///    holds, so the MIDX has to cover them — unless a MIDX already exists, in
-///    which case the next rule decides instead.
-/// 2. `repack-midx.c:199-200`, `midx_has_unknown_packs()`. If the *existing*
-///    MIDX names a pack the new one would not, that pack may be part of a
-///    bitmap's reachability closure, and the cruft packs are kept for the same
-///    reason. In git a pack from the old MIDX counts as known when it is in the
-///    include list, or (with `--geometric`) below the split line, or in
-///    `non_kept_packs` and not marked for deletion. This port has no geometric
-///    split and no deletion marks — the packs still on disk at this point *are*
-///    the survivors, and `write_midx_without_cruft` includes exactly the
-///    non-cruft ones — so "known" collapses to "still in the new include set".
-fn resolve_midx_cruft(
-    must_contain_cruft: bool,
+/// 1. `builtin/repack.c:597-614`. When the main `pack-objects` wrote nothing,
+///    the non-cruft packs may refer to once-cruft objects, so with no MIDX on
+///    disk the new one has to cover the cruft packs (`no_new_main_pack`).
+/// 2. `midx_has_unknown_packs()` (repack-midx.c:74-138). A pack the existing
+///    MIDX names that is neither in the list, nor below the geometric split,
+///    nor a surviving non-kept pack may be part of a bitmap's reachability
+///    closure, and the cruft packs are kept for it.
+#[allow(clippy::too_many_arguments)]
+fn midx_included_packs(
+    st: &State,
+    local: &[&Path],
     new_packs: &[(String, usize)],
+    geometry_surviving: Option<Vec<PathBuf>>,
+    geometry_rolled_up: Option<Vec<PathBuf>>,
+    marked: &[PathBuf],
+    must_contain_cruft: bool,
+    no_new_main_pack: bool,
     existing_midx_packs: Option<&[String]>,
-    pack_dir: &Path,
-) -> bool {
-    if must_contain_cruft {
-        return true;
+) -> Vec<String> {
+    let idx_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let is_cruft = |p: &Path| p.with_extension("mtimes").is_file();
+    let marked_for_deletion = |p: &Path| marked.iter().any(|m| m == p);
+    // `existing->non_kept_packs` that `existing_pack_is_marked_for_deletion()`
+    // leaves alone.
+    let surviving_non_kept =
+        |p: &Path| droppable(st, p) && !is_cruft(p) && !marked_for_deletion(p);
+
+    let mut include: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    include.extend(local.iter().filter(|p| !droppable(st, p)).map(|p| idx_name(p)));
+    include.extend(new_packs.iter().map(|(hash, _)| format!("pack-{hash}.idx")));
+    match &geometry_surviving {
+        Some(paths) => include.extend(paths.iter().map(|p| idx_name(p))),
+        None => include.extend(local.iter().filter(|p| surviving_non_kept(p)).map(|p| idx_name(p))),
     }
-    if new_packs.is_empty() && existing_midx_packs.is_none() {
-        return true;
-    }
-    let Some(existing) = existing_midx_packs else {
-        return false;
+
+    let must_contain_cruft = must_contain_cruft || (no_new_main_pack && existing_midx_packs.is_none());
+    let unknown = || {
+        existing_midx_packs.is_some_and(|names| {
+            names.iter().any(|name| {
+                if include.contains(name) {
+                    return false;
+                }
+                match &geometry_rolled_up {
+                    Some(rolled_up) => !rolled_up.iter().any(|p| idx_name(p) == *name),
+                    None => !local.iter().any(|p| idx_name(p) == *name && surviving_non_kept(p)),
+                }
+            })
+        })
     };
-    // The include set the new MIDX would carry: every non-cruft `.idx` left in
-    // the directory.
-    let include: std::collections::HashSet<String> = fs::read_dir(pack_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".idx"))
-        .filter(|name| !pack_dir.join(name).with_extension("mtimes").is_file())
-        .collect();
-    existing.iter().any(|name| !include.contains(name))
+    if must_contain_cruft || unknown() {
+        let cruft: Vec<String> = local
+            .iter()
+            .filter(|p| droppable(st, p) && is_cruft(p) && !marked_for_deletion(p))
+            .map(|p| idx_name(p))
+            .collect();
+        include.extend(cruft);
+    }
+    include.into_iter().collect()
+}
+
+/// `write_midx_included_packs()` (repack-midx.c:326-387): write the MIDX over
+/// `include`, and with a bitmap asked for, through the `multi-pack-index write
+/// --bitmap` child itself, so that what it refuses (a bitmap without full
+/// closure among them) is refused here too.
+///
+/// `Some(code)` is the child's failure, which `cmd_repack()` returns after
+/// `goto cleanup` — skipping `-d`, `prune-packed` and `update-server-info`
+/// (builtin/repack.c:740-742).
+#[allow(clippy::too_many_arguments)]
+fn write_midx_included_packs(
+    st: &State,
+    repo: &gix::Repository,
+    objdir: &Path,
+    pack_dir: &Path,
+    include: &[String],
+    new_packs: &[(String, usize)],
+    geometry_preferred: Option<String>,
+    progress: bool,
+) -> Result<Option<ExitCode>> {
+    // `if (!include.nr) goto done;`
+    if include.is_empty() {
+        return Ok(None);
+    }
+    // `.write_bitmaps = write_bitmaps > 0` (builtin/repack.c:733): the unasked
+    // `-1` writes a MIDX without one.
+    if st.write_bitmaps <= 0 {
+        let paths = include.iter().map(|name| pack_dir.join(name)).collect();
+        super::multi_pack_index::write_midx_of(pack_dir, repo.object_hash(), paths)?;
+        return Ok(None);
+    }
+
+    // `pack_geometry_preferred_pack()`, or else the first of `names` that is
+    // not a cruft pack (repack-midx.c:339-369).
+    let preferred = geometry_preferred.or_else(|| {
+        let mut names: Vec<&String> = new_packs.iter().map(|(hash, _)| hash).collect();
+        names.sort();
+        names
+            .into_iter()
+            .find(|hash| !pack_dir.join(format!("pack-{hash}.mtimes")).is_file())
+            .map(|hash| format!("pack-{hash}.pack"))
+    });
+    let snapshot = write_refs_snapshot(repo, objdir)?;
+
+    // `repack_prepare_midx_command()` (repack-midx.c:280-297) and the
+    // `--preferred-pack`, `--refs-snapshot` and `--stdin-packs` it is given.
+    let mut args: Vec<String> = vec![
+        if progress { "--progress" } else { "--no-progress" }.to_string(),
+        "--bitmap".to_string(),
+    ];
+    if let Some(name) = preferred {
+        args.push(format!("--preferred-pack={name}"));
+    }
+    args.push(format!("--refs-snapshot={}", snapshot.display()));
+    args.push("--stdin-packs".to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let code = super::multi_pack_index::write_child(&args, include);
+    // The snapshot is a tempfile, unlinked when `cmd_repack()` exits.
+    let _ = fs::remove_file(&snapshot);
+    let code = code?;
+    if code != ExitCode::SUCCESS {
+        return Ok(Some(code));
+    }
+
+    // `remove_redundant_bitmaps()` (repack-midx.c:253-278): a pack the MIDX now
+    // covers loses its own `.bitmap`.
+    for name in include {
+        let stem = name.strip_suffix(".idx").unwrap_or(name);
+        let path = pack_dir.join(format!("{stem}.bitmap"));
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: could not remove stale bitmap: {}: {}",
+                    path.display(),
+                    crate::external::strerror(&e)
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `midx_snapshot_refs()` (repack-midx.c:44-72) into the
+/// `<objdir>/bitmap-ref-tips_XXXXXX` tempfile `cmd_repack()` makes for it
+/// (builtin/repack.c:440-450): first the `pack.preferBitmapTips` refs, marked
+/// `+`, then every ref, each line the commit the ref peels to, once.
+fn write_refs_snapshot(repo: &gix::Repository, objdir: &Path) -> Result<PathBuf> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut out = String::new();
+    let mut add = |reference: gix::Reference<'_>, preferred: bool, out: &mut String| {
+        let mut reference = reference;
+        let raw = reference.target().try_id().map(ToOwned::to_owned);
+        // `reference_get_peeled_oid()`, falling back to the ref's own value.
+        let id = match reference.peel_to_id_in_place() {
+            Ok(id) => id.detach(),
+            Err(_) => match raw {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        if !seen.insert(id) {
+            return;
+        }
+        if repo.find_object(id).is_ok_and(|o| o.kind == gix::object::Kind::Commit) {
+            out.push_str(&format!("{}{id}\n", if preferred { "+" } else { "" }));
+        }
+    };
+    let options = super::pack_objects::BitmapOptions::from_repo(repo);
+    let platform = repo.references()?;
+    for prefix in &options.preferred_tips {
+        let prefix = match prefix.ends_with('/') {
+            true => prefix.clone(),
+            false => format!("{prefix}/"),
+        };
+        if let Ok(iter) = platform.prefixed(prefix.as_bytes()) {
+            for reference in iter.flatten() {
+                add(reference, true, &mut out);
+            }
+        }
+    }
+    for reference in platform.all()?.flatten() {
+        add(reference, false, &mut out);
+    }
+
+    // `xmks_tempfile()`: six random characters, created exclusively.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ u128::from(std::process::id());
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for attempt in 0u128..64 {
+        let mut v = seed.wrapping_add(attempt.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let suffix: String = (0..6)
+            .map(|_| {
+                let c = LETTERS[(v % LETTERS.len() as u128) as usize] as char;
+                v /= LETTERS.len() as u128;
+                c
+            })
+            .collect();
+        let path = objdir.join(format!("bitmap-ref-tips_{suffix}"));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(out.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("unable to create temporary file in {}", objdir.display())
 }
 
 /// Encode `ids` as a pack, install it in `pack_dir` as `pack-<checksum>.pack`,
@@ -1589,14 +1855,6 @@ fn resolve_midx_cruft(
 /// entries, which is precisely what `repack.useDeltaBaseOffset=false` asks for.
 /// The naming rule is unchanged: a pack is named after its own trailing
 /// checksum, which is what git does and what `gc` does here.
-/// Whether this run writes a `.bitmap`, resolved as `cmd_repack()` resolves
-/// `write_bitmaps`.
-///
-/// `-b` / `--no-write-bitmap-index` decides outright. Failing that
-/// `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, does. With
-/// nobody having said anything git falls back to writing one only when the whole
-/// repository goes into a single pack *and* the repository is bare — the case
-/// where the pack is guaranteed to hold the closure a bitmap needs.
 /// Whether `--honor-pack-keep` reaches the `pack-objects` child, which decides
 /// whether an on-disk `.keep` pack's objects are copied into the new pack.
 ///
@@ -1621,12 +1879,7 @@ fn resolve_midx_cruft(
 /// objects it holds are already delivered, so writing them again would leave the
 /// repository holding two copies rather than one.
 fn honor_pack_keep(st: &State, repo: &gix::Repository) -> bool {
-    let requested = st.write_bitmap.or_else(|| {
-        let snapshot = repo.config_snapshot();
-        snapshot
-            .boolean("repack.writeBitmaps")
-            .or_else(|| snapshot.boolean("pack.writeBitmaps"))
-    });
+    let requested = st.write_bitmap.or(st.bitmap_cfg);
     // `repack_config()` reads `repack.packkeptobjects` into the same variable the
     // flag writes (builtin/repack.c:65-68), and `cmd_repack()` runs the config
     // before `parse_options()`, so the flag wins where both speak.
@@ -1636,18 +1889,40 @@ fn honor_pack_keep(st: &State, repo: &gix::Repository) -> bool {
     !asked.unwrap_or(requested.unwrap_or(false) && !st.write_midx)
 }
 
-fn write_bitmaps(st: &State, repo: &gix::Repository) -> bool {
-    if let Some(explicit) = st.write_bitmap {
-        return explicit;
+/// `repack.writeBitmaps` and its older spelling `pack.writeBitmaps`, which
+/// `repack_config()` writes into the one `write_bitmaps` as the callback meets
+/// them, so the last of either in configuration order is what counts:
+///
+/// ```c
+/// if (!strcmp(var, "repack.writebitmaps") ||
+///     !strcmp(var, "pack.writebitmaps")) {
+///         write_bitmaps = git_config_bool(var, value);
+/// ```
+///
+/// (builtin/repack.c:77-81.) `Err` is `git_config_bool()`'s `die()` line
+/// (config.c), minus `fatal: `.
+fn write_bitmaps_config(repo: &gix::Repository) -> Result<Option<bool>, String> {
+    let mut found = None;
+    for (key, value) in crate::config::config_entries_in_order(Some(repo)) {
+        let key = key.to_ascii_lowercase();
+        if key != "repack.writebitmaps" && key != "pack.writebitmaps" {
+            continue;
+        }
+        found = Some(match value {
+            None => true,
+            Some(raw) => crate::optint::maybe_bool(&raw)
+                .ok_or_else(|| format!("bad boolean config value '{raw}' for '{key}'"))?,
+        });
     }
-    let snapshot = repo.config_snapshot();
-    if let Some(configured) = snapshot
-        .boolean("repack.writeBitmaps")
-        .or_else(|| snapshot.boolean("pack.writeBitmaps"))
-    {
-        return configured;
-    }
-    st.all_into_one && repo.is_bare()
+    Ok(found)
+}
+
+/// The two facts about the repository `cmd_repack()` resolves `write_bitmaps`
+/// against: `is_bare_repository()` and `odb_has_alternates()`.
+#[derive(Default)]
+struct RepoFacts {
+    bare: bool,
+    has_alternates: bool,
 }
 
 /// `revs->pending` as the `pack-objects` this command drives fills it, which is
@@ -1742,6 +2017,7 @@ fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) 
 /// Encode `ids` as a pack under the pack *prefix* `base_prefix`, which
 /// `pack-objects` completes with `-<hash>` and the extension of each artifact,
 /// and hand back the path of the `.idx`.
+#[allow(clippy::too_many_arguments)]
 fn write_pack(
     repo: &gix::Repository,
     st: &State,
@@ -1750,8 +2026,9 @@ fn write_pack(
     write_rev: bool,
     progress: bool,
     write_bitmap: bool,
+    main: bool,
 ) -> Result<PathBuf> {
-    write_pack_with(repo, st, ids, base_prefix, write_rev, progress, write_bitmap, false)
+    write_pack_with(repo, st, ids, base_prefix, write_rev, progress, write_bitmap, main, false)
 }
 
 /// The cruft pack's delta search, which is not the reachable pack's.
@@ -1797,18 +2074,21 @@ fn write_pack_with(
     write_rev: bool,
     progress: bool,
     write_bitmap: bool,
+    main: bool,
     cruft: bool,
 ) -> Result<PathBuf> {
     let allow_ofs_delta = repo
         .config_snapshot()
         .boolean("repack.useDeltaBaseOffset")
         .unwrap_or(true);
-    // git's `repack.useDeltaIslands`, which `cmd_repack()` turns into
-    // `pack-objects --delta-islands`.
-    let use_delta_islands = repo
-        .config_snapshot()
-        .boolean("repack.useDeltaIslands")
-        .unwrap_or(false);
+    // `use_delta_islands`: `repack.useDeltaIslands`, overridden by `-i` /
+    // `--[no-]delta-islands` (builtin/repack.c:82-84, 225-226), which
+    // `cmd_repack()` turns into `pack-objects --delta-islands` for the main
+    // child only (:503-504).
+    let use_delta_islands = main
+        && st.delta_islands.unwrap_or_else(|| {
+            repo.config_snapshot().boolean("repack.useDeltaIslands").unwrap_or(false)
+        });
     let packed = super::pack_objects::packed_for(
         repo,
         ids,
@@ -1816,7 +2096,13 @@ fn write_pack_with(
             allow_ofs_delta,
             progress,
             use_delta_islands,
-            no_reuse_delta: st.no_reuse_delta,
+            // `-f` and `-F` reach the main, promisor and filtered children
+            // through `po_args`, but not the cruft child: `cruft_po_args` copies
+            // the window, depth, threads, size limit, `--local`, `--quiet` and
+            // `--delta-base-offset` across and nothing else
+            // (builtin/repack.c:632-646).
+            no_reuse_delta: !cruft && st.no_reuse_delta,
+            no_reuse_object: !cruft && st.no_reuse_object,
             // The four `pack-objects` forwards, already validated by
             // [`forwarded_value_check`], shadowing `pack.window`,
             // `pack.windowMemory`, `pack.depth` and `pack.threads`. A negative
@@ -2635,6 +2921,21 @@ impl Geometry {
             .collect()
     }
 
+    /// The index paths of the packs at or above the split, which
+    /// `midx_included_packs()` puts in the MIDX (repack-midx.c:164-182).
+    fn surviving_paths(&self, existing: &[pack::index::File]) -> Vec<PathBuf> {
+        self.packs[self.split..].iter().map(|&i| existing[i].path().to_path_buf()).collect()
+    }
+
+    /// `pack_geometry_preferred_pack()` (repack-geometry.c:214-248): the
+    /// largest pack above the split, as the `pack-<hash>.pack` basename
+    /// `--preferred-pack` takes, or `None` when every pack rolls up.
+    fn preferred_pack(&self, existing: &[pack::index::File]) -> Option<String> {
+        let &last = self.packs[self.split..].last()?;
+        let path = existing[last].path().with_extension("pack");
+        path.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
     /// The index paths `-d` may remove: the rolled-up packs, and only those.
     fn rolled_up_paths(&self, existing: &[pack::index::File], pack_dir: &Path) -> Vec<PathBuf> {
         self.packs[..self.split]
@@ -3225,6 +3526,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
     let on = !negated;
     match OPTS[idx].long {
         "local" => st.local = on,
+        "delta-islands" => st.delta_islands = Some(on),
         // `--no-name-hash-version` restores the default, which git accepts.
         "name-hash-version" => {
             st.name_hash_version = match value {
@@ -3383,10 +3685,13 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             // delta is searched for afresh instead of being kept from the pack
             // it is already in.
             'f' => st.no_reuse_delta = true,
-            // `-F` controls *object* reuse — copying a stored entry's bytes —
-            // which this writer never does, so it already behaves as asked.
-            // `-i` enables delta islands, which are not modelled.
-            'F' | 'i' => {}
+            // `po_args.no_reuse_object`, `pack-objects --no-reuse-object`
+            // (`repack.c:29-30`): no stored entry is copied out byte for byte,
+            // and, as `if (!reuse_object) reuse_delta = 0;` follows
+            // (builtin/pack-objects.c:5370-5371), no stored delta is kept either.
+            'F' => st.no_reuse_object = true,
+            // `use_delta_islands`, `pack-objects --delta-islands`.
+            'i' => st.delta_islands = Some(true),
             'l' => st.local = true,
             'g' => {
                 // The remainder of the cluster is the value, else the next argv.
@@ -3594,7 +3899,7 @@ fn promisor_objects_in_odb_order(repo: &gix::Repository) -> Vec<ObjectId> {
 
 /// The option conflicts stock git rejects before it does any work, in git's own
 /// order. Each prints `fatal: <msg>` on stderr and exits 128.
-fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
+fn preflight(st: &mut State, midx: &MidxConfig, facts: &RepoFacts) -> Option<ExitCode> {
     // die_for_incompatible_opt3(-A, -k/--keep-unreachable, --cruft)
     let triad = [
         (st.loosen_unreachable, "-A"),
@@ -3614,16 +3919,48 @@ fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
         _ => {}
     }
 
-    if st.geometric && st.all_into_one {
-        return Some(fatal("options '--geometric' and '-A/-a' cannot be used together"));
+    // ```c
+    // if (write_bitmaps < 0) {
+    //         if (write_midx == REPACK_WRITE_MIDX_NONE &&
+    //             (!(pack_everything & ALL_INTO_ONE) || !is_bare_repository(repo)))
+    //                 write_bitmaps = 0;
+    // }
+    // [...]
+    // if (write_bitmaps && !(pack_everything & ALL_INTO_ONE) &&
+    //     write_midx == REPACK_WRITE_MIDX_NONE)
+    //         die(_(incremental_bitmap_conflict_error));
+    //
+    // if (write_bitmaps && po_args.local &&
+    //     odb_has_alternates(repo->objects)) {
+    //         [...]
+    //         warning(_("disabling bitmap writing, as some objects are not being packed"));
+    //         write_bitmaps = 0;
+    // }
+    // ```
+    //
+    // (builtin/repack.c:407-431.) `write_bitmaps` starts from the config and
+    // the flag overrides it, so `repack.writeBitmaps=true` alone makes an
+    // incremental repack die. The two later tests take the unasked `-1` for
+    // true, so `-l` in a repository with alternates warns even when nobody
+    // asked for a bitmap, provided one would have been written by default.
+    let mut write_bitmaps = match st.write_bitmap.or(st.bitmap_cfg) {
+        Some(on) => i32::from(on),
+        None => -1,
+    };
+    if write_bitmaps < 0 && !st.write_midx && (!st.all_into_one || !facts.bare) {
+        write_bitmaps = 0;
     }
-
-    if st.write_bitmap == Some(true) && !st.all_into_one && !st.write_midx {
+    if write_bitmaps != 0 && !st.all_into_one && !st.write_midx {
         return Some(fatal(
             "Incremental repacks are incompatible with bitmap indexes.  Use\n\
              --no-write-bitmap-index or disable the pack.writeBitmaps configuration.",
         ));
     }
+    if write_bitmaps != 0 && st.local && facts.has_alternates {
+        eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
+        write_bitmaps = 0;
+    }
+    st.write_bitmaps = write_bitmaps;
 
     // `builtin/repack.c:291-296`, which sits between the bitmap-conflict die
     // above (:274) and the `--filter-to` die below (:407-408) — pinned against
@@ -3646,6 +3983,13 @@ fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
             "invalid value for --midx-new-layer-threshold: {}",
             midx.new_layer_threshold
         )));
+    }
+
+    // `if (geometry.split_factor) { if (pack_everything) die(...); }`
+    // (builtin/repack.c:460-462), reached only after the bitmap resolution and
+    // the MIDX range checks above, so their diagnostics come first.
+    if st.geometric && st.all_into_one {
+        return Some(fatal("options '--geometric' and '-A/-a' cannot be used together"));
     }
 
     if st.filter_to && !st.filter {

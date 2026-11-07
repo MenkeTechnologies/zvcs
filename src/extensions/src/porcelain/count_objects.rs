@@ -185,7 +185,7 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
     for fanout in 0u16..256 {
         let prefix = format!("{fanout:02x}");
         let sub = objdir.join(&prefix);
-        for name in sorted_dir(&sub) {
+        for name in readdir_names(&sub) {
             let path = sub.join(&name);
             let name = name.to_string_lossy().into_owned();
             // `hex_to_bytes()` accepts either case, so mixed-case names count too.
@@ -320,7 +320,7 @@ fn scan_pack_dir(objdir: &Path, hash: gix::hash::Kind, garbage: &mut Garbage) ->
     // directory has been seen, so a `.rev` next to its pair is not garbage.
     let mut deferred: Vec<PathBuf> = Vec::new();
 
-    for name in sorted_dir(&dir) {
+    for name in readdir_names(&dir) {
         let name = name.to_string_lossy().into_owned();
         // The multi-pack-index and its companions are handled separately by git
         // and are never candidates for garbage.
@@ -443,15 +443,17 @@ impl Garbage {
     }
 }
 
-/// Entry names of `dir` in sorted order; a missing or unreadable directory
-/// yields nothing, matching git's tolerance of an absent fan-out directory.
-fn sorted_dir(dir: &Path) -> Vec<OsString> {
+/// Entry names of `dir` in `readdir()` order, which is the order both
+/// `for_each_file_in_obj_subdir()` (object-file.c:1062-1074) and
+/// `for_each_file_in_pack_subdir()` (packfile.c:828-843) visit them in — so
+/// the order the `garbage found` warnings come out in is the filesystem's,
+/// not sorted. A missing or unreadable directory yields nothing, matching
+/// git's tolerance of an absent fan-out directory.
+fn readdir_names(dir: &Path) -> Vec<OsString> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut names: Vec<OsString> = rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-    names.sort();
-    names
+    rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect()
 }
 
 /// Bytes a file actually occupies, matching `git-compat-util.h`'s

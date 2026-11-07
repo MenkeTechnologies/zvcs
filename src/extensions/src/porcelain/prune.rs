@@ -853,21 +853,39 @@ pub(super) fn mtime_of(path: &Path) -> Option<i64> {
     fs::symlink_metadata(path).ok().map(|md| md.mtime())
 }
 
-/// `prune_tmp_file()`: keep anything younger than `expire`, otherwise report
-/// under `-n`/`-v` and unlink unless `-n`. A file that has vanished between the
-/// scan and here is silently skipped, as the `lstat()` guard does.
+/// `prune_tmp_file()` (builtin/prune.c:31-55): keep anything younger than
+/// `expire`, otherwise report under `-n`/`-v` and remove unless `-n` — a
+/// directory as a "temporary directory", taken out with everything in it by
+/// `remove_dir_recursively()`, anything else as a "temporary file" through
+/// `unlink_or_warn()`. An entry `lstat()` cannot see is `error("Could not stat
+/// '%s'")` and left alone.
 fn prune_tmp_file(path: &Path, shown: &Path, expire: i64, dry_run: bool, verbose: bool) {
-    let Some(mtime) = mtime_of(path) else {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = fs::symlink_metadata(path) else {
+        eprintln!("error: Could not stat '{}'", shown.display());
         return;
     };
-    if mtime > expire {
+    if md.mtime() > expire {
+        return;
+    }
+    if md.is_dir() {
+        if dry_run || verbose {
+            println!("Removing stale temporary directory {}", shown.display());
+        }
+        if !dry_run {
+            let _ = fs::remove_dir_all(path);
+        }
         return;
     }
     if dry_run || verbose {
         println!("Removing stale temporary file {}", shown.display());
     }
     if !dry_run {
-        let _ = fs::remove_file(path);
+        if let Err(e) = fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("warning: unable to unlink '{}': {}", shown.display(), crate::external::strerror(&e));
+            }
+        }
     }
 }
 

@@ -1104,12 +1104,13 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         opts.subject_prefix.push_str(&format!(" v{r}"));
     }
 
-    let (commits, paths, pending) = match select_commits(&repo, &opts)? {
+    let (commits, paths, pending, walk_uninteresting) = match select_commits(&repo, &opts)? {
         Selected::Commits {
             commits,
             paths,
             pending,
-        } => (commits, paths, pending),
+            uninteresting,
+        } => (commits, paths, pending, uninteresting),
         Selected::Exit(code) => return Ok(code),
     };
     // builtin/log.c:2220-2227, immediately after `setup_revisions()`. format-patch
@@ -1213,15 +1214,20 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         _ => super::range_diff::CREATION_FACTOR_FOR_THE_SAME_SERIES,
     };
 
-    // git validates the `--range-diff` range after the walk
-    // (`infer_range_diff_ranges`); an unresolvable side dies 128 there, before
-    // any supported-but-unported diff option would matter.
+    // `infer_range_diff_ranges()` runs after the walk (builtin/log.c:2395-2400), so
+    // `is_range_diff_range()` (range-diff.c:616-641) sees the flags the walk left: a
+    // `<prev>` endpoint the walk excluded counts as negative. A token
+    // `setup_revisions()` cannot resolve dies 128 there, before any
+    // supported-but-unported diff option would matter.
     let range_diff_ranges = match opts.range_diff.clone() {
         Some(rd) => {
-            if let Err(code) = validate_range_diff(&repo, &rd) {
-                return Ok(code);
-            }
-            Some(infer_range_diff_ranges(&repo, &rd, &commits, &walked)?)
+            let prev_is_range =
+                match super::range_diff::is_range_diff_range_flagged(&repo, &rd, &walk_uninteresting) {
+                    super::range_diff::RangeKind::Bad => return Ok(super::range_diff::bad_revision(&repo, &rd)),
+                    super::range_diff::RangeKind::Range => true,
+                    super::range_diff::RangeKind::NotRange => false,
+                };
+            Some(infer_range_diff_ranges(&repo, &rd, prev_is_range, &commits, &walked)?)
         }
         None => None,
     };
@@ -1421,12 +1427,12 @@ fn diff_title(reroll: Option<&str>, generic: &str, rerolled: &str) -> String {
 fn infer_range_diff_ranges(
     repo: &gix::Repository,
     prev: &str,
+    prev_is_range: bool,
     commits: &[ObjectId],
     walked: &[ObjectId],
 ) -> Result<(String, String)> {
     let head = commits.last().expect("caller rejects an empty series");
     let head_hex = head.to_hex().to_string();
-    let prev_is_range = is_range_diff_range(repo, prev);
     let r1 = if prev_is_range {
         prev.to_string()
     } else {
@@ -1443,22 +1449,6 @@ fn infer_range_diff_ranges(
         }
     };
     Ok((r1, r2))
-}
-
-/// Port of `is_range_diff_range()` (`range-diff.c`): true when the argument
-/// resolves to both a positive and a negative endpoint, i.e. it names a range
-/// rather than a single tip.
-fn is_range_diff_range(repo: &gix::Repository, arg: &str) -> bool {
-    let resolves = |s: &str| {
-        repo.rev_parse_single(BStr::new(if s.is_empty() { "HEAD" } else { s }))
-            .is_ok()
-    };
-    // Only the two range spellings contribute endpoints of both signs: a bare
-    // tip is positive-only and a `^<rev>` is negative-only, so neither counts.
-    let Some((left, right)) = arg.split_once("...").or_else(|| arg.split_once("..")) else {
-        return false;
-    };
-    resolves(left) && resolves(right)
 }
 
 /// The `origin` `cmd_format_patch` picks up from its walk: the single boundary
@@ -1551,17 +1541,10 @@ fn emit_diff_of_diff(
         // `get_notes_args()`: format-patch pushes `--no-notes` unless the series
         // itself renders notes (`rev->show_notes`).
         let notes_on = opts.notes.show;
-        match super::range_diff::show_range_diff(
-            repo,
-            r1,
-            r2,
-            creation_factor,
-            notes_on,
-            out,
-        )? {
-            Ok(()) => {}
-            Err(code) => return Ok(Err(code)),
-        }
+        // Neither caller looks at `show_range_diff()`'s result (builtin/log.c:1484,
+        // log-tree.c:736): an inner `git log` that fails has said so on stderr, the
+        // block stays empty and the series goes on.
+        let _reported = super::range_diff::show_range_diff(repo, r1, r2, creation_factor, notes_on, out)?;
     }
     Ok(Ok(()))
 }
@@ -2891,7 +2874,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--no-creation-factor" => o.creation_factor = None,
             // `--range-diff=<range>` / `--range-diff <range>`: the range is
-            // validated after the walk (see `validate_range_diff`).
+            // classified after the walk (see `infer_range_diff_ranges`).
             "--range-diff" => {
                 i += 1;
                 o.range_diff = Some(value_at(args, i, a)?);
@@ -4049,31 +4032,6 @@ fn emit_opt_error(o: &Opts) -> Option<ExitCode> {
     })
 }
 
-/// Port of the revision resolution `is_range_diff_range()` performs on
-/// `--range-diff=<arg>`: each side of an `a..b`/`a...b` range (an empty side is
-/// HEAD), or the bare argument, must resolve, else git `die()`s
-/// `bad revision '<arg>'` (exit 128) after the walk. The range-diff render is not
-/// ported, so a range git accepts is handled as an unsupported flag by the
-/// caller; only the resolution failure is reproduced here.
-fn validate_range_diff(repo: &gix::Repository, arg: &str) -> std::result::Result<(), ExitCode> {
-    let ok_side = |side: &str| -> bool {
-        let s = if side.is_empty() { "HEAD" } else { side };
-        repo.rev_parse_single(BStr::new(s)).is_ok()
-    };
-    let ok = if let Some((l, r)) = arg.split_once("...") {
-        ok_side(l) && ok_side(r)
-    } else if let Some((l, r)) = arg.split_once("..") {
-        ok_side(l) && ok_side(r)
-    } else {
-        ok_side(arg)
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(fatal(&format!("bad revision '{arg}'")))
-    }
-}
-
 /// Emulate C `strtoul(nptr, &end, 10)`, returning the accumulated base-10 value
 /// and the byte offset of `end` — the first character the conversion did not
 /// consume. Leading ASCII whitespace and a single optional sign are skipped;
@@ -4587,6 +4545,9 @@ enum Selected {
         /// needs it, because that is the one path where a commit can reach the
         /// output while still unparsed — see [`render_cover_letter`].
         pending: Vec<ObjectId>,
+        /// The commits the walk left `UNINTERESTING`, which `is_range_diff_range()` reads
+        /// off the objects afterwards. Collected only under `--range-diff`.
+        uninteresting: HashSet<ObjectId>,
     },
     Exit(ExitCode),
 }
@@ -5062,6 +5023,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
             commits: Vec::new(),
             paths,
             pending: Vec::new(),
+            uninteresting: HashSet::new(),
         });
     }
 
@@ -5069,6 +5031,30 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
     // every one of these, which is what makes their trees readable later even
     // under `--no-walk`.
     let pending: Vec<ObjectId> = tips.iter().chain(hidden.iter()).copied().collect();
+
+    // What the walk leaves `UNINTERESTING` on the objects, for `--range-diff`'s
+    // `is_range_diff_range()`: the pending negatives under `--no-walk`, where
+    // `prepare_revision_walk()` returns before `limit_list()`, and otherwise what
+    // `limit_list()` paints (revision.c:1446-1516).
+    let uninteresting: HashSet<ObjectId> = match (&o.range_diff, o.no_walk || hidden.is_empty()) {
+        (None, _) => HashSet::new(),
+        (Some(_), true) => hidden.iter().copied().collect(),
+        (Some(_), false) => {
+            let tips_left: Vec<(ObjectId, bool)> = tips.iter().map(|id| (*id, false)).collect();
+            super::log::limit_list_paint(
+                repo,
+                &super::log::LimitInput {
+                    tips: &tips_left,
+                    negatives: &hidden,
+                    parsed: &HashSet::new(),
+                    first_parent: o.first_parent,
+                    exclude_first_parent_only: false,
+                    ages: &crate::revopt::Ages::default(),
+                },
+            )
+            .uninteresting
+        }
+    };
 
     // The walk, plus each commit's real parents — `sort_in_topological_order()`
     // needs them and so does the merge filter below.
@@ -5185,6 +5171,7 @@ fn select_commits(repo: &gix::Repository, o: &Opts) -> Result<Selected> {
         commits: out,
         paths,
         pending,
+        uninteresting,
     })
 }
 

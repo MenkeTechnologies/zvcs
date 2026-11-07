@@ -2776,7 +2776,7 @@ struct Classified {
 /// The three answers `is_range_diff_range()` can give, distinguishing "resolves
 /// but is not a range" from "does not resolve at all", because upstream turns
 /// the latter into a fatal `bad revision` (exit 128) rather than a fall-through.
-enum RangeKind {
+pub(super) enum RangeKind {
     /// Both a positive and a negative endpoint: a range.
     Range,
     /// Resolves, but not to a range (a plain committish such as `main`).
@@ -2972,6 +2972,19 @@ fn committish(repo: &gix::Repository, spec: &str) -> bool {
 /// Modelled here by treating an id that appears on both sides as the single
 /// object it is: the tips that are also hidden count as negative.
 fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
+    is_range_diff_range_flagged(repo, spec, &std::collections::HashSet::new())
+}
+
+/// [`is_range_diff_range`] in a process whose objects already carry flags: `UNINTERESTING`
+/// is a bit on the `struct object`, so a commit an earlier walk in the same process
+/// painted (`flagged`) counts as negative whichever side of `spec` names it.
+/// `format-patch --range-diff` asks after its own walk (builtin/log.c:2395-2400), so
+/// a `<prev>` whose tip that walk excluded is no range.
+pub(super) fn is_range_diff_range_flagged(
+    repo: &gix::Repository,
+    spec: &str,
+    flagged: &std::collections::HashSet<ObjectId>,
+) -> RangeKind {
     // A word only `--end-of-options` lets through: `setup_revisions()` reads it
     // as an option, so it pends nothing whether `handle_revision_opt()` claims it
     // or leaves it over.
@@ -2980,7 +2993,7 @@ fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
     }
     match endpoints(repo, spec) {
         Ok((tips, hidden)) => {
-            let positive = tips.iter().filter(|id| !hidden.contains(id)).count();
+            let positive = tips.iter().filter(|id| !hidden.contains(id) && !flagged.contains(*id)).count();
             let negative = tips.len() + hidden.len() - positive;
             if positive > 0 && negative > 0 {
                 RangeKind::Range
@@ -3011,7 +3024,7 @@ fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
 /// lives for every command with a filename fallback. `cant_be_filename` is true
 /// here: `is_range_diff_range()` hands `setup_revisions()` a `--` of its own, so
 /// the operand can never be re-read as a path.
-fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
+pub(super) fn bad_revision(repo: &gix::Repository, spec: &str) -> ExitCode {
     if let Some(fatal) = super::log::early_revision_fatal(repo, spec, true) {
         eprint!("{fatal}");
         return ExitCode::from(128);

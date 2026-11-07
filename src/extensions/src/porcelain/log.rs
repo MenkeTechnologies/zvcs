@@ -670,6 +670,14 @@ pub(crate) enum Flavor {
     /// selects no merge diff and `log.follow` is never promoted. Headers are
     /// always shown (:805), as under [`Flavor::Log`].
     Reflog,
+    /// `cmd_show()` once something cleared its `rev.no_walk = 1`: it hands the
+    /// whole pending list to `cmd_log_walk()` (builtin/log.c:696-701). What differs
+    /// from `cmd_log()` is `rev.diff = 1` (:686) and `show_setup_revisions_tweak()`
+    /// (:651-659) in place of `log_setup_revisions_tweak()`: merges default to the
+    /// dense combined diff (or the first-parent one under `--first-parent`), the
+    /// patch is the format when none was asked for, `log.follow` is never promoted,
+    /// and no `REVARG_COMMITTISH` is set.
+    Show,
 }
 
 /// `git whatchanged`: `cmd_log()` under [`Flavor::WhatChanged`].
@@ -681,6 +689,12 @@ pub(crate) fn whatchanged(args: &[String]) -> Result<ExitCode> {
 /// what follows the `show` subcommand (or the whole implicit-`show` argv).
 pub(crate) fn reflog_show(args: &[String]) -> Result<ExitCode> {
     log_flavored(args, Flavor::Reflog)
+}
+
+/// `git show` whose `no_walk` a range cleared: `cmd_log_walk()` under
+/// [`Flavor::Show`] (builtin/log.c:696-701).
+pub(crate) fn show_walk(args: &[String]) -> Result<ExitCode> {
+    log_flavored(args, Flavor::Show)
 }
 
 pub fn log(args: &[String]) -> Result<ExitCode> {
@@ -2899,7 +2913,24 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // It never touches `merges_need_diff`, so `--first-parent` alone still asks for
     // no output format: it decides only what a merge's diff *is*, once something
     // else has asked for one.
-    if flavor == Flavor::Log && first_parent {
+    // `show_setup_revisions_tweak()` (builtin/log.c:651-659):
+    //
+    // ```c
+    // if (rev->first_parent_only)
+    //         diff_merges_default_to_first_parent(rev);
+    // else
+    //         diff_merges_default_to_dense_combined(rev);
+    // ```
+    //
+    // `diff_merges_default_to_dense_combined()` is `set_dense_combined()` unless a
+    // `--diff-merges` spelling was given (diff-merges.c:166-170), and its
+    // `common_setup()` raises `merges_need_diff` (diff-merges.c:56-61).
+    if flavor == Flavor::Show && !first_parent && !explicit_diff_merges {
+        diff_merges = DiffMerges::DenseCombined;
+        merges_need_diff = true;
+        remerge = false;
+    }
+    if matches!(flavor, Flavor::Log | Flavor::Show) && first_parent {
         if !explicit_diff_merges {
             diff_merges = DiffMerges::Separate;
         }
@@ -3012,8 +3043,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     let mut rev_input_given = false;
     // `REVARG_COMMITTISH`, which `cmd_log()` and `cmd_whatchanged()` set and
     // `cmd_log_reflog()`'s zeroed `setup_revision_opt` does not (builtin/log.c:546,
-    // :844, :799-800).
-    let committish = flavor != Flavor::Reflog;
+    // :844, :799-800). `cmd_show()` leaves `revarg_opt` zero too (:691-693).
+    let committish = flavor != Flavor::Reflog && flavor != Flavor::Show;
     let mut resolve_neg = |spec: &str, token: &str, gated: bool, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
         match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
             Ok(id) => {
@@ -3070,14 +3101,19 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             // its ancestry — out of the symmetric difference.
             if let (Ok(ia), Ok(ib)) = (resolve_rev(&repo, a), resolve_rev(&repo, b)) {
                 if let Ok(bases) = repo.merge_bases_many(ia, &[ib]) {
+                    // `get_merge_bases()` parses what its paint reaches, and those are the
+                    // parent lists `mark_parents_uninteresting()` can follow afterwards.
+                    let painted = merge_base_parsed(&repo, ia, &[ib]);
                     for base in bases {
                         let base = base.detach();
                         neg_ids.push(base);
-                        // `paint_down_to_common()` parses its way from both endpoints
-                        // down past the bases, so a merge base's whole ancestry is
-                        // loaded by the time `mark_parents_uninteresting()` runs.
-                        parsed.extend(ancestor_closure(&repo, &[base])?);
+                        // With a commit-graph the paint is not modelled; the base's whole
+                        // ancestry stands in for what it parsed.
+                        if painted.is_none() {
+                            parsed.extend(ancestor_closure(&repo, &[base])?);
+                        }
                     }
+                    parsed.extend(painted.into_iter().flatten());
                 }
             }
         } else if let Some((a, b)) = spec.split_once("..") {
@@ -3901,10 +3937,50 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // Walk in git's default commit-date order, then re-sort if a topological
     // order was asked for. `--graph` implies `--topo-order` unless `--date-order`
     // was given explicitly.
+    // An UNINTERESTING pending commit makes the walk limited unless a topological
+    // order can use generation numbers (revision.c:431-436), and so do
+    // `topo_order` without them and the options that set `revs->limited` where
+    // they are parsed (revision.c:2441-2547, :3195-3196). A limited walk is
+    // `limit_list()`, whose paint stops `SLOP` commits after the uninteresting side
+    // falls behind the last interesting date ([`limit_list_paint`]). `-L`, `-g`
+    // and `--no-walk` take their own paths.
+    let topo = order != Order::Default || graph || line_level;
+    let generation_numbers = repo.commit_graph().ok().is_some_and(|g| {
+        g.num_commits() > 0 && g.commit_at(gix::commitgraph::Position(0)).generation() != 0
+    });
+    let limited = (!neg_ids.is_empty() && !(topo && generation_numbers))
+        || (topo && !generation_numbers)
+        || ancestry_path
+        || cherry_mark
+        || cherry_pick
+        || left_only
+        || right_only
+        || show_children
+        || simplify_merges_opt
+        || simplify_by_decoration
+        || show_merge;
+    let limit_paint = (limited && !neg_ids.is_empty() && no_walk.is_none() && !walk_reflogs && !line_level)
+        .then(|| {
+            let tips_left: Vec<(ObjectId, bool)> =
+                tips.iter().copied().zip(tip_left.iter().copied()).collect();
+            limit_list_paint(
+                &repo,
+                &LimitInput {
+                    tips: &tips_left,
+                    negatives: &neg_ids,
+                    parsed: &parsed,
+                    first_parent,
+                    exclude_first_parent_only,
+                    ages: &ages,
+                },
+            )
+        });
     // Commits reachable from the negative tips are hidden from the walk (the `..`
     // range exclusion). Empty when no `A..B`/`^A` was given.
     let hidden = if neg_ids.is_empty() {
         HashSet::new()
+    } else if let Some(paint) = &limit_paint {
+        paint.uninteresting.clone()
     } else if exclude_first_parent_only {
         ancestor_closure_opt(&repo, &neg_ids, true)?
     } else if no_walk.is_some() {
@@ -4057,8 +4133,16 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             .filter(|(_, is_left)| **is_left)
             .map(|(id, _)| *id)
             .collect();
-        let mut left: HashSet<ObjectId> = left_tips.iter().copied().collect();
-        left.extend(ancestor_closure(&repo, &left_tips)?);
+        // A limited walk passes `SYMMETRIC_LEFT` only through the commits
+        // `limit_list()` popped (revision.c:1182-1219).
+        let left: HashSet<ObjectId> = match &limit_paint {
+            Some(paint) => paint.left.clone(),
+            None => {
+                let mut left: HashSet<ObjectId> = left_tips.iter().copied().collect();
+                left.extend(ancestor_closure(&repo, &left_tips)?);
+                left
+            }
+        };
         for node in &mut nodes {
             node.symmetric_left = left.contains(&node.id);
         }
@@ -5494,7 +5578,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // render loop there, counting records actually printed.
         match flavor {
             Flavor::WhatChanged => max_count,
-            Flavor::Log | Flavor::Reflog => {
+            Flavor::Log | Flavor::Reflog | Flavor::Show => {
                 if let Some(limit) = max_count {
                     // `get_revision()` stops asking for entries once the cap is
                     // spent, so the last one popped is the last one shown.
@@ -5519,6 +5603,27 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // `DIFF_FORMAT_NO_OUTPUT` (`-s`, `-q`) counts: it is a format, and it is what
     // makes `git log --diff-merges=separate -s` print two headerless merge records
     // instead of two patches.
+    //
+    // `show_setup_revisions_tweak()`'s `if (!rev->diffopt.output_format)
+    // rev->diffopt.output_format = DIFF_FORMAT_PATCH;` (builtin/log.c:657-658) runs
+    // inside `setup_revisions()`, so the patch it installs is a format the
+    // command line asked for by the time `revs->diff` is decided.
+    if flavor == Flavor::Show
+        && !(patch
+            || check
+            || stat
+            || numstat
+            || shortstat
+            || summary
+            || name_only
+            || name_status
+            || raw
+            || dirstat_on
+            || saw_no_patch
+            || quiet)
+    {
+        patch = true;
+    }
     let rendering_format = patch
         || check
         || stat
@@ -5561,7 +5666,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // `--diff-merges` spellings raise `merges_need_diff` alone, so the patch format
     // `diff_merges_setup_revs()` installs (diff-merges.c:188-191) would otherwise
     // reach nothing but merges. The pickaxe is what makes every commit diffable.
-    let all_need_diff = flavor == Flavor::WhatChanged
+    let all_need_diff = matches!(flavor, Flavor::WhatChanged | Flavor::Show)
         || merges_imply_patch
         || rendering_format
         // `int all_need_diff = opt->diff || opt->diffopt.flags.exit_with_status;`
@@ -5899,6 +6004,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             output_encoding: &output_encoding,
         },
         output_encoding: &output_encoding,
+        fence_shown: Vec::new(),
     });
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
@@ -5965,6 +6071,38 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 .collect(),
         ),
     };
+    // `opt->shown_dashes` across records: `next_commentary_block()` raises it when a
+    // mail format fences its notes (log-tree.c:685-693, :893-898), and only
+    // `log_tree_diff_flush()` lowers it (log-tree.c:929). `log_tree_diff()` reaches
+    // that flush for a root under `show_root_diff`, a non-merge when
+    // `all_need_diff`, and a merge only through `-m`/`--diff-merges=first-parent`'s
+    // per-parent loop or `do_remerge_diff()`, never through `do_diff_combined()`
+    // (log-tree.c:1188-1268); `-L` always flushes. A record that is not flushed
+    // finds the flag the previous record left.
+    if matches!(pretty, Pretty::Email | Pretty::MboxRd) && !notes_trees.is_empty() {
+        let mut shown_dashes = false;
+        let mut fence_shown = Vec::with_capacity(diff_nodes.len());
+        for node in diff_nodes.iter() {
+            let flushed = line_level
+                || match node.parents.len() {
+                    0 => all_need_diff && show_root,
+                    1 => all_need_diff,
+                    n => {
+                        (all_need_diff || merges_need_diff)
+                            && ((remerge && n == 2)
+                                || (!remerge && matches!(diff_merges, DiffMerges::Separate | DiffMerges::FirstParent)))
+                    }
+                };
+            if flushed {
+                shown_dashes = false;
+            }
+            fence_shown.push(shown_dashes);
+            if (flushed || always_show_header) && mail_notes_shown_dashes(&repo, &notes_trees, &pretty, node.id)? {
+                shown_dashes = true;
+            }
+        }
+        entries.params.fence_shown = fence_shown;
+    }
     let records: Vec<(usize, Option<ObjectId>, Option<ObjectId>)> = diff_nodes
         .iter()
         .enumerate()
@@ -6114,7 +6252,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             // A per-parent `-m` record is rendered on its own: the batched window has
             // one slot per commit and no room for the ` (from <oid>)` insert.
             Some(parent) => {
-                entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, Some(parent))?
+                entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, Some(parent), false)?
             }
         };
         // Where `show_log()` stops and `log_tree_diff_flush()` takes over. Under
@@ -7057,14 +7195,28 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     }
                     header_owed = false;
                 } else {
-                    block = entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, None)?;
+                    block = entry_block_from(
+                        &repo,
+                        &nodes[ni],
+                        &entries.params,
+                        &abbrev_cache,
+                        None,
+                        entries.params.fence_shown.get(ni).copied().unwrap_or(false),
+                    )?;
                     msg_len = block.len();
                 }
             } else if record_queue_empty {
                 if !last_of_merge || shown_before {
                     continue;
                 }
-                block = entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, None)?;
+                block = entry_block_from(
+                    &repo,
+                    &nodes[ni],
+                    &entries.params,
+                    &abbrev_cache,
+                    None,
+                    entries.params.fence_shown.get(ni).copied().unwrap_or(false),
+                )?;
                 msg_len = block.len();
                 painted = None;
             }
@@ -7778,6 +7930,9 @@ struct EntryParams<'a> {
     /// messages are re-coded into before they are rendered. Empty means
     /// `--encoding=none` — hand the stored bytes back untouched.
     output_encoding: &'a str,
+    /// Per node index, `opt->shown_dashes` as that record's `show_log()` finds it;
+    /// see [`RenderCtx::notes_fence_shown`]. Empty outside the mail formats.
+    fence_shown: Vec<bool>,
 }
 
 /// A look-ahead buffer of rendered commit records.
@@ -7818,7 +7973,7 @@ impl<'a> EntryWindow<'a> {
     ) -> Result<Vec<u8>> {
         if i < self.start || i >= self.start + self.slots.len() {
             let end = (i + Self::SPAN).min(nodes.len());
-            self.slots = self.render_span(repo, &nodes[i..end], abbrev)?;
+            self.slots = self.render_span(repo, &nodes[i..end], i, abbrev)?;
             self.start = i;
         }
         Ok(std::mem::take(&mut self.slots[i - self.start]))
@@ -7828,11 +7983,16 @@ impl<'a> EntryWindow<'a> {
         &self,
         repo: &gix::Repository,
         span: &[Node],
+        base: usize,
         abbrev: &std::cell::RefCell<AbbrevCache>,
     ) -> Result<Vec<Vec<u8>>> {
         let workers = crate::threads::count(span.len(), Self::PER_WORKER);
         if workers <= 1 {
-            return span.iter().map(|n| entry_block(repo, n, &self.params, abbrev)).collect();
+            return span
+                .iter()
+                .enumerate()
+                .map(|(k, n)| entry_block(repo, n, &self.params, abbrev, base + k))
+                .collect();
         }
 
         let cursor = std::sync::atomic::AtomicUsize::new(0);
@@ -7856,7 +8016,7 @@ impl<'a> EntryWindow<'a> {
                     loop {
                         let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(node) = span.get(i) else { break };
-                        mine.push((i, entry_block(&repo, node, params, &mine_abbrev)?));
+                        mine.push((i, entry_block(&repo, node, params, &mine_abbrev, base + i)?));
                     }
                     Ok((mine, mine_abbrev.into_inner()))
                 }));
@@ -7895,8 +8055,9 @@ fn entry_block(
     node: &Node,
     p: &EntryParams<'_>,
     abbrev: &std::cell::RefCell<AbbrevCache>,
+    index: usize,
 ) -> Result<Vec<u8>> {
-    entry_block_from(repo, node, p, abbrev, None)
+    entry_block_from(repo, node, p, abbrev, None, p.fence_shown.get(index).copied().unwrap_or(false))
 }
 
 /// [`entry_block`] with `show_log()`'s ` (from <oid>)` insert, which the per-parent
@@ -7907,6 +8068,7 @@ fn entry_block_from(
     p: &EntryParams<'_>,
     abbrev: &std::cell::RefCell<AbbrevCache>,
     from: Option<ObjectId>,
+    notes_fence_shown: bool,
 ) -> Result<Vec<u8>> {
     let mut commit = repo.find_object(node.id)?.try_into_commit()?;
     // `show_log()` renders from `repo_logmsg_reencode(commit, NULL, encoding)`
@@ -7979,6 +8141,7 @@ fn entry_block_from(
         mailmap: p.mailmap,
         notes: p.notes,
         notes_shown: p.notes_shown,
+        notes_fence_shown,
         repo,
         // `get_revision_mark()` (revision.c): boundary, then patch-equivalent, then the
         // symmetric side, then `--cherry-mark`'s plain `+`. `put_revision_mark()` follows the
@@ -9317,6 +9480,363 @@ pub(super) fn ancestor_closure(repo: &gix::Repository, roots: &[ObjectId]) -> Re
     ancestor_closure_opt(repo, roots, false)
 }
 
+/// The commits `get_merge_bases_many_0()` (commit-reach.c) parses on its way to the
+/// merge bases of `one` and `twos`, which are the commits whose parent lists
+/// `mark_parents_uninteresting()` can follow afterwards.
+///
+/// `paint_down_to_common()` parses each parent it is about to queue with a flag the
+/// parent lacks, and `remove_redundant_no_gen()` paints again from every base when
+/// there are several. Without a commit-graph every generation is
+/// `GENERATION_NUMBER_INFINITY`, so `paint_queue_get()` stops only once nothing
+/// but `STALE` commits is queued. A repository with a commit-graph takes the
+/// generation cut-offs this port does not model, and gets `None`.
+pub(super) fn merge_base_parsed(
+    repo: &gix::Repository,
+    one: ObjectId,
+    twos: &[ObjectId],
+) -> Option<HashSet<ObjectId>> {
+    if repo.commit_graph().is_ok() {
+        return None;
+    }
+    const PARENT1: u8 = 1;
+    const PARENT2: u8 = 2;
+    const STALE: u8 = 4;
+    const RESULT: u8 = 8;
+    const ENQUEUED: u8 = 16;
+    let reader = NodeReader::new(repo);
+    let mut nodes: HashMap<ObjectId, (i64, Vec<ObjectId>)> = HashMap::new();
+    let mut parsed: HashSet<ObjectId> = HashSet::new();
+    let mut parse = |id: ObjectId, parsed: &mut HashSet<ObjectId>| -> Option<(i64, Vec<ObjectId>)> {
+        parsed.insert(id);
+        if let Some(node) = nodes.get(&id) {
+            return Some(node.clone());
+        }
+        let node = reader.read(repo, id).ok()?;
+        nodes.insert(id, (node.time, node.parents.clone()));
+        Some((node.time, node.parents))
+    };
+    // `paint_down_to_common()` with its `paint_state` counters (commit-reach.c:87-275),
+    // returning the flags it left, which the caller reads and then clears.
+    let mut paint = |one: ObjectId, twos: &[ObjectId], parsed: &mut HashSet<ObjectId>| -> Option<(Vec<ObjectId>, HashMap<ObjectId, u8>)> {
+        let mut flags: HashMap<ObjectId, u8> = HashMap::new();
+        let mut result: Vec<ObjectId> = Vec::new();
+        *flags.entry(one).or_default() |= PARENT1;
+        if twos.is_empty() {
+            return Some((vec![one], flags));
+        }
+        // `compare_commits_by_gen_then_commit_date()`: every generation is infinite
+        // here, so the newest date wins and a tie keeps queue order.
+        let mut queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, ObjectId)> =
+            std::collections::BinaryHeap::new();
+        let mut ctr = 0u64;
+        let (mut p1, mut p2, mut mb) = (0usize, 0usize, 0usize);
+        let count = |f: u8, delta: isize, p1: &mut usize, p2: &mut usize, mb: &mut usize| {
+            let slot = match f & (PARENT1 | PARENT2 | STALE) {
+                PARENT1 => p1,
+                PARENT2 => p2,
+                x if x == PARENT1 | PARENT2 => mb,
+                _ => return,
+            };
+            *slot = slot.wrapping_add_signed(delta);
+        };
+        let mut put = |id: ObjectId,
+                       add: u8,
+                       flags: &mut HashMap<ObjectId, u8>,
+                       queue: &mut std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, ObjectId)>,
+                       time: i64,
+                       counters: (&mut usize, &mut usize, &mut usize)| {
+            let (p1, p2, mb) = counters;
+            let f = flags.entry(id).or_default();
+            let old = *f;
+            *f |= add;
+            if old & ENQUEUED != 0 {
+                count(old, -1, p1, p2, mb);
+                count(*f, 1, p1, p2, mb);
+            } else {
+                *f |= ENQUEUED;
+                queue.push((time, std::cmp::Reverse(ctr), id));
+                ctr += 1;
+                count(*f, 1, p1, p2, mb);
+            }
+        };
+        let time = parse(one, parsed)?.0;
+        put(one, 0, &mut flags, &mut queue, time, (&mut p1, &mut p2, &mut mb));
+        for &two in twos {
+            let time = parse(two, parsed)?.0;
+            put(two, PARENT2, &mut flags, &mut queue, time, (&mut p1, &mut p2, &mut mb));
+        }
+        // `paint_queue_get()`: the counters still include the commit being popped.
+        while let Some((_, _, id)) = queue.pop() {
+            let f = flags.get_mut(&id).expect("queued");
+            *f &= !ENQUEUED;
+            let current = *f;
+            if mb == 0 && p1 == 0 && p2 == 0 {
+                break;
+            }
+            count(current, -1, &mut p1, &mut p2, &mut mb);
+            let mut paint_flags = current & (PARENT1 | PARENT2 | STALE);
+            if paint_flags == PARENT1 | PARENT2 {
+                if current & RESULT == 0 {
+                    *flags.get_mut(&id).expect("queued") |= RESULT;
+                    result.push(id);
+                }
+                paint_flags |= STALE;
+            }
+            let parents = parse(id, parsed)?.1;
+            for p in parents {
+                if flags.get(&p).copied().unwrap_or(0) & paint_flags == paint_flags {
+                    continue;
+                }
+                let time = parse(p, parsed)?.0;
+                put(p, paint_flags, &mut flags, &mut queue, time, (&mut p1, &mut p2, &mut mb));
+            }
+        }
+        Some((result, flags))
+    };
+    // `merge_bases_many()` keeps the results the paint did not later mark `STALE`.
+    if twos.contains(&one) {
+        return Some(parsed);
+    }
+    let (result, flags) = paint(one, twos, &mut parsed)?;
+    let bases: Vec<ObjectId> =
+        result.into_iter().filter(|id| flags.get(id).copied().unwrap_or(0) & STALE == 0).collect();
+    if bases.len() > 1 {
+        // `remove_redundant_no_gen()` (commit-reach.c): paint from each base still
+        // standing against the others; a base the others reach is redundant.
+        let mut redundant = vec![false; bases.len()];
+        for i in 0..bases.len() {
+            if redundant[i] {
+                continue;
+            }
+            let others: Vec<usize> = (0..bases.len()).filter(|&j| j != i && !redundant[j]).collect();
+            let work: Vec<ObjectId> = others.iter().map(|&j| bases[j]).collect();
+            let (_, flags) = paint(bases[i], &work, &mut parsed)?;
+            if flags.get(&bases[i]).copied().unwrap_or(0) & PARENT2 != 0 {
+                redundant[i] = true;
+            }
+            for &j in &others {
+                if flags.get(&bases[j]).copied().unwrap_or(0) & PARENT1 != 0 {
+                    redundant[j] = true;
+                }
+            }
+        }
+    }
+    Some(parsed)
+}
+
+/// What `limit_list()` (revision.c:1446-1516) leaves behind on the objects: the
+/// commits it painted `UNINTERESTING` and the ones carrying `SYMMETRIC_LEFT`.
+pub(super) struct LimitPaint {
+    pub(super) uninteresting: HashSet<ObjectId>,
+    pub(super) left: HashSet<ObjectId>,
+}
+
+/// The inputs of [`limit_list_paint`] that come from the command line.
+pub(super) struct LimitInput<'a> {
+    /// The positive tips with their `SYMMETRIC_LEFT` flag, in pending order.
+    pub(super) tips: &'a [(ObjectId, bool)],
+    /// The `UNINTERESTING` pending commits, merge bases of `A...B` included.
+    pub(super) negatives: &'a [ObjectId],
+    /// Commits whose parent lists were read before the walk (see [`navigation_path`]).
+    pub(super) parsed: &'a HashSet<ObjectId>,
+    pub(super) first_parent: bool,
+    pub(super) exclude_first_parent_only: bool,
+    pub(super) ages: &'a crate::revopt::Ages,
+}
+
+/// `limit_list()`'s commit-date walk, run for what it paints: `process_parents()`
+/// passes `UNINTERESTING` from an uninteresting commit to all its parents
+/// (revision.c:1146-1173) and `SYMMETRIC_LEFT` from an interesting one to the
+/// parents it follows (revision.c:1182-1219), and `mark_parents_uninteresting()`
+/// (revision.c:278-292) carries a fresh `UNINTERESTING` down every parent list
+/// already read. The walk leaves through `still_interesting()` (revision.c:1306-1327):
+/// once nothing interesting is queued and the queue's newest commit is older than
+/// the last interesting one listed, it pops `SLOP` more uninteresting commits and
+/// stops. Under clock skew that stop comes before the uninteresting side has
+/// reached history the interesting side already listed, which then stays
+/// interesting and is shown, as git shows it.
+///
+/// `try_to_simplify_commit()`'s parent pruning under a pathspec is not modelled:
+/// every parent of an interesting commit is followed.
+pub(super) fn limit_list_paint(repo: &gix::Repository, input: &LimitInput<'_>) -> LimitPaint {
+    const UNINTERESTING: u8 = 1;
+    const SEEN: u8 = 2;
+    const LEFT: u8 = 4;
+    // `SLOP` (revision.c:1304).
+    const SLOP: u32 = 5;
+    struct Entry {
+        flags: u8,
+        time: i64,
+        // `commit->parents` once the commit is parsed.
+        parents: Option<Vec<ObjectId>>,
+    }
+    let reader = NodeReader::new(repo);
+    let mut commits: HashMap<ObjectId, Entry> = HashMap::new();
+    // `repo_parse_commit_gently()`: reads the date and the parent list once.
+    let parse = |commits: &mut HashMap<ObjectId, Entry>, id: ObjectId| {
+        let entry = commits.entry(id).or_insert(Entry { flags: 0, time: 0, parents: None });
+        if entry.parents.is_none() {
+            match reader.read(repo, id) {
+                Ok(node) => {
+                    entry.time = node.time;
+                    entry.parents = Some(node.parents);
+                }
+                Err(_) => entry.parents = Some(Vec::new()),
+            }
+        }
+    };
+    // `mark_parents_uninteresting()`: descend through parsed commits only, and stop
+    // at one already marked (`mark_one_parent_uninteresting()`, revision.c:254-276).
+    let exclude_first = input.exclude_first_parent_only;
+    let mark_parents_uninteresting = |commits: &mut HashMap<ObjectId, Entry>, id: ObjectId| {
+        let take = if exclude_first { 1 } else { usize::MAX };
+        let mut pending: Vec<ObjectId> = commits
+            .get(&id)
+            .and_then(|e| e.parents.as_ref())
+            .map(|p| p.iter().take(take).copied().collect())
+            .unwrap_or_default();
+        while let Some(p) = pending.pop() {
+            let entry = commits.entry(p).or_insert(Entry { flags: 0, time: 0, parents: None });
+            if entry.flags & UNINTERESTING != 0 {
+                continue;
+            }
+            entry.flags |= UNINTERESTING;
+            if let Some(parents) = &entry.parents {
+                pending.extend(parents.iter().take(take).copied());
+            }
+        }
+    };
+    for &id in input.parsed {
+        parse(&mut commits, id);
+    }
+    // `prepare_revision_walk()` lists each pending commit once, sorted by date
+    // with ties kept in pending order (`commit_list_sort_by_date()` is stable).
+    let mut pending: Vec<ObjectId> = Vec::new();
+    for &(id, left) in input.tips {
+        parse(&mut commits, id);
+        let entry = commits.get_mut(&id).expect("parsed");
+        if left {
+            entry.flags |= LEFT;
+        }
+        if entry.flags & SEEN == 0 {
+            entry.flags |= SEEN;
+            pending.push(id);
+        }
+    }
+    for &id in input.negatives {
+        parse(&mut commits, id);
+        commits.get_mut(&id).expect("parsed").flags |= UNINTERESTING;
+        // `handle_commit()` marks the ancestry it can already see (revision.c:432-433).
+        mark_parents_uninteresting(&mut commits, id);
+        let entry = commits.get_mut(&id).expect("parsed");
+        if entry.flags & SEEN == 0 {
+            entry.flags |= SEEN;
+            pending.push(id);
+        }
+    }
+    pending.sort_by(|a, b| commits[b].time.cmp(&commits[a].time));
+    // `compare_commits_by_commit_date()`, newest first; equal dates leave in
+    // insertion order (`prio_queue`'s counter).
+    let mut queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, ObjectId)> =
+        std::collections::BinaryHeap::new();
+    let mut ctr = 0u64;
+    let mut put = |queue: &mut std::collections::BinaryHeap<_>, time: i64, id: ObjectId| {
+        queue.push((time, std::cmp::Reverse(ctr), id));
+        ctr += 1;
+    };
+    for id in pending {
+        put(&mut queue, commits[&id].time, id);
+    }
+    let mut slop = SLOP;
+    let mut date = i64::MAX;
+    let mut interesting_cache: Option<ObjectId> = None;
+    while let Some((_, _, id)) = queue.pop() {
+        if interesting_cache == Some(id) {
+            interesting_cache = None;
+        }
+        let time = commits[&id].time;
+        // `if (revs->max_age != -1 && (commit->date < revs->max_age))` (revision.c:1474-1475).
+        if input.ages.below_max_age(time) {
+            commits.get_mut(&id).expect("queued").flags |= UNINTERESTING;
+        }
+        // `process_parents()`; a queued commit is never popped twice, so `ADDED`
+        // needs no bit of its own here.
+        let flags = commits[&id].flags;
+        let parents = commits[&id].parents.clone().unwrap_or_default();
+        if flags & UNINTERESTING != 0 {
+            for p in parents {
+                parse(&mut commits, p);
+                commits.get_mut(&p).expect("parsed").flags |= UNINTERESTING;
+                mark_parents_uninteresting(&mut commits, p);
+                let entry = commits.get_mut(&p).expect("parsed");
+                if entry.flags & SEEN == 0 {
+                    entry.flags |= SEEN;
+                    let t = entry.time;
+                    put(&mut queue, t, p);
+                }
+                if exclude_first {
+                    break;
+                }
+            }
+        } else {
+            let pass = flags & LEFT;
+            for p in parents {
+                parse(&mut commits, p);
+                let entry = commits.get_mut(&p).expect("parsed");
+                entry.flags |= pass;
+                if entry.flags & SEEN == 0 {
+                    entry.flags |= SEEN;
+                    let t = entry.time;
+                    put(&mut queue, t, p);
+                }
+                if input.first_parent {
+                    break;
+                }
+            }
+        }
+        if flags & UNINTERESTING != 0 {
+            mark_parents_uninteresting(&mut commits, id);
+            // `still_interesting()` with `everybody_uninteresting()` (revision.c:477-495).
+            slop = match queue.peek() {
+                None => 0,
+                Some(&(head, _, _)) if date <= head => SLOP,
+                Some(_) => {
+                    let cached = interesting_cache.is_some_and(|c| commits[&c].flags & UNINTERESTING == 0);
+                    let found = cached
+                        || match queue.iter().find(|(_, _, q)| commits[q].flags & UNINTERESTING == 0) {
+                            Some(&(_, _, q)) => {
+                                interesting_cache = Some(q);
+                                true
+                            }
+                            None => false,
+                        };
+                    if found { SLOP } else { slop - 1 }
+                }
+            };
+            if slop == 0 {
+                break;
+            }
+            continue;
+        }
+        // `min_age` and `max_age_as_filter` keep the commit out of the list, and
+        // out of `date` (revision.c:1487-1493).
+        if input.ages.ignores(time) {
+            continue;
+        }
+        date = time;
+    }
+    let mut paint = LimitPaint { uninteresting: HashSet::new(), left: HashSet::new() };
+    for (id, entry) in commits {
+        if entry.flags & UNINTERESTING != 0 {
+            paint.uninteresting.insert(id);
+        }
+        if entry.flags & LEFT != 0 {
+            paint.left.insert(id);
+        }
+    }
+    paint
+}
+
 /// [`ancestor_closure`] with `revs->exclude_first_parent_only` in hand.
 ///
 /// ```c
@@ -10207,6 +10727,7 @@ pub(crate) fn format_commit(
         // instruction format expands to nothing, as it does under git.
         notes: &[],
         notes_shown: false,
+        notes_fence_shown: false,
         repo,
         mark: "",
         revision_mark: ">",
@@ -12421,6 +12942,7 @@ pub(crate) fn rev_list_pretty_body(
         // prints no notes even where `log` would.
         notes: &[],
         notes_shown: false,
+        notes_fence_shown: false,
         repo,
         mark: "",
         // `%m`: `get_revision_mark(NULL, commit)`, which the caller answers from
@@ -12591,6 +13113,8 @@ pub(crate) struct ShowEntry<'a> {
     pub(crate) date_explicit: bool,
     /// `--log-size`: see [`RenderCtx::log_size`].
     pub(crate) log_size: bool,
+    /// See [`RenderCtx::notes_fence_shown`].
+    pub(crate) notes_fence_shown: bool,
 }
 
 /// A reusable [`render_entry`] driver for the commands that render one record at
@@ -12670,6 +13194,7 @@ impl<'r> EntryRenderer<'r> {
             mailmap: opts.mailmap,
             notes: opts.notes,
             notes_shown: opts.notes_shown,
+            notes_fence_shown: opts.notes_fence_shown,
             repo: self.repo,
             // No `--boundary` mark and no `--graph` columns.
             mark: "",
@@ -12750,6 +13275,11 @@ struct RenderCtx<'a> {
     /// `pretty_ctx->notes_message != NULL`: whether the notes display is on at
     /// all, which is what `%N` distinguishes from "on, but no tree had a note".
     notes_shown: bool,
+    /// `opt->shown_dashes` as `show_log()` finds it: raised by the last
+    /// `next_commentary_block()` and lowered only by `log_tree_diff_flush()`
+    /// (log-tree.c:685-693, :929), so a record that is not diffed inherits it
+    /// from the one before.
+    notes_fence_shown: bool,
     /// Rendering a note means reading its blob.
     repo: &'a gix::Repository,
     /// `get_revision_mark()`: `- ` for a `--boundary` commit, empty otherwise.
@@ -12979,7 +13509,8 @@ fn render_entry(
             // since everything past it is commentary a patch applier drops.
             let notes = notes_block(commit, ctx)?;
             if !notes.is_empty() {
-                out.extend_from_slice(b"---\n");
+                // `next_commentary_block()`: `x = opt->shown_dashes ? "\n" : "---\n"`.
+                out.extend_from_slice(if ctx.notes_fence_shown { b"\n" } else { b"---\n" });
                 out.extend_from_slice(&notes);
             }
         }

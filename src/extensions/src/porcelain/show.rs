@@ -379,6 +379,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `unsorted_input` never reaches `cmd_show`'s own loop, which is why
     // `--no-walk=sorted` and `--no-walk=unsorted` are indistinguishable here.
     let mut no_walk = true;
+    // The first option this port does not parse itself. `cmd_show()` hands a walk to
+    // `cmd_log_walk()` (builtin/log.c:696-701), so once a range has cleared `no_walk`
+    // the whole command line goes to `git log`'s parser under `Flavor::Show`, which
+    // knows it; while `no_walk` stands it is still refused.
+    let mut unparsed: Option<&str> = None;
     // `revs->max_count`: -1 (unlimited) in git; `None` here.
     let mut max_count: Option<usize> = None;
     // `-n <n>`: the count lives in the next argv slot.
@@ -1250,7 +1255,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(129));
                     }
                 } else if s.starts_with('-') {
-                    bail!("unsupported option {s}");
+                    unparsed.get_or_insert(s);
                 } else {
                     // `add_pending_object_with_path()` clears `revs->no_walk` the
                     // moment an UNINTERESTING object is pended, so the two are
@@ -1616,6 +1621,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // a revision walk; plain object names are shown directly.
     let mut walk_tips: Vec<ObjectId> = Vec::new();
     let mut walk_hidden: Vec<ObjectId> = Vec::new();
+    // A positive `A...B` pends `A` with `SYMMETRIC_LEFT` (revision.c handle_dotdot_1()),
+    // which `process_parents()` passes down the walk. This port's own walk carries no
+    // side, so a walk whose format prints it (`%m`, `get_revision_mark(NULL, ...)`,
+    // pretty.c) goes to `git log`'s; the option spellings that read it are not parsed
+    // here and go there anyway.
+    let mut symmetric_left = false;
     let mut plain: Vec<(String, ObjectId)> = Vec::new();
     // The names `add_reflog_for_walk()` was handed, in argument order.
     let mut reflog_names: Vec<String> = Vec::new();
@@ -1943,10 +1954,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     .iter()
                     .map(|c| c.detach())
                     .collect();
-                // `paint_down_to_common()` parses its way from both endpoints
-                // past the bases, so a base's whole ancestry is loaded before
-                // `mark_parents_uninteresting()` runs over it.
-                parsed_commits.extend(super::log::ancestor_closure(&repo, &bases)?);
+                // `get_merge_bases()` parses what its paint reaches, and those are
+                // the parent lists `mark_parents_uninteresting()` can follow. With a
+                // commit-graph the paint is not modelled; the bases' whole ancestry
+                // stands in for it.
+                match super::log::merge_base_parsed(&repo, theirs, &[ours]) {
+                    Some(painted) => parsed_commits.extend(painted),
+                    None => parsed_commits.extend(super::log::ancestor_closure(&repo, &bases)?),
+                }
                 // `handle_dotdot_1()` pends the merge bases before either endpoint.
                 let (left, right) =
                     (range_endpoint(spec, "...", false), range_endpoint(spec, "...", true));
@@ -1964,6 +1979,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     walk_hidden.push(ours);
                 } else {
                     walk_hidden.extend(bases);
+                    symmetric_left = true;
                     plain.push((left.clone(), theirs));
                     plain.push((right.clone(), ours));
                     walk_tips.push(theirs);
@@ -2018,6 +2034,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // loop — see through an annotated tag to the commit it names, on the positive and the negative
     // side alike, which is why `git show v1 ^v1` prints nothing rather than the tag's own header.
     let needs_walk = !no_walk;
+    // `if (!rev.no_walk) { ret = cmd_log_walk(&rev); ... }` (builtin/log.c:696-701):
+    // a walk is `git log`'s, graph and every walk option included, so a command
+    // line this port's own walk does not cover goes to `git log`'s under
+    // `Flavor::Show`. `--stdin` is excluded because its lines are read already.
+    let prints_side = symmetric_left && matches!(&pretty, Pretty::User(f) if user_format_has_mark(f));
+    if needs_walk && !read_stdin && (graph || prints_side || unparsed.is_some()) {
+        return super::log::show_walk(args);
+    }
+    if let Some(s) = unparsed {
+        bail!("unsupported option {s}");
+    }
     // `if (revs->reflog_info && revs->limited) die(...)` (revision.c:3218-3219).
     // `-L` and `--graph` set `topo_order` (revision.c:3177, :2788), which is what
     // limits it (revision.c:3195-3196).
@@ -2107,8 +2134,28 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         nodes
     } else if needs_walk && !line_level {
+        // An UNINTERESTING pending commit makes `cmd_log_walk()` limited unless a
+        // topological order can use generation numbers (revision.c:431-436), and
+        // `limit_list()` paints only as far as its `SLOP` lets it.
+        let generation_numbers = repo.commit_graph().ok().is_some_and(|g| {
+            g.num_commits() > 0 && g.commit_at(gix::commitgraph::Position(0)).generation() != 0
+        });
         let hidden = if walk_hidden.is_empty() {
             std::collections::HashSet::new()
+        } else if order == super::log::Order::Default || !generation_numbers {
+            let tips: Vec<(ObjectId, bool)> = walk_tips.iter().map(|id| (*id, false)).collect();
+            super::log::limit_list_paint(
+                &repo,
+                &super::log::LimitInput {
+                    tips: &tips,
+                    negatives: &walk_hidden,
+                    parsed: &parsed_commits,
+                    first_parent,
+                    exclude_first_parent_only: false,
+                    ages: &counts.ages(),
+                },
+            )
+            .uninteresting
         } else {
             super::log::ancestor_closure(&repo, &walk_hidden)?
         };
@@ -2245,6 +2292,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         false => pathspecs.clone(),
     };
     let disp = DisplayOpts {
+        shown_dashes: std::cell::Cell::new(false),
         reflog: std::cell::RefCell::new(None),
         reflog_walk: reflog_from.is_some(),
         date_explicit,
@@ -2598,6 +2646,21 @@ fn parents_of(repo: &gix::Repository, id: ObjectId) -> Result<Vec<ObjectId>> {
     Ok(commit.parent_ids().map(|p| p.detach()).collect())
 }
 
+/// Whether a user format expands `%m`, the one placeholder that prints a commit's
+/// `SYMMETRIC_LEFT` side (`format_commit_one()`, pretty.c). `%%` is a literal `%`.
+fn user_format_has_mark(fmt: &str) -> bool {
+    let mut bytes = fmt.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            match bytes.next() {
+                Some(b'm') => return true,
+                Some(_) | None => {}
+            }
+        }
+    }
+    false
+}
+
 /// The name git records for one endpoint of a range argument under `--source`.
 ///
 /// `handle_dotdot_1` passes the endpoint token — not the whole argument — to
@@ -2815,6 +2878,11 @@ struct RenameWarnState {
 }
 
 struct DisplayOpts<'a> {
+    /// `opt->shown_dashes`, which `cmd_show()`'s shared `rev_info` carries from one
+    /// record to the next: raised by a mail format's notes fence
+    /// (`next_commentary_block()`, log-tree.c:685-693) and lowered only by
+    /// `log_tree_diff_flush()` (log-tree.c:929).
+    shown_dashes: std::cell::Cell<bool>,
     /// The reflog entry the record being rendered stands for under `-g`, which
     /// `show_log()` prints the selector and message of.
     reflog: std::cell::RefCell<Option<super::log::ReflogEntry>>,
@@ -3723,6 +3791,24 @@ fn show_commit_record(
 ) -> Result<()> {
     let parents: Vec<_> = commit.parent_ids().collect();
     let is_merge = parents.len() > 1;
+    // Whether `log_tree_diff()` reaches `log_tree_diff_flush()` for this record, which
+    // lowers `opt->shown_dashes` before anything else (log-tree.c:929, :1188-1268): `-L`,
+    // a root under `show_root_diff`, every non-merge (`cmd_show()` sets `rev.diff`), a
+    // per-parent `-m`/first-parent merge record and a two-parent remerge, but not
+    // `do_diff_combined()` nor `--no-diff-merges`.
+    let flushed = line_log_pairs.is_some()
+        || matches!(remerge, Some(Remerge::Diff { .. }))
+        || match parents.len() {
+            0 => disp.show_root,
+            1 => true,
+            _ => {
+                remerge.is_none()
+                    && matches!(disp.merges, super::log::DiffMerges::Separate | super::log::DiffMerges::FirstParent)
+            }
+        };
+    if flushed {
+        disp.shown_dashes.set(false);
+    }
     // The tree this record diffs against: the re-merged tree under
     // `--diff-merges=remerge` (`diff_tree_oid(&res.tree->object.oid, oid, …)`,
     // log-tree.c:1076), the named parent for a `separate` record, otherwise the
@@ -4011,8 +4097,12 @@ fn show_commit_record(
             reflog: reflog.as_ref(),
             date_explicit: disp.date_explicit,
             log_size: disp.log_size,
+            notes_fence_shown: disp.shown_dashes.get(),
         },
     )?;
+    if super::log::mail_notes_shown_dashes(repo, disp.notes, pretty, commit.id().detach())? {
+        disp.shown_dashes.set(true);
+    }
     // `repo_format_commit_message()`'s tail: the *rendered record* is converted out
     // of UTF-8 into the requested encoding, and a conversion that cannot be done
     // leaves the UTF-8 bytes in place (pretty.c:2026-2046). Only a user format takes

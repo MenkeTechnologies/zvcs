@@ -397,7 +397,14 @@ struct State {
     title: Option<&'static str>,
     /// [`FIRST_READ_BEFORE_METER`] unless the caller knows better.
     first_read_override: Option<u64>,
+    /// `index-pack --show-resolving-progress` without `-v`: only `Resolving deltas` is drawn.
+    resolving_only: bool,
+    /// Where the meters write instead of stderr, from whichever thread draws them.
+    relay: Option<Relay>,
 }
+
+/// A sink for meter output that any thread may write to.
+pub(crate) type Relay = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 impl Meters {
     pub(crate) fn new(plan: Plan) -> Self {
@@ -413,6 +420,8 @@ impl Meters {
                 local_base_objects: 0,
                 title: None,
                 first_read_override: None,
+                resolving_only: false,
+                relay: None,
             })),
         }
     }
@@ -435,6 +444,21 @@ impl Meters {
             let mut state = meters.state();
             state.title = Some(title);
             state.first_read_override = Some(first_read);
+        }
+        meters
+    }
+
+    /// The meters of the `index-pack` child `receive-pack` runs for a kept pack: no `-v`, so no
+    /// `Receiving objects`, and `--show-resolving-progress` when it is not quiet and has the
+    /// sideband muxer for a stderr (object-file.c:1401-1402), so `Resolving deltas` is drawn
+    /// (builtin/index-pack.c:1340-1343) and reaches the pusher through `relay`, the
+    /// `copy_to_sideband()` muxer (builtin/receive-pack.c:481, :2312-2324).
+    pub(crate) fn resolving_only(relay: Relay) -> Self {
+        let meters = Meters::index_pack("Receiving objects", u64::MAX);
+        {
+            let mut state = meters.state();
+            state.resolving_only = true;
+            state.relay = Some(relay);
         }
         meters
     }
@@ -507,8 +531,10 @@ impl prodash::Count for Meters {
                 }
             }
             Role::Deltas => {
-                if let Some(meter) = self.state().deltas.as_mut() {
-                    meter.advance(step);
+                let mut state = self.state();
+                let relay = state.relay.clone();
+                if let Some(meter) = state.deltas.as_mut() {
+                    drawn(relay, || meter.advance(step));
                 }
             }
             _ => {}
@@ -535,7 +561,7 @@ impl prodash::Progress for Meters {
                     Meter::counted(
                         state.title.unwrap_or("Receiving objects"),
                         nr_objects,
-                        plan.index_pack_verbose(),
+                        plan.index_pack_verbose() && !state.resolving_only,
                     )
                 };
                 // With the header passed on, every read the child makes follows
@@ -561,7 +587,7 @@ impl prodash::Progress for Meters {
                     let mut meter = Meter::counted("Resolving deltas", nr_deltas, plan.index_pack_verbose());
                     // `threaded_second_pass()` displays the resolved count before
                     // it takes its first object (builtin/index-pack.c:1113-1115).
-                    meter.set(0);
+                    drawn(state.relay.clone(), || meter.set(0));
                     state.deltas = Some(meter);
                 }
             }
@@ -603,11 +629,21 @@ impl Drop for Meters {
                         1 => "completed with 1 local object".to_string(),
                         n => format!("completed with {n} local objects"),
                     };
-                    meter.stop(&msg);
+                    drawn(state.relay.clone(), || meter.stop(&msg));
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Run `draw` with what it writes going to `relay` rather than stderr when there is one. The
+/// relay is installed for the call itself, because the vendored indexer resolves deltas on
+/// worker threads and [`crate::progress::with_relay`] is per thread.
+fn drawn(relay: Option<Relay>, draw: impl FnOnce()) {
+    match relay {
+        Some(relay) => crate::progress::with_relay(move |bytes: &[u8]| relay(bytes), draw),
+        None => draw(),
     }
 }
 

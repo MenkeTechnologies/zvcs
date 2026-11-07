@@ -323,6 +323,13 @@ pub struct SendOptions {
     /// `args->negotiation_restrict`: `remote.<name>.negotiationRestrict`
     /// (transport.c:970), empty in the same two cases.
     pub negotiation_restrict: Vec<String>,
+    /// `Some` for `git send-pack`, carrying the `error()`s its source match already raised.
+    /// `cmd_send_pack()` runs `match_push_refs()` itself, after `git_connect()` and the
+    /// advertisement (builtin/send-pack.c:279-312), and a failed match there is a `goto
+    /// cleanup` that closes the connection without writing anything more, where `git push`
+    /// ends a failed match through `transport_disconnect()`, whose `disconnect_git()`
+    /// writes a flush first (transport.c:1024-1025).
+    pub send_pack_match: Option<Vec<String>>,
 }
 
 /// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
@@ -431,6 +438,10 @@ pub struct Outcome {
     /// `send-pack --helper-status` reports one line per entry, so the ones no
     /// refspec matched have to survive to the report as `no match`.
     pub advertised: Vec<String>,
+    /// The tip each of [`advertised`][Self::advertised] names, in the same order: the `old_oid` every entry of
+    /// `remote_refs` carries, which `transport_summary_width()` measures whether or not a refspec matched it
+    /// (transport.c:881-892).
+    pub advertised_tips: Vec<ObjectId>,
     /// `unpack ok`, or the server's failure reason.
     pub unpack: Result<(), String>,
     /// `send_pack()`'s `if (!remote_refs)` return (send-pack.c:542-547): the remote advertised
@@ -566,6 +577,59 @@ fn sign_failure(e: crate::gitsig::SignFailure) -> anyhow::Error {
     }
 }
 
+/// The `die()` `send_pack()` reaches after the advertisement and before the command
+/// list (send-pack.c:564-580), once its own `fatal:` line is out.
+///
+/// `die()` exits with the connection half-open: nothing more is written, not even a
+/// flush, so the receive-pack on the other end reads EOF where its command list belongs
+/// and dies `fatal: the remote end hung up unexpectedly` on the stderr it shares with a
+/// local or ssh client; a `git://` daemon keeps that line in its own log. Over smart HTTP
+/// there is no such peer, and the hang-up is reported on this side.
+fn die_half_open<T: gix::protocol::transport::client::blocking_io::Transport>(
+    connection: &mut gix::remote::Connection<'_, '_, '_, T>,
+    url: &str,
+) -> anyhow::Error {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return crate::fatal::die("the remote end hung up unexpectedly");
+    }
+    connection.skip_end_of_interaction();
+    anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL))
+}
+
+/// `strbuf_add_unique_abbrev(&quickref, oid, DEFAULT_ABBREV)` (transport.c:740, :751): the
+/// abbreviation `print_ok_ref_status()` writes on each side of `..`/`...`, unique in this
+/// repository from `core.abbrev` (or its automatic length) up.
+pub fn quickref_abbrev(repo: &gix::Repository, oid: &ObjectId) -> String {
+    crate::abbrev::default_unique_abbrev(repo, oid)
+}
+
+/// `transport_summary_width()` (transport.c:871-892): twice the widest
+/// [`quickref_abbrev`] over the `old_oid` and `new_oid` of every entry of `remote_refs`,
+/// plus 3 for the `...`, or `2 * FALLBACK_DEFAULT_ABBREV + 3` when the list is empty.
+///
+/// ```c
+/// for (; refs; refs = refs->next) {
+///         maxw = measure_abbrev(&refs->old_oid, maxw);
+///         maxw = measure_abbrev(&refs->new_oid, maxw);
+/// }
+/// if (maxw < 0)
+///         maxw = FALLBACK_DEFAULT_ABBREV;
+/// return (2 * maxw + 3);
+/// ```
+///
+/// `remote_refs` is the whole advertisement with the refs the push creates appended, so an
+/// advertised ref no refspec matched is measured too: its `old_oid` is its advertised tip and
+/// its `new_oid` is null, which measures at the starting length.
+pub fn summary_width(repo: &gix::Repository, outcome: &Outcome) -> usize {
+    let widest = outcome
+        .advertised_tips
+        .iter()
+        .chain(outcome.statuses.iter().flat_map(|s| [&s.old, &s.new]))
+        .map(|oid| quickref_abbrev(repo, oid).len())
+        .max();
+    2 * widest.unwrap_or(crate::abbrev::FALLBACK_DEFAULT_ABBREV) + 3
+}
+
 /// Push `requests` to `remote` over receive-pack, returning each ref's verdict.
 ///
 /// Ports `send_pack()`: negotiate capabilities, emit the command list, build and
@@ -676,6 +740,7 @@ pub fn send_pack(
             }
         }
     }
+    let advertised_tips: Vec<ObjectId> = advertised_order.iter().map(|name| advertised[name]).collect();
 
     // git's capability selection (send-pack.c, "Does the other end support…"):
     // prefer report-status-v2, fall back to report-status; request side-band-64k
@@ -1065,11 +1130,26 @@ pub fn send_pack(
     // (`transport_push()`, transport.c:1466-1467.) A refspec the match refused —
     // a deletion of a ref the remote does not have — fails the whole push before
     // the hook, the upload or any status block; the other refspecs are not sent.
-    if statuses.iter().any(|s| s.pre_transport) {
+    //
+    // `git send-pack` reaches the same end from `cmd_send_pack()`, its source errors
+    // included, and closes without the flush ([`SendOptions::send_pack_match`]). Its
+    // `error()`s are out before that close, which the receive-pack on the other end
+    // answers with its hang-up, so they are printed here rather than by the caller.
+    let send_pack_errors = opts.send_pack_match.as_deref();
+    if send_pack_errors.is_some_and(|e| !e.is_empty()) || statuses.iter().any(|s| s.pre_transport) {
         statuses.retain(|s| s.pre_transport);
+        if let Some(errors) = send_pack_errors {
+            let refused = statuses.iter().filter_map(|s| s.result.as_ref().err());
+            for reason in errors.iter().chain(refused) {
+                eprintln!("error: {reason}");
+            }
+            statuses.clear();
+            connection.skip_end_of_interaction();
+        }
         return Ok(Outcome {
             url,
             statuses,
+            advertised_tips,
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: false,
@@ -1089,6 +1169,7 @@ pub fn send_pack(
             return Ok(Outcome {
                 url,
                 statuses: Vec::new(),
+                advertised_tips,
                 advertised: advertised_order,
                 unpack: Ok(()),
                 no_refs: false,
@@ -1120,6 +1201,7 @@ pub fn send_pack(
         return Ok(Outcome {
             url,
             statuses,
+            advertised_tips,
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: true,
@@ -1205,22 +1287,19 @@ pub fn send_pack(
     if opts.atomic {
         if !caps.contains("atomic") {
             // `die(_("the receiving end does not support --atomic push"))`
-            // (send-pack.c:608), reached with the connection still half-open —
-            // the same shape as the two refusals below, so the peer reads EOF
-            // where it expected the command list and the transport reports the
-            // hang-up as the second `fatal:`.
+            // (send-pack.c:574-575), reached with the connection still half-open —
+            // the same shape as the two refusals around it ([`die_half_open`]).
             eprintln!("fatal: the receiving end does not support --atomic push");
-            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+            return Err(die_half_open(&mut connection, &url));
         }
         cap_buf.push_str(" atomic");
     }
     if !opts.push_options.is_empty() {
         if !caps.contains("push-options") {
-            // `send_pack()` dies with the first line; the connection is then torn
-            // down half-open and `transport_push()` reports that as the hang-up.
-            // Two `fatal:` lines, in this order, exit 128.
+            // `send_pack()` dies with this line (send-pack.c:579-580) and the
+            // connection half-open ([`die_half_open`]), exit 128.
             eprintln!("fatal: the receiving end does not support push options");
-            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+            return Err(die_half_open(&mut connection, &url));
         }
         cap_buf.push_str(" push-options");
     }
@@ -1260,13 +1339,10 @@ pub fn send_pack(
         Signed::Always => {
             if nonce.is_none() {
                 // `die(_("the receiving end does not support --signed push"))`
-                // (send-pack.c:543). `send_pack()` dies with the connection
-                // still half-open, so the `receive-pack` on the other end reads
-                // EOF where it expected the command list and the transport
-                // reports that as the hang-up — the same two-`fatal:` shape the
-                // push-options refusal above produces, exit 128.
+                // (send-pack.c:565-566). `send_pack()` dies with the connection
+                // still half-open ([`die_half_open`]), exit 128.
                 eprintln!("fatal: the receiving end does not support --signed push");
-                return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+                return Err(die_half_open(&mut connection, &url));
             }
             true
         }
@@ -1357,6 +1433,7 @@ pub fn send_pack(
             return Ok(Outcome {
                 url,
                 statuses,
+                advertised_tips,
                 advertised: advertised_order,
                 unpack: Ok(()),
                 no_refs: false,
@@ -1390,6 +1467,7 @@ pub fn send_pack(
         return Ok(Outcome {
             url,
             statuses,
+            advertised_tips,
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: false,
@@ -1405,6 +1483,7 @@ pub fn send_pack(
         return Ok(Outcome {
             url,
             statuses,
+            advertised_tips,
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: false,
@@ -1535,6 +1614,7 @@ pub fn send_pack(
                 return Ok(Outcome {
                     url,
                     statuses,
+                    advertised_tips,
                     advertised: advertised_order,
                     unpack: Ok(()),
                     no_refs: false,
@@ -1682,6 +1762,7 @@ pub fn send_pack(
     Ok(Outcome {
         url,
         statuses,
+        advertised_tips,
         advertised: advertised_order,
         unpack,
         no_refs: false,

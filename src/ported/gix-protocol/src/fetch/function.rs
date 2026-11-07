@@ -262,9 +262,14 @@ where
                                     });
                                     continue 'negotiation;
                                 }
-                                let response =
-                                    crate::fetch::Response::from_line_reader(protocol_version, &mut rd, false, true)
-                                        .await?;
+                                let response = crate::fetch::Response::from_line_reader_on_connection(
+                                    protocol_version,
+                                    &mut rd,
+                                    false,
+                                    true,
+                                    !is_stateless,
+                                )
+                                .await?;
                                 let mut acked = false;
                                 for ack in response.acknowledgements() {
                                     match ack {
@@ -300,9 +305,14 @@ where
                                 if got_ready && no_done {
                                     // No `done` is owed: the pack follows this very answer
                                     // (fetch-pack.c:616-619).
-                                    let mut response =
-                                        crate::fetch::Response::from_line_reader(protocol_version, &mut rd, true, false)
-                                            .await?;
+                                    let mut response = crate::fetch::Response::from_line_reader_on_connection(
+                                        protocol_version,
+                                        &mut rd,
+                                        true,
+                                        false,
+                                        !is_stateless,
+                                    )
+                                    .await?;
                                     // The shallow list answers the first flush, not the last one (fetch-pack.c:455-481).
                                     if response.shallow_updates().is_empty() {
                                         response.append_v1_shallow_updates(first_shallows.take());
@@ -329,9 +339,14 @@ where
                                 previous_response_had_at_least_one_in_common: false,
                             });
                             let mut rd = arguments.send(transport, true).await?;
-                            let mut response =
-                                crate::fetch::Response::from_line_reader(protocol_version, &mut rd, true, false)
-                                    .await?;
+                            let mut response = crate::fetch::Response::from_line_reader_on_connection(
+                                protocol_version,
+                                &mut rd,
+                                true,
+                                false,
+                                !is_stateless,
+                            )
+                            .await?;
                             // The shallow list answers the first flush, not the last one (fetch-pack.c:455-481).
                             if response.shallow_updates().is_empty() {
                                 response.append_v1_shallow_updates(first_shallows.take());

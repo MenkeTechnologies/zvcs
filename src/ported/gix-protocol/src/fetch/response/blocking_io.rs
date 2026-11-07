@@ -49,6 +49,23 @@ impl Response {
         client_expects_pack: bool,
         wants_to_negotiate: bool,
     ) -> Result<Response, response::Error> {
+        Self::from_line_reader_on_connection(version, reader, client_expects_pack, wants_to_negotiate, false)
+    }
+
+    /// Like [`Response::from_line_reader()`], for a V0/V1 response read off a connection that `persists` across
+    /// requests (a pipe or socket rather than a stateless HTTP exchange).
+    ///
+    /// `find_common()` reads its shallow lines and acknowledgements with a `packet_reader` set up without
+    /// `PACKET_READ_GENTLE_ON_EOF` (fetch-pack.c:372-374), so on such a connection the end of the stream ahead of
+    /// the pack is `packet_read_with_status()`'s `die(_("the remote end hung up unexpectedly"))`
+    /// (pkt-line.c:364-372), as for a server that died over the request. Only a stateless response ends there.
+    pub fn from_line_reader_on_connection<'a>(
+        version: Protocol,
+        reader: &mut impl ExtendedBufRead<'a>,
+        client_expects_pack: bool,
+        wants_to_negotiate: bool,
+        persists: bool,
+    ) -> Result<Response, response::Error> {
         match version {
             Protocol::V0 | Protocol::V1 => {
                 let mut line = String::new();
@@ -76,6 +93,7 @@ impl Response {
                         // `PACKET_READ_GENTLE_ON_EOF` and dies at that end (fetch-pack.c:372-374, pkt-line.c:364-372).
                         Some(Err(err))
                             if err.kind() == io::ErrorKind::UnexpectedEof
+                                && !persists
                                 && gix_transport::client::RpcEnded::find(&err).is_none() =>
                         {
                             break 'lines false;

@@ -5,12 +5,67 @@ use crate::{
     packetline::blocking_io::{Writer, encode},
 };
 
+/// The `struct strbuf req_buf` a request is built in before it goes out whole.
+///
+/// git never writes a request one pkt-line at a time: `find_common()` collects its
+/// wants, shallow lines and `deepen*` arguments in `req_buf` and hands the lot to
+/// `send_request()`, one `write_in_full()` (fetch-pack.c:254-264, :361-459),
+/// `send_fetch_request()` does the same for a v2 `fetch` (fetch-pack.c:1384-1445),
+/// `get_remote_refs()` for `ls-refs` (connect.c:690-711) and `send_pack()` for its
+/// commands (send-pack.c:486-694). A server that dies over the first line it reads
+/// (`deepen-not is not a ref`) has then been given the whole request already, so
+/// the client learns of the death from the read that follows,
+/// `the remote end hung up unexpectedly`, and never from a write into the closed
+/// pipe. Packet lines are collected here until a flush sends them in one
+/// `write_all()`; once [`RequestWriter::into_parts()`] gives the writer away the
+/// collected lines go out ahead of the first write and everything after passes
+/// straight through, as a pack follows `send_pack()`s commands.
+struct RequestBuf<W: io::Write> {
+    req_buf: Vec<u8>,
+    out: W,
+    passthrough: bool,
+}
+
+impl<W: io::Write> RequestBuf<W> {
+    /// `send_request()`: `write_in_full(fd, buf->buf, buf->len)`, then `strbuf_setlen(&req_buf, 0)`.
+    fn send_request(&mut self) -> io::Result<()> {
+        if !self.req_buf.is_empty() {
+            let buf = std::mem::take(&mut self.req_buf);
+            self.out.write_all(&buf)?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: io::Write> io::Write for RequestBuf<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.passthrough {
+            self.send_request()?;
+            return self.out.write(buf);
+        }
+        self.req_buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.send_request()?;
+        self.out.flush()
+    }
+}
+
+impl<W: io::Write> Drop for RequestBuf<W> {
+    /// A writer dropped with lines still collected sends them, as `BufWriter` would.
+    fn drop(&mut self) {
+        let _ = self.send_request();
+    }
+}
+
 /// A [`Write`][io::Write] implementation optimized for writing packet lines.
 /// A type implementing `Write` for packet lines, which when done can be transformed into a `Read` for
 /// obtaining the response.
 pub struct RequestWriter<'a> {
     on_into_read: MessageKind,
-    writer: Writer<Box<dyn io::Write + 'a>>,
+    writer: Writer<RequestBuf<Box<dyn io::Write + 'a>>>,
     reader: Box<dyn ExtendedBufRead<'a> + Unpin + 'a>,
     trace: bool,
 }
@@ -43,7 +98,11 @@ impl<'a> RequestWriter<'a> {
         on_into_read: MessageKind,
         trace: bool,
     ) -> Self {
-        let mut writer = Writer::new(Box::new(writer) as Box<dyn io::Write>);
+        let mut writer = Writer::new(RequestBuf {
+            req_buf: Vec::new(),
+            out: Box::new(writer) as Box<dyn io::Write>,
+            passthrough: false,
+        });
         match write_mode {
             WriteMode::Binary => writer.enable_binary_mode(),
             WriteMode::OneLfTerminatedLinePerWriteCall => writer.enable_text_mode(),
@@ -109,6 +168,8 @@ impl<'a> RequestWriter<'a> {
     /// the underlying transport mechanism. Failure to do so may result in a deadlock depending on how the write and read mechanism
     /// is implemented.
     pub fn into_parts(self) -> (Box<dyn io::Write + 'a>, Box<dyn ExtendedBufRead<'a> + Unpin + 'a>) {
-        (self.writer.into_inner(), self.reader)
+        let mut writer = self.writer.into_inner();
+        writer.passthrough = true;
+        (Box::new(writer), self.reader)
     }
 }

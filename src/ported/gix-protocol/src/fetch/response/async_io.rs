@@ -48,6 +48,18 @@ impl Response {
         client_expects_pack: bool,
         wants_to_negotiate: bool,
     ) -> Result<Response, response::Error> {
+        Self::from_line_reader_on_connection(version, reader, client_expects_pack, wants_to_negotiate, false).await
+    }
+
+    /// See the blocking `Response::from_line_reader_on_connection()`: on a connection that `persists` the end of
+    /// the stream ahead of the pack is `die(_("the remote end hung up unexpectedly"))` (pkt-line.c:364-372).
+    pub async fn from_line_reader_on_connection(
+        version: Protocol,
+        reader: &mut (impl ExtendedBufRead<'_> + Unpin),
+        client_expects_pack: bool,
+        wants_to_negotiate: bool,
+        persists: bool,
+    ) -> Result<Response, response::Error> {
         match version {
             Protocol::V0 | Protocol::V1 => {
                 let mut line = String::new();
@@ -64,7 +76,7 @@ impl Response {
                         // [a lot](https://github.com/git/git/blob/9e49351c3060e1fa6e0d2de64505b7becf157f28/fetch-pack.c#L583-L594)
                         // to deal with this correctly.
                         // For now this is acceptable, as V2 can be used as a workaround, which also is the default.
-                        Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => break 'lines false,
+                        Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof && !persists => break 'lines false,
                         Some(Err(err)) => return Err(err.into()),
                         Some(Ok(Err(err))) => return Err(err.into()),
                         None => {

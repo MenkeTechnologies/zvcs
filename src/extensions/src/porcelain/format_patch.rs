@@ -6284,6 +6284,23 @@ fn emit_shortlog(
         } else {
             title
         };
+        // insert_one_record() (builtin/shortlog.c:73-85): skip leading
+        // whitespace, drop a "[PATCH...]" prefix that closes on the first line,
+        // skip the blanks after it, then fold the rest with format_subject().
+        let mut s = title.as_slice();
+        while s.first().is_some_and(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+            s = &s[1..];
+        }
+        if s.starts_with(b"[PATCH") {
+            let eol = s.iter().position(|&b| b == b'\n').unwrap_or(s.len());
+            if let Some(eob) = s.iter().position(|&b| b == b']').filter(|&eob| eob < eol) {
+                s = &s[eob + 1..];
+            }
+        }
+        while s.first().is_some_and(|&b| matches!(b, b' ' | b'\t' | b'\r')) {
+            s = &s[1..];
+        }
+        let (title, _) = format_subject(s);
         match groups.iter_mut().find(|(name, _)| *name == author) {
             Some((_, subjects)) => subjects.push(title),
             None => groups.push((author, vec![title])),
@@ -7178,7 +7195,10 @@ fn render_changes(
     for change in changes {
         let mut one: Vec<u8> = Vec::new();
         let (stat, paint) = emit_change(repo, &drivers, &mut one, change, abbrev, opts, dissimilarity)?;
-        if from_contents && stat.added == 0 && stat.deleted == 0 && is_plain_edit(change) {
+        // builtin_diff() sets `o->found_changes` for any binary pair whose
+        // contents differ (diff.c:3943-3989), whatever
+        // whitespace is ignored, so only a text edit can come out empty.
+        if from_contents && stat.added == 0 && stat.deleted == 0 && stat.binary.is_none() && is_plain_edit(change) {
             continue;
         }
         // `run_diff_cmd()` (diff.c:4969-4972) hands the pair to the driver and

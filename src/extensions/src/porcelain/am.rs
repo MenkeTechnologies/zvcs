@@ -410,6 +410,10 @@ struct Opts {
     utf8: bool,
     keep: Keep,
     empty: Empty,
+    /// `--signoff`/`--no-signoff`/`-s` as typed: `state.signoff` after
+    /// parse_options(), which runs after am_load() (builtin/am.c:2454-2458), so
+    /// a resumed session takes it over the `sign` file.
+    signoff_given: Option<bool>,
     message_id: bool,
     scissors: Option<bool>,
     quoted_cr: Option<&'static str>,
@@ -446,6 +450,7 @@ impl Default for Opts {
             threeway: false,
             quiet: false,
             signoff: false,
+            signoff_given: None,
             utf8: true,
             keep: Keep::False,
             empty: Empty::Stop,
@@ -828,8 +833,14 @@ fn parse_long(
         "no-3way" => o.threeway = flag(tok, attached, false)?,
         "quiet" => o.quiet = flag(tok, attached, true)?,
         "no-quiet" => o.quiet = flag(tok, attached, false)?,
-        "signoff" => o.signoff = flag(tok, attached, true)?,
-        "no-signoff" => o.signoff = flag(tok, attached, false)?,
+        "signoff" => {
+            o.signoff = flag(tok, attached, true)?;
+            o.signoff_given = Some(o.signoff);
+        }
+        "no-signoff" => {
+            o.signoff = flag(tok, attached, false)?;
+            o.signoff_given = Some(o.signoff);
+        }
         "utf8" => o.utf8 = flag(tok, attached, true)?,
         "no-utf8" => o.utf8 = flag(tok, attached, false)?,
         "keep" => {
@@ -1011,7 +1022,10 @@ fn parse_short(
             'i' => o.interactive = true,
             '3' => o.threeway = true,
             'q' => o.quiet = true,
-            's' => o.signoff = true,
+            's' => {
+                o.signoff = true;
+                o.signoff_given = Some(true);
+            }
             'u' => o.utf8 = true,
             'k' => o.keep = Keep::True,
             'm' => o.message_id = true,
@@ -1875,6 +1889,8 @@ struct Cli {
     ignore_date: bool,
     committer_date_is_author_date: bool,
     gpg_sign: Option<Option<String>>,
+    /// [`Opts::signoff_given`].
+    signoff: Option<bool>,
 }
 
 impl Cli {
@@ -1887,6 +1903,7 @@ impl Cli {
             ignore_date: o.ignore_date,
             committer_date_is_author_date: o.committer_date_is_author_date,
             gpg_sign: o.gpg_sign.clone(),
+            signoff: o.signoff_given,
         }
     }
 }
@@ -2070,7 +2087,16 @@ fn run_am_loop(
     }
 
     let ctx = Ctx::new(repo, state_dir)?;
-    let ld = load_state(state_dir);
+    let mut ld = load_state(state_dir);
+    // parse_options() overwrites what am_load() read (builtin/am.c:2454-2458),
+    // for the am_run() cmd_am() starts on a live session. am_resolve() and
+    // am_skip() call am_load() again before their am_run() (:1987-1989,
+    // :2143-2145), so the rest of their run follows the `sign` file.
+    if resume {
+        if let Some(signoff) = cli.signoff {
+            ld.signoff = signoff;
+        }
+    }
 
     let mut cur = read_count(state_dir, "next")?;
     let last = read_count(state_dir, "last")?;
@@ -2090,7 +2116,7 @@ fn run_am_loop(
         }
 
         let info = if resume {
-            match load_current(repo, state_dir)? {
+            match load_current(repo, state_dir, cli)? {
                 Some(ci) => ci,
                 None => return Ok(ExitCode::from(128)),
             }
@@ -2119,14 +2145,7 @@ fn run_am_loop(
             // appends it after either parse arm, so a `--rebasing --signoff`
             // replay gets it too.
             if ld.signoff {
-                let sig = repo
-                    .committer()
-                    .transpose()?
-                    .ok_or_else(|| anyhow::anyhow!("unable to auto-detect email address"))?;
-                let ident = format!("{} <{}>", sig.name, sig.email);
-                let mut msg = String::from_utf8_lossy(&ci.msg).into_owned();
-                super::commit::append_signoff(&mut msg, &ident, 0, true);
-                ci.msg = msg.into_bytes();
+                am_append_signoff(repo, &mut ci.msg)?;
             }
             write_author_script(state_dir, &ci)?;
             // `write_commit_msg(state)` (builtin/am.c:1858), unconditional.
@@ -3177,7 +3196,7 @@ fn am_resolve(
     allow_empty: bool,
 ) -> Result<ExitCode> {
     let ctx = Ctx::new(repo, state_dir)?;
-    let info = match load_current(repo, state_dir)? {
+    let info = match load_current(repo, state_dir, cli)? {
         Some(ci) => ci,
         None => return Ok(ExitCode::from(128)),
     };
@@ -3415,13 +3434,34 @@ fn die_user_resolve(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Resu
     Ok(ExitCode::from(128))
 }
 
+/// Port of `am_append_signoff()` (builtin/am.c:1189-1196): the raw message
+/// bytes go into a strbuf, so a non-UTF-8 body keeps its bytes, and the flag is
+/// 0, so a sign-off that is not the last trailer is added again.
+fn am_append_signoff(repo: &gix::Repository, msg: &mut Vec<u8>) -> Result<()> {
+    let sig = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("unable to auto-detect email address"))?;
+    let ident = format!("{} <{}>", sig.name, sig.email);
+    super::commit::append_signoff_bytes(msg, ident.as_bytes(), 0, false);
+    Ok(())
+}
+
 /// `am_load`'s `read_am_author_script`/`read_commit_msg` plus
 /// `validate_resume_state`: read the current patch's message and authorship back
 /// from the state directory. `None` means git died (`cannot resume: … does not
 /// exist.`) and the message has been printed.
-fn load_current(repo: &gix::Repository, state_dir: &Path) -> Result<Option<CommitInfo>> {
+fn load_current(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Result<Option<CommitInfo>> {
     let msg = match std::fs::read(state_dir.join("final-commit")) {
-        Ok(m) => m,
+        // `if (state.signoff == SIGNOFF_EXPLICIT) am_append_signoff(&state);`
+        // (builtin/am.c:2489-2490): a `--signoff` typed on the resuming command
+        // signs the loaded message in memory; `final-commit` keeps its bytes.
+        Ok(mut m) => {
+            if cli.signoff == Some(true) {
+                am_append_signoff(repo, &mut m)?;
+            }
+            m
+        }
         Err(_) => {
             eprintln!(
                 "fatal: cannot resume: {} does not exist.",

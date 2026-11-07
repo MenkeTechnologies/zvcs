@@ -1550,7 +1550,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     let rela = std::path::Path::new(path);
                     filter.convert(repo, rela, &bytes).unwrap_or(bytes)
                 };
-                match read_preimage(&staged, idx_view, o.cached, old, &mut convert, p.is_rename) {
+                match read_preimage(&staged, idx_view, o.cached, old, &mut convert, p.is_rename || p.is_copy) {
                     PreRead::Found(bytes) => {
                         // apply.c:3862 / :3884-3885 / :3892-3902, in that order: an
                         // earlier patch's result, then the index entry under
@@ -2602,6 +2602,8 @@ fn read_preimage(
     // the worktree or the index as it stands, never from an earlier patch's result.
     // A three-way swap-rename therefore fails on the middle name in git, and does
     // here too.
+    // A copy whose source an earlier patch in the run modifies copies the
+    // original, so the caller passes `is_rename || is_copy`.
     is_rename: bool,
 ) -> PreRead {
     let staged = if is_rename { &EMPTY_STAGED } else { staged };
@@ -2631,6 +2633,18 @@ fn read_preimage(
                         ) {
                             Ok(h) if h == ce.id => {}
                             _ => return PreRead::Mismatch,
+                        }
+                        // `verify_index_match()`'s ie_match_stat(): for a regular
+                        // entry, a flipped owner x bit is MODE_CHANGED when
+                        // core.fileMode is trusted (read-cache.c:316-324).
+                        let ce_mode = ce.mode.bits();
+                        if ce_mode & S_IFMT == 0o100000 && trust_executable_bit(Some(repo)) {
+                            use std::os::unix::fs::MetadataExt;
+                            if let Ok(md) = std::fs::symlink_metadata(old) {
+                                if md.file_type().is_file() && (ce_mode ^ md.mode()) & 0o100 != 0 {
+                                    return PreRead::Mismatch;
+                                }
+                            }
                         }
                     }
                     // `stat_ret < 0` in `check_preimage()`: the file is not there at
@@ -2874,13 +2888,17 @@ impl Patch {
     /// `-R`: swap the two images, so the patch undoes itself.
     fn reverse(&mut self) {
         std::mem::swap(&mut self.old_name, &mut self.new_name);
-        std::mem::swap(&mut self.is_new, &mut self.is_delete);
-        std::mem::swap(&mut self.added, &mut self.deleted);
         // A reversal swaps the two sides' modes too, so a reversed creation's
         // `new file mode` becomes the deletion's `deleted file mode`, and a
-        // reversed mode change inverts. Context lines are direction-neutral, so
-        // `h.context` (used by --no-add) is left as is.
-        std::mem::swap(&mut self.old_mode, &mut self.new_mode);
+        // reversed mode change inverts — but only `if (p->new_mode ||
+        // p->is_delete)` (apply.c:2348-2349): an `index` line's mode alone stays
+        // the pre-image's. Context lines are direction-neutral, so `h.context`
+        // (used by --no-add) is left as is.
+        if self.new_mode.is_some() || self.is_delete {
+            std::mem::swap(&mut self.old_mode, &mut self.new_mode);
+        }
+        std::mem::swap(&mut self.is_new, &mut self.is_delete);
+        std::mem::swap(&mut self.added, &mut self.deleted);
         for h in &mut self.hunks {
             std::mem::swap(&mut h.pre, &mut h.post);
             std::mem::swap(&mut h.pre_common, &mut h.post_common);
@@ -3745,12 +3763,12 @@ fn parse_one(
                 p.score = val as u32;
             }
         } else if let Some(rest) = l.strip_prefix("index ") {
-            // `index <old>..<new> <mode>` carries the mode when it did not change;
-            // git creates the result with it, so an executable file stays one.
+            // `index <old>..<new> <mode>` is `gitdiff_oldmode()` (apply.c:1150-1151):
+            // it names the pre-image's mode only. `check_preimage()` then warns when
+            // the file on disk has another, and gives `new_mode` the mode the file
+            // has (apply.c:3918-3926), so an executable file stays one.
             if let Some((_, m)) = rest.split_once(' ') {
-                if p.new_mode.is_none() {
-                    p.new_mode = Some(mode(m)?);
-                }
+                p.old_mode = Some(mode(m)?);
             }
             // The ids themselves matter to a binary patch, which is only applied
             // when the line named them in full.
@@ -4029,6 +4047,15 @@ fn parse_hunk(
     // `state->linenr` still points at the `@@` line.
     let (old_pos, mut old_rem, new_pos, mut new_rem) =
         hunk_range(&header).ok_or_else(|| spans.corrupt_at(start, start))?;
+    // `if (offset > 0 && patch->recount) recount_diff(...)` (apply.c:1807-1808):
+    // the body's counts replace the header's, unless the scan meets a line that
+    // is neither a body line nor the next header, which keeps the header's.
+    if recount {
+        if let Some((old, new)) = recount_diff(&lines[start + 1..]) {
+            old_rem = old;
+            new_rem = new;
+        }
+    }
 
     let mut h = Hunk {
         old_pos,
@@ -4065,7 +4092,7 @@ fn parse_hunk(
             i += 1;
             continue;
         }
-        if !recount && old_rem == 0 && new_rem == 0 {
+        if old_rem == 0 && new_rem == 0 {
             break;
         }
         // `if (!len || line[len-1] != '\n') return -1;` — a last line cut off before its
@@ -4093,8 +4120,10 @@ fn parse_hunk(
                 h.context.push(body.to_vec());
                 h.trailing += 1;
                 last = Side::Context;
-                old_rem = old_rem.saturating_sub(1);
-                new_rem = new_rem.saturating_sub(1);
+                // `unsigned long` counters (apply.c:1781): a body line past the
+                // header's count wraps them, so the scan runs on to a corrupt end.
+                old_rem = old_rem.wrapping_sub(1);
+                new_rem = new_rem.wrapping_sub(1);
             }
             b'-' => {
                 h.body.push((i, b'-', h.pre.len()));
@@ -4103,7 +4132,7 @@ fn parse_hunk(
                 h.trailing = 0;
                 deleted += 1;
                 last = Side::Pre;
-                old_rem = old_rem.saturating_sub(1);
+                old_rem = old_rem.wrapping_sub(1);
             }
             _ => {
                 h.body.push((i, b'+', h.post.len()));
@@ -4112,7 +4141,7 @@ fn parse_hunk(
                 h.trailing = 0;
                 added += 1;
                 last = Side::Post;
-                new_rem = new_rem.saturating_sub(1);
+                new_rem = new_rem.wrapping_sub(1);
             }
         }
         i += 1;
@@ -4123,7 +4152,7 @@ fn parse_hunk(
     // `state->linenr` has been advanced past every line consumed, so the line
     // reported is the one that stopped the scan, or the first line past the
     // input when it simply ended.
-    if !recount && (old_rem != 0 || new_rem != 0) {
+    if old_rem != 0 || new_rem != 0 {
         return Err(spans.corrupt_at(start, i));
     }
     // `if (!patch->recount && !deleted && !added) return -1;` — a fragment that
@@ -4140,6 +4169,47 @@ fn parse_hunk(
         h.raw.extend_from_slice(line);
     }
     Ok((h, added, deleted, i))
+}
+
+/// Port of `recount_diff()` (apply.c:1524-1572) over the lines after a fragment
+/// header: count the pre- and post-image lines up to the end of the input, the
+/// next `@@ ` header or the next `diff ` line. Any other line ends the scan with
+/// `warning: recount: unexpected line: <line>` (the line keeps its newline, so
+/// the warning ends with a blank line) and `None`, which keeps the header's counts.
+fn recount_diff(body: &[&[u8]]) -> Option<(usize, usize)> {
+    let (mut old, mut new) = (0usize, 0usize);
+    for &line in body {
+        let ok = match line.first() {
+            Some(b' ' | b'\n') => {
+                old += 1;
+                new += 1;
+                continue;
+            }
+            Some(b'-') => {
+                old += 1;
+                continue;
+            }
+            Some(b'+') => {
+                new += 1;
+                continue;
+            }
+            Some(b'\\') => continue,
+            Some(b'@') => line.starts_with(b"@@ "),
+            Some(b'd') => line.starts_with(b"diff "),
+            _ => false,
+        };
+        if !ok {
+            // `%.*s` stops at a NUL inside the line.
+            let shown = line.iter().position(|&b| b == 0).map_or(line, |nul| &line[..nul]);
+            let mut msg = b"warning: recount: unexpected line: ".to_vec();
+            msg.extend_from_slice(shown);
+            msg.push(b'\n');
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), &msg);
+            return None;
+        }
+        break;
+    }
+    Some((old, new))
 }
 
 /// Which image(s) the most recent body line joined, for the `\ No newline` rule.

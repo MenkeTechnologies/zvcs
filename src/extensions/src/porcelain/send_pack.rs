@@ -430,6 +430,11 @@ fn push(st: &State) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
+    // `receive_unpack_status()`'s `error(_("remote unpack failed: %s"), ...)` comes out of
+    // `receive_status()` inside `send_pack()`, ahead of any status block (send-pack.c:744-746).
+    if let Err(reason) = &outcome.unpack {
+        eprintln!("error: remote unpack failed: {reason}");
+    }
     if st.helper_status {
         print_helper_status(&outcome);
     } else {
@@ -445,7 +450,14 @@ fn push(st: &State) -> Result<ExitCode> {
         eprintln!("Everything up-to-date");
     }
 
-    Ok(if bad { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    // A failed unpack is `receive_status()`'s -1, which `send_pack()` returns as it is
+    // (send-pack.c:744-760) and `run_builtin()` masks to 255; a rejected ref is
+    // `ERROR_SEND_PACK_BAD_REF_STATUS`, 1.
+    Ok(match (outcome.unpack.is_err(), bad) {
+        (true, _) => ExitCode::from(255),
+        (false, true) => ExitCode::from(1),
+        (false, false) => ExitCode::SUCCESS,
+    })
 }
 
 /// One packet as `packet_read()` sees it under `PACKET_READ_GENTLE_ON_EOF`
@@ -575,6 +587,7 @@ fn build_requests(
                     check_reachable: None,
                 explicit_delete: false,
                 unqualified_dst: None,
+                explicit: false,
                 });
             }
         }
@@ -624,6 +637,7 @@ fn build_requests(
                 check_reachable: None,
                 explicit_delete: !dst.starts_with("refs/"),
                 unqualified_dst: None,
+                explicit: true,
             });
             continue;
         }
@@ -638,9 +652,14 @@ fn build_requests(
         // stored for it, unpeeled, so an annotated tag is pushed as the tag.
         let (src_name, new) = match crate::refname::count_refspec_match(src, &local_refs) {
             (1, Some(name)) => (name.clone(), repo.rev_parse_single(name.as_str())?.detach()),
-            (0, _) => match repo.rev_parse_single(src) {
-                Ok(id) => (src.to_owned(), id.detach()),
-                Err(_) => {
+            // `repo_get_oid()` takes a full-length hex without asking the object
+            // store (`get_oid_basic()`, object-name.c), so an absent object is
+            // still a source.
+            (0, _) => match crate::objname::full_hex(repo, src)
+                .or_else(|| repo.rev_parse_single(src).ok().map(|id| id.detach()))
+            {
+                Some(id) => (src.to_owned(), id),
+                None => {
                     missing.push((requests.len(), format!("src refspec {src} does not match any")));
                     continue;
                 }
@@ -665,6 +684,7 @@ fn build_requests(
             check_reachable: None,
             explicit_delete: false,
             unqualified_dst,
+            explicit: true,
         });
     }
     Ok((requests, missing))

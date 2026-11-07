@@ -24,6 +24,8 @@ pub struct Connection<R, W> {
     pub(in crate::client) writer: W,
     pub(in crate::client) line_provider: StreamingPeekableIter<R>,
     pub(in crate::client) state: ConnectionState,
+    /// Ends the writing half of a socket on its own, for a connection to a daemon.
+    pub(in crate::client) write_half: Option<std::net::TcpStream>,
 }
 
 impl<R, W> Connection<R, W> {
@@ -65,6 +67,14 @@ where
 
     fn configure(&mut self, _config: &dyn Any) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         Ok(())
+    }
+
+    /// `shutdown(fd[0], SHUT_WR)` (send-pack.c:715-716), which only a socket has.
+    fn write_half_closer(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        let socket = self.write_half.take()?;
+        Some(Box::new(move || {
+            socket.shutdown(std::net::Shutdown::Write).ok();
+        }))
     }
 }
 
@@ -141,6 +151,7 @@ where
         Connection {
             writer: write,
             line_provider: StreamingPeekableIter::new(read, &[PacketLineRef::Flush], trace),
+            write_half: None,
             state: ConnectionState {
                 path: repository_path.into(),
                 virtual_host: virtual_host.map(|(h, p)| (h.into(), p)),
@@ -267,12 +278,13 @@ pub mod connect {
             }
         };
         let write = read.try_clone()?;
+        let write_half = read.try_clone()?;
         let vhost = std::env::var("GIT_OVERRIDE_VIRTUAL_HOST")
             .ok()
             .map(parse_host)
             .transpose()?
             .unwrap_or_else(|| (host.to_owned(), vhost_port));
-        Ok(Connection::new(
+        let mut connection = Connection::new(
             read,
             write,
             desired_version,
@@ -280,7 +292,9 @@ pub mod connect {
             Some(vhost),
             git::ConnectMode::Daemon,
             trace,
-        ))
+        );
+        connection.write_half = Some(write_half);
+        Ok(connection)
     }
 }
 

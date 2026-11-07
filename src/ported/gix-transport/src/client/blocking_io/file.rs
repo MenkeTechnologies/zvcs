@@ -5,6 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::Write,
     process::{self, Stdio},
+    sync::{Arc, Mutex},
 };
 
 use bstr::{BStr, BString, ByteSlice, io::BufReadExt};
@@ -66,7 +67,9 @@ pub struct SpawnProcessOnDemand {
     /// local service it starts inherits that directory, and a relative repository path is
     /// read from there (`start_command(conn)` with `conn->dir` unset, connect.c:1479-1491).
     current_dir: Option<std::path::PathBuf>,
-    connection: Option<Connection<Box<dyn std::io::Read + Send>, process::ChildStdin>>,
+    connection: Option<Connection<Box<dyn std::io::Read + Send>, SharedStdin>>,
+    /// The child's stdin the connection writes to, kept here as well so it can be closed ahead of the connection.
+    stdin: Option<SharedStdin>,
     child: Option<process::Child>,
     trace: bool,
 }
@@ -96,6 +99,7 @@ impl SpawnProcessOnDemand {
             child: None,
             current_dir: None,
             connection: None,
+            stdin: None,
             desired_version: version,
             trace,
         }
@@ -135,6 +139,7 @@ impl SpawnProcessOnDemand {
             child: None,
             current_dir: None,
             connection: None,
+            stdin: None,
             desired_version: version,
             trace,
         }
@@ -305,6 +310,11 @@ impl client::TransportWithoutIO for SpawnProcessOnDemand {
     fn configure(&mut self, _config: &dyn Any) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         Ok(())
     }
+
+    fn write_half_closer(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        let stdin = self.stdin.clone()?;
+        Some(Box::new(move || stdin.close()))
+    }
 }
 
 impl Drop for SpawnProcessOnDemand {
@@ -319,8 +329,42 @@ impl Drop for SpawnProcessOnDemand {
             // Killing the child instead cuts the service off mid-run. For `git-receive-pack` that
             // means its `post-receive` and `post-update` hooks — which run *after* the report-status
             // the client has already read — are never reached.
+            //
+            // A [write half closer][client::TransportWithoutIO::write_half_closer()] still held elsewhere shares
+            // the stdin, so it is closed here rather than left to the last owner.
+            if let Some(stdin) = self.stdin.take() {
+                stdin.close();
+            }
             drop(self.connection.take());
             child.wait().ok();
+        }
+    }
+}
+
+/// The stdin of the spawned service, shared between the connection that writes to it and a
+/// [write half closer][client::TransportWithoutIO::write_half_closer()] that may end it first.
+#[derive(Clone)]
+struct SharedStdin(Arc<Mutex<Option<process::ChildStdin>>>);
+
+impl SharedStdin {
+    /// Close the pipe: the service reads end of file once it has read what was written before.
+    fn close(&self) {
+        drop(self.0.lock().expect("not poisoned").take());
+    }
+}
+
+impl Write for SharedStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock().expect("not poisoned").as_mut() {
+            Some(stdin) => stdin.write(buf),
+            None => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.lock().expect("not poisoned").as_mut() {
+            Some(stdin) => stdin.flush(),
+            None => Ok(()),
         }
     }
 }
@@ -454,9 +498,11 @@ impl client::blocking_io::Transport for SpawnProcessOnDemand {
             )),
             None => Box::new(child.stdout.take().expect("stdout configured")),
         };
+        let stdin = SharedStdin(Arc::new(Mutex::new(child.stdin.take())));
+        self.stdin = Some(stdin.clone());
         self.connection = Some(Connection::new_for_spawned_process(
             stdout,
-            child.stdin.take().expect("stdin configured"),
+            stdin,
             self.desired_version,
             self.path.clone(),
             self.trace,

@@ -60,6 +60,14 @@ pub trait TransportWithoutIO {
     ///
     /// The caller must know how that `config` data looks like for the intended implementation.
     fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
+
+    /// A handle that closes the half of the connection this side writes while the answer to what it wrote is still
+    /// read. `send_pack()` does that when `pack-objects` fails after the command list went out, `close(out)` and,
+    /// on a socket, `shutdown(fd[0], SHUT_WR)` (send-pack.c:713-718): the receiving end reads end of file where the
+    /// pack belongs and reports it. `None` for a transport whose request is not a stream it can end on its own.
+    fn write_half_closer(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
 }
 
 // Would be nice if the box implementation could auto-forward to all implemented traits.
@@ -92,6 +100,10 @@ impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for Box<T> {
     fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         self.deref_mut().configure(config)
     }
+
+    fn write_half_closer(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.deref_mut().write_half_closer()
+    }
 }
 
 impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for &mut T {
@@ -122,5 +134,9 @@ impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for &mut T {
 
     fn configure(&mut self, config: &dyn Any) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         self.deref_mut().configure(config)
+    }
+
+    fn write_half_closer(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.deref_mut().write_half_closer()
     }
 }

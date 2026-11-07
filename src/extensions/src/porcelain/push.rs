@@ -801,8 +801,7 @@ git push <groupname>\n"
             let first_line = e
                 .downcast_ref::<SrcRefspecMissing>()
                 .map(ToString::to_string)
-                .or_else(|| e.downcast_ref::<SrcRefspecAmbiguous>().map(ToString::to_string))
-                .or_else(|| e.downcast_ref::<DstRefspecCollision>().map(ToString::to_string));
+                .or_else(|| e.downcast_ref::<SrcRefspecAmbiguous>().map(ToString::to_string));
             match first_line {
                 Some(line) => {
                     let url = remote
@@ -1457,7 +1456,7 @@ fn build_requests(
                     new: id,
                     force: true,
                     expected: None,
-                    only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+                    only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false,
                 });
             }
         }
@@ -1470,7 +1469,7 @@ fn build_requests(
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
             if let Some(id) = r.try_id() {
                 let short = short_ref(&name).to_string();
-                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None });
+                requests.push(Request { src: Some(name.clone()), name: name.clone(), new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false });
                 upstreams.push((short, name));
             }
         }
@@ -1494,7 +1493,7 @@ fn build_requests(
             // fetch reporting "would clobber existing tag" because the two sides
             // now name different objects.
             if let Some(id) = r.try_id() {
-                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None });
+                tag_requests.push(Request { src: Some(name.clone()), name, new: id.detach(), force: f.force, expected: None, only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false });
             }
         }
         // Only `--tags` on its own is complete here; with refspecs alongside, the
@@ -1540,10 +1539,16 @@ fn build_requests(
                 // it with (remote.c:1152-1163).
                 explicit_delete: !spec.starts_with("refs/"),
                 unqualified_dst: None,
+                explicit: true,
             });
         }
         return Ok((requests, upstreams));
     }
+
+    // `refspec_append(&rs, "refs/tags/*")` comes ahead of `set_refspecs()`
+    // (builtin/push.c:864-867), so a tag a pattern below also matches is pushed
+    // through this one (`get_ref_match()` takes the first pattern, remote.c:1376-1395).
+    requests.append(&mut tag_requests);
 
     if specs.is_empty() {
         // A matching refspec *is* the request set, and it is built from the
@@ -1579,23 +1584,10 @@ fn build_requests(
                 requests.extend(expand_pattern_refspec(repo, spec, f.force)?);
                 continue;
             }
+            // A destination two explicit refspecs land on is refused while the
+            // refspecs are matched against the advertisement, in the wire layer
+            // (`match_explicit()`, remote.c:1337-1341).
             let (req, up) = parse_refspec(repo, spec, f.force, &local_refs)?;
-            // ```c
-            // if (matched_dst->peer_ref)
-            //         return error(_("dst ref %s receives from more than one src"),
-            //                      matched_dst->name);
-            // ```
-            //
-            // (`match_explicit()`, remote.c:1177-1179.) The destination remembers
-            // which source claimed it, and a second explicit refspec landing on it
-            // is refused — an `error()` that fails the whole push before anything
-            // is sent, not a last-one-wins overwrite. `fetch` refuses the same
-            // collision as a `die()` with a different sentence.
-            if let Some(claimed) = requests.iter().find(|r| r.name == req.name) {
-                if claimed.src != req.src {
-                    return Err(anyhow::Error::new(DstRefspecCollision(req.name.clone())));
-                }
-            }
             requests.push(req);
             if let Some(up) = up {
                 upstreams.push(up);
@@ -1606,7 +1598,6 @@ fn build_requests(
     if f.follow_tags {
         append_followed_tags(repo, &mut requests)?;
     }
-    requests.append(&mut tag_requests);
     Ok((requests, upstreams))
 }
 
@@ -1664,7 +1655,7 @@ fn append_followed_tags(repo: &gix::Repository, requests: &mut Vec<Request>) -> 
         if tips.iter().any(|tip| reachable(repo, peeled, *tip)) {
             // Never forced: a followed tag is an addition, and git refuses to
             // clobber a differing remote tag here just as it does for `--tags`.
-            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None, explicit_delete: false, unqualified_dst: None });
+            requests.push(Request { src: Some(name.clone()), name, new: tag_object, force: false, expected: None, only_if_absent: true, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false });
         }
     }
     Ok(())
@@ -1750,6 +1741,13 @@ fn parse_refspec(
 
     let new = if src.is_empty() {
         null(repo) // `:dst` deletes the remote ref.
+    } else if let Some(id) = matched_src.is_none().then(|| crate::objname::full_hex(repo, src)).flatten() {
+        // `try_explicit_object_name()` asks `repo_get_oid()`, whose
+        // `get_oid_basic()` takes a full-length hex as it is, without asking the
+        // object store (remote.c:1141, object-name.c): an absent object is pushed
+        // under its own name and fails later, in the destination match or in
+        // `pack-objects`.
+        id
     } else {
         repo.rev_parse_single(src)
             .map_err(|_| anyhow::Error::new(SrcRefspecMissing(src.to_string())))?
@@ -1844,6 +1842,7 @@ fn parse_refspec(
                 }
                 _ => None,
             },
+            explicit: true,
         },
         upstream,
     ))
@@ -1931,20 +1930,6 @@ impl std::fmt::Display for SrcRefspecAmbiguous {
 }
 
 impl std::error::Error for SrcRefspecAmbiguous {}
-
-/// Two explicit refspecs naming one destination — `match_explicit()`'s
-/// `dst ref %s receives from more than one src`, the third of its `error()`s and
-/// the third failure the push reports with the same trailer.
-#[derive(Debug)]
-struct DstRefspecCollision(String);
-
-impl std::fmt::Display for DstRefspecCollision {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "dst ref {} receives from more than one src", self.0)
-    }
-}
-
-impl std::error::Error for DstRefspecCollision {}
 
 /// `get_local_heads()`'s candidate set: the name of every ref under `refs/`
 /// whose name is well formed, in iteration order.
@@ -2053,7 +2038,9 @@ fn check_push_refs(repo: &gix::Repository, specs: &[String]) -> bool {
         }
         match crate::refname::count_refspec_match(src, &local_refs) {
             (1, _) => {}
-            (0, _) if repo.rev_parse_single(src).is_ok() => {}
+            // `repo_get_oid()` takes a full-length hex without asking the object
+            // store (`get_oid_basic()`, object-name.c).
+            (0, _) if crate::objname::full_hex(repo, src).is_some() || repo.rev_parse_single(src).is_ok() => {}
             (0, _) => {
                 eprintln!("error: {}", SrcRefspecMissing(src.to_string()));
                 all_matched = false;
@@ -2325,7 +2312,7 @@ fn current_branch_request(repo: &gix::Repository, force: bool) -> Result<(Reques
             new,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: true,
         },
         (branch, name),
     ))
@@ -2928,6 +2915,13 @@ fn report_porcelain<'a>(
 ) -> Result<(ExitCode, bool, Option<PushFailure<'a>>)> {
     let mut any_failed = outcome.unpack.is_err();
     let mut rejected: Vec<(&str, &str)> = Vec::new();
+    // `receive_unpack_status()`'s `error()` is send-pack's, on stderr whatever the format
+    // (send-pack.c:744-746), and the -1 `receive_status()` returns with it is
+    // `push_ret`, which keeps `Done` back (transport.c:1560-1561).
+    if let Err(reason) = &outcome.unpack {
+        eprintln!("error: remote unpack failed: {reason}");
+    }
+    let done = outcome.unpack.is_ok();
     // `if (!quiet || err)` (transport.c:1545) gates the status block whatever the
     // format is, so `push --porcelain -q` that went through prints its trailing
     // `Done` and nothing else. `err` is `push_had_errors()`: any ref that reached
@@ -3005,9 +2999,9 @@ fn report_porcelain<'a>(
         // next to the advice (builtin/push.c:392-409). `Done` still follows the
         // tracking refs (transport.c:1560-1561).
         let failure = PushFailure { rejected, color: String::new() };
-        return Ok((ExitCode::from(1), true, Some(failure)));
+        return Ok((ExitCode::from(1), done, Some(failure)));
     }
-    Ok((ExitCode::SUCCESS, true, None))
+    Ok((ExitCode::SUCCESS, done, None))
 }
 
 /// Shorten a full ref name for display (`refs/heads/main` → `main`).
@@ -3298,7 +3292,7 @@ pub(super) fn expand_pattern_refspec(
             new: id,
             force,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false,
         });
     }
     Ok(out)
@@ -3413,7 +3407,7 @@ mod tests {
             new: tip,
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         requests.into_iter().skip(1).map(|r| r.name).collect()
@@ -3442,7 +3436,7 @@ mod tests {
             // Even under `--force`, a followed tag must not inherit the force bit.
             force: true,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
 
@@ -3468,7 +3462,7 @@ mod tests {
             new: gix::hash::ObjectId::null(repo.object_hash()),
             force: false,
             expected: None,
-            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None,
+            only_if_absent: false, check_reachable: None, explicit_delete: false, unqualified_dst: None, explicit: false,
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");

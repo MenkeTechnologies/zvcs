@@ -114,6 +114,13 @@ pub struct Request {
     /// (remote.c:1302-1331), which only the wire layer has, so [`name`][Self::name]
     /// is a placeholder until then.
     pub unqualified_dst: Option<UnqualifiedDst>,
+    /// The request comes from an explicit refspec — neither a pattern, the
+    /// matching refspec `:`, `--all`, `--mirror`, `--tags` nor a followed tag.
+    /// Only those go through `match_explicit()` (remote.c:1279-1281), which
+    /// refuses a destination a second explicit refspec lands on; everything else
+    /// is placed by `match_push_refs()`'s remainder pass, which skips a
+    /// destination that already has a source (remote.c:1619-1622).
+    pub explicit: bool,
 }
 
 /// The two halves of a refspec `match_explicit()` needs to place an unqualified
@@ -885,10 +892,69 @@ pub fn send_pack(
                 check_reachable: None,
                 explicit_delete: false,
                 unqualified_dst: None,
+                explicit: false,
             })
             .collect(),
     };
-    for (req_idx, req) in requests.iter().chain(matched.iter()).enumerate() {
+    let requests: Vec<&Request> = requests.iter().chain(matched.iter()).collect();
+    // `match_explicit_refs()` places every explicit refspec before
+    // `match_push_refs()` picks the remainder (remote.c:1597-1625), so the
+    // destinations those refspecs claim are settled first:
+    //
+    // ```c
+    // if (matched_dst->peer_ref) {
+    //         ret = error(_("dst ref %s receives from more than one src"),
+    //                     matched_dst->name);
+    //         goto out;
+    // } else {
+    //         matched_dst->peer_ref = allocated_src ?
+    //                                 matched_src :
+    //                                 copy_ref(matched_src);
+    // ```
+    //
+    // (`match_explicit()`, remote.c:1337-1346.) `count_refspec_match()` walks
+    // `dst`, the advertisement with every ref `make_linked_ref()` appended to it
+    // so far, so `main:refs/heads/x main:x` lands twice on one linked ref. A
+    // second explicit refspec on a claimed destination is refused, even with the
+    // same source; a pattern, the matching refspec or a followed tag is skipped
+    // there instead (`if (dst_peer->peer_ref) goto free_name;`, remote.c:1619-1622).
+    let mut linked: Vec<String> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut explicit_dst: HashMap<usize, std::result::Result<String, (String, Option<String>)>> = HashMap::new();
+    for (req_idx, req) in requests.iter().enumerate().filter(|(_, req)| req.explicit) {
+        let dst: Vec<String> = advertised_order.iter().chain(linked.iter()).cloned().collect();
+        let placed = match_explicit_dst(repo, req, &dst).and_then(|name| {
+            // An unqualified deletion the remote does not have gets no linked ref
+            // and fails below with `unable to delete` (remote.c:1320-1322).
+            if req.explicit_delete && !dst.contains(&name) {
+                return Ok(name);
+            }
+            if !claimed.insert(name.clone()) {
+                return Err((format!("dst ref {name} receives from more than one src"), None));
+            }
+            if !dst.contains(&name) {
+                linked.push(name.clone());
+            }
+            Ok(name)
+        });
+        explicit_dst.insert(req_idx, placed);
+    }
+    // The linked refs head the refs `match_push_refs()` creates.
+    created.extend(linked);
+    // The remainder pass walks the local refs, `for (ref = src; ref; ref = ref->next)`
+    // (remote.c:1599-1630), in `for_each_ref()` order, and `add_missing_tags()` runs
+    // after it (:1632-1633). The order is the order the refs it creates are listed in.
+    let mut order: Vec<usize> = (0..requests.len()).collect();
+    order.sort_by_key(|&at| {
+        let req = requests[at];
+        match (req.explicit, req.only_if_absent) {
+            (true, _) => (0, None),
+            (false, false) => (1, req.src.as_deref()),
+            (false, true) => (2, None),
+        }
+    });
+    let mut remainder_srcs: HashSet<String> = HashSet::new();
+    for (req_idx, req) in order.into_iter().map(|at| (at, requests[at])) {
         // A followed tag (`--follow-tags`) the remote already carries is dropped
         // outright — not reported, not sent — exactly as git omits it from the
         // ref list it builds after reading the advertisement.
@@ -913,7 +979,19 @@ pub fn send_pack(
         // `refs/tags/outermost`, which is the only way deleting a remote tag by
         // its short name has ever worked; guessing `refs/heads/outermost` made
         // every such delete report `remote ref does not exist`.
-        let name = match match_explicit_dst(repo, req, &advertised_order) {
+        let placed = match explicit_dst.remove(&req_idx) {
+            Some(placed) => placed,
+            // The remainder pass hands each local ref the first pattern that matches
+            // it, or the matching refspec when none does (`get_ref_match()`,
+            // remote.c:1376-1395), and leaves alone a destination that already has a
+            // source (remote.c:1619-1622).
+            None if !req.only_if_absent && req.src.as_ref().is_some_and(|src| !remainder_srcs.insert(src.clone())) => {
+                continue
+            }
+            None if claimed.insert(req.name.clone()) => Ok(req.name.clone()),
+            None => continue,
+        };
+        let name = match placed {
             Ok(name) => name,
             Err((reason, hint)) => {
                 match_errors.push((req_idx, reason.clone(), hint.clone()));
@@ -948,6 +1026,7 @@ pub fn send_pack(
             check_reachable: req.check_reachable.clone(),
             explicit_delete: req.explicit_delete,
             unqualified_dst: None,
+            explicit: req.explicit,
         };
         if !advertised.contains_key(&req.name) && !created.contains(&req.name) {
             created.push(req.name.clone());
@@ -1619,6 +1698,7 @@ pub fn send_pack(
     // has (git's `pack-objects --revs <new> --not <haves>`). A delete needs no
     // pack.
     let need_pack = wire.iter().any(|w| w.new != null);
+    let mut pack_failed = false;
     let pack_bytes = if need_pack {
         let wants: Vec<ObjectId> = pack_tips.clone();
         // Haves are everything the remote advertised plus the old tips, restricted
@@ -1635,7 +1715,29 @@ pub fn send_pack(
         // under `args->progress` (:74-75, odb/source-files.c:847-849), which draws
         // every meter and the closing `Total …` line on stderr.
         let thin = opts.thin && !caps.contains("no-thin");
-        super::pack_objects::pack_for_push(repo, &wants, &haves, thin, caps.contains("ofs-delta"), opts.progress)?
+        // `pack-objects --revs` reads the wants `pack_objects()` feeds it in
+        // `remote_refs` order, every ref with a new value (send-pack.c:91-96), and
+        // `get_reference()` dies on the first object it cannot parse:
+        // `die("bad object %s", name)` (revision.c). A full-length hex source is
+        // accepted without its object (`get_oid_basic()`), so this is where an
+        // absent one fails. `send_pack()` then sends no pack, reads the report the
+        // receiving end makes of the missing pack and fails (send-pack.c:713-735).
+        let mut fed: Vec<(usize, ObjectId)> = wire
+            .iter()
+            .map(|w| (w.name.as_str(), w.new))
+            .chain(statuses.iter().map(|s| (s.name.as_str(), s.new)))
+            .filter(|(_, new)| *new != null)
+            .map(|(name, new)| (remote_refs_position(&advertised_order, &created, name), new))
+            .collect();
+        fed.sort_by_key(|(at, _)| *at);
+        match fed.iter().find(|(_, new)| !repo.has_object(*new)) {
+            Some((_, bad)) => {
+                eprintln!("fatal: bad object {bad}");
+                pack_failed = true;
+                Vec::new()
+            }
+            None => super::pack_objects::pack_for_push(repo, &wants, &haves, thin, caps.contains("ofs-delta"), opts.progress)?,
+        }
     } else {
         Vec::new()
     };
@@ -1643,6 +1745,40 @@ pub fn send_pack(
     // `git_transport_push()` closes both ends without the flush `disconnect_git()`
     // would send, and clears `finished_handshake` (transport.c:999-1003, :1024-1025).
     connection.skip_end_of_interaction();
+
+    let is_http = url.starts_with("http://") || url.starts_with("https://");
+    // Over http send-pack is remote-curl's child, and after a failed `pack-objects` it
+    // closes its stdout with neither pack nor the flush that ends a stateless request
+    // (send-pack.c:713-716, :741-742). `rpc_service()` reads that request with
+    // `packet_read_with_status()`, which is not gentle on end of file
+    // (remote-curl.c:674-675), so remote-curl dies `the remote end hung up unexpectedly`
+    // (pkt-line.c:371) before it posts anything. send-pack then reads remote-curl's end:
+    // the demultiplexer names itself and `receive_status()` dies the same way, and the
+    // push goes on with a dead helper ([`Outcome::helper_ended`]).
+    if pack_failed && is_http {
+        eprintln!("fatal: the remote end hung up unexpectedly");
+        if use_sideband {
+            Sideband::new(repo).disconnected("send-pack");
+        }
+        if status_report.is_some() {
+            eprintln!("fatal: the remote end hung up unexpectedly");
+        }
+        return Ok(Outcome {
+            url,
+            statuses,
+            advertised_tips,
+            advertised: advertised_order,
+            unpack: Ok(()),
+            no_refs: false,
+            aborted: None,
+            match_failed: false,
+            helper_ended: Some(true),
+        });
+    }
+    // Anywhere else the commands go out and the write half is closed where the pack
+    // belonged, `close(out)` and on a socket `shutdown(fd[0], SHUT_WR)`
+    // (send-pack.c:713-716); the receiving end reports the pack it never got.
+    let close_write = if pack_failed { connection.transport_mut().write_half_closer() } else { None };
 
     // POST the request: command list + flush + pack, written verbatim (the pack is
     // not pkt-line framed). `into_parts` hands back the raw writer and the response
@@ -1653,14 +1789,16 @@ pub fn send_pack(
         .into_parts();
     let wrote = writer
         .write_all(&req_buf)
-        .and_then(|()| if need_pack { writer.write_all(&pack_bytes) } else { Ok(()) })
+        .and_then(|()| if need_pack && !pack_failed { writer.write_all(&pack_bytes) } else { Ok(()) })
         .and_then(|()| writer.flush());
     drop(writer);
+    if let Some(close_write) = close_write {
+        close_write();
+    }
     // Once a request failed remote-curl reads on to the end of what send-pack writes and drops it
     // (remote-curl.c:1143-1151), so over http a write that found the request gone is no failure of send-pack's:
     // the response it reads next says what happened.
     if let Err(e) = wrote {
-        let is_http = url.starts_with("http://") || url.starts_with("https://");
         if !(is_http && e.kind() == std::io::ErrorKind::BrokenPipe) {
             return Err(e.into());
         }

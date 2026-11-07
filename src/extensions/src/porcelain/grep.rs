@@ -393,6 +393,20 @@ enum Tok {
     Close,
 }
 
+impl Tok {
+    /// The token's `p->pattern`: what `append_grep_pattern()` recorded for it
+    /// (builtin/grep.c:810-880), which grep.c's compile errors name.
+    fn pattern(&self) -> &str {
+        match self {
+            Tok::Atom(s) => s.as_str(),
+            Tok::Close => ")",
+            Tok::Open => "(",
+            Tok::And => "--and",
+            Tok::Not => "--not",
+        }
+    }
+}
+
 /// A compiled boolean expression over the atom matchers, mirroring git's
 /// `grep_expr` tree. `Atom(i)` indexes the per-atom matcher list built in token
 /// order (the same order as the flat `patterns` list).
@@ -945,7 +959,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 d if d.is_ascii_digit() => {
                     let len = group[c..].iter().take_while(|g| g.is_ascii_digit()).count();
                     let run: String = group[c..c + len].iter().collect();
-                    let n = run.parse::<usize>().unwrap_or(usize::MAX);
+                    let n = parse_context_signed(&run).unwrap_or(0);
                     pre_context = n;
                     post_context = n;
                     c += len;
@@ -2699,14 +2713,17 @@ fn parse_context_nonneg(spelled: &str, value: &str) -> Result<usize, ExitCode> {
     }
 }
 
-/// Parse a `-C`/`--context` value. git parses this one as a plain signed number
-/// (always naming it `switch `C'`), so a negative value is accepted and means
-/// unlimited context rather than being rejected the way `-A`/`-B` are.
+/// Parse a `-C`/`--context`/`-<num>` value as `context_callback()` does
+/// (builtin/grep.c:920-938): `strtol()` into a `long` (leading blanks and a sign
+/// taken, overflow saturating, an empty value read as 0), narrowed into its
+/// `int value`, then stored in the `unsigned pre_context`/`post_context` of
+/// `struct grep_opt` (grep.h:170-171). So `-C -1` is `UINT_MAX` and
+/// `-C 4294967296` is 0; the line loop then adds `post_context` in `unsigned`
+/// arithmetic, see [`post_window`].
 fn parse_context_signed(value: &str) -> Result<usize, ExitCode> {
-    match value.parse::<i64>() {
-        Ok(n) if n < 0 => Ok(usize::MAX),
-        Ok(n) => Ok(n as usize),
-        Err(_) => {
+    match crate::diffopt::strtol_long(value) {
+        Some(n) => Ok(n as i32 as u32 as usize),
+        None => {
             eprintln!("error: switch `C' expects a numerical value");
             Err(ExitCode::from(129))
         }
@@ -2864,7 +2881,9 @@ impl TokParser<'_> {
             }
             return match self.not_expr()? {
                 Some(x) => Ok(Some(Expr::Not(Box::new(x)))),
-                None => Err("--not not followed by pattern expression".into()),
+                // `if (!x) die("--not followed by non pattern expression");`
+                // (grep.c:646-648).
+                None => Err("--not followed by non pattern expression".into()),
             };
         }
         self.atom_expr()
@@ -2893,10 +2912,13 @@ impl TokParser<'_> {
         // git ORs two adjacent expressions with no explicit operator between them,
         // stopping at a closing paren or the end of the token stream.
         if let Some(xv) = x {
-            if self.peek().is_some() && !matches!(self.peek(), Some(Tok::Close)) {
+            if let Some(p) = self.peek().filter(|t| !matches!(t, Tok::Close)) {
+                // `die("not a pattern expression %s", p->pattern)` names the
+                // token the second operand was to start at (grep.c:682-688).
+                let p = p.pattern().to_owned();
                 return match self.or_expr()? {
                     Some(y) => Ok(Some(Expr::Or(Box::new(xv), Box::new(y)))),
-                    None => Err("not a pattern expression".into()),
+                    None => Err(format!("not a pattern expression {p}")),
                 };
             }
             return Ok(Some(xv));
@@ -2913,13 +2935,7 @@ fn build_expr(toks: &[Tok]) -> Result<Expr, String> {
     let mut p = TokParser { toks, pos: 0, atom: 0 };
     let x = p.or_expr()?;
     if p.pos < toks.len() {
-        let leftover = match &toks[p.pos] {
-            Tok::Atom(s) => s.as_str(),
-            Tok::Close => ")",
-            Tok::Open => "(",
-            Tok::And => "--and",
-            Tok::Not => "--not",
-        };
+        let leftover = toks[p.pos].pattern();
         return Err(format!("incomplete pattern expression group: {leftover}"));
     }
     x.ok_or_else(|| "no pattern given".to_string())
@@ -3069,10 +3085,14 @@ fn run_textconv(cmd: &str, content: &[u8]) -> Result<Vec<u8>> {
     }
     // git's `use_shell` invocation, with the temp path as the command's single
     // positional argument.
-    let output = crate::external::prepare_shell_cmd_str(cmd, [&path])
-        .stderr(std::process::Stdio::inherit())
-        .output();
+    let mut child = crate::external::prepare_shell_cmd_str(cmd, [&path]);
+    let output = child.stderr(std::process::Stdio::inherit()).output();
     let _ = std::fs::remove_file(&path);
+    // `start_command()`'s `error_errno("cannot run %s", cmd->args.v[0])`
+    // (run-command.c:759-761) for a program it could not start.
+    if let Err(e) = &output {
+        eprintln!("error: cannot run {}: {}", child.get_program().to_string_lossy(), crate::external::strerror(e));
+    }
     match output {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(_) | Err(_) => crate::git_fatal!("unable to read files to diff"),
@@ -3413,7 +3433,7 @@ fn render_funcctx<W: Write>(
                     show_function = false;
                 }
             }
-            if show_function || (last_hit != 0 && lno <= last_hit + post) {
+            if show_function || (last_hit != 0 && lno <= post_window(last_hit, post)) {
                 fc_emit(out, &cx, idx, b'-', &mut last_shown)?;
             }
         }
@@ -3455,6 +3475,14 @@ fn write_line_header(
 /// `printed_any` carries that "first hunk" state between files. Returns whether
 /// this file produced a match, for the exit status.
 #[allow(clippy::too_many_arguments)]
+/// The last line of the post-context window after the hit at `last_hit`:
+/// `last_hit + opt->post_context` (grep.c:1668, :1757), both `unsigned`, so the
+/// sum wraps. `-C -1` stores `UINT_MAX`, which wraps to `last_hit - 1` and shows
+/// no line after a hit at all while its pre-context reaches the top of the file.
+fn post_window(last_hit: usize, post: usize) -> usize {
+    (last_hit as u32).wrapping_add(post as u32) as usize
+}
+
 fn render_context(
     out: &mut impl Write,
     content: &[u8],
@@ -3491,17 +3519,22 @@ fn render_context(
         return Ok(false);
     }
 
-    // Every match drags its pre/post neighbours into the shown set; overlapping
-    // windows merge, which is what makes adjacent matches share one hunk.
+    // Every match drags its pre-context into the shown set (`show_pre_context()`,
+    // grep.c:1378-1385) and a line that is no match is shown while it lies in
+    // the post-context of the last hit (grep.c:1757); overlapping windows
+    // merge, which is what makes adjacent matches share one hunk.
     let mut show = vec![false; n];
-    for (idx, matched) in is_match.iter().enumerate() {
-        if !*matched {
-            continue;
-        }
-        let lo = idx.saturating_sub(pre);
-        let hi = idx.saturating_add(post).min(n - 1);
-        for s in show.iter_mut().take(hi + 1).skip(lo) {
-            *s = true;
+    let mut last_hit = 0usize;
+    for idx in 0..n {
+        let lno = idx + 1;
+        if is_match[idx] {
+            let lo = idx.saturating_sub(pre);
+            for s in show.iter_mut().take(idx + 1).skip(lo) {
+                *s = true;
+            }
+            last_hit = lno;
+        } else if last_hit != 0 && lno <= post_window(last_hit, post) {
+            show[idx] = true;
         }
     }
 

@@ -866,7 +866,10 @@ fn run_filters(positional: &[&str], path: Option<&str>) -> Result<ExitCode> {
             &blob,
             rela.as_bytes().as_bstr(),
             gix::filter::plumbing::driver::apply::Delay::Forbid,
-        )?;
+        )
+        // `convert_to_working_tree()` dies on a required filter that fails
+        // (convert.c:1518), naming the path and the driver.
+        .map_err(|e| crate::fatal::die(e.to_string()))?;
         std::io::copy(&mut converted, &mut out)?;
         drop(converted);
     } else {
@@ -1048,10 +1051,15 @@ impl<'repo> Textconv<'repo> {
         let dir = temp_blob_dir()?;
         let file = self.prep_temp_blob(&dir, path, blob)?;
 
-        let output = crate::external::prepare_shell_cmd_str(program, [&file])
-            .stderr(std::process::Stdio::inherit())
-            .output();
+        let mut cmd = crate::external::prepare_shell_cmd_str(program, [&file]);
+        let output = cmd.stderr(std::process::Stdio::inherit()).output();
         let _ = std::fs::remove_dir_all(&dir);
+        // `start_command()` reports a program it could not start with
+        // `error_errno("cannot run %s", cmd->args.v[0])` (run-command.c:759-761)
+        // before `run_textconv()` hands back NULL.
+        if let Err(e) = &output {
+            eprintln!("error: cannot run {}: {}", cmd.get_program().to_string_lossy(), crate::external::strerror(e));
+        }
 
         match output {
             Ok(o) if o.status.success() => Ok(Some(o.stdout)),
@@ -1079,7 +1087,10 @@ impl<'repo> Textconv<'repo> {
             blob,
             path,
             gix::filter::plumbing::driver::apply::Delay::Forbid,
-        )?;
+        )
+        // `convert_to_working_tree()` dies on a required filter that fails
+        // (convert.c:1518), naming the path and the driver.
+        .map_err(|e| crate::fatal::die(e.to_string()))?;
         let mut handle = std::fs::File::create(&file)?;
         std::io::copy(&mut converted, &mut handle)?;
         drop(converted);
@@ -2933,7 +2944,10 @@ fn emit_object(
                         &object.data,
                         rest.as_bstr(),
                         gix::filter::plumbing::driver::apply::Delay::Forbid,
-                    )?;
+                    )
+                    // `convert_to_working_tree()` dies on a required filter that
+                    // fails (convert.c:1518), naming the path and the driver.
+                    .map_err(|e| crate::fatal::die(e.to_string()))?;
                     std::io::copy(&mut converted, out)?;
                     drop(converted);
                 }

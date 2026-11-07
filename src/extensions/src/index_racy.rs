@@ -131,7 +131,7 @@ fn match_stat_basic_differs(
 /// git this port targets is not built with — measured on the stock binary, which smudges an
 /// entry whose recorded nanoseconds are *earlier* than the index's within the same second. So
 /// the comparison is on whole seconds, exactly as the non-`USE_NSEC` branch does it.
-fn is_racy_stat(index: &gix::index::File, stat: &gix::index::entry::Stat) -> bool {
+pub(crate) fn is_racy_stat(index: &gix::index::File, stat: &gix::index::entry::Stat) -> bool {
     let isec = index.timestamp().unix_seconds();
     isec != 0 && isec as u32 <= stat.mtime.secs
 }

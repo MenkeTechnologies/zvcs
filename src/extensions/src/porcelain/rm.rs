@@ -650,7 +650,6 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     //    Full removal refuses on staged OR local; --cached refuses only when the
     //    staged content matches neither HEAD nor the worktree (staged AND local).
     if !opts.force {
-        let hash_kind = repo.object_hash();
         // `if (repo_get_oid(the_repository, "HEAD", &oid)) oidclr(&oid, …)`
         // (builtin/rm.c:382-384): the name goes through `get_oid_basic()`, so its
         // `core.warnAmbiguousRefs` read and ambiguity warning happen here, and only
@@ -662,6 +661,8 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         let mut both: Vec<String> = Vec::new();
         let mut staged_only: Vec<String> = Vec::new();
         let mut local_only: Vec<String> = Vec::new();
+        // The `convert_to_git()` pipeline `ce_compare_data()` hashes through, built on first use.
+        let mut filter: Option<super::convert_to_git::WorktreeFilter> = None;
 
         for t in &selected {
             if t.stage != 0 {
@@ -669,24 +670,39 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             }
             let path_str = t.path.to_str_lossy().into_owned();
 
-            let head_id: Option<ObjectId> = match &head_tree {
-                Some(tree) => tree
-                    .lookup_entry_by_path(std::path::Path::new(&path_str))?
-                    .map(|e| e.id().detach()),
-                None => None,
+            // `lstat(ce->name, &st)` comes first (builtin/rm.c:142-157): a path
+            // gone from the worktree, or a file that became a directory, is
+            // skipped before either kind of change is asked about.
+            let Some(st) = worktree_lstat(&repo, &t.path) else {
+                continue;
             };
-            let staged = head_id.map(|h| h != t.id).unwrap_or(true);
+            if st.is_dir() && t.mode != Mode::COMMIT {
+                continue;
+            }
 
             let local = if t.mode == Mode::COMMIT {
                 if let Some(wd) = &workdir {
                     die_on_broken_submodule_gitfile(wd, &path_str)?;
                 }
-                submodule_is_dirty(&repo, &t.path)
+                // `ce_match_stat_basic()`'s gitlink arm: anything but a
+                // directory is TYPE_CHANGED (read-cache.c:331-337).
+                !st.is_dir() || submodule_is_dirty(&repo, &t.path)
             } else {
-                match worktree_blob(&repo, &t.path, t.mode, hash_kind)? {
-                    Some(wt_id) => wt_id != t.id,
-                    None => false, // already gone from the worktree
-                }
+                let entry = index
+                    .entry_by_path_and_stage(t.path.as_ref(), gix::index::entry::Stage::Unconflicted)
+                    .expect("a selected stage-0 path is in the index");
+                ie_modified(&repo, &index, entry, &t.path, &st, &mut filter)?
+            };
+
+            // `no_head || get_tree_entry(…) || ce->ce_mode != create_ce_mode(mode)
+            // || !oideq(&ce->oid, &oid)` (builtin/rm.c:191-195).
+            let head_entry = match &head_tree {
+                Some(tree) => tree.lookup_entry_by_path(std::path::Path::new(&path_str))?,
+                None => None,
+            };
+            let staged = match head_entry {
+                Some(e) => e.id() != t.id || create_ce_mode(u32::from(e.mode().value())) != t.mode.bits(),
+                None => true,
             };
 
             match (staged, local) {
@@ -886,28 +902,18 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     Ok(ret)
 }
 
-/// Hash the working-tree content at `path` into its git blob id, or `None` if the
-/// file is absent. Symlinks hash their target string (as git stores them); an
-/// unreadable file is treated as changed (conservative — forces `-f`).
-fn worktree_blob(
-    repo: &gix::Repository,
-    path: &BString,
-    mode: Mode,
-    hash_kind: gix::hash::Kind,
-) -> Result<Option<ObjectId>> {
-    // `check_local_mod()` stats `lstat(ce->name, &st)` (builtin/rm.c:142): relative
-    // to the cwd setup left, which is the top of the work tree when there is one
-    // and wherever the command was started when there is not (`rm --cached` in a
-    // bare repository, which never passed `setup_work_tree()`).
+/// `check_local_mod()`'s `lstat(ce->name, &st)` (builtin/rm.c:142-146), with the
+/// path resolved against the cwd setup left: the top of the work tree when there
+/// is one and wherever the command was started when there is not (`rm --cached`
+/// in a bare repository, which never passed `setup_work_tree()`). `None` is the
+/// `continue`: ENOENT and ENOTDIR are silent, any other failure warns first.
+fn worktree_lstat(repo: &gix::Repository, path: &BString) -> Option<Lstat> {
     let abs = match repo.workdir_path(path.as_bstr()) {
         Some(abs) => abs,
         None => gix::path::from_bstr(path.as_bstr()).into_owned(),
     };
-    let meta = match std::fs::symlink_metadata(&abs) {
-        Ok(m) => m,
-        // `if (!is_missing_file_error(errno)) warning_errno(_("failed to stat '%s'"), …);`
-        // then `continue` either way (builtin/rm.c:142-146): ENOENT and ENOTDIR
-        // are silent, anything else warns, and the path is never refused.
+    match gix::index::fs::Metadata::from_path_no_follow(&abs) {
+        Ok(meta) => Some(Lstat { abs, meta }),
         Err(e) => {
             use std::io::ErrorKind::{NotADirectory, NotFound};
             if !matches!(e.kind(), NotFound | NotADirectory) {
@@ -917,30 +923,131 @@ fn worktree_blob(
                     crate::external::strerror(&e)
                 );
             }
-            return Ok(None);
+            None
         }
-    };
-    // "if a file was removed and it is now a directory, that is the same as
-    // ENOENT as far as git is concerned" (builtin/rm.c:149-157); gitlinks never
-    // reach here.
-    if meta.is_dir() {
-        return Ok(None);
     }
+}
 
-    let content: Vec<u8> = if mode == Mode::SYMLINK || meta.is_symlink() {
-        use std::os::unix::ffi::OsStrExt;
-        std::fs::read_link(&abs)
-            .map_err(|e| anyhow::anyhow!("failed to read symlink {}: {e}", path.to_str_lossy()))?
-            .as_os_str()
-            .as_bytes()
-            .to_vec()
+/// One worktree path and its `lstat()`.
+pub(super) struct Lstat {
+    pub(super) abs: std::path::PathBuf,
+    pub(super) meta: gix::index::fs::Metadata,
+}
+
+impl Lstat {
+    fn is_dir(&self) -> bool {
+        self.meta.is_dir()
+    }
+}
+
+/// `create_ce_mode()` (read-cache.h): the index mode a tree entry's mode stands for.
+fn create_ce_mode(mode: u32) -> u32 {
+    match mode & 0o170000 {
+        0o120000 => 0o120000,
+        0o040000 | 0o160000 => 0o160000,
+        _ if mode & 0o100 != 0 => 0o100755,
+        _ => 0o100644,
+    }
+}
+
+/// `ie_match_stat(the_repository->index, ce, &st, 0)` for a non-gitlink entry
+/// (builtin/rm.c:178-183), asked of the index `refresh_index()` already walked
+/// (builtin/rm.c:363-364). The refresh replaced the stat data of every entry
+/// whose content `ie_modified()` (read-cache.c:445-494) found unchanged, so what
+/// is left reads as `ie_modified()` on the entry as it was read:
+///
+/// * skip-worktree and assume-valid entries are unchanged, intent-to-add ones
+///   changed (read-cache.c:400-412);
+/// * a type change, or an owner-x-bit change under `core.fileMode`, is
+///   changed whatever the content (`ce_match_stat_basic()`, :311-352);
+/// * stat data that matches is trusted unless it is racy (:431-436);
+/// * a size change is trusted unless the index recorded size 0 (:466-488);
+/// * anything else goes to the file: `ce_modified_check_fs()` (:255-279).
+pub(super) fn ie_modified(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    entry: &gix::index::Entry,
+    path: &BString,
+    st: &Lstat,
+    filter: &mut Option<super::convert_to_git::WorktreeFilter>,
+) -> Result<bool> {
+    use gix::index::entry::Flags;
+    if entry.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID) {
+        return Ok(false);
+    }
+    if entry.flags.contains(Flags::INTENT_TO_ADD) {
+        return Ok(true);
+    }
+    let snapshot = repo.config_snapshot();
+    let trust_executable_bit = snapshot.boolean("core.fileMode").unwrap_or(true);
+    let has_symlinks = snapshot.boolean("core.symlinks").unwrap_or(true);
+    let meta = &st.meta;
+    let type_or_mode_changed = if entry.mode == Mode::SYMLINK {
+        !meta.is_symlink() && (has_symlinks || !meta.is_file())
     } else {
-        std::fs::read(&abs)
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.to_str_lossy()))?
+        !meta.is_file() || (trust_executable_bit && meta.is_executable() != (entry.mode == Mode::FILE_EXECUTABLE))
     };
+    if type_or_mode_changed {
+        return Ok(true);
+    }
+    let Ok(now) = gix::index::entry::Stat::from_fs(meta) else {
+        return Ok(true);
+    };
+    // `match_stat_data()`'s DATA_CHANGED, plus "Racily smudged entry?".
+    let data_changed =
+        entry.stat.size != now.size || (entry.stat.size == 0 && entry.id != index.object_hash().empty_blob());
+    let changed = data_changed || !entry.stat.matches(&now, repo.stat_options()?);
+    if !changed {
+        if !crate::index_racy::is_racy_stat(index, &entry.stat) {
+            return Ok(false);
+        }
+    } else if data_changed && entry.stat.size != 0 {
+        return Ok(true);
+    }
+    Ok(modified_check_fs(repo, entry, path, st, filter))
+}
 
-    let id = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &content)?;
-    Ok(Some(id))
+/// `ce_modified_check_fs()` (read-cache.c:255-279), switched on the type `lstat()`
+/// saw: a regular file is `ce_compare_data()`, the blob `index_fd()` makes of it
+/// through `convert_to_git()` (read-cache.c:231-245), so a clean filter or EOL
+/// normalisation does not read as a change; a symlink is `ce_compare_link()`, its
+/// target against the blob (:247-271); anything else is TYPE_CHANGED. A file that
+/// cannot be read or converted is `match = -1`, a change.
+fn modified_check_fs(
+    repo: &gix::Repository,
+    entry: &gix::index::Entry,
+    path: &BString,
+    st: &Lstat,
+    filter: &mut Option<super::convert_to_git::WorktreeFilter>,
+) -> bool {
+    if st.meta.is_symlink() {
+        let Ok(target) = std::fs::read_link(&st.abs) else {
+            return true;
+        };
+        return match repo.find_object(entry.id) {
+            Ok(blob) => gix::path::into_bstr(target).as_ref() != blob.data.as_slice(),
+            Err(_) => true,
+        };
+    }
+    if !st.meta.is_file() {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(&st.abs) else {
+        return true;
+    };
+    let filter = match filter {
+        Some(f) => f,
+        none => match super::convert_to_git::WorktreeFilter::new(repo, false, false) {
+            Ok(f) => none.insert(f),
+            Err(_) => return true,
+        },
+    };
+    let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
+    match filter.convert(repo, &rela, &bytes) {
+        Ok(stored) => gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &stored)
+            .map_or(true, |id| id != entry.id),
+        Err(_) => true,
+    }
 }
 
 /// The `read_gitfile("<path>/.git")` that bad_to_remove_submodule() reaches through

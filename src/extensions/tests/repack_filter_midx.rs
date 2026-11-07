@@ -258,7 +258,8 @@ fn filtered_pack_written_elsewhere_is_not_preferred() {
 
 /// `cmd_repack()` pushes `--write-bitmap-index` at `pack-objects` only
 /// `if (write_midx == REPACK_WRITE_MIDX_NONE)`: under `--write-midx` the bitmap
-/// belongs to the MIDX, and the packs are left bare. Without `--write-midx` the
+/// belongs to the MIDX — `multi-pack-index-<hash>.bitmap` — and the packs are
+/// left bare. Without `--write-midx` the
 /// same `-b` does write one, which is what pins this to the MIDX gate rather
 /// than to bitmaps being off.
 #[test]
@@ -268,7 +269,14 @@ fn write_midx_moves_the_bitmap_off_the_pack() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let after = pack_dir_entries(&repo);
     assert!(after.contains(&"multi-pack-index".to_string()), "no midx written: {after:?}");
-    assert!(!after.iter().any(|n| n.ends_with(".bitmap")), "pack bitmap written: {after:?}");
+    assert!(
+        !after.iter().any(|n| n.starts_with("pack-") && n.ends_with(".bitmap")),
+        "pack bitmap written: {after:?}"
+    );
+    assert!(
+        after.iter().any(|n| n.starts_with("multi-pack-index-") && n.ends_with(".bitmap")),
+        "no midx bitmap written: {after:?}"
+    );
 
     let (repo, home) = fixture("bitmap-nomidx");
     let out = run(&repo, &home, &["repack", "-a", "-b"]);

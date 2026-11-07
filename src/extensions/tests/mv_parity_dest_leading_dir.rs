@@ -159,7 +159,8 @@ fn keep_going_still_remaps_a_directorys_entries() {
         "Renaming d to nodir/d\nRenaming d/c to nodir/d/c\nRenaming d/e to nodir/d/e\n"
     );
     assert_eq!(text(&out.stderr), "");
-    // The directory stayed where it was on disk; the index moved its entries.
+    // The index moved its entries, and the source directory is gone from disk as
+    // stock 2.56.0 leaves it, files and all: nothing is left at `d` or `nodir`.
     assert_eq!(fx.tracked(), "a\nb\nl\nnodir/d/c\nnodir/d/e\n");
-    assert!(fx.dir.join("d/c").exists());
+    assert!(!fx.dir.join("d").exists() && !fx.dir.join("nodir").exists());
 }

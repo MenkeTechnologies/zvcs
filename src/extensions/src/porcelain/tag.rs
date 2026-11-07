@@ -806,13 +806,15 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         colopts = super::column::DISABLED;
     }
 
-    // The object this writes carries an identity, and git fills the halves
-    // the user did not give rather than refusing — except under
-    // `user.useConfigOnly`, which is the one case it says so.
+    // Only an annotated tag asks for a strict identity: `create_tag()` formats its
+    // tagger line with `git_committer_info(IDENT_STRICT)` (builtin/tag.c:315-323),
+    // and nothing else `cmd_tag()` runs does, so listing, `-d`, `-v` and a
+    // lightweight tag go on where the identity is incomplete. The verdict reads only
+    // the environment and the config, so it is taken before the reflog defaults are
+    // injected and reported where `create_tag()` asks for it.
     let mut repo = crate::setup::discover()?;
-    if let Some(code) = crate::ensure_object_identity(&mut repo, "Committer") {
-        return Ok(code);
-    }
+    let tagger_refusal = crate::fmt_ident_strict(&repo, "Committer");
+    crate::ensure_reflog_identity(&mut repo);
 
     // `want_color(format.use_color)`: the option when it was given, else
     // `color.ui`, with `auto` decided by stdout. `git tag` has no `color.tag`
@@ -916,6 +918,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         &trailers,
         create_reflog,
         signer.as_ref(),
+        tagger_refusal.as_ref(),
     )
 }
 
@@ -1416,6 +1419,7 @@ fn create_tag(
     trailers: &[String],
     create_reflog: bool,
     signer: Option<&crate::gitsig::Signer>,
+    tagger_refusal: Option<&crate::IdentRefusal>,
 ) -> Result<ExitCode> {
     if positionals.len() > 2 {
         return fatal("too many arguments");
@@ -1487,6 +1491,11 @@ fn create_tag(
         // hits on the annotated path.
         if repo.find_header(target).is_err() {
             return fatal("bad object type.");
+        }
+        // `git_committer_info(IDENT_STRICT)` for the `tagger` header comes next
+        // (builtin/tag.c:315-323), ahead of the editor and the message.
+        if let Some(refusal) = tagger_refusal {
+            return Ok(refusal.die());
         }
         let message_given = message_file.is_some() || !messages.is_empty();
         let raw = match message_file {

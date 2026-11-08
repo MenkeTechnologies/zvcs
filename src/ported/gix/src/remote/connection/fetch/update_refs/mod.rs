@@ -76,6 +76,47 @@ pub(crate) fn update(
     write_packed_refs: fetch::WritePackedRefs,
     atomic: bool,
 ) -> Result<update::Outcome, update::Error> {
+    update_queued(
+        repo,
+        message,
+        mappings,
+        refspecs,
+        extra_refspecs,
+        fetch_tags,
+        dry_run,
+        show_forced_updates,
+        write_packed_refs,
+        atomic,
+        Queue::default(),
+    )
+}
+
+/// What a fetch puts into its ref transaction beside the updates [`update()`] derives, and the
+/// order it queues them in.
+#[derive(Debug, Default)]
+pub(crate) struct Queue {
+    /// `--atomic --prune`'s deletions, queued ahead of every update (`prune_refs()`,
+    /// builtin/fetch.c:1478-1485).
+    pub prune: Vec<RefEdit>,
+    /// The rank of each local ref's update, lowest first; see `Prepare::with_update_order()`.
+    pub order: std::collections::HashMap<gix_ref::FullName, u32>,
+}
+
+/// [`update()`], with `queue`'s deletions and order applied to the transaction.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn update_queued(
+    repo: &Repository,
+    message: RefLogMessage,
+    mappings: &[fetch::refmap::Mapping],
+    refspecs: &[gix_refspec::RefSpec],
+    extra_refspecs: &[gix_refspec::RefSpec],
+    fetch_tags: fetch::Tags,
+    dry_run: fetch::DryRun,
+    show_forced_updates: bool,
+    write_packed_refs: fetch::WritePackedRefs,
+    atomic: bool,
+    queue: Queue,
+) -> Result<update::Outcome, update::Error> {
     let _span = gix_trace::detail!("update_refs()", mappings = mappings.len());
     let mut edits = Vec::new();
     let mut updates = Vec::new();
@@ -360,15 +401,47 @@ pub(crate) fn update(
     // promise that the rest doesn't get applied either.
     let rejected_atomically = atomic && updates.iter().any(|update| update.mode.is_rejected());
 
-    let edits = match dry_run {
-        fetch::DryRun::No if rejected_atomically => edits,
+    // ```c
+    // if (oideq(&ref->old_oid, &ref->new_oid)) {
+    //         if (verbosity > 0)
+    //                 format_display(display_buffer, '=', _("[up to date]"), NULL,
+    //                                remote, pretty_ref, summary_width);
+    //         return 0;
+    // }
+    // ```
+    //
+    // (`update_local_ref()`, builtin/fetch.c:906-911.) A ref that already has the value queues
+    // nothing, and neither does a rejected one, so only the updates that move a ref enter the
+    // transaction. They enter it in the order git queues them, behind `--atomic`'s deletions.
+    let mut queued: Vec<usize> = updates
+        .iter()
+        .filter(|update| matches!(update.mode, Mode::New | Mode::FastForward | Mode::Forced))
+        .filter_map(|update| update.edit_index)
+        .collect();
+    queued.sort_by_key(|&index| queue.order.get(&edits[index].name).copied().unwrap_or(u32::MAX));
+    let mut transaction = queue.prune;
+    let pruned = transaction.len();
+    transaction.extend(queued.iter().map(|&index| edits[index].clone()));
+
+    match dry_run {
+        // `do_fetch()` aborts the transaction `store_updated_refs()` filled and never prepared
+        // (builtin/fetch.c:2140-2147), and `ref_transaction_abort()` runs the hook at `aborted`
+        // over what it holds all the same (refs.c:2732-2756).
+        fetch::DryRun::No if rejected_atomically => {
+            let mut lines = Vec::new();
+            for edit in &transaction {
+                gix_ref::file::transaction::edit_hook_line(&mut lines, repo.object_hash(), edit, false);
+            }
+            gix_ref::file::run_transaction_hook(&repo.refs, "aborted", &lines);
+        }
         fetch::DryRun::No => {
-            let _span = gix_trace::detail!("apply", edits = edits.len());
+            let _span = gix_trace::detail!("apply", edits = transaction.len());
             let (file_lock_fail, packed_refs_lock_fail) = repo
                 .config
                 .lock_timeout()
                 .map_err(crate::reference::edit::Error::from)?;
-            repo.refs
+            let applied = repo
+                .refs
                 .transaction()
                 .packed_refs(
                     match write_packed_refs {
@@ -377,13 +450,16 @@ pub(crate) fn update(
                         fetch::WritePackedRefs::Never => gix_ref::file::transaction::PackedRefs::DeletionsOnly
                     }
                 )
-                .prepare(edits, file_lock_fail, packed_refs_lock_fail)
+                .prepare(transaction, file_lock_fail, packed_refs_lock_fail)
                 .map_err(crate::reference::edit::Error::from)?
                 .commit(repo.committer().transpose().map_err(|err| update::Error::EditReferences(crate::reference::edit::Error::ParseCommitterTime(err)))?)
-                .map_err(crate::reference::edit::Error::from)?
+                .map_err(crate::reference::edit::Error::from)?;
+            for (index, edit) in queued.into_iter().zip(applied.into_iter().skip(pruned)) {
+                edits[index] = edit;
+            }
         }
-        fetch::DryRun::Yes => edits,
-    };
+        fetch::DryRun::Yes => {}
+    }
 
     Ok(update::Outcome {
         edits,

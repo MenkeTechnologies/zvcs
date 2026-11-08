@@ -461,7 +461,7 @@ where
             }
         }
 
-        let update_refs = refs::update(
+        let update_refs = refs::update_queued(
             repo,
             self.reflog_message
                 .take()
@@ -474,6 +474,7 @@ where
             self.show_forced_updates,
             self.write_packed_refs,
             self.atomic,
+            std::mem::take(&mut self.queue),
         )?;
 
         if let Some(bundle) = write_pack_bundle.as_mut() {

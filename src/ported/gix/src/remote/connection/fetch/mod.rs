@@ -190,6 +190,7 @@ where
             show_forced_updates: true,
             filter: None,
             shallow_update: shallow::Mode::Reject,
+            queue: Default::default(),
         })
     }
 }
@@ -298,6 +299,7 @@ where
     show_forced_updates: bool,
     filter: Option<gix_protocol::fetch::filter::Filter>,
     shallow_update: shallow::Mode,
+    queue: refs::Queue,
 }
 
 /// Builder
@@ -384,6 +386,25 @@ where
     /// [`refs::update::Outcome::rejected_atomically`] says so.
     pub fn with_atomic(mut self, enabled: bool) -> Self {
         self.inner.atomic = enabled;
+        self
+    }
+
+    /// The deletions `--prune` makes, which `--atomic` puts into the very transaction the updates go
+    /// into, ahead of them (`prune_refs()`, builtin/fetch.c:1478-1485). Without `--atomic` git
+    /// prunes in a transaction of its own before the fetch, which is the caller's to run.
+    pub fn with_atomic_prune(mut self, deletions: Vec<gix_ref::transaction::RefEdit>) -> Self {
+        self.inner.queue.prune = deletions;
+        self
+    }
+
+    /// The position of each local ref's update in the transaction, lowest first; a ref not named
+    /// goes after every one that is, in ref-map order.
+    ///
+    /// git queues the updates as `store_updated_refs()` visits the ref map, one pass per
+    /// `fetch_head_status` (builtin/fetch.c:1241-1249), and `backfill_tags()` adds its tags last,
+    /// so the `reference-transaction` hook sees them in that order and not the ref map's.
+    pub fn with_update_order(mut self, order: std::collections::HashMap<gix_ref::FullName, u32>) -> Self {
+        self.inner.queue.order = order;
         self
     }
 

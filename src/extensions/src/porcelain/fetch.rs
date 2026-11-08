@@ -3551,6 +3551,24 @@ fn fetch_one(
         }
     }
 
+    // ```c
+    // if (prune) {
+    //         [...]
+    //         if (rs->nr) {
+    //                 retcode = prune_refs(&display_state, rs, transaction, ref_map);
+    //         } else {
+    //                 retcode = prune_refs(&display_state, &transport->remote->fetch,
+    //                                      transaction, ref_map);
+    //         }
+    //         [...]
+    // }
+    // ```
+    //
+    // (`do_fetch()`, builtin/fetch.c:2014-2028.) The stale refs go before a single object is
+    // asked for: in one `refs_delete_refs()` transaction of their own, or under `--atomic` as
+    // the first entries of the transaction the updates join (`prune_refs()`, :1478-1491).
+    let (prune_lines, atomic_prune, dangling_symrefs) = prune_refs(repo, &prune_prefixes, prepared.ref_map(), opts)?;
+
     // Which auto-followed tags git would have left for its *second* pass. This
     // has to be decided here, against the object database as it stands before a
     // single object arrives — see [`backfilled_tags`].
@@ -3558,6 +3576,11 @@ fn fetch_one(
         true => backfilled_tags(repo, prepared.ref_map()),
         false => TagPasses::default(),
     };
+    let update_order = update_order(
+        prepared.ref_map(),
+        &tag_passes,
+        FetchHeadStatus::new(explicit_refspecs, upstream, remote_name.as_deref(), &merge_spec_values),
+    );
 
     // `fetch_pack_config()` (`fetch-pack.c:1995`) reads `fetch.fsck.<msg-id>`,
     // `fetch.fsck.skipList`, `fetch.fsckObjects` and `transfer.fsckObjects` from
@@ -3665,6 +3688,8 @@ fn fetch_one(
         .with_keep_pack(opts.keep)
         .with_filter(fetch_filter.clone())
         .with_atomic(opts.atomic)
+        .with_atomic_prune(atomic_prune)
+        .with_update_order(update_order)
         .with_show_forced_updates(opts.show_forced_updates)
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
@@ -3924,26 +3949,8 @@ fn fetch_one(
     let mut update_lines: Vec<Line> = Vec::new();
     let mut fetch_head_rows: Vec<(String, bool)> = Vec::new();
     let mut rejected = false;
-    // ```c
-    // for (rm = *head; rm; rm = rm->next) {
-    //         if (branch_merge_matches(branch, i, rm->name)) {
-    //                 rm->fetch_head_status = FETCH_HEAD_MERGE;
-    //                 break;
-    //         }
-    // }
-    // ```
-    //
-    // (`add_merge_config()`, builtin/fetch.c:223-228.) The `break` is the whole point: the
-    // *first* ref-map entry naming `branch.<name>.merge` becomes the merge candidate, and a
-    // second refspec that maps the same remote ref somewhere else does not. The loop runs once
-    // per `branch.<name>.merge` (`branch->merge_nr`), matching with `refname_match()`, so each
-    // value marks its own first entry.
-    let mut merge_marked: Vec<bool> = upstream.map_or_else(Vec::new, |(_, merges)| vec![false; merges.len()]);
-    // `branch_has_merge_config(branch_get(NULL))`: `set_merge()` records merge
-    // configuration only for a branch with both `branch.<name>.remote` and
-    // `branch.<name>.merge` (remote.c:1757-1776, 1837-1840) — the upstream.
-    let has_merge = upstream.is_some();
-    let mut first_row_marked = false;
+    let mut head_status =
+        FetchHeadStatus::new(explicit_refspecs, upstream, remote_name.as_deref(), &merge_spec_values);
     // Set when a refspec would overwrite a ref some worktree has checked out and
     // `--update-head-ok` was not given: git turns that into a fatal for the whole
     // command rather than a per-ref rejection.
@@ -4000,98 +4007,12 @@ fn fetch_one(
         .map(|r| (r.0, r.1, r.2, r.3, false))
         .chain(second_pass.into_iter().map(|r| (r.0, r.1, r.2, r.3, true)))
     {
-        // An exact object id on the command line becomes a ref named after the refspec
-        // source as typed, `alloc_ref(name)` with `name = refspec->src` (remote.c:2141-2152), and that `rm->name`
-        // is what the summary row and the FETCH_HEAD note quote (builtin/fetch.c:1324-1365).
-        let exact_oid_source = mapping.remote.as_id().and_then(|_| {
-            mapping
-                .spec_index
-                .get(&ref_map.refspecs, &ref_map.extra_refspecs)
-                .and_then(|spec| spec.to_ref().source().map(|src| src.to_string()))
-        });
-        let remote_full = mapping
-            .remote
-            .as_name()
-            .map(|n| n.to_string())
-            .or_else(|| exact_oid_source.clone())
-            .unwrap_or_default();
+        let exact_oid_source = exact_oid_source(ref_map, mapping);
+        let remote_full = remote_full_name(ref_map, mapping);
         let remote_id = mapping.remote.as_id().map(ToOwned::to_owned);
-
-        // Opportunistic mappings exist only to move the tracking ref. git marks them `FETCH_HEAD_IGNORE`
-        // because their row would duplicate the one the command-line refspec already contributed.
         let opportunistic = ref_map.is_opportunistic(mapping);
-        // git marks every entry a *command-line* refspec produced `FETCH_HEAD_MERGE`. Refs that only
-        // automatic tag following pulled in are added afterwards and keep the default `not-for-merge`
-        // — which includes a `--dry-run` second-pass row that re-renders a command-line mapping.
-        let from_command_line = !backfill
-            && explicit_refspecs
-            && matches!(
-                mapping.spec_index,
-                gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)
-            );
-
-        // git's `enum fetch_head_status` for this entry: the opportunistic second stage is
-        // `FETCH_HEAD_IGNORE` (builtin/fetch.c:596), everything a command-line refspec
-        // produced is `FETCH_HEAD_MERGE` ("Merge everything on the command line",
-        // builtin/fetch.c:513-515), and with no command-line refspec the single entry
-        // `add_merge_config()` picks out is the merge candidate. The rest are
-        // `FETCH_HEAD_NOT_FOR_MERGE`.
-        //
-        // ```c
-        // if (!i && !has_merge && ref_map &&
-        //     !remote->fetch.items[0].pattern)
-        //         ref_map->fetch_head_status = FETCH_HEAD_MERGE;
-        // ```
-        //
-        // (`get_ref_map()`, builtin/fetch.c:559-561.) Without a `branch.<name>.merge`
-        // for the current branch, the ref the first configured refspec names exactly
-        // is the merge candidate.
-        let first_exact_refspec_row = !explicit_refspecs
-            && !has_merge
-            && !first_row_marked
-            && matches!(
-                mapping.spec_index,
-                gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(0)
-            )
-            && ref_map
-                .refspecs
-                .first()
-                .is_some_and(|s| !s.to_ref().source().is_some_and(|src| src.contains(&b'*')));
-        // A row one of the `branch.<name>.merge` refspecs produced. git adds it only when no
-        // earlier entry named that value (`if (rm) continue;`, builtin/fetch.c:229-230), so a
-        // value a configured refspec already mapped leaves no row of its own.
-        let merge_extra = match mapping.spec_index {
-            gix::protocol::fetch::refmap::SpecIndex::Implicit(i) => merge_spec_values.get(i).copied(),
-            gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_) => None,
-        };
-        if let Some(value) = merge_extra {
-            if std::mem::replace(&mut merge_marked[value], true) {
-                continue;
-            }
-        }
-        let status: u8 = if opportunistic {
-            2
-        } else if merge_extra.is_some() || from_command_line {
-            0
-        } else if first_exact_refspec_row {
-            first_row_marked = true;
-            0
-        } else if !explicit_refspecs
-            && upstream.is_some_and(|(r, merges)| {
-                Some(r.as_str()) == remote_name.as_deref()
-                    && merges.iter().zip(merge_marked.iter_mut()).fold(false, |hit, (m, marked)| {
-                        if !*marked && crate::refname::refname_match(m, &remote_full) > 0 {
-                            *marked = true;
-                            true
-                        } else {
-                            hit
-                        }
-                    })
-            })
-        {
-            0
-        } else {
-            1
+        let Some(status) = head_status.next(ref_map, mapping, backfill) else {
+            continue;
         };
         let for_merge = status == 0;
 
@@ -4184,8 +4105,13 @@ fn fetch_one(
         // command line: only the implicit tag-following mappings are filtered.
         // `git pull . tag v0.2.0` then merges, and without it the pull ends on
         // `couldn't find remote ref FETCH_HEAD`.
+        //
+        // Nor is `--prune-tags`' tag refspec, which `fetch_one()` appends to `remote->fetch` or to
+        // the command line's (builtin/fetch.c:2464-2469) and so maps every remote tag as any
+        // refspec would: an implicit mapping here, but no tag following is left to filter for.
         if is_tag
             && mapping.spec_index.implicit_index().is_some()
+            && follows_tags
             && !matches!(opts.tags, Some(Tags::All))
             && update.mode == Mode::NoChangeNeeded
         {
@@ -4506,76 +4432,25 @@ fn fetch_one(
         return Ok(Verdict::Fatal);
     }
 
-    // `--atomic` aborted the transaction: no ref moved, so nothing may be pruned and no FETCH_HEAD
+    // `--atomic` aborted the transaction: no ref moved, the pruned ones included, so no FETCH_HEAD
     // row may be recorded either. git leaves the file truncated and empty, and still prints the
     // summary of what it would have done.
     let atomic_abort = update_refs.rejected_atomically;
 
-    // --- prune stale tracking refs ----------------------------------------
-    let mut prune_lines: Vec<Line> = Vec::new();
-    if !prune_prefixes.is_empty() && !atomic_abort {
-        // Every local ref the remote still advertises is kept; the rest under a
-        // pruned prefix are deleted (git's `prune_refs`).
-        let kept: HashSet<BString> = ref_map
-            .mappings
-            .iter()
-            .filter_map(|m| m.local.clone())
-            .collect();
-        let mut pruned: HashSet<BString> = HashSet::new();
-
-        // Collect candidates first, then delete: mutating refs while the ref
-        // iterator still borrows the store would be unsound.
-        let mut to_delete: Vec<(FullName, String, gix::ObjectId)> = Vec::new();
-        for prefix in &prune_prefixes {
-            for r in repo.references()?.prefixed(&prefix[..])? {
-                let r = r.map_err(anyhow::Error::msg)?;
-                // Never prune symbolic tracking refs like `refs/remotes/*/HEAD`.
-                if matches!(r.target(), TargetRef::Symbolic(_)) {
-                    continue;
-                }
-                let full = r.name().as_bstr().to_owned();
-                if kept.contains(&full) || !pruned.insert(full.clone()) {
-                    continue;
-                }
-                let id = match r.target() {
-                    TargetRef::Object(id) => id.to_owned(),
-                    TargetRef::Symbolic(_) => continue,
-                };
-                to_delete.push((
-                    FullName::try_from(full.as_bstr())?,
-                    r.name().shorten().to_string(),
-                    id,
-                ));
-            }
-        }
-
-        for (name, short, id) in to_delete {
-            if !opts.dry_run {
-                repo.edit_reference(RefEdit {
-                    change: Change::Delete {
-                        expected: PreviousValue::Any,
-                        log: RefLog::AndReference,
-                        message: Default::default(),
-                    },
-                    name: name.clone(),
-                    deref: false,
-                })?;
-            }
-            prune_lines.push(Line {
-                flag: '-',
-                summary: "[deleted]".to_string(),
-                from: "(none)".to_string(),
-                to: short,
-                reason: "",
-                old: id,
-                new: null,
-                full: name.as_bstr().to_string(),
-                widens: false,
-                // Prune rows are not ref-map entries at all: `prune_refs()` reports them
-                // before the walk, and they are prepended to the summary below.
-                status: 0,
-                backfill: false,
-            });
+    // ```c
+    // if (dry_run)
+    //         return 0;
+    // ```
+    //
+    // (`s_update_ref()`, builtin/fetch.c:651-652.) A dry run queues nothing, but `do_fetch()`
+    // begins its transaction and commits it all the same (:2037-2044, :2075-2078), or under
+    // `--atomic` with a refused update aborts it (:2140-2147), so the hook runs over an empty
+    // transaction.
+    if opts.dry_run {
+        if atomic_abort {
+            gix::refs::file::run_transaction_hook(&repo.refs, "aborted", b"");
+        } else {
+            repo.edit_references(Vec::<RefEdit>::new())?;
         }
     }
 
@@ -4715,6 +4590,12 @@ fn fetch_one(
     update_lines.sort_by_key(|l| (l.backfill, l.status));
 
     // Pruned refs are reported first, mirroring git's prune-before-fetch order.
+    let pruned_rows = prune_lines.len();
+    let print_dangling = || {
+        for line in &dangling_symrefs {
+            eprintln!("{line}");
+        }
+    };
     let mut lines = prune_lines;
     lines.extend(update_lines);
 
@@ -4733,6 +4614,7 @@ fn fetch_one(
                 ));
             }
             print!("{out}");
+            print_dangling();
         } else {
             let rendered: Vec<(String, String)> = lines
                 .iter()
@@ -4779,6 +4661,10 @@ fn fetch_one(
             // git 2.50.1 padded both, which is why this is the one row shape the
             // two releases disagree about.
             let sw = if rejected { 0 } else { 2 * abbrev + 3 };
+            // `prune_refs()` prints its rows on the spot, padded to its own
+            // `transport_summary_width(stale_refs)` (builtin/fetch.c:1493-1501), so they keep the
+            // column whatever becomes of the updates.
+            let prune_sw = 2 * abbrev + 3;
             let fw = lines
                 .iter()
                 .zip(&rendered)
@@ -4788,18 +4674,26 @@ fn fetch_one(
                 .unwrap_or(0)
                 .max(REFCOL_WIDTH);
             eprintln!("From {url}");
-            for (l, (from, to)) in lines.iter().zip(&rendered) {
+            for (i, (l, (from, to))) in lines.iter().zip(&rendered).enumerate() {
+                if i == pruned_rows {
+                    print_dangling();
+                }
+                let sw = if i < pruned_rows { prune_sw } else { sw };
                 eprintln!(
                     " {} {:<sw$} {:<fw$} -> {}{}",
                     l.flag, l.summary, from, to, l.reason,
                 );
             }
+            if pruned_rows == lines.len() {
+                print_dangling();
+            }
         }
     }
 
     // git's `do_set_head`: only a refspec-less fetch of a configured remote follows the remote's
-    // `HEAD`, and only when `remote.<name>.followRemoteHEAD` is not `never`.
-    if !opts.dry_run && !explicit_refspecs && has_configured_refspecs {
+    // `HEAD`, and only when `remote.<name>.followRemoteHEAD` is not `never`. `--dry-run` does not
+    // stop it: `set_head()` is not one of the writes `dry_run` guards (builtin/fetch.c:2121-2127).
+    if !explicit_refspecs && has_configured_refspecs {
         if let Some(name) = remote_name.as_deref() {
             set_head_from_remote(repo, name, follow_head.unwrap_or(FollowRemoteHead::Create), ref_map, opts)?;
         }
@@ -4875,6 +4769,307 @@ fn fetch_follow_remote_head(repo: &gix::Repository) -> Option<FollowRemoteHead> 
     follow
 }
 
+/// Port of git's `prune_refs()` (builtin/fetch.c:1465-1512): delete every local ref under a
+/// pruned refspec destination that `ref_map` no longer maps onto, and return the `[deleted]`
+/// rows, the deletions the update transaction is to begin with under `--atomic`, and the
+/// dangling-symref warnings that follow the rows.
+///
+/// ```c
+/// if (!dry_run) {
+///         if (transaction) {
+///                 for (ref = stale_refs; ref; ref = ref->next) {
+///                         result = ref_transaction_delete(transaction, ref->name, NULL,
+///                                                         NULL, 0, "fetch: prune", &err);
+///                         [...]
+///                 }
+///         } else {
+///                 result = refs_delete_refs(get_main_ref_store(the_repository),
+///                                           "fetch: prune", &refnames,
+///                                           0);
+///         }
+/// }
+/// ```
+///
+/// Without `--atomic` the deletions are one transaction of their own, committed here.
+fn prune_refs(
+    repo: &gix::Repository,
+    prune_prefixes: &[Vec<u8>],
+    ref_map: &gix::remote::fetch::RefMap,
+    opts: &FetchOpts,
+) -> Result<(Vec<Line>, Vec<RefEdit>, Vec<String>)> {
+    if prune_prefixes.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    // Every local ref the remote still advertises is kept; the rest under a
+    // pruned prefix are stale (`get_stale_heads()`, remote.c).
+    let kept: HashSet<BString> = ref_map.mappings.iter().filter_map(|m| m.local.clone()).collect();
+    let mut stale: Vec<(FullName, String, gix::ObjectId)> = Vec::new();
+    for prefix in prune_prefixes {
+        for r in repo.references()?.prefixed(&prefix[..])? {
+            let r = r.map_err(anyhow::Error::msg)?;
+            // Never prune symbolic tracking refs like `refs/remotes/*/HEAD`.
+            let TargetRef::Object(id) = r.target() else { continue };
+            let name = r.name().to_owned();
+            if kept.contains(name.as_bstr()) || stale.iter().any(|(known, _, _)| *known == name) {
+                continue;
+            }
+            stale.push((name, r.name().shorten().to_string(), id.to_owned()));
+        }
+    }
+    // `get_stale_heads()` collects them in `refs_for_each_ref()` order, by name.
+    stale.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let deletions: Vec<RefEdit> = stale
+        .iter()
+        .map(|(name, _, _)| RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+                message: "fetch: prune".into(),
+            },
+            name: name.clone(),
+            deref: false,
+        })
+        .collect();
+    let atomic = match (opts.dry_run, opts.atomic) {
+        (true, _) => Vec::new(),
+        (false, true) => deletions,
+        (false, false) => {
+            if !deletions.is_empty() {
+                repo.edit_references(deletions)?;
+            }
+            Vec::new()
+        }
+    };
+    // `refs_warn_dangling_symrefs(..., stderr, "   ", dry_run, &refnames)` under
+    // `verbosity >= 0`, after the rows (builtin/fetch.c:1502-1504).
+    let names: Vec<FullName> = stale.iter().map(|(name, _, _)| name.clone()).collect();
+    let dangling = match opts.quiet {
+        true => Vec::new(),
+        false => super::remote::dangling_symref_warnings(repo, &names, "   ", opts.dry_run)?,
+    };
+
+    let null = gix::ObjectId::null(repo.object_hash());
+    let lines = stale
+        .into_iter()
+        .map(|(name, short, id)| Line {
+            flag: '-',
+            summary: "[deleted]".to_string(),
+            from: "(none)".to_string(),
+            to: short,
+            reason: "",
+            old: id,
+            new: null,
+            full: name.as_bstr().to_string(),
+            widens: false,
+            // Prune rows are not ref-map entries at all: `prune_refs()` reports them
+            // before the walk, and they are prepended to the summary.
+            status: 0,
+            backfill: false,
+        })
+        .collect();
+    Ok((lines, atomic, dangling))
+}
+
+/// The order `do_fetch()` queues the updates of `ref_map` in, as each local ref's rank.
+///
+/// `store_updated_refs()` walks the ref map once per `fetch_head_status` (builtin/fetch.c:1241-1249)
+/// and `update_local_ref()` queues each update as it is met, so the transaction holds the merge
+/// candidates first, then the rest, then the opportunistic entries; `backfill_tags()` runs the
+/// same walk over the tags it recovered, sorted by name (:395), after all of them (:2050-2071).
+fn update_order(
+    ref_map: &gix::remote::fetch::RefMap,
+    tag_passes: &TagPasses,
+    mut status: FetchHeadStatus<'_>,
+) -> std::collections::HashMap<FullName, u32> {
+    let deferred = |m: &gix::protocol::fetch::refmap::Mapping| {
+        m.remote.as_name().is_some_and(|n| tag_passes.deferred.contains(BStr::new(n)))
+    };
+    let mut second_pass: Vec<_> = ref_map.mappings.iter().filter(|m| deferred(m)).collect();
+    second_pass.sort_by_key(|m| m.remote.as_name().map(ToOwned::to_owned));
+    let mut ranked: Vec<(bool, u8, FullName)> = Vec::new();
+    for (mapping, backfill) in ref_map
+        .mappings
+        .iter()
+        .filter(|m| !deferred(m))
+        .map(|m| (m, false))
+        .chain(second_pass.into_iter().map(|m| (m, true)))
+    {
+        let Some(head_status) = status.next(ref_map, mapping, backfill) else { continue };
+        if let Some(local) = mapping.local.as_ref() {
+            if let Ok(name) = FullName::try_from(local.as_bstr()) {
+                ranked.push((backfill, head_status, name));
+            }
+        }
+    }
+    ranked.sort_by_key(|(backfill, head_status, _)| (*backfill, *head_status));
+    let mut order = std::collections::HashMap::new();
+    for (rank, (_, _, name)) in ranked.into_iter().enumerate() {
+        order.entry(name).or_insert(rank as u32);
+    }
+    order
+}
+
+/// An exact object id on the command line becomes a ref named after the refspec source as
+/// typed, `alloc_ref(name)` with `name = refspec->src` (remote.c:2141-2152), and that `rm->name`
+/// is what the summary row and the FETCH_HEAD note quote (builtin/fetch.c:1324-1365).
+fn exact_oid_source(
+    ref_map: &gix::remote::fetch::RefMap,
+    mapping: &gix::protocol::fetch::refmap::Mapping,
+) -> Option<String> {
+    mapping.remote.as_id().and_then(|_| {
+        mapping
+            .spec_index
+            .get(&ref_map.refspecs, &ref_map.extra_refspecs)
+            .and_then(|spec| spec.to_ref().source().map(|src| src.to_string()))
+    })
+}
+
+/// `rm->name` of a ref-map entry: the remote ref, or the object id as typed.
+fn remote_full_name(
+    ref_map: &gix::remote::fetch::RefMap,
+    mapping: &gix::protocol::fetch::refmap::Mapping,
+) -> String {
+    mapping
+        .remote
+        .as_name()
+        .map(|n| n.to_string())
+        .or_else(|| exact_oid_source(ref_map, mapping))
+        .unwrap_or_default()
+}
+
+/// git's `enum fetch_head_status` of each ref-map entry, as `store_updated_refs()` meets them
+/// (builtin/fetch.c:1241-1249): `FETCH_HEAD_MERGE` (0), `FETCH_HEAD_NOT_FOR_MERGE` (1),
+/// `FETCH_HEAD_IGNORE` (2). Some of it is decided by which entry comes first, so the entries
+/// have to be asked about in ref-map order, the backfilled tags last.
+struct FetchHeadStatus<'a> {
+    explicit_refspecs: bool,
+    upstream: Option<&'a (String, Vec<String>)>,
+    remote_name: Option<&'a str>,
+    /// `merge_spec_values[i]` is the index into `branch.<name>.merge` of extra refspec `i`.
+    merge_spec_values: &'a [usize],
+    /// ```c
+    /// for (rm = *head; rm; rm = rm->next) {
+    ///         if (branch_merge_matches(branch, i, rm->name)) {
+    ///                 rm->fetch_head_status = FETCH_HEAD_MERGE;
+    ///                 break;
+    ///         }
+    /// }
+    /// ```
+    ///
+    /// (`add_merge_config()`, builtin/fetch.c:223-228.) The `break` is the whole point: the
+    /// *first* ref-map entry naming `branch.<name>.merge` becomes the merge candidate, and a
+    /// second refspec that maps the same remote ref somewhere else does not. The loop runs once
+    /// per `branch.<name>.merge` (`branch->merge_nr`), matching with `refname_match()`, so each
+    /// value marks its own first entry.
+    merge_marked: Vec<bool>,
+    first_row_marked: bool,
+}
+
+impl<'a> FetchHeadStatus<'a> {
+    fn new(
+        explicit_refspecs: bool,
+        upstream: Option<&'a (String, Vec<String>)>,
+        remote_name: Option<&'a str>,
+        merge_spec_values: &'a [usize],
+    ) -> Self {
+        FetchHeadStatus {
+            explicit_refspecs,
+            upstream,
+            remote_name,
+            merge_spec_values,
+            merge_marked: upstream.map_or_else(Vec::new, |(_, merges)| vec![false; merges.len()]),
+            first_row_marked: false,
+        }
+    }
+
+    /// The status of `mapping`, or `None` for a row of a `branch.<name>.merge` value an earlier
+    /// entry already named, which git never adds to the ref map.
+    fn next(
+        &mut self,
+        ref_map: &gix::remote::fetch::RefMap,
+        mapping: &gix::protocol::fetch::refmap::Mapping,
+        backfill: bool,
+    ) -> Option<u8> {
+        use gix::protocol::fetch::refmap::SpecIndex;
+        let explicit_refspecs = self.explicit_refspecs;
+        // Opportunistic mappings exist only to move the tracking ref. git marks them `FETCH_HEAD_IGNORE`
+        // because their row would duplicate the one the command-line refspec already contributed.
+        let opportunistic = ref_map.is_opportunistic(mapping);
+        // git marks every entry a *command-line* refspec produced `FETCH_HEAD_MERGE`. Refs that only
+        // automatic tag following pulled in are added afterwards and keep the default `not-for-merge`
+        // — which includes a `--dry-run` second-pass row that re-renders a command-line mapping.
+        let from_command_line =
+            !backfill && explicit_refspecs && matches!(mapping.spec_index, SpecIndex::ExplicitInRemote(_));
+
+        // git's `enum fetch_head_status` for this entry: the opportunistic second stage is
+        // `FETCH_HEAD_IGNORE` (builtin/fetch.c:596), everything a command-line refspec
+        // produced is `FETCH_HEAD_MERGE` ("Merge everything on the command line",
+        // builtin/fetch.c:513-515), and with no command-line refspec the single entry
+        // `add_merge_config()` picks out is the merge candidate. The rest are
+        // `FETCH_HEAD_NOT_FOR_MERGE`.
+        //
+        // ```c
+        // if (!i && !has_merge && ref_map &&
+        //     !remote->fetch.items[0].pattern)
+        //         ref_map->fetch_head_status = FETCH_HEAD_MERGE;
+        // ```
+        //
+        // (`get_ref_map()`, builtin/fetch.c:559-561.) Without a `branch.<name>.merge`
+        // for the current branch, the ref the first configured refspec names exactly
+        // is the merge candidate. `branch_has_merge_config(branch_get(NULL))`: `set_merge()`
+        // records merge configuration only for a branch with both `branch.<name>.remote` and
+        // `branch.<name>.merge` (remote.c:1757-1776, 1837-1840) — the upstream.
+        let has_merge = self.upstream.is_some();
+        let first_exact_refspec_row = !explicit_refspecs
+            && !has_merge
+            && !self.first_row_marked
+            && matches!(mapping.spec_index, SpecIndex::ExplicitInRemote(0))
+            && ref_map
+                .refspecs
+                .first()
+                .is_some_and(|s| !s.to_ref().source().is_some_and(|src| src.contains(&b'*')));
+        // A row one of the `branch.<name>.merge` refspecs produced. git adds it only when no
+        // earlier entry named that value (`if (rm) continue;`, builtin/fetch.c:229-230), so a
+        // value a configured refspec already mapped leaves no row of its own.
+        let merge_extra = match mapping.spec_index {
+            SpecIndex::Implicit(i) => self.merge_spec_values.get(i).copied(),
+            SpecIndex::ExplicitInRemote(_) => None,
+        };
+        if let Some(value) = merge_extra {
+            if std::mem::replace(&mut self.merge_marked[value], true) {
+                return None;
+            }
+        }
+        let remote_name = self.remote_name;
+        let merge_marked = &mut self.merge_marked;
+        Some(if opportunistic {
+            2
+        } else if merge_extra.is_some() || from_command_line {
+            0
+        } else if first_exact_refspec_row {
+            self.first_row_marked = true;
+            0
+        } else if !explicit_refspecs
+            && self.upstream.is_some_and(|(r, merges)| {
+                Some(r.as_str()) == remote_name
+                    && merges.iter().zip(merge_marked.iter_mut()).fold(false, |hit, (m, marked)| {
+                        if !*marked && crate::refname::refname_match(m, &remote_full_name(ref_map, mapping)) > 0 {
+                            *marked = true;
+                            true
+                        } else {
+                            hit
+                        }
+                    })
+            })
+        {
+            0
+        } else {
+            1
+        })
+    }
+}
+
 /// Port of git's `set_head()`: point `refs/remotes/<name>/HEAD` at the branch the remote's `HEAD`
 /// names, under the policy `remote.<name>.followRemoteHEAD` sets.
 ///
@@ -4918,7 +5113,32 @@ fn set_head_from_remote(
     // `always` (and a bare mirror) rewrites it.
     let create_only = follow != FollowRemoteHead::Always && !bare_mirror;
     let (previous, was_detached) = super::remote::symref_prev(repo, head_ref.as_str())?;
-    if !(create_only && previous.is_some()) {
+    if create_only && previous.is_some() {
+        // ```c
+        // if (ref_transaction_create(transaction, ref, NULL, target,
+        //                            REF_NO_DEREF, logmsg, &err))
+        //         goto error_return;
+        // prepret = ref_transaction_prepare(transaction, &err);
+        // if (prepret && prepret != REF_TRANSACTION_ERROR_CREATE_EXISTS)
+        //         goto error_return;
+        // ```
+        //
+        // (`refs_update_symref_extended()`, refs.c:2532-2538.) The create is attempted all
+        // the same: `ref_transaction_prepare()` runs the hook at `preparing` (refs.c:2713-2717)
+        // before the backend finds the ref there, and the transaction is freed, not aborted.
+        use gix::refs::file::transaction::{HookValue, hook_line};
+        let mut lines = Vec::new();
+        hook_line(
+            &mut lines,
+            repo.object_hash(),
+            None,
+            Some(HookValue::Symbolic(target.as_bytes().as_bstr())),
+            head_ref.as_bytes().as_bstr(),
+        );
+        if !gix::refs::file::run_transaction_hook(&repo.refs, "preparing", &lines) {
+            gix::refs::file::transaction_hook_refused(&repo.refs, "preparing", &[&lines]);
+        }
+    } else {
         let previous_id = super::remote::resolved_id(repo, head_ref.as_str())?;
         repo.edit_reference(RefEdit {
             change: Change::Update {

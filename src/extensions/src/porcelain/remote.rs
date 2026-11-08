@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::config::{File as ConfigFile, Source};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
-use gix::refs::{FullName, Target};
+use gix::refs::{FullName, Target, TargetRef};
 
 /// `git remote` — manage the set of tracked repositories.
 ///
@@ -649,6 +649,62 @@ fn tracking_refs(repo: &gix::Repository, name: &str) -> Result<Vec<(FullName, Ta
 fn full_name(name: &str) -> Result<FullName> {
     name.try_into()
         .map_err(|e| anyhow::anyhow!("invalid reference name '{name}': {e}"))
+}
+
+/// Port of `refs_warn_dangling_symrefs()` (refs.c:490-534): one line for every symbolic ref
+/// that resolves to one of `deleted`, which the caller prints after its report of the
+/// deletions.
+///
+/// ```c
+/// resolves_to = refs_resolve_ref_unsafe(d->refs, ref->name, 0, NULL, NULL);
+/// if (!resolves_to
+///     || !string_list_has_string(d->refnames, resolves_to)) {
+///         return 0;
+/// }
+///
+/// msg = d->dry_run
+///         ? _("%s%s will become dangling after %s is deleted\n")
+///         : _("%s%s has become dangling after %s was deleted\n");
+/// ```
+///
+/// Resolving without `RESOLVE_REF_READING` follows the chain to its last name whether or not
+/// that ref exists, for as many reads as `SYMREF_MAXDEPTH` (5) allows, the symbolic ref's own
+/// included (refs.c:2147-2199).
+pub(super) fn dangling_symref_warnings(
+    repo: &gix::Repository,
+    deleted: &[FullName],
+    indent: &str,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for r in repo.references()?.all()? {
+        let Ok(r) = r else { continue };
+        let TargetRef::Symbolic(first) = r.target() else { continue };
+        let mut resolves_to = first.to_owned();
+        let mut depth = 1;
+        let resolved = loop {
+            match repo.try_find_reference(resolves_to.as_ref()) {
+                Ok(Some(next)) => match next.target() {
+                    TargetRef::Symbolic(target) if depth < 4 => {
+                        resolves_to = target.to_owned();
+                        depth += 1;
+                    }
+                    TargetRef::Symbolic(_) => break false,
+                    TargetRef::Object(_) => break true,
+                },
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        };
+        if resolved && deleted.contains(&resolves_to) {
+            let name = r.name().as_bstr();
+            lines.push(match dry_run {
+                true => format!("{indent}{name} will become dangling after {} is deleted", resolves_to.as_bstr()),
+                false => format!("{indent}{name} has become dangling after {} was deleted", resolves_to.as_bstr()),
+            });
+        }
+    }
+    Ok(lines)
 }
 
 /// Delete `name`, reflog included.
@@ -3014,15 +3070,34 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
             .map_or(name, String::as_str)
     );
 
+    // `refs_delete_refs(…, "remote: prune", &refs_to_prune, 0)` (builtin/remote.c:1646-1648):
+    // every stale ref goes in one transaction, ahead of the report.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let mut names = stale.iter().map(|full| full_name(full)).collect::<Result<Vec<_>>>()?;
+    names.sort();
+    if !dry_run {
+        repo.edit_references(names.iter().cloned().map(|name| RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+                message: "remote: prune".into(),
+            },
+            name,
+            deref: false,
+        }))?;
+    }
     for full in &stale {
         let short = full.strip_prefix("refs/remotes/").unwrap_or(full);
         if dry_run {
             println!(" * [would prune] {short}");
         } else {
             println!(" * [pruned] {short}");
-            delete_ref(repo, full_name(full)?)?;
         }
+    }
+    // `refs_warn_dangling_symrefs(..., stdout, " ", dry_run, &refs_to_prune)`
+    // (builtin/remote.c:1661-1662).
+    for line in dangling_symref_warnings(repo, &names, " ", dry_run)? {
+        println!("{line}");
     }
     Ok(true)
 }

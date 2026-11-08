@@ -110,6 +110,14 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             revs.push(a);
             continue;
         }
+        // `--end-of-options` ends the options as `--` does, matched by `strcmp()`
+        // before any long-option lookup and dropped since describe's
+        // `parse_options()` passes no `PARSE_OPT_KEEP_UNKNOWN_OPT`
+        // (parse-options.c:1119-1124, builtin/describe.c:651).
+        if a == "--end-of-options" {
+            no_more_options = true;
+            continue;
+        }
         // Resolve the long name the way `parse_long_opt()` resolves it, so a
         // unique abbreviation reaches the arm its full spelling reaches.
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
@@ -211,18 +219,6 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
         return run_contains(&revs, all, always, &match_pats, &exclude_pats);
     }
 
-    // `} else if (dirty) { die(…, "--dirty"); } else if (broken) { die(…, "--broken"); }`
-    // (builtin/describe.c:824-827): both are about the work tree, so neither can name a
-    // commit to describe.
-    if !revs.is_empty() {
-        if dirty.is_some() {
-            return fatal("option '--dirty' and commit-ishes cannot be used together");
-        }
-        if broken.is_some() {
-            return fatal("option '--broken' and commit-ishes cannot be used together");
-        }
-    }
-
     // `--all` wins the ref selection; `--tags` only widens tags to unannotated ones.
     let select = if all {
         SelectRef::AllRefs
@@ -245,6 +241,19 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     // "No tags can describe").
     if !always && !has_any_name(&repo, select, &filter)? {
         return fatal("No names found, cannot describe anything.");
+    }
+
+    // `} else if (dirty) { die(…, "--dirty"); } else if (broken) { die(…, "--broken"); }`
+    // (builtin/describe.c:786-790): both are about the work tree, so neither can name a
+    // commit to describe. These branches come after the "No names found" gate
+    // (builtin/describe.c:722-723), which therefore wins when no ref names anything.
+    if !revs.is_empty() {
+        if dirty.is_some() {
+            return fatal("option '--dirty' and commit-ishes cannot be used together");
+        }
+        if broken.is_some() {
+            return fatal("option '--broken' and commit-ishes cannot be used together");
+        }
     }
 
     // ```c

@@ -1915,6 +1915,7 @@ fn collect_commit_info(
     // There is no `--no-use-mailmap` to turn it off; blame has no such option.
     let mailmap = crate::mailmap::Mailmap::read(Some(repo));
     let mut info: HashMap<ObjectId, CommitInfo> = HashMap::new();
+    let output_encoding = crate::revfilter::log_output_encoding(repo, opts.encoding.as_deref());
     for line in lines {
         if info.contains_key(&line.commit_id) {
             continue;
@@ -1922,7 +1923,16 @@ fn collect_commit_info(
         let ci = if &line.commit_id == null_id {
             not_committed_info(line.commit_id, opts, rel_path)
         } else {
-            let commit = repo.find_commit(line.commit_id)?;
+            // `get_commit_info()` reads the identities and the subject out of
+            // `repo_logmsg_reencode(commit, NULL, get_log_output_encoding())`
+            // (builtin/blame.c:205-206), not out of the stored bytes.
+            let stored = repo.find_commit(line.commit_id)?;
+            // Parentage is the graph's, shallow and graft files included, not
+            // the `parent` lines of the buffer.
+            let is_root = stored.parent_ids().next().is_none();
+            let mut data = stored.data.clone();
+            super::log::logmsg_reencode(&mut data, &output_encoding);
+            let commit = gix::objs::CommitRef::from_bytes(&data, repo.object_hash())?;
             let author = commit.author()?;
             let committer = commit.committer()?;
             // `map_user()` rewrites only the name and the e-mail; the timestamp it
@@ -1954,11 +1964,11 @@ fn collect_commit_info(
             // *committer* date, and the bound is ignored under `--reverse`.
             let date_cut = opts.reverse_from.is_none()
                 && opts.ages().below_max_age(committer_time.map(|t| t.seconds).unwrap_or(0));
-            let boundary = (!opts.show_root && commit.parent_ids().next().is_none())
+            let boundary = (!opts.show_root && is_root)
                 || opts.reverse_from.is_some_and(|from| from == line.commit_id)
                 || opts.bottom.contains(&line.commit_id)
                 || date_cut;
-            let summary = Vec::from(commit.message()?.summary().into_owned());
+            let summary = Vec::from(commit.message().summary().into_owned());
             CommitInfo {
                 display_author: display_author(
                     author_name.as_slice().into(),
@@ -2132,6 +2142,15 @@ fn emit_object_name(buf: &mut Vec<u8>, ci: &CommitInfo, line: &Line, name_width:
 
 /// Right-justify `s` into `buf` to a minimum byte width of `min`, matching C's
 /// `%*s` (spaces on the left, no truncation).
+/// `utf8_strwidth(name)`, the columns `longest_author` and the padding after the
+/// author are measured in (builtin/blame.c:567, :688-690): display columns of
+/// the C string, so a wide character counts two, a combining one or a C1
+/// control none, and an ill-formed name its byte length (utf8.c:211-234).
+fn author_width(name: &[u8]) -> usize {
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    crate::utf8::utf8_strnwidth(&name[..end], false) as usize
+}
+
 fn pad_left(buf: &mut Vec<u8>, s: &[u8], min: usize) {
     pad(buf, min.saturating_sub(s.len()));
     buf.extend_from_slice(s);
@@ -2235,7 +2254,7 @@ fn emit_human(
     } else {
         lines
             .iter()
-            .map(|l| info[&l.commit_id].display_author.len())
+            .map(|l| author_width(&info[&l.commit_id].display_author))
             .max()
             .unwrap_or(0)
     };
@@ -2293,7 +2312,7 @@ fn emit_human(
         if !opts.suppress {
             buf.extend_from_slice(b" (");
             buf.extend_from_slice(&ci.display_author);
-            pad(&mut buf, w_author.saturating_sub(ci.display_author.len()));
+            pad(&mut buf, w_author.saturating_sub(author_width(&ci.display_author)));
             buf.push(b' ');
             // `printf(" (%s%*s %10s", name, pad, "", format_time(…))`
             // (`builtin/blame.c:380-384`): `format_time()` left-justifies the
@@ -3253,6 +3272,13 @@ enum RevOptValue {
     /// `-U<n>` / `--unified=<n>`, which spells it with the dashes:
     /// `error: --unified expects a numerical value`.
     Unified,
+    /// `diff_opt_dirstat()` (diff.c:5685-5699), whose `parse_dirstat_opt()` dies
+    /// with every complaint `parse_dirstat_params()` collected, 128.
+    /// `--dirstat-by-file` parses `files` first, which never fails.
+    Dirstat,
+    /// `diff_opt_ignore_regex()` (diff.c:5838-5856): `regcomp()` failing is
+    /// `error: invalid regex given to -I: '<v>'`, 129.
+    IgnoreRegex,
 }
 
 /// The parser [`RevOptValue`] names for one long-option *name* (no `--`, no value).
@@ -3271,6 +3297,8 @@ fn rev_opt_value_parser(name: &str) -> Option<RevOptValue> {
             RevOptValue::StatWidth
         }
         "unified" => RevOptValue::Unified,
+        "dirstat" | "dirstat-by-file" => RevOptValue::Dirstat,
+        "ignore-matching-lines" => RevOptValue::IgnoreRegex,
         _ => return None,
     })
 }
@@ -3358,6 +3386,19 @@ fn rev_opt_value_refusal(
             )),
             Some(_) => None,
         },
+        RevOptValue::Dirstat => {
+            let mut ds = super::diff_files::DirStat::default();
+            let errors = super::diff_files::parse_dirstat_params(value, &mut ds);
+            (!errors.is_empty()).then(|| {
+                (
+                    format!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n"),
+                    ExitCode::from(128),
+                )
+            })
+        }
+        RevOptValue::IgnoreRegex => super::diff_pickaxe::compile_regex(value.as_bytes())
+            .is_err()
+            .then(|| (format!("error: invalid regex given to -I: '{value}'\n"), ExitCode::from(129))),
     })
 }
 
@@ -4917,6 +4958,10 @@ struct Options {
     max_age: Option<i64>,
     /// `-S <revs-file>`: git's `revs_file`, a graft file read by `read_ancestry()`.
     revs_file: Option<String>,
+    /// `--encoding=<enc>`, as `handle_revision_opt()` stores it in
+    /// `git_log_output_encoding` (revision.c:2739-2745): `none` is the empty
+    /// string. `None` leaves `get_log_output_encoding()` to the config.
+    encoding: Option<String>,
     /// `-M[<score>]`: the value is git's `sb->move_score`.
     detect_moved: Option<u32>,
     /// `-C[<score>]`, `-C -C` and `-C -C -C`: git's `PICKAXE_BLAME_COPY*` bits together with
@@ -5016,6 +5061,118 @@ enum ParseOutcome {
 /// lost for every later one. Verified against git 2.55.0:
 /// `git blame --no-bogus a.txt` names the option, `git blame -w --no-bogus a.txt`
 /// prints `(null)`.
+/// The argv word the expanded token `expanded_idx` came from.
+///
+/// `parse_short_opt()` works through a clump inside one argv slot, so
+/// `overwrite_argv()`'s "is this still my own slot" test (revision.c:2340) is
+/// about words, not about the tokens [`crate::parseopt::expand_short`] splits a
+/// clump into: `-sx` names `-x`, `-s -x` prints `(null)`.
+fn original_word_index(original: &[String], expanded_idx: usize) -> usize {
+    (0..original.len())
+        .find(|&k| crate::parseopt::expand_short(&original[..=k], SHORT_OPTS).len() > expanded_idx)
+        .unwrap_or(original.len())
+}
+
+/// What `handle_revision_opt()` makes of a short word `git blame`'s own
+/// `options[]` left over.
+enum ShortWord {
+    /// Recognised and stored somewhere `cmd_blame()` never reads back.
+    Dropped,
+    /// `-g`, `--walk-reflogs`' short spelling, which diverts every commit
+    /// operand into the reflog walk (revision.c:306-319); not ported.
+    WalkReflogs,
+    /// Neither parser knows it; the payload is `ctx->argv[0]` as
+    /// `parse_revision_opt()` prints it.
+    Unknown(String),
+    /// A `diff_opt_parse()` switch that takes a value: the switch letter, what
+    /// was attached to it, and whether it is required (and so taken from the
+    /// next argv slot when nothing is attached).
+    Value { letter: char, attached: String, required: bool },
+}
+
+/// `handle_revision_opt()` on one short word: its own `strcmp()` chain, then
+/// `diff_merges_parse_opts()`, then `diff_opt_parse()`.
+///
+/// The chain compares the whole word, so only a lone `-r`, `-t`, `-v`, `-m`,
+/// `-E`, `-i`, `-F`, `-P` or `-g` matches (revision.c:2459, :2583-2592,
+/// :2726-2733, diff-merges.c:125). Anything else goes to `diff_opt_parse()`
+/// (revision.c:2758-2762), whose `parse_options()` runs `PARSE_OPT_ONE_SHOT`
+/// over the word's characters (diff.c:6303-6321): a value-taking switch ends
+/// the word, and an unknown character stops it with nothing consumed. When
+/// that character is not the first, `parse_options_step()` has rewritten the
+/// slot to `-<rest>` (parse-options.c:1090-1096), which is the name
+/// `parse_revision_opt()`'s `error()` then prints (revision.c:2775).
+fn revision_short_word(word: &str) -> ShortWord {
+    match word {
+        "-g" => return ShortWord::WalkReflogs,
+        "-r" | "-t" | "-v" | "-m" | "-E" | "-i" | "-F" | "-P" => return ShortWord::Dropped,
+        _ => {}
+    }
+    let body = &word[1..];
+    for (pos, c) in body.char_indices() {
+        let rest = &body[pos + c.len_utf8()..];
+        match c {
+            // `diff.c:prep_parse_options()`'s flag switches (diff.c:6022-6233).
+            'p' | 's' | 'u' | 'W' | 'z' | 'D' | 'w' | 'b' | 'a' | 'R' => {}
+            // `PARSE_OPT_OPTARG` callbacks: only an attached value is theirs.
+            'U' | 'X' | 'B' | 'M' | 'C' => {
+                return ShortWord::Value { letter: c, attached: rest.to_string(), required: false };
+            }
+            // `OPT_INTEGER('l')`, `-I`, `-S`, `-G` and `OPT_FILENAME('O')`.
+            'l' | 'I' | 'S' | 'G' | 'O' => {
+                return ShortWord::Value { letter: c, attached: rest.to_string(), required: true };
+            }
+            _ if pos == 0 => return ShortWord::Unknown(word.to_string()),
+            _ => return ShortWord::Unknown(format!("-{}", &body[pos..])),
+        }
+    }
+    ShortWord::Dropped
+}
+
+/// A value one of `diff_opt_parse()`'s short switches refuses, as the
+/// diagnostic and exit status. The callbacks shared with a long option go
+/// through [`rev_opt_value_refusal`] under that option's name; the rest are
+/// checked here.
+fn diff_short_value_refusal(
+    repo: &gix::Repository,
+    letter: char,
+    value: &str,
+) -> Result<Option<(String, ExitCode)>> {
+    let long = match letter {
+        'U' => "unified",
+        'B' => "break-rewrites",
+        'M' => "find-renames",
+        'C' => "find-copies",
+        'X' => "dirstat",
+        'I' => "ignore-matching-lines",
+        // `get_value()`'s `OPTION_INTEGER` branch (parse-options.c:260-289) at
+        // `int` precision, naming the switch through `optname()`.
+        'l' => {
+            let message = if value.is_empty() {
+                Some("error: switch `l' expects a numerical value\n".to_string())
+            } else {
+                match super::range_diff::git_parse_signed(value, i32::MIN.into(), i32::MAX.into()) {
+                    Ok(_) => None,
+                    Err(super::range_diff::MagnitudeError::Range) => Some(format!(
+                        "error: value {value} for switch `l' not in range [{},{}]\n",
+                        i32::MIN,
+                        i32::MAX
+                    )),
+                    Err(super::range_diff::MagnitudeError::Invalid) => Some(
+                        "error: switch `l' expects an integer value with an optional k/m/g suffix\n"
+                            .to_string(),
+                    ),
+                }
+            };
+            return Ok(message.map(|m| (m, ExitCode::from(129))));
+        }
+        // `diff_opt_pickaxe_string()`, `diff_opt_pickaxe_regex()` and
+        // `OPT_FILENAME` only store their value.
+        _ => return Ok(None),
+    };
+    rev_opt_value_refusal(repo, long, value)
+}
+
 fn unknown_option_name(args: &[String], idx: usize, positionals: usize) -> String {
     if idx > positionals {
         "(null)".to_string()
@@ -5230,6 +5387,7 @@ impl Options {
         let mut max_age: Option<i64> = None;
         // `-S <revs-file>` (git's `revs_file`), an `OPT_STRING` so the last one wins.
         let mut revs_file: Option<String> = None;
+        let mut encoding: Option<String> = None;
         let mut detect_moved: Option<u32> = None;
         // How many `-C`s were given and the last explicit `-C<score>` / `-M<score>`, which git
         // keeps in `blame_copy_score` / `blame_move_score` and only applies when non-zero.
@@ -5258,6 +5416,7 @@ impl Options {
         // what the revision-option arms below then see — `cmd_blame()` passes
         // `PARSE_OPT_KEEP_UNKNOWN_OPT`.
         let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+        let original_args = args;
         let args = &expanded[..];
 
         let mut i = 0;
@@ -5524,29 +5683,25 @@ impl Options {
                 "--no-show-stats" => show_stats = false,
                 "--no-score-debug" => score_debug = false,
                 _ if a.starts_with("-L") => line_specs.push(a[2..].to_string()),
-                // `--encoding=<enc>` (`OPT_STRING(0, "encoding", ...)`): the encoding the
-                // author names and summaries are written in. Everything here is already
-                // UTF-8, so `utf-8` and `none` are what the output is either way; any
-                // other encoding would need a transcoding step that is not ported, and
-                // silently emitting UTF-8 under a Latin-1 request would be wrong.
+                // `--encoding=<enc>`, `handle_revision_opt()`'s `parse_long_opt("encoding")`
+                // (revision.c:2739-2745): the encoding `get_commit_info()` re-codes each
+                // commit into (builtin/blame.c:205-206); `none` stores the empty string,
+                // which leaves the commit as it is stored.
                 "--encoding" => {
-                    let v = args.get(i + 1).cloned().unwrap_or_default();
-                    i += 1;
-                    if !encoding_is_passthrough(&v) {
-                        bail!(
-                            "unsupported option: --encoding={v} (only utf-8 and none are \
-                             ported; transcoding author names is not)"
-                        );
-                    }
+                    let v = if i + 1 < args.len() {
+                        i += 1;
+                        args[i].clone()
+                    } else {
+                        match trailing_option_missing_value(a)? {
+                            Some(code) => return Ok(ParseOutcome::Reported(code)),
+                            None => String::new(),
+                        }
+                    };
+                    encoding = Some(if v == "none" { String::new() } else { v });
                 }
                 _ if a.starts_with("--encoding=") => {
                     let v = &a["--encoding=".len()..];
-                    if !encoding_is_passthrough(v) {
-                        bail!(
-                            "unsupported option: {a} (only utf-8 and none are ported; \
-                             transcoding author names is not)"
-                        );
-                    }
+                    encoding = Some(if v == "none" { String::new() } else { v.to_string() });
                 }
                 _ if a.starts_with("--abbrev=") => {
                     match parse_abbrev_cb(&a["--abbrev=".len()..]) {
@@ -5676,6 +5831,45 @@ impl Options {
                         i += 1;
                     }
                 }
+                // A short word blame's own table did not claim, as
+                // `parse_revision_opt()` hands it to `handle_revision_opt()`
+                // (revision.c:2768-2780) — see [`revision_short_word`].
+                _ if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 => match revision_short_word(a) {
+                    ShortWord::Dropped => {}
+                    ShortWord::WalkReflogs => bail!("unsupported option: {a}"),
+                    ShortWord::Unknown(name) => {
+                        let word = original_word_index(original_args, i);
+                        let name = if word > pre.len() { "(null)".to_string() } else { name };
+                        return Ok(ParseOutcome::Unknown(name));
+                    }
+                    ShortWord::Value { letter, attached, required } => {
+                        // `get_arg()` (parse-options.c:47-62): a required value not
+                        // attached to its switch is the next argv slot.
+                        let value = if attached.is_empty() && required {
+                            if i + 1 == args.len() {
+                                let mut err = std::io::stderr().lock();
+                                writeln!(err, "error: switch `{letter}' requires a value")?;
+                                err.flush()?;
+                                return Ok(ParseOutcome::Reported(ExitCode::from(129)));
+                            }
+                            i += 1;
+                            Some(args[i].as_str())
+                        } else {
+                            // A `PARSE_OPT_OPTARG` switch with nothing attached
+                            // reaches its callback with a NULL `arg`, which none of
+                            // them refuse.
+                            (!attached.is_empty()).then_some(attached.as_str())
+                        };
+                        if let Some(value) = value {
+                            if let Some((message, code)) = diff_short_value_refusal(repo, letter, value)? {
+                                let mut err = std::io::stderr().lock();
+                                write!(err, "{message}")?;
+                                err.flush()?;
+                                return Ok(ParseOutcome::Reported(code));
+                            }
+                        }
+                    }
+                },
                 // A short option that git's *revision* parser owns and whose value
                 // is simply absent — `-S`, `-G`, `-I`, `-O`, `-n`. `get_arg()`
                 // reports it as ``switch `<c>' requires a value`` at 129 (and `-n`
@@ -5769,6 +5963,7 @@ impl Options {
             indent_heuristic,
             max_age,
             revs_file,
+            encoding,
             detect_moved,
             detect_copied,
             diff_algorithm,
@@ -6649,16 +6844,4 @@ mod tests {
             "(null)"
         );
     }
-}
-
-/// Whether `--encoding=<enc>` asks for the bytes this port already produces: UTF-8 in
-/// any of its spellings, or `none` (git's "do not convert"). git also falls back to
-/// passing the bytes through when the platform's iconv does not know the name, but that
-/// is a silent fallback rather than a promise, so only these are accepted here.
-///
-/// Shared with the history commands, which take the same option for commit messages —
-/// every IDE passes `--encoding=UTF-8` to `log` and `blame` alike.
-pub(crate) fn encoding_is_passthrough(enc: &str) -> bool {
-    let lower = enc.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "utf-8" | "utf8" | "none" | "")
 }

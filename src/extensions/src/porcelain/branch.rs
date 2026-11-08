@@ -1435,9 +1435,12 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
                 .or_insert_with(|| gix::path::into_bstr(path).to_str_lossy().into_owned());
         }
     };
-    if !repo.is_bare() {
-        add("main-worktree/HEAD", checkout_of(&common));
-    }
+    // `get_main_worktree()` (worktree.c:120-146) builds the main entry for a bare
+    // repository too, its path the common dir itself, and
+    // `populate_worktree_map()` (ref-filter.c:2383-2398) keys it by its `HEAD`
+    // like any other, so `%(worktreepath)` of a bare repository's `HEAD` branch
+    // is the repository's path.
+    add("main-worktree/HEAD", checkout_of(&common));
     let Ok(dir) = std::fs::read_dir(common.join("worktrees")) else {
         return map;
     };

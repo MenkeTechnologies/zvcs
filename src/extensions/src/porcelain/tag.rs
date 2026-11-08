@@ -378,6 +378,12 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             positionals.push(typed);
             continue;
         }
+        // `--end-of-options` ends the options as `--` does, by an exact
+        // `strcmp()` ahead of any abbreviation (parse-options.c:1119-1124).
+        if a == "--end-of-options" {
+            operands_only = true;
+            continue;
+        }
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;

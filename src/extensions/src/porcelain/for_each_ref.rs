@@ -1049,7 +1049,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
-        if a == "--" {
+        // `--` and, by the same exact `strcmp()`, `--end-of-options` end the
+        // options (parse-options.c:1113-1124); neither abbreviates.
+        if a == "--" || a == "--end-of-options" {
             only_patterns = true;
             i += 1;
             continue;
@@ -2247,11 +2249,15 @@ fn parse_align_position(s: &str) -> Option<AlignPos> {
     }
 }
 
-/// Pad `content` to `spec.width` display columns per the position; content at or
-/// over the width is returned unchanged (git never truncates). Display width is
-/// the char count — exact for the ASCII refnames this pads in practice.
+/// Pad `content` to `spec.width` display columns per the position, as
+/// `strbuf_utf8_align()` (utf8.c:820-840), which `end_align_handler()` hands
+/// the block's output as a C string (ref-filter.c:1187): the content stops at
+/// its first NUL, its width is `utf8_strnwidth()`'s display columns (a wide
+/// character counts two, a combining one none, invalid UTF-8 its byte length),
+/// and content already as wide as the block is copied unpadded.
 fn pad_align(content: &[u8], spec: &AlignSpec) -> Vec<u8> {
-    let cols = String::from_utf8_lossy(content).chars().count();
+    let content = content.split(|&b| b == 0).next().unwrap_or_default();
+    let cols = crate::utf8::utf8_strnwidth(content, false).max(0) as usize;
     if cols >= spec.width {
         return content.to_vec();
     }
@@ -2502,9 +2508,16 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
             let Some(arg) = m else {
                 return Err(fatal_atom("expected format: %(is-base:<committish>)"));
             };
+            // The same non-quiet `lookup_commit_reference_by_name()` as
+            // ahead-behind (ref-filter.c:920), so a non-commit operand reports
+            // `object.c:178`'s "is a blob, not a commit" before the die.
             let resolved = ctx.repo.and_then(|r| {
                 let id = crate::objname::resolve(r, arg)?;
-                match crate::objname::lookup_commit_reference(r, id) {
+                let found = crate::objname::lookup_commit_reference(r, id);
+                if let Some(note) = found.type_error() {
+                    eprintln!("error: {note}");
+                }
+                match found {
                     crate::objname::CommitRef::Commit(id) => Some(id),
                     _ => None,
                 }
@@ -3404,9 +3417,14 @@ fn render_upstream(
         .expect("checked above")
         .as_bstr();
 
-    // `remotename` / `remoteref` never resolve a tracking ref, so they answer
-    // even for a branch that has no push destination at all.
-    let tracking = if rr.push_remote {
+    // `%(push:remotename)` / `%(push:remoteref)` never resolve a tracking ref,
+    // so they answer even for a branch that has no push destination at all
+    // (ref-filter.c:2510-2511). `%(upstream)` checks `push_remote` nowhere:
+    // every option, those two included, renders empty unless
+    // `branch_get_upstream()` names one (ref-filter.c:2495-2501), so a branch
+    // with a remote but no merge, a merge but no remote, or a merge the
+    // remote's refspecs do not map has no `%(upstream:remotename)` either.
+    let tracking = if rr.push_remote && for_push {
         None
     } else {
         // `branch_get_upstream()`'s value as it stands: for the local remote `.`

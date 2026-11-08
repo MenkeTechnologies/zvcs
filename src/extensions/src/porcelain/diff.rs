@@ -3925,7 +3925,7 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
 
     // `--diff-filter`: keep only deltas whose status letter is selected.
     if let Some(filter) = &diff_filter {
-        deltas.retain(|d| diff_filter_selected(filter, status_char(d)));
+        retain_diff_filter(filter, &mut deltas, |d| (status_char(d), d.score));
     }
 
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
@@ -5190,20 +5190,26 @@ fn mode_kind(mode: u32) -> Option<EntryKind> {
     }
 }
 
-/// `--diff-filter`: an uppercase letter selects a status, its lowercase excludes it.
-/// When only exclusions are given every other status is kept; when any inclusion is
-/// present, unlisted statuses are dropped — matching `diff_opt_diff_filter()`.
-pub(crate) fn diff_filter_selected(filter: &[u8], status: u8) -> bool {
-    let up = status.to_ascii_uppercase();
-    if filter.iter().any(|&f| f == up.to_ascii_lowercase()) {
-        return false;
-    }
-    let has_include = filter.iter().any(|f| f.is_ascii_uppercase());
-    if has_include {
-        filter.contains(&up)
-    } else {
-        true
-    }
+/// `diffcore_apply_filter()` (diff.c:7283-7321) over one queue: which pairs it keeps,
+/// each pair given as its status letter and its `p->score`. `filter` is every
+/// `--diff-filter=` value as written, folded the way `diff_opt_diff_filter()` and
+/// `diff_setup_done()` fold them ([`super::diff_filter`]), so `match_filter()`
+/// (diff.c:7272-7281) answers `B` for a modification `-B` scored, and `*`
+/// (`DIFF_STATUS_FILTER_AON`) keeps the whole queue when any pair matched and clears
+/// it when none did.
+pub(crate) fn diff_filter_keep(filter: &[u8], pairs: &[(u8, u32)]) -> Vec<bool> {
+    let mut folded = super::diff_filter::Filter::default();
+    // Each value passed `accumulate()` when it was parsed, so this cannot fail.
+    let _ = folded.accumulate(&String::from_utf8_lossy(filter));
+    let pairs: Vec<(u8, Option<u32>)> = pairs.iter().map(|&(status, score)| (status, (score != 0).then_some(score))).collect();
+    super::diff_filter::apply(folded, &pairs)
+}
+
+/// [`diff_filter_keep`] applied to a queue in place.
+pub(crate) fn retain_diff_filter<T>(filter: &[u8], queue: &mut Vec<T>, pair: impl Fn(&T) -> (u8, u32)) {
+    let pairs: Vec<(u8, u32)> = queue.iter().map(pair).collect();
+    let mut keep = diff_filter_keep(filter, &pairs).into_iter();
+    queue.retain(|_| keep.next().unwrap_or(false));
 }
 
 // ---------------------------------------------------------------------------
@@ -7285,10 +7291,14 @@ fn commit_deltas(
         find_copies_harder: opts.find_copies_harder,
         break_opt: opts.break_opt,
         rename_empty: opts.rename_empty,
-        rename_limit: repo
-            .config_snapshot()
-            .integer("diff.renameLimit")
-            .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT),
+        // `-l<n>`, else `diff.renameLimit` (diff.c:5317-5318).
+        rename_limit: match opts.rename_limit < 0 {
+            true => repo
+                .config_snapshot()
+                .integer("diff.renameLimit")
+                .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT),
+            false => opts.rename_limit,
+        },
         hash_kind: repo.object_hash(),
         ..Default::default()
     };
@@ -7332,7 +7342,7 @@ fn commit_deltas(
     // `diffcore_apply_filter()` (diffcore-*.c), which `diffcore_std()` runs after
     // rename detection so a pair is judged by the status it finally carries.
     if let Some(filter) = &opts.diff_filter {
-        deltas.retain(|d| diff_filter_selected(filter, status_char(d)));
+        retain_diff_filter(filter, &mut deltas, |d| (status_char(d), d.score));
     }
 
     // `userdiff_find_by_path()` runs on `attr_path`, which `run_diff()` captures
@@ -10544,15 +10554,6 @@ impl GenericPair {
     }
 }
 
-/// `match_filter()` (diff.c:7272-7281): a modification that carries a score (a
-/// rewrite `diffcore_break()` measured) answers to `B`, any other pair to its status.
-fn generic_filter_selected(filter: &[u8], status: u8, score: u32) -> bool {
-    match status == b'M' && score != 0 {
-        true => diff_filter_selected(filter, b'B'),
-        false => diff_filter_selected(filter, status),
-    }
-}
-
 /// `diff_unmodified_pair()` (diff.c:6484-6514) for two tree sides.
 fn generic_unmodified(one: &diffcore_rename::FileSpec, two: &diffcore_rename::FileSpec) -> bool {
     one.valid() == two.valid() && one.mode == two.mode && one.path == two.path && one.oid == two.oid
@@ -10647,13 +10648,16 @@ fn generic_parent_queue(
     diffcore_rename::resolve_rename_copy(&mut q);
 
     let kind = |mode: u32| gix::objs::tree::EntryMode::try_from(mode).ok().map(|m| m.kind());
+    // `diffcore_apply_filter()` (diff.c:7506) over the whole queue, `*` included.
+    let keep = match &scan.filter {
+        Some(filter) => diff_filter_keep(filter, &q.pairs.iter().map(|p| (p.status, p.score)).collect::<Vec<_>>()),
+        None => vec![true; q.pairs.len()],
+    };
     let mut out = Vec::with_capacity(q.pairs.len());
-    for pair in &q.pairs {
+    for (pair, keep) in q.pairs.iter().zip(keep) {
         let (one, two) = (&q.specs[pair.one], &q.specs[pair.two]);
-        if let Some(filter) = &scan.filter {
-            if !generic_filter_selected(filter, pair.status, pair.score) {
-                continue;
-            }
+        if !keep {
+            continue;
         }
         // `intersect_paths()` passes over `diff_unmodified_pair()` (combine-diff.c:50).
         if generic_unmodified(one, two) {

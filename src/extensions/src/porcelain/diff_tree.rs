@@ -2568,7 +2568,7 @@ fn combined_commit(
     walk_opts.filter = ALL_STATUSES;
     walk_opts.route = None;
 
-    let scan = combined_scan(repo, opts)?;
+    let (scan, objfind) = combined_scan(repo, opts)?;
     // Each surviving path with, per parent, the pair `intersect_paths()` recorded
     // for it, that pair's status letter and the parent's name for the path.
     let mut rows: Vec<(BString, Vec<(Change, u8, BString)>)> = Vec::new();
@@ -2619,6 +2619,12 @@ fn combined_commit(
                 }
             }
             rows.push((c.path.clone(), sides));
+        }
+        // `combined_objfind()` (combine-diff.c:1462-1483): keep a path whose result
+        // id or any parent's id is in `opt->objfind` (`match_objfind()`, :1448-1460).
+        if !objfind.is_empty() {
+            let found = |side: Option<Side>| side.is_some_and(|s| objfind.contains(&s.id));
+            rows.retain(|(_, sides)| found(sides[0].0.new) || sides.iter().any(|(c, ..)| found(c.old)));
         }
     }
 
@@ -2720,8 +2726,11 @@ fn combined_commit(
 
     // Pass 3 — the combined patch, from the shared `diff --cc` engine.
     if fmt & OF_PATCH != 0 {
-        let paths: Vec<String> =
-            opts.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        // The paths `combined_objfind()` kept, when it ran, else the pathspec.
+        let paths: Vec<String> = match objfind.is_empty() {
+            true => opts.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
+            false => rows.iter().map(|(path, _)| String::from_utf8_lossy(path).into_owned()).collect(),
+        };
         // `show_combined_header()` (combine-diff.c:931-933, :985) reads
         // `opt->flags.full_index`, `opt->a_prefix`/`opt->b_prefix` and
         // `rev->combined_all_paths` alongside the path set; they are the last four
@@ -2797,7 +2806,11 @@ fn combined_header_opts(diff_args: &[String], all_paths: bool) -> super::diff::C
 /// (combine-diff.c:1542-1548) is false and the multitree scan runs. `diff-tree` is
 /// plumbing: `git_diff_basic_config()` (diff.c:478-487) reads `diff.renameLimit`
 /// but not `diff.renames`, so rename detection waits for `-M`/`-C`.
-fn combined_scan(repo: &gix::Repository, opts: &Opts) -> Result<Option<super::diff::GenericScan>> {
+///
+/// The second value is `opt->objfind` when the multitree scan runs, for
+/// `combined_objfind()` (combine-diff.c:1559-1564) to narrow its paths with; the
+/// generic scan applies `--find-object` in each parent's `diffcore_pickaxe()`.
+fn combined_scan(repo: &gix::Repository, opts: &Opts) -> Result<(Option<super::diff::GenericScan>, Vec<ObjectId>)> {
     use super::diff_pickaxe::Kind;
     use super::diffcore_rename::{parse_break_opt, parse_rename_score, DETECT_COPY, DETECT_RENAME};
     let mut rename = super::diffcore_rename::Options {
@@ -2884,16 +2897,20 @@ fn combined_scan(repo: &gix::Repository, opts: &Opts) -> Result<Option<super::di
     let need_generic_pathscan =
         rename.break_opt != -1 || rename.detect_rename != 0 || content_pickaxe || opts.filter_given;
     if !need_generic_pathscan {
-        return Ok(None);
+        let objfind = match kind {
+            Some(Kind::ObjFind(ids)) => ids,
+            _ => Vec::new(),
+        };
+        return Ok((None, objfind));
     }
-    Ok(Some(super::diff::GenericScan {
+    Ok((Some(super::diff::GenericScan {
         // A routed run has moved `-R` to `route_reverse` (see `needs_pairs`).
         reverse: opts.reverse || opts.route_reverse,
         rename,
         filter,
         keep: None,
         pickaxe: kind.map(|kind| std::rc::Rc::new(super::diff::GenericPickaxe { kind, all: pickaxe_all, text })),
-    }))
+    }), Vec::new()))
 }
 
 /// The `--color[=<when>]` / `--no-color` the command line left in force, the last

@@ -295,6 +295,15 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // file, while a missing `:(optional)<file>` leaves it (parse-options.c:223-233).
     let mut order_assigned = false;
     let mut pending_order = false;
+    // `-l <n>`, the separated spelling of `OPT_INTEGER('l', NULL,
+    // &options->rename_limit, …)` (diff.c:6167): parse-options takes the next argv
+    // entry when nothing is glued on.
+    let mut pending_rename_limit = false;
+    // `--find-object=<object-id>` (`diff_opt_find_object()`, diff.c:5501-5521), each
+    // occurrence one more id in `opt->objfind`; resolved once the repository is
+    // open. `pending_find_object` is the separated spelling.
+    let mut find_object_specs: Vec<String> = Vec::new();
+    let mut pending_find_object = false;
     // `--pickaxe-all` (`o->pickaxe_opts & DIFF_PICKAXE_ALL`) and `--pickaxe-regex`
     // (`DIFF_PICKAXE_REGEX`), the two knobs `diffcore_pickaxe()` reads beside the
     // needle itself: the first keeps the whole queue when any pair matched, the
@@ -464,6 +473,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         let value_slot = pending_pickaxe.is_some()
             || pending_order
+            || pending_rename_limit
+            || pending_find_object
             || pending_line_range
             || pending_ignore_regex
             || pending_move_word.is_some()
@@ -524,6 +535,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         if std::mem::take(&mut pending_order) {
             order_assigned |= crate::parseopt::opt_filename(&mut order_cli, a, crate::parseopt::discovered_prefix)?;
+            continue;
+        }
+        if std::mem::take(&mut pending_find_object) {
+            find_object_specs.push(a.clone());
+            continue;
+        }
+        if std::mem::take(&mut pending_rename_limit) {
+            match super::diff::parse_rename_limit(a) {
+                Ok(n) => patch_opts.rename_limit = n,
+                Err(code) => return Ok(code),
+            }
             continue;
         }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
@@ -622,6 +644,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "-S" => pending_pickaxe = Some('S'),
             "-G" => pending_pickaxe = Some('G'),
             "-O" => pending_order = true,
+            // `-l<n>`: `options->rename_limit` (diff.c:6167), which `diff_setup_done()`
+            // only replaces with `diff.renameLimit` while it is negative
+            // (diff.c:5317-5318).
+            "-l" => pending_rename_limit = true,
+            s if s.len() > 2 && s.starts_with("-l") => match super::diff::parse_rename_limit(&s[2..]) {
+                Ok(n) => patch_opts.rename_limit = n,
+                Err(code) => return Ok(code),
+            },
             s if s.starts_with("-O") => {
                 order_assigned |= crate::parseopt::opt_filename(&mut order_cli, &s[2..], crate::parseopt::discovered_prefix)?;
             }
@@ -716,6 +746,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // combined (`--cc`) diff. A no-op for a single non-merge commit.
             "--first-parent" => first_parent = true,
             "--pickaxe-all" => pickaxe_all = true,
+            "--find-object" => pending_find_object = true,
+            s if s.starts_with("--find-object=") => find_object_specs.push(s["--find-object=".len()..].to_string()),
             "--pickaxe-regex" => pickaxe_regex = true,
             "-i" | "--regexp-ignore-case" => pickaxe_icase = true,
             // The grep dialect flags beside it (revision.c:2686-2696) only choose
@@ -1342,6 +1374,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
     if pending_line_range {
         eprintln!("error: switch `L' requires a value");
+        return Ok(ExitCode::from(129));
+    }
+    if pending_find_object {
+        eprintln!("error: option `find-object' requires a value");
         return Ok(ExitCode::from(129));
     }
     // A trailing `--decorate-refs`/`--decorate-refs-exclude` with nothing after it
@@ -2201,10 +2237,28 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `pickaxe_match()` then counts regex matches where it counted substrings.
     // `diff_setup_done()` (diff.c): `DIFF_PICKAXE_REGEX` is `-S`'s modifier, and git
     // names the pairing explicitly rather than ignoring it.
+    let mut objfind: Vec<ObjectId> = Vec::with_capacity(find_object_specs.len());
+    for spec in &find_object_specs {
+        match crate::objname::find_object(&repo, spec) {
+            Ok(id) => objfind.push(id),
+            Err(e) => return Ok(e.report()),
+        }
+    }
+    // `diff_setup_done()` (diff.c:5241-5253): the pickaxe kinds exclude one another,
+    // and `--pickaxe-all` has no meaning for `--find-object`.
+    if usize::from(pickaxe_s.is_some()) + usize::from(pickaxe_g.is_some()) + usize::from(!objfind.is_empty()) > 1 {
+        return Ok(fatal("options '-G', '-S', and '--find-object' cannot be used together\n"));
+    }
     if pickaxe_regex && pickaxe_g.is_some() {
         return Ok(fatal(
             "options '-G' and '--pickaxe-regex' cannot be used together, \
              use '--pickaxe-regex' with '-S'\n",
+        ));
+    }
+    if pickaxe_all && !objfind.is_empty() {
+        return Ok(fatal(
+            "options '--pickaxe-all' and '--find-object' cannot be used together, \
+             use '--pickaxe-all' with '-G' and '-S'\n",
         ));
     }
     // `diffcore_pickaxe()` compiles `-G`, and `-S` under `--pickaxe-regex`, with
@@ -2227,7 +2281,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             bad_regex.get_or_insert(msg);
             None
         });
-    let pickaxe = Pickaxe { s, g, all: pickaxe_all, bad_regex };
+    let pickaxe = Pickaxe { s, g, objfind, all: pickaxe_all, bad_regex };
 
     let mut out: Vec<u8> = Vec::new();
     // git marks each commit it prints as SHOWN, so a commit named twice (or reached
@@ -3028,6 +3082,9 @@ struct Pickaxe {
     s: Option<super::diff_pickaxe::Needle>,
     /// `-G<regex>`: a filepair hits when any added/removed line matches.
     g: Option<regex::bytes::Regex>,
+    /// `--find-object` (`opt->objfind`): a filepair hits when either valid side's id
+    /// is in the set (diffcore-pickaxe.c:140-145). Empty without the option.
+    objfind: Vec<ObjectId>,
     /// `--pickaxe-all` (`DIFF_PICKAXE_ALL`): when any pair in the queue matched,
     /// `diffcore_pickaxe()` keeps the *whole* queue instead of only the matches —
     /// so the commit shows every file it touched. When nothing matched the queue is
@@ -3041,7 +3098,7 @@ struct Pickaxe {
 
 impl Pickaxe {
     fn active(&self) -> bool {
-        self.s.is_some() || self.g.is_some() || self.bad_regex.is_some()
+        self.s.is_some() || self.g.is_some() || self.bad_regex.is_some() || !self.objfind.is_empty()
     }
 
     /// `regcomp_or_die()` at the first `diffcore_pickaxe()` call.
@@ -3915,8 +3972,11 @@ fn show_commit_record(
         };
         // Only a pass that reached `too_many_rename_candidates()` writes the
         // `diff_options` fields (see `git log`'s `record_rename_warnings`); an
-        // empty report leaves the previous commit's in place.
-        if warn.needed_rename_limit != 0 || warn.degraded_cc_to_c {
+        // empty report leaves the previous commit's in place. A combined record
+        // never writes them: `diff_tree_combined()` runs every rename pass, its
+        // first-parent `--stat` included, on its own copy of the options
+        // (`diffopts = *opt`, combine-diff.c:1518).
+        if !combined && (warn.needed_rename_limit != 0 || warn.degraded_cc_to_c) {
             disp.rename_warn.borrow_mut().current = warn;
         }
         if let Some(specs) = &specs {
@@ -3930,15 +3990,7 @@ fn show_commit_record(
             // (`diffcore_pickaxe()`), where the default keeps just the matches.
             let hit: Vec<bool> = f
                 .iter()
-                .map(|c| {
-                    let mut buf = Vec::new();
-                    emit_patch(repo, &mut buf, c).is_ok()
-                        && super::log::pickaxe_hit_needle(
-                            &buf,
-                            pickaxe.s.as_ref(),
-                            pickaxe.g.as_ref(),
-                        )
-                })
+                .map(|c| pickaxe_pair_hit(repo, c, pickaxe, disp.patch.text))
                 .collect();
             match pickaxe.all && hit.iter().any(|&h| h) {
                 true => {}
@@ -3962,7 +4014,7 @@ fn show_commit_record(
         // `diffcore_apply_filter()`: the name and stat formats report the same
         // filtered queue the patch renders.
         if let Some(filter) = &disp.patch.diff_filter {
-            f.retain(|c| super::diff::diff_filter_selected(filter, c.status));
+            super::diff::retain_diff_filter(filter, &mut f, |c| (c.status, c.score));
         }
         queue_nonempty = !f.is_empty();
         if disp.patch.ws != super::diff::Whitespace::Keep {
@@ -4187,6 +4239,15 @@ fn show_commit_record(
     }
 
     if combined {
+        // `-S`/`-G` are part of what selects `find_paths_generic()`
+        // (combine-diff.c:1542-1548), whose per-parent `diffcore_std()` the
+        // survivors stand for; `--find-object` is masked out of that test.
+        let mut combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
+            repo,
+            &disp.patch,
+            disp.combined_all_paths,
+            pickaxe.active() && pickaxe.objfind.is_empty(),
+        );
         // `find_paths_generic()` (combine-diff.c:1378-1420) runs `diffcore_std()` —
         // and so `diffcore_pickaxe()` — against each parent in turn and intersects
         // what survives, so a path reaches a combined section only when it hit the
@@ -4194,27 +4255,28 @@ fn show_commit_record(
         // intersection of the unfiltered per-parent sets, so testing each path
         // against each parent and keeping the ones that hit everywhere is the same
         // answer. `None` means no pickaxe: nothing to narrow.
+        //
+        // `--find-object` without that scan is `combined_objfind()` over the
+        // multitree paths instead (combine-diff.c:1559-1564), keeping a path whose
+        // result id or any parent's id is a needle (`match_objfind()`,
+        // :1448-1460). A path differs from every parent, so that is the union of
+        // the per-parent hits.
+        let union = combined_hdr.scan.is_none();
         let survivors: Option<Vec<Vec<u8>>> = match pickaxe.active() {
             false => None,
             true => Some(combined_pickaxe_survivors(
-                repo, commit, &parents, pathspecs, disp, pickaxe,
+                repo, commit, &parents, pathspecs, disp, pickaxe, union,
             )?),
         };
         // The pathspec limit the combined writers take: the tree walk's, which the
-        // rename pass sees through (combine-diff.c:1403). An empty survivor list
-        // means "no path at all", so the writers below are skipped outright then.
-        let combined_paths: Vec<String> =
-            pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        // rename pass sees through (combine-diff.c:1403), or the surviving paths
+        // when no per-parent scan carries them. An empty survivor list means "no
+        // path at all", so the writers below are skipped outright then.
         let combined_empty = survivors.as_ref().is_some_and(Vec::is_empty);
-        // `-S`/`-G` are part of what selects `find_paths_generic()`
-        // (combine-diff.c:1542-1548), whose per-parent `diffcore_std()` the
-        // survivors stand for.
-        let mut combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
-            repo,
-            &disp.patch,
-            disp.combined_all_paths,
-            pickaxe.active(),
-        );
+        let combined_paths: Vec<String> = match (&survivors, union) {
+            (Some(kept), true) => kept.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
+            _ => pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
+        };
         if let Some(scan) = &mut combined_hdr.scan {
             scan.keep = survivors;
         }
@@ -4777,6 +4839,14 @@ fn collect_changes(
         gix::diff::Options::default(),
     )?;
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
+    // `diff_tree_oid()` walks the trees through `opt->pathspec`
+    // (`skip_uninteresting()`, tree-diff.c:320-337, :469-471), so the queue
+    // `diffcore_rename()` pairs within holds only the paths the pathspec names: a
+    // rename whose source lies outside it is an addition, never an `R` from a
+    // deletion the walk did not queue.
+    if let Some(specs) = specs {
+        changes.retain(|c| specs.matches(change_path(c)));
+    }
 
     // `diffcore_rename()` reads a blob only with a source and a destination to pair, or
     // with copies or `-B` making every modification a source (diffcore-rename.c:1416-1462),
@@ -4884,9 +4954,11 @@ fn detect_renames(
         find_copies_harder: popts.find_copies_harder,
         break_opt: popts.break_opt,
         rename_empty: popts.rename_empty,
-        rename_limit: cfg
-            .integer("diff.renameLimit")
-            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        // `-l<n>`, else `diff.renameLimit` (diff.c:5317-5318).
+        rename_limit: match popts.rename_limit < 0 {
+            true => cfg.integer("diff.renameLimit").unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+            false => popts.rename_limit,
+        },
         hash_kind: repo.object_hash(),
         ..Default::default()
     };
@@ -5658,6 +5730,26 @@ fn short_oid(repo: &gix::Repository, id: &ObjectId, plain: bool) -> Result<Strin
     Ok(id.attach(repo).shorten()?.to_string())
 }
 
+/// `pickaxe_match()` (diffcore-pickaxe.c:129-182) for one pair of a commit's queue.
+///
+/// `--find-object` compares the ids of the valid sides (:140-145). `-G` passes over
+/// a pair either of whose sides is binary unless `--text` is given (:162-167), and
+/// with `--text` reads the binary sides as lines, which the binary patch line
+/// [`emit_patch`] writes for them would hide.
+fn pickaxe_pair_hit(repo: &gix::Repository, c: &FileChange, pickaxe: &Pickaxe, text: bool) -> bool {
+    if !pickaxe.objfind.is_empty() {
+        let found = |mode: Option<u32>, id: ObjectId| mode.is_some() && pickaxe.objfind.contains(&id);
+        return found(c.old_mode, c.old_id) || found(c.new_mode, c.new_id);
+    }
+    let mut buf = Vec::new();
+    let rendered = match (c.is_binary, pickaxe.g.is_some()) {
+        (true, true) if !text => return false,
+        (true, true) => emit_text_hunks(&mut buf, &c.old_content, &c.new_content),
+        _ => emit_patch(repo, &mut buf, c),
+    };
+    rendered.is_ok() && super::log::pickaxe_hit_needle(&buf, pickaxe.s.as_ref(), pickaxe.g.as_ref())
+}
+
 /// The paths a combined merge's sections survive the pickaxe with.
 ///
 /// `find_paths_generic()` (combine-diff.c:1378-1420) diffs the merge against each
@@ -5673,6 +5765,9 @@ fn combined_pickaxe_survivors(
     pathspecs: &[Vec<u8>],
     disp: &DisplayOpts<'_>,
     pickaxe: &Pickaxe,
+    // Fold the per-parent hits by union rather than intersection: `combined_objfind()`'s
+    // answer, for a `--find-object` the multitree scan carries.
+    union: bool,
 ) -> Result<Vec<Vec<u8>>> {
     let specs = match pathspecs.is_empty() {
         true => None,
@@ -5688,11 +5783,7 @@ fn combined_pickaxe_survivors(
         }
         let hit: Vec<bool> = f
             .iter()
-            .map(|c| {
-                let mut buf = Vec::new();
-                emit_patch(repo, &mut buf, c).is_ok()
-                    && super::log::pickaxe_hit_needle(&buf, pickaxe.s.as_ref(), pickaxe.g.as_ref())
-            })
+            .map(|c| pickaxe_pair_hit(repo, c, pickaxe, disp.patch.text))
             .collect();
         let keep_all = pickaxe.all && hit.iter().any(|&h| h);
         let kept: Vec<Vec<u8>> = f
@@ -5703,6 +5794,10 @@ fn combined_pickaxe_survivors(
             .collect();
         survivors = Some(match survivors {
             None => kept,
+            Some(mut prev) if union => {
+                prev.extend(kept.into_iter().filter(|p| !prev.contains(p)).collect::<Vec<_>>());
+                prev
+            }
             Some(prev) => prev.into_iter().filter(|p| kept.contains(p)).collect(),
         });
     }

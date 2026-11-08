@@ -1237,6 +1237,10 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // `diff_merges_default_to_first_parent()` consults, so `--no-diff-merges
     // --first-parent` keeps a merge diffless while `--first-parent` alone does not.
     let mut explicit_diff_merges = false;
+    // `revs->combined_all_paths` (`--combined-all-paths`, diff-merges.c:145-146):
+    // every mode spelling runs `suppress()` first (diff-merges.c:13-23), which
+    // clears it, so only one written after the last of them survives.
+    let mut combined_all_paths = false;
     // `revs->merges_need_diff` / `revs->merges_imply_patch`. `common_setup()`
     // raises `merges_need_diff` for every mode but `off`, and `-m` clears it again
     // (diff-merges.c:125-127) — which is why `git log -m` alone still prints no
@@ -2417,6 +2421,10 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             merges_need_diff = false;
             remerge = false;
             explicit_diff_merges = true;
+            combined_all_paths = false;
+            // `suppress()` (diff-merges.c:13-23) clears `merges_imply_patch` too, so
+            // `-c -m` asks for no patch on a non-merge.
+            merges_imply_patch = false;
             // `set_separate()`'s second statement, which is not about the diff at
             // all: `revs->simplify_history = 0` (diff-merges.c:38). It is why
             // `git log -m -- <path>` shows a merge that `git log -- <path>`
@@ -2428,12 +2436,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             merges_imply_patch = true;
             remerge = false;
             explicit_diff_merges = true;
+            combined_all_paths = false;
         } else if a == "--cc" {
             diff_merges = DiffMerges::DenseCombined;
             merges_need_diff = true;
             merges_imply_patch = true;
             remerge = false;
             explicit_diff_merges = true;
+            combined_all_paths = false;
         } else if a == "--dd" {
             // `set_first_parent()` (diff-merges.c:43-47) is `set_separate()` plus
             // `first_parent_merges`, so it clears `simplify_history` the way
@@ -2444,6 +2454,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             merges_imply_patch = true;
             remerge = false;
             explicit_diff_merges = true;
+            combined_all_paths = false;
             full_history = true;
         } else if a == "--remerge-diff" {
             // `set_remerge_diff()` plus `merges_imply_patch = 1`
@@ -2453,11 +2464,17 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             merges_need_diff = true;
             merges_imply_patch = true;
             explicit_diff_merges = true;
+            combined_all_paths = false;
             full_history = true;
         } else if a == "--no-diff-merges" {
             diff_merges = DiffMerges::Off;
             merges_need_diff = false;
             remerge = false;
+            explicit_diff_merges = true;
+            combined_all_paths = false;
+            merges_imply_patch = false;
+        } else if a == "--combined-all-paths" {
+            combined_all_paths = true;
             explicit_diff_merges = true;
         } else if let Some(v) = a.strip_prefix("--diff-merges=") {
             match DiffMerges::parse(v) {
@@ -2469,6 +2486,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     // `merges_need_diff` at zero.
                     merges_need_diff = m != DiffMerges::Off;
                     explicit_diff_merges = true;
+                    combined_all_paths = false;
+                    merges_imply_patch = false;
                     // `set_separate()` and `set_first_parent()` (which calls it)
                     // also clear `revs->simplify_history`; `set_combined()`,
                     // `set_dense_combined()` and `set_none()` do not.
@@ -2488,6 +2507,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     remerge = true;
                     merges_need_diff = true;
                     explicit_diff_merges = true;
+                    combined_all_paths = false;
+                    merges_imply_patch = false;
                     full_history = true;
                 }
                 None => {
@@ -2937,6 +2958,16 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         if diff_merges == DiffMerges::Separate {
             diff_merges = DiffMerges::FirstParent;
         }
+    }
+    // `diff_merges_setup_revs()` (diff-merges.c:184-185):
+    //
+    // ```c
+    // if (revs->combined_all_paths && !revs->combine_merges)
+    //         die("--combined-all-paths makes no sense without -c or --cc");
+    // ```
+    if combined_all_paths && !matches!(diff_merges, DiffMerges::Combined | DiffMerges::DenseCombined) {
+        eprintln!("fatal: --combined-all-paths makes no sense without -c or --cc");
+        return Ok(ExitCode::from(128));
     }
 
     // `-L` (`rev->line_level_traverse`). git rejects the combinations it cannot
@@ -5248,7 +5279,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     let combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
         &repo,
         &patch_opts,
-        false,
+        combined_all_paths,
         follow
             || pickaxe_g_re.is_some()
             || pickaxe_regex_error.is_some()
@@ -6577,7 +6608,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // `diffcore_apply_filter()`: the name and stat formats report the
                 // same filtered queue the patch renders.
                 if let Some(filter) = &patch_opts.diff_filter {
-                    files.retain(|f| super::diff::diff_filter_selected(filter, f.status));
+                    super::diff::retain_diff_filter(filter, &mut files, |f| (f.status, f.score));
                 }
                 // `diffcore_pickaxe()` munges the queue itself, so every format below
                 // sees only the pairs that matched — `git log -Sfoo --raw` names the
@@ -6592,7 +6623,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // slot, so the queue it leaves behind is the one every format below
                 // renders.
                 if let Some(re) = &pickaxe_g_re {
-                    grep_filter_files(&repo, re, pickaxe_all, &mut files)?;
+                    grep_filter_files(&repo, re, pickaxe_all, patch_opts.text, &mut files)?;
                 }
                 if has_pickaxe {
                     // Both sides of a rename, since limiting the tree diff to the
@@ -6653,13 +6684,13 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                             other.retain(|f| f.path.starts_with(prefix.as_bytes()));
                         }
                         if let Some(filter) = &patch_opts.diff_filter {
-                            other.retain(|f| super::diff::diff_filter_selected(filter, f.status));
+                            super::diff::retain_diff_filter(filter, &mut other, |f| (f.status, f.score));
                         }
                         if let Some(px) = &pickaxe {
                             pickaxe_filter_files(&repo, px, &mut other)?;
                         }
                         if let Some(re) = &pickaxe_g_re {
-                            grep_filter_files(&repo, re, pickaxe_all, &mut other)?;
+                            grep_filter_files(&repo, re, pickaxe_all, patch_opts.text, &mut other)?;
                         }
                         let here: HashSet<Vec<u8>> = other.into_iter().map(|f| f.path).collect();
                         match objfind {
@@ -6819,22 +6850,31 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                                 .max(MINIMUM_ABBREV),
                             z,
                             true,
-                            false,
+                            combined_all_paths,
                             merge_hdr.scan.as_ref(),
                         )?);
                         separator = true;
                     } else if name_only || name_status {
-                        for (path, letters, _) in super::diff::merge_combined_names(
+                        for (path, letters, names) in super::diff::merge_combined_names(
                             &repo,
                             node.id,
                             &node.parents,
                             combined_limit,
-                            false,
+                            combined_all_paths,
                             merge_hdr.scan.as_ref(),
                         )? {
                             if name_status {
                                 diff.extend_from_slice(letters.as_bytes());
                                 diff.push(fsep);
+                            }
+                            // `show_raw_diff()` prints each parent's name for the path
+                            // before the result's, under either name format
+                            // (combine-diff.c:1268-1274).
+                            if combined_all_paths {
+                                for name in &names {
+                                    diff.extend_from_slice(&name_field(name, z));
+                                    diff.push(fsep);
+                                }
                             }
                             diff.extend_from_slice(&name_field(&path, z));
                             diff.push(fend);
@@ -12669,8 +12709,14 @@ fn grep_filter_files(
     repo: &gix::Repository,
     re: &regex::bytes::Regex,
     all: bool,
+    // `--text` (`o->flags.text`), which lets `-G` read a binary side.
+    text: bool,
     files: &mut Vec<FileChange>,
 ) -> Result<()> {
+    let mut drivers = match text {
+        true => None,
+        false => Some(super::cat_file::Textconv::new(repo)?),
+    };
     let blob = |side: Option<(u32, ObjectId)>| -> Vec<u8> {
         let Some((_, id)) = side else { return Vec::new() };
         repo.find_object(id).map(|o| o.data.clone()).unwrap_or_default()
@@ -12681,6 +12727,19 @@ fn grep_filter_files(
         // than reusing whatever patch the command is about to print, so `-U<n>`,
         // the whitespace flags and `--diff-algorithm` do not reach it.
         let (old, new) = (blob(f.old_side), blob(f.new_side));
+        // `pickaxe_match()` (diffcore-pickaxe.c:162-167): without `--text`, `-G`
+        // passes over a pair either of whose sides `diff_filespec_is_binary()`
+        // (diff.c:3712-3734) calls binary, the path's diff driver first.
+        if let Some(drivers) = drivers.as_mut() {
+            let old_path = f.source.as_deref().unwrap_or(&f.path);
+            let binary = super::filespec::filespec_is_binary;
+            if binary(drivers.binary_attr(old_path.as_bstr())?, &old)
+                || binary(drivers.binary_attr(f.path.as_bstr())?, &new)
+            {
+                hit.push(false);
+                continue;
+            }
+        }
         let before = super::diff_pickaxe::split_lines(&old);
         let after = super::diff_pickaxe::split_lines(&new);
         let mut found = false;

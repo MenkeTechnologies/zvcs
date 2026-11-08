@@ -1915,6 +1915,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `--not` holds at this argv position.
             "--alternate-refs" => {
                 for id in crate::alternate_refs::tips(&repo) {
+                    // `get_reference()`'s `die("bad object %s", name)` under the name
+                    // `add_one_alternate_ref()` gives every tip (revision.c:1873-1878,
+                    // :359-369): an alternate's ref whose object this repository
+                    // cannot read — a receive-pack quarantine's view of a broken ref
+                    // in the store it is about to migrate into, say.
+                    if repo.find_object(id).is_err() {
+                        return Ok(fatal("bad object .alternate"));
+                    }
                     let cmdline_commit = names_a_commit(&repo, id);
                     if let Some(id) = peel_recording_tags(&repo, id, negate, &mut pending) {
                         seeds.push(Seed {
@@ -5064,6 +5072,15 @@ fn pend_non_commit(
     let Ok(object) = repo.find_object(id) else {
         return false;
     };
+    // A tag whose chain ends at a tree or a blob was already handled by
+    // `handle_commit()`'s tag loop in [`resolve_named`], which pended the tags
+    // and the object they peel to — the operand is no error, as with
+    // `git rev-list --objects <tag-on-a-blob>`.
+    if object.kind == gix::object::Kind::Tag {
+        return object
+            .peel_tags_to_end()
+            .is_ok_and(|end| matches!(end.kind, gix::object::Kind::Tree | gix::object::Kind::Blob));
+    }
     if !matches!(object.kind, gix::object::Kind::Tree | gix::object::Kind::Blob) {
         return false;
     }

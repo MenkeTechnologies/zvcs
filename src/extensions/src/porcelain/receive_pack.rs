@@ -92,6 +92,17 @@
 //!     otherwise `push_to_deploy()`'s four children, whose refusals
 //!     (`Working directory has unstaged changes` and the rest) become the `ng`
 //!     reason.
+//!   * **The connectivity check** (`check_connected()`, unless
+//!     `--skip-connectivity-check`): a `rev-list --objects --stdin --not
+//!     --exclude-hidden=receive --all --quiet --alternate-refs` child is fed every
+//!     pushed tip, inside the quarantine, its stderr on band 2; when it fails, each
+//!     tip is asked again on its own and the ones that fail are refused with
+//!     `missing necessary objects`.
+//!   * **Aliased updates** (`check_aliased_updates()`): a command naming a symref
+//!     to a ref another command of the push also writes is skipped when the two
+//!     agree, and both are refused with `inconsistent aliased update` when they do
+//!     not; a symref that does not resolve is `broken symref`. A lone update
+//!     through a symref writes the ref it points at.
 //!   * **`receive.updateServerInfo`** refreshes `info/refs` and
 //!     `objects/info/packs` after the refs move.
 //!   * **`receive.autogc`** hands the repository to
@@ -151,7 +162,13 @@
 //!      consumed and dropped, and the shallow-update switch that governs them is
 //!      deliberately left unread rather than named here: grafting
 //!      the pushed history onto the receiving repository's shallow boundary is
-//!      not implemented.
+//!      not implemented, so a push whose history ends at a shallow commit this
+//!      repository lacks fails the connectivity check (`missing necessary
+//!      objects`) where git says `shallow update not allowed`, or, under
+//!      `receive.shallowUpdate`, extends `shallow`. A shallow push whose
+//!      boundary this repository already has is served in full.
+//!   2. **A delete through a symref** is refused rather than deleting the ref
+//!      the symref points at.
 //!
 //! Object alternates (git appends one `<oid> .have` line per alternate ref) bail
 //! rather than producing a short advertisement.
@@ -230,6 +247,9 @@ struct Opts {
     /// a push certificate may echo a nonce some *other* process minted — which
     /// is the only situation `receive.certNonceSlop` grades.
     stateless_rpc: bool,
+    /// `--skip-connectivity-check` (`OPT_HIDDEN_BOOL`, builtin/receive-pack.c:2506):
+    /// `execute_commands()` runs no `check_connected()` pass over the pushed tips.
+    skip_connectivity_check: bool,
     /// The single `<git-dir>` operand, exactly as spelled on the command line.
     dir: String,
 }
@@ -351,7 +371,7 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     if opts.advertise_only {
         return Ok(ExitCode::SUCCESS);
     }
-    receive(&mut repo, &config, opts.stateless_rpc, opts.quiet)
+    receive(&mut repo, &config, &opts)
 }
 
 /// Either a fully parsed command line, or a terminal exit code for the
@@ -367,6 +387,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
     let mut quiet = false;
     let mut advertise_only = false;
     let mut stateless_rpc = false;
+    let mut skip_connectivity_check = false;
     let mut positionals: Vec<&str> = Vec::new();
     let mut no_more_opts = false;
 
@@ -403,7 +424,11 @@ fn parse(args: &[String]) -> Result<Parsed> {
             };
             let known = matches!(
                 name,
-                "quiet" | "http-backend-info-refs" | "advertise-refs" | "stateless-rpc"
+                "quiet"
+                    | "http-backend-info-refs"
+                    | "advertise-refs"
+                    | "stateless-rpc"
+                    | "skip-connectivity-check"
             );
             if known && value.is_some() {
                 eprintln!("error: option `{name}' takes no value");
@@ -413,9 +438,10 @@ fn parse(args: &[String]) -> Result<Parsed> {
                 "quiet" => quiet = on,
                 "http-backend-info-refs" | "advertise-refs" => advertise_only = on,
                 "stateless-rpc" => stateless_rpc = on,
+                "skip-connectivity-check" => skip_connectivity_check = on,
                 // Real but unported git options; the receive path they belong
                 // to is not implemented, so accepting them would mislead.
-                "skip-connectivity-check" | "reject-thin-pack-for-testing" | "signed-push" => {
+                "reject-thin-pack-for-testing" | "signed-push" => {
                     let flag = format!("--{name}");
                     bail!("unsupported flag {flag:?} ({PORTED})")
                 }
@@ -457,6 +483,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
         quiet,
         advertise_only,
         stateless_rpc,
+        skip_connectivity_check,
         dir: (*dir).to_string(),
     }))
 }
@@ -628,6 +655,11 @@ struct Command {
     /// `cmd->did_not_exist`: a delete of a ref that was already gone. It keeps
     /// the ref out of `post-receive`/`post-update` without being an error.
     did_not_exist: bool,
+    /// `cmd->skip_update`: `check_aliased_update()` found this command writing
+    /// a ref another command of the push also writes, through a symref, so
+    /// `update()` never runs for it (builtin/receive-pack.c:1685-1727). Unlike
+    /// `error`, it leaves the `ok` the client is told and the hooks' view alone.
+    skip_update: bool,
     /// `cmd->run_proc_receive`: `receive.procReceiveRefs` matched, so the
     /// `proc-receive` hook owns this ref instead of the ref store. Cleared again
     /// when the hook answers `option fall-through`.
@@ -638,6 +670,13 @@ struct Command {
     /// as well as) the ref the client asked for. Only `report-status-v2` can
     /// carry these.
     reports: Vec<PushReport>,
+}
+
+impl Command {
+    /// `should_process_cmd()` (builtin/receive-pack.c:1851-1854).
+    fn should_process(&self) -> bool {
+        self.error.is_none() && !self.skip_update
+    }
 }
 
 /// git's `struct ref_push_report` — one `option`-decorated line of a
@@ -1133,7 +1172,8 @@ To squelch this message, you can set it to 'refuse'.
 /// `send-pack` speaks: pkt-line commands, then a flush, then a raw (non-pkt) pack,
 /// then a plain pkt-line `report-status`. An empty command list (immediate flush) is
 /// a no-op success, matching a client that connects and hangs up.
-fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, quiet: bool) -> Result<ExitCode> {
+fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<ExitCode> {
+    let stateless_rpc = opts.stateless_rpc;
     // Each accepted ref update writes a reflog; a bare remote often has no configured
     // identity, so seed a synthesized system default (as git does) to keep the reflog
     // write from failing the push.
@@ -1147,7 +1187,6 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
     let mut cmds: Vec<Command> = Vec::new();
     let mut caps: Vec<u8> = Vec::new();
     let mut cert: Vec<u8> = Vec::new();
-    let mut first_line = true;
     loop {
         // git's `packet_read()` failures are `die()`s, so they print `fatal: `
         // on receive-pack's own stderr and stop the session there.
@@ -1159,17 +1198,32 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
                 return Ok(ExitCode::from(128));
             }
         };
-        let (body, cap) = match (first_line, line.iter().position(|&b| b == 0)) {
-            (true, Some(n)) => (&line[..n], Some(line[n + 1..].to_vec())),
-            _ => (&line[..], None),
-        };
-        first_line = false;
-        if let Some(c) = cap {
-            caps = c;
-        }
-        let text = std::str::from_utf8(body)
+        let nul = line.iter().position(|&b| b == 0);
+        let text = std::str::from_utf8(&line[..nul.unwrap_or(line.len())])
             .map_err(|_| anyhow!("protocol error: non-utf8 command"))?
             .trim_end();
+
+        // A shallow client announces its grafts before the commands. The shallow
+        // machinery is not ported, so the list is consumed and dropped rather
+        // than mis-parsed as a command.
+        if let Some(rest) = text.strip_prefix("shallow ") {
+            if gix::ObjectId::from_hex(rest.as_bytes()).is_err() {
+                eprintln!("fatal: protocol error: expected shallow sha, got '{rest}'");
+                return Ok(ExitCode::from(128));
+            }
+            continue;
+        }
+
+        // `read_head_info()` reads a feature list off every other line that
+        // carries one, the first command's included, and only ever sets flags
+        // (builtin/receive-pack.c:2212-2246): the `shallow` lines a shallow
+        // client sends first carry none, so the list is on the command after them.
+        if let Some(n) = nul {
+            if !caps.is_empty() {
+                caps.push(b' ');
+            }
+            caps.extend_from_slice(&line[n + 1..]);
+        }
 
         // `push-cert` opens the certificate block: pkt-lines with their newlines
         // intact, up to `push-cert-end`. A flush inside the block ends the whole
@@ -1183,16 +1237,6 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
                     return Ok(ExitCode::from(128));
                 }
             }
-        }
-        // A shallow client announces its grafts before the commands. The shallow
-        // machinery is not ported, so the list is consumed and dropped rather
-        // than mis-parsed as a command.
-        if let Some(rest) = text.strip_prefix("shallow ") {
-            if gix::ObjectId::from_hex(rest.as_bytes()).is_err() {
-                eprintln!("fatal: protocol error: expected shallow sha, got '{rest}'");
-                return Ok(ExitCode::from(128));
-            }
-            continue;
         }
 
         cmds.push(parse_command(text)?);
@@ -1223,6 +1267,8 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
         sideband: cap_present(&caps, b"side-band-64k"),
         keep_alive: config.keep_alive,
     };
+    // `-q`, or the `quiet` capability the client asked for (builtin/receive-pack.c:2225-2226).
+    let quiet = opts.quiet || cap_present(&caps, b"quiet");
     let report_v2 = cap_present(&caps, b"report-status-v2");
     let use_atomic = config.advertise_atomic && cap_present(&caps, b"atomic");
     let use_push_options = config.advertise_push_options && cap_present(&caps, b"push-options");
@@ -1264,9 +1310,7 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
             Some(mut t) => {
                 // git reports the *child*'s failure rather than the reason; the reason
                 // itself has already gone back on band 2, printed by that child.
-                // `-q`, or the `quiet` capability the client asked for (builtin/receive-pack.c:2225-2226),
-                // keeps `index-pack` from drawing its delta meter.
-                let quiet = quiet || cap_present(&caps, b"quiet");
+                // `quiet` keeps `index-pack` from drawing its delta meter.
                 if let Err(status) = ingest_pack(repo, &mut t, &mut stdin, config, &mut band, quiet) {
                     unpack = Err(status);
                 }
@@ -1291,6 +1335,8 @@ fn receive(repo: &mut gix::Repository, config: &Config, stateless_rpc: bool, qui
         use_push_options.then_some(&push_options[..]),
         cert.as_ref(),
         transaction.as_mut(),
+        !opts.skip_connectivity_check,
+        quiet,
         &mut band,
     );
     // `odb_transaction_finalize()` (object-file.c:1452-1464).
@@ -1402,6 +1448,7 @@ fn parse_command(text: &str) -> Result<Command> {
         name: name.to_string(),
         error: None,
         did_not_exist: false,
+        skip_update: false,
         proc_receive: false,
         proc_receive_returned: false,
         reports: Vec::new(),
@@ -1422,6 +1469,8 @@ fn execute_commands(
     push_options: Option<&[String]>,
     cert: Option<&PushCert>,
     transaction: Option<&mut Transaction>,
+    check_connectivity: bool,
+    quiet: bool,
     band: &mut Band,
 ) {
     if unpack.is_err() {
@@ -1429,6 +1478,26 @@ fn execute_commands(
             cmd.error = Some("unpacker error".into());
         }
         return;
+    }
+
+    // `if (!skip_connectivity_check)` (builtin/receive-pack.c:2034-2059): one
+    // `check_connected()` over every tip a command still means to write
+    // (`iterate_receive_command_list()`, :1806-1821), its rev-list's stderr on
+    // band 2 when there is one (`opt.err_fd = muxer.in`), and the meter only
+    // there and only unquiet (`opt.progress = err_fd && !quiet`). When it fails,
+    // `set_connectivity_errors()` asks again one command at a time.
+    if check_connectivity {
+        let env = odb_transaction_env(transaction.as_deref());
+        let tips: Vec<gix::ObjectId> = cmds
+            .iter()
+            .filter(|c| c.new != zero && !c.skip_update)
+            .map(|c| c.new)
+            .collect();
+        let progress = band.sideband && !quiet;
+        let relay = band.sideband.then_some(&mut *band);
+        if check_connected(repo, &tips, env, true, relay, progress) {
+            set_connectivity_errors(repo, cmds, zero, env);
+        }
     }
 
     // `reject_updates_to_hidden()`: a ref the advertisement suppressed cannot be
@@ -1467,15 +1536,11 @@ fn execute_commands(
     // only hook that runs inside the quarantine, and so the only one handed
     // `odb_transaction_env()` (builtin/receive-pack.c:944-945, :2081).
     let mut env = hook_env(repo, push_options.unwrap_or_default(), cert);
-    if let Some(t) = &transaction {
-        env.set.extend(
-            t.quarantine
-                .as_ref()
-                .into_iter()
-                .flat_map(|q| q.env())
-                .map(|(k, v)| (k.clone(), v.to_string_lossy().into_owned())),
-        );
-    }
+    env.set.extend(
+        odb_transaction_env(transaction.as_deref())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string_lossy().into_owned())),
+    );
     if run_receive_hook(repo, "pre-receive", cmds, false, &env, band) {
         for cmd in cmds.iter_mut() {
             if cmd.error.is_none() {
@@ -1503,6 +1568,8 @@ fn execute_commands(
             return;
         }
     }
+
+    check_aliased_updates(repo, cmds, band);
 
     let head = head_name(repo);
 
@@ -1705,7 +1772,7 @@ fn execute_commands_non_atomic(
     for deletions in [true, false] {
         let mut queued = Vec::new();
         for i in 0..cmds.len() {
-            if cmds[i].error.is_some() || cmds[i].proc_receive || (cmds[i].new == zero) != deletions {
+            if !cmds[i].should_process() || cmds[i].proc_receive || (cmds[i].new == zero) != deletions {
                 continue;
             }
             match check_command(repo, config, &cmds[i], zero, head, band) {
@@ -1745,7 +1812,7 @@ fn execute_commands_atomic(
     let mut reported: Option<&str> = None;
 
     for i in 0..cmds.len() {
-        if cmds[i].error.is_some() || cmds[i].proc_receive {
+        if !cmds[i].should_process() || cmds[i].proc_receive {
             continue;
         }
         match check_command(repo, config, &cmds[i], zero, head, band) {
@@ -1778,6 +1845,246 @@ fn execute_commands_atomic(
             }
         }
     }
+}
+
+/// `odb_transaction_env()`: the quarantine's `GIT_OBJECT_DIRECTORY`,
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` and `GIT_QUARANTINE_PATH`, which a child must
+/// be handed to see the objects the push brought before they are migrated.
+fn odb_transaction_env(transaction: Option<&Transaction>) -> &[(String, std::ffi::OsString)] {
+    transaction
+        .and_then(|t| t.quarantine.as_ref())
+        .map(|q| q.env())
+        .unwrap_or_default()
+}
+
+/// `check_connected()` (connected.c:76-200) as receive-pack calls it, with no
+/// transport and no shallow file: `git rev-list --objects --stdin --not
+/// [--exclude-hidden=receive] --all --quiet --alternate-refs` fed `tips`, which
+/// fails when anything they reach is missing from the repository. Returns
+/// whether it failed — the C function's non-zero.
+///
+/// `relay` is `opt.err_fd`: the child's stderr goes to band 2 through
+/// [`relay_child_output`] when it is set, and is inherited otherwise
+/// (`rev_list.no_stderr = opt->quiet`, which receive-pack never sets).
+fn check_connected(
+    repo: &gix::Repository,
+    tips: &[gix::ObjectId],
+    env: &[(String, std::ffi::OsString)],
+    exclude_hidden: bool,
+    relay: Option<&mut Band>,
+    progress: bool,
+) -> bool {
+    // `oid = fn(cb_data); if (!oid) return err;`
+    let mut tips = tips;
+    if tips.is_empty() {
+        return false;
+    }
+    // `check_connected_promisor()` (connected.c:39-67): connected outright when
+    // every tip is in a promisor pack. The walk stops at the first tip that is
+    // not, and rev-list is fed from that one on — the tips before it are not
+    // asked about again.
+    let promisor = super::rev_list::has_promisor_remote(repo);
+    if promisor {
+        let held = super::rev_list::promisor_pack_objects(repo);
+        match tips.iter().position(|id| !held.contains(id)) {
+            None => return false,
+            Some(first) => tips = &tips[first..],
+        }
+    }
+
+    let mut cmd = match crate::hosted::git_exe() {
+        Ok(exe) => std::process::Command::new(exe),
+        Err(_) => {
+            eprintln!("error: Could not run 'git rev-list'");
+            return true;
+        }
+    };
+    cmd.args(["rev-list", "--objects", "--stdin"]);
+    if promisor {
+        cmd.arg("--exclude-promisor-objects");
+    }
+    cmd.arg("--not");
+    // `opt->exclude_hidden_refs_section`, which only the joint check sets, to
+    // `"receive"` (builtin/receive-pack.c:2051).
+    if exclude_hidden {
+        cmd.arg("--exclude-hidden=receive");
+    }
+    cmd.args(["--all", "--quiet", "--alternate-refs"]);
+    if progress {
+        cmd.arg("--progress=Checking connectivity");
+    }
+    let (dir, git_dir) = enter_repo_dir(repo);
+    cmd.current_dir(dir)
+        .env("GIT_DIR", git_dir)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::piped())
+        // `rev_list.no_stdout = 1`.
+        .stdout(std::process::Stdio::null())
+        .stderr(if relay.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::inherit()
+        });
+    let Ok(mut child) = cmd.spawn() else {
+        eprintln!("error: Could not run 'git rev-list'");
+        return true;
+    };
+
+    // `fprintf(rev_list_in, "%s\n", oid_to_hex(oid))` for each tip, with SIGPIPE
+    // ignored: a rev-list that died early is reported by its exit status, and only
+    // a write failure other than EPIPE/EINVAL is worth a word of its own.
+    let mut failed = false;
+    if let Some(mut sink) = child.stdin.take() {
+        let text: String = tips.iter().map(|id| format!("{id}\n")).collect();
+        if let Err(e) = sink.write_all(text.as_bytes()).and_then(|()| sink.flush()) {
+            if !matches!(e.raw_os_error(), Some(libc::EPIPE) | Some(libc::EINVAL)) {
+                eprintln!("error: failed write to rev-list: {}", crate::external::strerror(&e));
+            }
+            failed = true;
+        }
+    }
+    if let Some(band) = relay {
+        relay_child_output(&mut child, band);
+    }
+    !child.wait().is_ok_and(|status| status.success()) || failed
+}
+
+/// `set_connectivity_errors()` (builtin/receive-pack.c:1773-1799): after the
+/// joint check failed, each command's tip on its own — every command, whatever
+/// it already carries — with the child's stderr on receive-pack's own (`opt`
+/// has no `err_fd` here), no meter and no `--exclude-hidden`. A tip that fails
+/// is `missing necessary objects`; a delete has no tip and passes
+/// (`command_singleton_iterator()`).
+fn set_connectivity_errors(
+    repo: &gix::Repository,
+    cmds: &mut [Command],
+    zero: gix::ObjectId,
+    env: &[(String, std::ffi::OsString)],
+) {
+    for cmd in cmds.iter_mut() {
+        let tip: &[gix::ObjectId] = if cmd.new == zero { &[] } else { std::slice::from_ref(&cmd.new) };
+        if check_connected(repo, tip, env, false, None, false) {
+            cmd.error = Some("missing necessary objects".into());
+        }
+    }
+}
+
+/// `check_aliased_updates()` (builtin/receive-pack.c:1742-1761): a command whose
+/// ref is a symref to the ref another command of the same push writes is not run
+/// on its own. When the two agree on both values the symref's command is only
+/// skipped (and reported `ok`); when they disagree both are refused.
+fn check_aliased_updates(repo: &gix::Repository, cmds: &mut [Command], band: &mut Band) {
+    for i in 0..cmds.len() {
+        if cmds[i].error.is_some() {
+            continue;
+        }
+        // `check_aliased_update()` (:1729-1740): resolve
+        // `get_git_namespace() + cmd->ref_name` with no `RESOLVE_REF_READING`.
+        let (dst_name, is_symref) = resolve_ref_unsafe(repo, &cmds[i].name);
+        // `check_aliased_update_internal()` (:1685-1727).
+        if !is_symref {
+            continue;
+        }
+        let Some(dst_name) = dst_name else {
+            band.error(&format!("refusing update to broken symref '{}'", cmds[i].name));
+            cmds[i].skip_update = true;
+            cmds[i].error = Some("broken symref".into());
+            continue;
+        };
+        // `dst_name = strip_namespace(dst_name)`. A target outside the namespace
+        // strips to NULL, which no command can be named; it is left alone.
+        let prefix = repo.namespace().map(|ns| ns.as_bstr().to_string()).unwrap_or_default();
+        let Some(dst_name) = dst_name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        // `string_list_lookup(list, dst_name)` over every command's ref name.
+        let Some(j) = cmds.iter().position(|c| c.name == dst_name) else {
+            continue;
+        };
+        cmds[i].skip_update = true;
+        if cmds[i].old == cmds[j].old && cmds[i].new == cmds[j].new {
+            continue;
+        }
+        cmds[j].skip_update = true;
+        let abbrev = |id: &gix::ObjectId| crate::abbrev::default_unique_abbrev(repo, id);
+        band.error(&format!(
+            "refusing inconsistent update between symref '{}' ({}..{}) and its target '{}' ({}..{})",
+            cmds[i].name,
+            abbrev(&cmds[i].old),
+            abbrev(&cmds[i].new),
+            cmds[j].name,
+            abbrev(&cmds[j].old),
+            abbrev(&cmds[j].new),
+        ));
+        cmds[i].error = Some("inconsistent aliased update".into());
+        cmds[j].error = Some("inconsistent aliased update".into());
+    }
+}
+
+/// `SYMREF_MAXDEPTH` (refs.h): how many symrefs a resolution follows.
+const SYMREF_MAXDEPTH: usize = 5;
+
+/// `refs_resolve_ref_unsafe(refs, get_git_namespace() + name, 0, NULL, &flag)`
+/// (refs.c:2113-2194): the full name the chain of symrefs
+/// starting at `name` ends on, and whether there was a symref in it
+/// (`REF_ISSYMREF`). Without `RESOLVE_REF_READING` a missing ref ends the chain
+/// rather than failing it; a malformed name, an unreadable ref or a chain longer
+/// than [`SYMREF_MAXDEPTH`] yields `None`.
+fn resolve_ref_unsafe(repo: &gix::Repository, name: &str) -> (Option<String>, bool) {
+    let prefix = repo.namespace().map(|ns| ns.as_bstr().to_string()).unwrap_or_default();
+    // The chain is read raw: a symref's target is a full on-disk name, never
+    // namespaced again.
+    let mut raw = repo.clone();
+    raw.clear_namespace();
+    let mut refname = format!("{prefix}{name}");
+    let mut is_symref = false;
+    let mut resolved = None;
+    for _ in 0..SYMREF_MAXDEPTH {
+        if !super::check_ref_format::check_refname_format(
+            refname.as_bytes(),
+            super::check_ref_format::ALLOW_ONELEVEL,
+        ) {
+            break;
+        }
+        match raw.try_find_reference(refname.as_str()) {
+            Ok(Some(found)) if found.name().as_bstr() == refname.as_str() => match found.target() {
+                gix::refs::TargetRef::Symbolic(target) => {
+                    is_symref = true;
+                    refname = target.as_bstr().to_string();
+                }
+                gix::refs::TargetRef::Object(_) => {
+                    resolved = Some(refname);
+                    break;
+                }
+            },
+            // A missing ref is OK.
+            Ok(_) => {
+                resolved = Some(refname);
+                break;
+            }
+            // `parse_loose_ref_contents()` takes `ref: <anything>` as a symref
+            // before the loop's `check_refname_format()` refuses its target
+            // (refs/files-backend.c, refs.c:2178-2185); gix refuses the file
+            // whole, so the `ref:` it holds is looked for here.
+            Err(_) => {
+                is_symref |= loose_ref_is_symref(&raw, &refname);
+                break;
+            }
+        }
+    }
+    (resolved, is_symref)
+}
+
+/// Whether the loose file for `refname` starts with `ref:`, the files backend's
+/// symref marker. Per-worktree names live in the git directory, the rest in the
+/// common one (`files_ref_path()`).
+fn loose_ref_is_symref(repo: &gix::Repository, refname: &str) -> bool {
+    let per_worktree = !refname.contains('/')
+        || ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter()
+            .any(|p| refname.starts_with(p));
+    let base = if per_worktree { repo.git_dir() } else { repo.common_dir() };
+    std::fs::read(base.join(refname)).is_ok_and(|content| content.starts_with(b"ref:"))
 }
 
 /// The largest payload one side-band packet can carry: 65520 minus the 4-byte
@@ -2508,7 +2815,13 @@ fn ref_edit(
             new: Target::Object(new),
         }
     };
-    Ok(RefEdit { change, name: full, deref: false })
+    // `update()` passes no `REF_NO_DEREF` (builtin/receive-pack.c:1603-1648), so an
+    // update naming a symref writes the ref it points at, and the symref keeps only
+    // a log entry (`split_symref_update()`, refs/files-backend.c:2499-2610). A
+    // delete through a symref is not followed here: gix compares the old value
+    // against the symref itself and refuses it.
+    let deref = new != zero;
+    Ok(RefEdit { change, name: full, deref })
 }
 
 // ---------------------------------------------------------------------------
@@ -3246,7 +3559,7 @@ fn run_proc_receive_hook(
     if !failed {
         let mut request = Vec::new();
         for cmd in cmds.iter() {
-            if !cmd.proc_receive || cmd.error.is_some() {
+            if !cmd.proc_receive || cmd.skip_update || cmd.error.is_some() {
                 continue;
             }
             pkt_line(

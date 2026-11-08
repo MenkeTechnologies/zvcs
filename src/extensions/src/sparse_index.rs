@@ -388,6 +388,18 @@ pub fn path_in_sparse_checkout(repo: &gix::Repository, path: &[u8]) -> bool {
     }
 }
 
+/// [`path_in_sparse_checkout`] for a caller that asks it of every index entry, as
+/// `init_sparse_checkout_patterns()` reads the pattern file once per index (dir.c:1560-1574):
+/// the patterns are loaded here once and the returned closure only matches.
+pub fn path_in_sparse_checkout_matcher(repo: &gix::Repository) -> impl Fn(&[u8]) -> bool {
+    let settings = settings(repo);
+    let patterns = settings
+        .apply_sparse_checkout
+        .then(|| crate::porcelain::sparse_checkout::UnpackPatterns::load(repo, settings.cone))
+        .flatten();
+    move |path: &[u8]| patterns.as_ref().is_none_or(|p| p.path_in_sparse_checkout(path))
+}
+
 /// `path_in_cone_mode_sparse_checkout()` (dir.c:1631-1635): [`path_in_sparse_checkout`], except
 /// that patterns which are not cone-shaped take every path in.
 pub fn path_in_cone_mode_sparse_checkout(repo: &gix::Repository, path: &[u8]) -> bool {

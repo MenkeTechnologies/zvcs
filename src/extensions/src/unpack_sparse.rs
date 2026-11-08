@@ -556,63 +556,74 @@ impl SparseCheckout {
     /// not entered, a directory a gitlink names is skipped, and `.git` is never looked at
     /// (`treat_path()`, `treat_directory()`, dir.c).
     fn untracked_under(&self, wt: &mut Worktree<'_, '_>, prefix: &BString) -> bool {
-        let Some(workdir) = wt.repo.workdir().map(std::path::Path::to_path_buf) else {
-            return false;
+        let (repo, src) = (wt.repo, wt.src);
+        untracked_under(repo, src, prefix, &mut |name, dtype| self.excluded(wt, name, dtype))
+    }
+}
+
+/// [`SparseCheckout::untracked_under`] against `src`, with `excluded` standing for
+/// `o->internal.dir`: `verify_clean_subdirectory()`'s `read_directory()` for any
+/// `unpack_trees()` caller, sparse or not.
+pub(crate) fn untracked_under(
+    repo: &gix::Repository,
+    src: &gix::index::File,
+    prefix: &BString,
+    excluded: &mut dyn FnMut(&BStr, Mode) -> bool,
+) -> bool {
+    let Some(workdir) = repo.workdir().map(std::path::Path::to_path_buf) else {
+        return false;
+    };
+    let icase = repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
+    let mut pending: Vec<BString> = vec![prefix.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(read) = std::fs::read_dir(workdir.join(gix::path::from_bstr(dir.as_bstr()).as_ref())) else {
+            continue;
         };
-        let icase = wt.repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
-        let mut pending: Vec<BString> = vec![prefix.clone()];
-        while let Some(dir) = pending.pop() {
-            let Ok(read) = std::fs::read_dir(workdir.join(gix::path::from_bstr(dir.as_bstr()).as_ref())) else {
+        for entry in read.flatten() {
+            let file_name = gix::path::os_str_into_bstr(&entry.file_name()).map(|n| n.to_owned());
+            let Ok(file_name) = file_name else { continue };
+            if file_name == ".git" {
                 continue;
-            };
-            for entry in read.flatten() {
-                let file_name = gix::path::os_str_into_bstr(&entry.file_name()).map(|n| n.to_owned());
-                let Ok(file_name) = file_name else { continue };
-                if file_name == ".git" {
+            }
+            let Ok(file_type) = entry.file_type() else { continue };
+            let mut rel = dir.clone();
+            rel.extend_from_slice(&file_name);
+            if !file_type.is_dir() {
+                // `index_file_exists(istate, path, len, ignore_case)`.
+                let tracked = src.entry_by_path(rel.as_bstr()).is_some()
+                    || (icase
+                        && src
+                            .entries()
+                            .iter()
+                            .any(|e| e.path(src).eq_ignore_ascii_case(rel.as_slice())));
+                if tracked || !(file_type.is_file() || file_type.is_symlink()) {
                     continue;
                 }
-                let Ok(file_type) = entry.file_type() else { continue };
-                let mut rel = dir.clone();
-                rel.extend_from_slice(&file_name);
-                if !file_type.is_dir() {
-                    // `index_file_exists(istate, path, len, ignore_case)`.
-                    let tracked = wt.src.entry_by_path(rel.as_bstr()).is_some()
-                        || (icase
-                            && wt
-                                .src
-                                .entries()
-                                .iter()
-                                .any(|e| e.path(wt.src).eq_ignore_ascii_case(rel.as_slice())));
-                    if tracked || !(file_type.is_file() || file_type.is_symlink()) {
-                        continue;
-                    }
-                    if !self.excluded(wt, rel.as_bstr(), Mode::FILE) {
-                        return true;
-                    }
-                    continue;
-                }
-                if self.excluded(wt, rel.as_bstr(), Mode::DIR) {
-                    continue;
-                }
-                // `directory_exists_in_index()`: a gitlink is skipped, a directory the index
-                // has entries under is entered.
-                if wt
-                    .src
-                    .entry_by_path(rel.as_bstr())
-                    .is_some_and(|e| e.mode == Mode::COMMIT)
-                {
-                    continue;
-                }
-                rel.push(b'/');
-                let in_index = wt.src.prefixed_entries_range(rel.as_bstr()).is_some();
-                if !in_index && is_nonbare_repository_dir(&entry.path()) {
+                if !excluded(rel.as_bstr(), Mode::FILE) {
                     return true;
                 }
-                pending.push(rel);
+                continue;
             }
+            if excluded(rel.as_bstr(), Mode::DIR) {
+                continue;
+            }
+            // `directory_exists_in_index()`: a gitlink is skipped, a directory the index
+            // has entries under is entered.
+            if src
+                .entry_by_path(rel.as_bstr())
+                .is_some_and(|e| e.mode == Mode::COMMIT)
+            {
+                continue;
+            }
+            rel.push(b'/');
+            let in_index = src.prefixed_entries_range(rel.as_bstr()).is_some();
+            if !in_index && is_nonbare_repository_dir(&entry.path()) {
+                return true;
+            }
+            pending.push(rel);
         }
-        false
     }
+    false
 }
 
 /// What `verify_absent_1()` and `verify_clean_subdirectory()` read: `o->src_index` with its loop

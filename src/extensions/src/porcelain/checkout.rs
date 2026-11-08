@@ -3973,6 +3973,85 @@ pub(super) fn set_force(on: bool) {
     FORCE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `verify_absent(merge, ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN, o)` for
+/// `merged_entry()` under `UNPACK_RESET_PROTECT_UNTRACKED` (unpack-trees.c:2479-2535), the
+/// entry `path` of `mode` being one `old` does not hold: what stands in its way, as
+/// `unpack_plumbing_errors[]` words it, or `None`. `check_leading_path()` finds the first
+/// leading component that is not a directory, which `check_ok_to_remove()` (:2419-2473) then
+/// weighs as `DT_UNKNOWN`; otherwise the path itself is weighed as `ce_to_dtype(ce)`.
+fn protect_untracked_refusal(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    tracked: &HashSet<BString>,
+    excludes: &mut Option<gix::AttributeStack<'_>>,
+    path: &BStr,
+    mode: Mode,
+) -> Option<String> {
+    use gix::bstr::ByteSlice;
+    let workdir = repo.workdir()?;
+    let mut name: &BStr = path;
+    let mut leading = false;
+    let mut at = 0;
+    while let Some(slash) = path[at..].find_byte(b'/') {
+        let lead = path[..at + slash].as_bstr();
+        match std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(lead).as_ref())) {
+            Ok(meta) if meta.is_dir() => {}
+            // A symlink is a leading component that "exists but is not a directory".
+            Ok(_) => {
+                name = lead;
+                leading = true;
+                break;
+            }
+            // "Return zero if some leading path component of 'name' does not exist."
+            Err(_) => return None,
+        }
+        at += slash + 1;
+    }
+    let full = workdir.join(gix::path::from_bstr(name).as_ref());
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    // "It may be that the 'lstat()' succeeded even though target 'ce' was absent, because
+    // there is an old entry that is different only in case.."
+    if repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false)
+        && super::reset::icase_exists(repo, old, name, &full, &meta)
+    {
+        return None;
+    }
+    // "ce->name is explicitly excluded, so it is Ok to overwrite it."
+    let dtype = match leading {
+        true if meta.is_dir() => Mode::DIR,
+        true => Mode::FILE,
+        false if mode == Mode::COMMIT => Mode::DIR,
+        false => Mode::FILE,
+    };
+    let mut is_excluded = |name: &BStr, dtype: Mode| {
+        excludes
+            .as_mut()
+            .is_some_and(|stack| stack.at_entry(name, Some(dtype)).map(|p| p.is_excluded()).unwrap_or(false))
+    };
+    if is_excluded(name, dtype) {
+        return None;
+    }
+    // "We are checking out path "foo" and found "foo/." in the working tree." Under
+    // `o->reset` `verify_clean_subdirectory()` lets every index entry below it through, and
+    // refuses only for what `read_directory()` finds untracked (:2323-2396).
+    if meta.is_dir() {
+        if mode == Mode::COMMIT {
+            return None;
+        }
+        let mut prefix = name.to_owned();
+        prefix.push(b'/');
+        return crate::unpack_sparse::untracked_under(repo, old, &prefix, &mut is_excluded)
+            .then(|| format!("Updating '{name}' would lose untracked files in it"));
+    }
+    // "The previous round may already have decided to delete this path, which is in a
+    // subdirectory that is being replaced with a blob": a tracked leading file the new tree
+    // drops is `CE_REMOVE` in the result.
+    if leading && tracked.contains(name) {
+        return None;
+    }
+    Some(format!("Untracked working tree file '{name}' would be overwritten by merge."))
+}
+
 /// `get_progress()` for the unpack a branch switch runs: `total` entries removed
 /// or written, reported when this command's `show_progress` is on.
 fn unpack_progress(total: usize) -> Result<crate::worktree::UpdatingFiles> {
@@ -4284,6 +4363,37 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             ..Default::default()
         },
     );
+    // `--discard-changes` without `-f` is `UNPACK_RESET_PROTECT_UNTRACKED`
+    // (builtin/checkout.c:765-766): `oneway_merge()` hands a path the index does not
+    // hold to `merged_entry()` with no `old`, whose `verify_absent(merge,
+    // ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN, o)` (unpack-trees.c:2538-2541) refuses a
+    // file in its way. `reset_tree()` installs no porcelain messages and no
+    // `show_all_errors`, so `add_rejected_path()` reports the first refusal through
+    // `error()` and `unpack_trees()` fails, which `reset_tree()` turns into 128
+    // (:779-792). In a sparse checkout `CE_NEW_SKIP_WORKTREE` makes `verify_absent()`
+    // return at once and the sparse loops above check the entry instead.
+    if sparse.is_none() && !FORCE.load(std::sync::atomic::Ordering::Relaxed) {
+        let tracked: HashSet<BString> = {
+            let backing = old.path_backing();
+            old.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        // `preserve_ignored = !o->force && !o->overwrite_ignore` (:767), and `switch`
+        // defaults `overwrite_ignore` on (:1897): the standard excludes are consulted.
+        let mut excludes = repo
+            .excludes(&old, None, gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped)
+            .ok();
+        let backing = new_index.path_backing();
+        for e in new_index.entries() {
+            let path = e.path_in(backing);
+            if tracked.contains(path) {
+                continue;
+            }
+            if let Some(message) = protect_untracked_refusal(repo, &old, &tracked, &mut excludes, path, e.mode) {
+                eprintln!("error: {message}");
+                return Err(anyhow::Error::new(crate::fatal::Silent(128)));
+            }
+        }
+    }
 
     // What actually gets written: everything the tree changes, plus every
     // carried-forward entry whose worktree file is missing or stat-dirty. A kept entry

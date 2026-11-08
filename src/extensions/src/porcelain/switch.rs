@@ -688,10 +688,15 @@ fn switch_existing(
     // `!strcmp(old_branch_info->path, new_branch_info->path)` (builtin/checkout.c:1022)
     // compares two branch paths, so a detached `HEAD` (no `old_branch_info->path`) is never
     // "already on" anything: `git switch HEAD~1` there is `a branch is expected`.
+    //
+    // `parse_branchname_arg()` resolves the operand before any of that (builtin/checkout.c:
+    // 1495-1539), so the unborn branch `HEAD` names is no branch to be on: it takes the
+    // not-a-local-branch path below, and is `invalid reference: <b>` unless a remote DWIMs it.
     let head_name = repo.head_name()?;
     if head_name.is_some()
         && head_name.as_ref().map(|n| n.as_bstr())
             == FullName::try_from(full.as_str()).ok().as_ref().map(|n| n.as_bstr())
+        && repo.try_find_reference(full.as_str())?.is_some()
     {
         if let Some(code) = operation_gate(repo) {
             return Ok(code);
@@ -1331,7 +1336,8 @@ fn switch_orphan(
     if let Some(code) = unmerged_gate(repo, force)? {
         return Ok(code);
     }
-    let old = repo.index_or_load_from_head()?.into_owned();
+    // A missing index file is an empty index (read-cache.c:2232), on an unborn branch too.
+    let old = crate::index_open::or_empty(repo)?;
     if !old.entries().is_empty() {
         // `orphan_from_empty_tree`: the target tree is the empty one, so the same
         // two-way pass every switch runs decides this — and refuses in the same

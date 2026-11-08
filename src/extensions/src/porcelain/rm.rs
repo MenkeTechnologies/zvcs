@@ -53,11 +53,10 @@
 //! while still removing whatever the other pathspecs matched. `--sparse` puts
 //! those entries back in scope and the report never fires.
 //!
-//! Deviations kept honest: an entry counts as outside the definition when it
-//! carries the index `SKIP_WORKTREE` bit; git additionally re-checks the path
-//! against the sparse patterns (`path_in_sparse_checkout`), which only differs
-//! for an index left out of sync with an edited pattern file. Pathspec files are
-//! read through the one shared `parse_pathspec_file` port in `commit`.
+//! An entry counts as outside the definition when it carries the index
+//! `SKIP_WORKTREE` bit or the sparse patterns exclude its path
+//! (`path_in_sparse_checkout`), as a file `sparse-checkout set` left behind does.
+//! Pathspec files are read through the one shared `parse_pathspec_file` port in `commit`.
 
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -359,6 +358,11 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // instead of an I/O error.
     let snapshot = repo.index_or_empty()?;
     let index = gix::index::File::clone(&snapshot);
+    // `ce_skip_worktree(ce) || !path_in_sparse_checkout(ce->name, the_repository->index)`
+    // (builtin/rm.c:316-319, and pathspec.c:84 for the skip-worktree tally): an entry the
+    // patterns exclude is out of scope even without the bit, as when `sparse-checkout set`
+    // left a modified file behind.
+    let in_sparse_checkout = crate::sparse_index::path_in_sparse_checkout_matcher(&repo);
     let targets_all: Vec<Target> = {
         let backing = index.path_backing();
         index
@@ -369,7 +373,8 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 id: e.id,
                 mode: e.mode,
                 stage: e.stage_raw(),
-                sparse: e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE),
+                sparse: e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE)
+                    || !in_sparse_checkout(e.path_in(backing)),
                 intent_to_add: e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD),
             })
             .collect()
@@ -640,6 +645,14 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 "please stage your changes to .gitmodules or stash them to proceed",
             ));
         }
+    }
+
+    // `if (!index_only) submodules_absorb_gitdir_if_needed();` (builtin/rm.c:368-369):
+    // ahead of the up-to-date check and of `-n`'s early return, and with `-f` too, a
+    // submodule whose repository is not behind a gitfile is moved into the superproject
+    // so that removing its work tree loses nothing.
+    if let (false, Some(wd)) = (opts.cached, &workdir) {
+        submodules_absorb_gitdir_if_needed(&repo, &index, &selected, wd)?;
     }
 
     // 9. Up-to-date safety check (skipped with -f). Unmerged (stage != 0) paths are
@@ -1224,4 +1237,66 @@ fn trim_ascii(mut b: &[u8]) -> &[u8] {
         }
     }
     b
+}
+
+/// `submodules_absorb_gitdir_if_needed()` (builtin/rm.c:74-99): for each listed
+/// gitlink whose directory exists and is not empty, `absorb_git_dir_into_superproject()`
+/// unless `submodule_uses_gitfile()` says the repository already lives elsewhere. An
+/// unmerged path is looked up by its "ours" entry (`get_ours_cache_pos()`, :59-72).
+fn submodules_absorb_gitdir_if_needed(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    selected: &[Target],
+    workdir: &std::path::Path,
+) -> Result<()> {
+    use gix::index::entry::Stage;
+    for t in selected {
+        let Some(ce) = index
+            .entry_by_path_and_stage(t.path.as_ref(), Stage::Unconflicted)
+            .or_else(|| index.entry_by_path_and_stage(t.path.as_ref(), Stage::Ours))
+        else {
+            continue;
+        };
+        let dir = workdir.join(gix::path::from_bstr(t.path.as_bstr()));
+        // `!file_exists(ce->name) || is_empty_dir(name)`: `is_empty_dir()` is false for
+        // anything `opendir()` cannot open (dir.c:3337-3352).
+        let empty_dir = std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none());
+        if ce.mode != Mode::COMMIT || std::fs::symlink_metadata(&dir).is_err() || empty_dir {
+            continue;
+        }
+        if !submodule_uses_gitfile(&dir, &t.path.to_str_lossy())? {
+            super::submodule::absorb_one(repo, &t.path, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// `submodule_uses_gitfile()` (submodule.c:1962-1994): `read_gitfile()` on `<path>/.git`,
+/// which dies on a `.git` file that is malformed or leads to no repository and answers no
+/// gitfile for a directory or nothing, and then a `git submodule foreach --quiet
+/// --recursive "test -f .git"` child run in the submodule under
+/// `prepare_submodule_repo_env()`, with no stdin, stdout or stderr, so that a nested
+/// submodule with a `.git` directory makes the answer no.
+fn submodule_uses_gitfile(dir: &std::path::Path, path: &str) -> Result<bool> {
+    use crate::porcelain::rev_parse::{gitfile_error_message, read_gitfile_gently};
+    let shown = format!("{path}/.git");
+    match read_gitfile_gently(&dir.join(".git")) {
+        Err(err) => crate::git_fatal!("{}", gitfile_error_message(std::path::Path::new(&shown), err)),
+        Ok(None) => return Ok(false),
+        Ok(Some(_)) => {}
+    }
+    let mut cp = std::process::Command::new(crate::hosted::git_exe()?);
+    cp.args(["submodule", "foreach", "--quiet", "--recursive", "test -f .git"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // `prepare_submodule_repo_env()` → `sanitize_repo_env()` (run-command.c:1995-2010): every
+    // `local_repo_env` variable but the two that carry `-c` configuration.
+    for name in crate::alternate_refs::LOCAL_REPO_ENV {
+        if *name != "GIT_CONFIG_PARAMETERS" && *name != "GIT_CONFIG_COUNT" {
+            cp.env_remove(name);
+        }
+    }
+    Ok(cp.status().is_ok_and(|status| status.success()))
 }

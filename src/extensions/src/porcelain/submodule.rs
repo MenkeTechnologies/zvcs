@@ -2808,7 +2808,7 @@ fn absorb_repo(
 /// git's `absorb_git_dir_into_superproject` (submodule.c:2556): make the
 /// submodule's repository live under the superproject's `modules/<name>`, with
 /// `<path>/.git` a `gitdir:` file pointing at it, then recurse.
-fn absorb_one(
+pub(super) fn absorb_one(
     repo: &gix::Repository,
     path: &BString,
     super_prefix: Option<&str>,

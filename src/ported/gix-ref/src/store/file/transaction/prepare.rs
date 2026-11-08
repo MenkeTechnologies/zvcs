@@ -223,7 +223,14 @@ impl Transaction<'_, '_> {
                         PreviousValue::MustExistAndMatch(previous) | PreviousValue::ExistingMustMatch(previous),
                         Some(existing),
                     ) => {
-                        if *previous != existing.target {
+                        // A symbolic reference updated without being dereferenced has its
+                        // old object id checked against the value its referent resolves to
+                        // (`lock_ref_for_update()`, refs/files-backend.c:2764-2789).
+                        let referent_matches = matches!(
+                            (&*previous, &existing.target),
+                            (Target::Object(id), Target::Symbolic(_)) if symref_previous_oid == Some(*id)
+                        );
+                        if *previous != existing.target && !referent_matches {
                             let actual = existing.target.clone();
                             let expected = previous.to_owned();
                             let full_name = change.name();

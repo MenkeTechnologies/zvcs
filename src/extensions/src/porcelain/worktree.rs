@@ -2966,11 +2966,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
         crate::refstore::state_ref_write(&wt_repo, "HEAD", &head, "")?;
         Some(wt_repo)
     } else {
-        let head_line = match &head {
-            StateRef::Symbolic(name) => format!("ref: {name}\n"),
-            StateRef::Object(oid) => format!("{}\n", oid.to_hex()),
-        };
-        std::fs::write(admin.join("HEAD"), head_line)?;
+        crate::refstore::write_ref_file_with_hook(&repo, "HEAD", &head, &admin.join("HEAD"))?;
         None
     };
 
@@ -3018,8 +3014,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
         // `make_worktree_orphan()` (builtin/worktree.c:411-423) runs `symbolic-ref HEAD
         // refs/heads/<branch>` in the new worktree, `refs_update_symref(…, NULL)` once more.
-        if let Some(wt_repo) = &wt_repo {
-            crate::refstore::state_ref_write(wt_repo, "HEAD", &head, "")?;
+        match &wt_repo {
+            Some(wt_repo) => crate::refstore::state_ref_write(wt_repo, "HEAD", &head, "")?,
+            None => crate::refstore::write_ref_file_with_hook(&repo, "HEAD", &head, &admin.join("HEAD"))?,
         }
         let mut empty = gix::index::State::new(repo.object_hash());
         // The `reset --hard` over an unborn `HEAD` unpacks the empty tree, so its cache-tree names
@@ -3035,6 +3032,10 @@ fn add(args: &[String]) -> Result<ExitCode> {
             std::fs::File::create(admin.join("index"))?,
             crate::config::index_write_options(&repo),
         )?;
+        // The `reset --hard` over the unborn `HEAD` moves no ref, and ends in
+        // `remove_branch_state()` (builtin/reset.c:542-543) all the same.
+        let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
+        super::reset::remove_branch_state(&wt_repo, false)?;
         if lock_it {
             let reason = lock_reason.unwrap_or_else(|| "added with --lock".to_string());
             write_file(&admin.join("locked"), &reason)?;
@@ -3058,11 +3059,13 @@ fn add(args: &[String]) -> Result<ExitCode> {
             }
         }
         None => {
+            // The creation of `HEAD` is logged first; the reset's own `HEAD` line is the
+            // transaction's, appended below.
+            write_worktree_reflog(&repo, &admin, start.oid())?;
             if checkout {
-                std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
+                let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
+                reset_ref_updates(&wt_repo, start.oid())?;
             }
-            let reset_line = checkout && !matches!(start, Start::Detached(_));
-            write_worktree_reflog(&repo, &admin, start.oid(), checkout, reset_line)?;
         }
     }
 
@@ -3949,6 +3952,9 @@ fn reset_ref_updates(wt_repo: &gix::Repository, oid: ObjectId) -> Result<()> {
         name: "HEAD".try_into()?,
         deref: true,
     })?;
+    // `reset_refs()` is followed by `remove_branch_state()` (builtin/reset.c:542-543), whose
+    // two `AUTO_MERGE` deletions are transactions of the new worktree too.
+    super::reset::remove_branch_state(wt_repo, false)?;
     Ok(())
 }
 
@@ -3963,16 +3969,10 @@ fn reset_reflog_message(action: &str, rev: Option<&str>) -> String {
     }
 }
 
-/// The reflogs `add_worktree()` leaves behind: in `logs/HEAD` the creation of the new `HEAD`, and —
-/// when `reset_line` — the `reset --hard` that checks the worktree out; in `logs/ORIG_HEAD`, when
-/// `checkout` ran that reset and `core.logAllRefUpdates` is `always`, its `ORIG_HEAD` update.
-fn write_worktree_reflog(
-    repo: &gix::Repository,
-    admin: &Path,
-    oid: ObjectId,
-    checkout: bool,
-    reset_line: bool,
-) -> Result<()> {
+/// The reflog `add_worktree()` writes in the files backend: in `logs/HEAD` the creation of the new
+/// `HEAD`. The `reset --hard` that checks the worktree out logs its own updates through its
+/// transactions ([`reset_ref_updates`]).
+fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId) -> Result<()> {
     let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
     let sig = match repo.committer() {
         Some(Ok(sig)) => sig,
@@ -3987,15 +3987,7 @@ fn write_worktree_reflog(
     // `log_ref_write_fd()` (refs/files-backend.c) adds the tab *with* the message and nothing at
     // all without one, so the first line — `add_worktree()` creates `HEAD` with no message — ends
     // right after the committer.
-    let mut text = format!("{} {} {sig}\n", zero.to_hex(), oid.to_hex());
-    if reset_line {
-        text.push_str(&format!(
-            "{} {} {sig}\t{}\n",
-            oid.to_hex(),
-            oid.to_hex(),
-            reset_reflog_message("updating HEAD", Some("HEAD"))
-        ));
-    }
+    let text = format!("{} {} {sig}\n", zero.to_hex(), oid.to_hex());
     // `log_ref_setup()` (refs/files-backend.c) resolves an unset `core.logAllRefUpdates` to
     // `LOG_REFS_NORMAL` in a non-bare repository, which logs `HEAD`
     // (`should_autocreate_reflog()`, refs.c:1064-1078); only an explicit `false` leaves the new
@@ -4008,27 +4000,6 @@ fn write_worktree_reflog(
     }
     std::fs::create_dir_all(admin.join("logs"))?;
     std::fs::write(admin.join("logs").join("HEAD"), text)?;
-    // `reset_refs()` (builtin/reset.c:309-315) points the fresh worktree's `ORIG_HEAD` at the `HEAD`
-    // it just resolved. The files backend logs a ref outside `HEAD`, `refs/heads/`, `refs/remotes/`
-    // and `refs/notes/` only when `should_autocreate_reflog()` (refs.c) sees
-    // `core.logAllRefUpdates=always`; the new worktree has no `logs/ORIG_HEAD` to append to yet.
-    // The child reads the common config plus the `config.worktree` that
-    // `copy_filtered_worktree_config()` copied from this worktree, so this snapshot answers alike.
-    let always = repo
-        .config_snapshot()
-        .string("core.logAllRefUpdates")
-        .is_some_and(|v| v.eq_ignore_ascii_case(b"always"));
-    if checkout && always {
-        std::fs::write(
-            admin.join("logs").join("ORIG_HEAD"),
-            format!(
-                "{} {} {sig}\t{}\n",
-                zero.to_hex(),
-                oid.to_hex(),
-                reset_reflog_message("updating ORIG_HEAD", None)
-            ),
-        )?;
-    }
     Ok(())
 }
 

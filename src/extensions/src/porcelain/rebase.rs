@@ -2352,10 +2352,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     write_orig_head(&repo, head_oid)?;
 
     // The sequencer detaches HEAD at <onto> first, ...
-    set_head(
+    set_head_expecting(
         &repo,
         Target::Object(onto_oid),
         &format!("{} (start): checkout {onto_spec}", reflog_action()),
+        head_old_value(&repo),
     )?;
 
     // ... moves the worktree and index onto the new tree, ...
@@ -2586,7 +2587,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                         force_create_reflog: false,
                         message: format!("{} (finish): {name} onto {onto_oid}", reflog_action()).into(),
                     },
-                    expected: PreviousValue::MustExistAndMatch(Target::Object(head_oid)),
+                    // The sequencer's tail passes the original head as the old value
+                    // (sequencer.c:5276-5277); the apply backend's
+                    // `move_to_original_branch()` updates the branch through
+                    // `update_refs()` with none (builtin/rebase.c:592-619, reset.c:70-73).
+                    expected: if apply_backend {
+                        PreviousValue::Any
+                    } else {
+                        PreviousValue::MustExistAndMatch(Target::Object(head_oid))
+                    },
                     new: Target::Object(tip),
                 },
                 name: b.clone(),
@@ -4703,10 +4712,11 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     write_orig_head(repo, start.state.orig_head)?;
-    set_head(
+    set_head_expecting(
         repo,
         Target::Object(base),
         &format!("{} (start): checkout {onto_label}", reflog_action()),
+        head_old_value(repo),
     )?;
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(repo, start.old_index, base, &should_interrupt)?;
@@ -4905,10 +4915,11 @@ fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<(
         return Ok(());
     }
     write_orig_head(repo, start.state.orig_head)?;
-    set_head(
+    set_head_expecting(
         repo,
         Target::Object(start.state.onto),
         &format!("{} (start): checkout {}", reflog_action(), start.onto_spec),
+        head_old_value(repo),
     )?;
     let should_interrupt = AtomicBool::new(false);
     update_clean_worktree(repo, start.old_index, start.state.onto, &should_interrupt)?;
@@ -4955,6 +4966,12 @@ fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<(
 /// `…_UPDATE_ORIG_HEAD` (`builtin/rebase.c:1390-1391`, `1416-1417`) and so leave
 /// it alone.
 fn write_orig_head(repo: &gix::Repository, head: ObjectId) -> Result<()> {
+    // `update_refs()` hands the update the value `ORIG_HEAD` held, when it held one
+    // (reset.c:43-54).
+    let expected = match repo.try_find_reference("ORIG_HEAD").ok().flatten().map(|r| r.target().try_id().map(ToOwned::to_owned)) {
+        Some(Some(old_orig)) => PreviousValue::MustExistAndMatch(Target::Object(old_orig)),
+        _ => PreviousValue::Any,
+    };
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -4962,7 +4979,7 @@ fn write_orig_head(repo: &gix::Repository, head: ObjectId) -> Result<()> {
                 force_create_reflog: false,
                 message: format!("{}: updating ORIG_HEAD", reflog_action()).into(),
             },
-            expected: PreviousValue::Any,
+            expected,
             new: Target::Object(head),
         },
         name: full_name("ORIG_HEAD")?,
@@ -6163,6 +6180,7 @@ impl<'r> Sequencer<'r> {
                         // `CHERRY_PICK_HEAD`, `MERGE_MSG` and `AUTO_MERGE` all go,
                         // so a dropped pick leaves no trace of the merge that
                         // produced it.
+                        crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", oid, "")?;
                         let git_dir = repo.git_dir();
                         let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
                         let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
@@ -6185,6 +6203,12 @@ impl<'r> Sequencer<'r> {
 
         if item.cmd.is_fixup() {
             return self.commit_fixup(item, &commit, applied.tree_id, final_fixup);
+        }
+        // `do_pick_commit()` writes `CHERRY_PICK_HEAD` for a `pick`, `reword` or `edit`
+        // that merged before `do_commit()` runs (sequencer.c:2500-2511), and the commit
+        // deletes it again once it lands (sequencer.c:1741-1744).
+        if is_pick_like(item.cmd) {
+            crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", oid, "")?;
         }
 
         let mut author = commit.author()?.to_owned()?;
@@ -6227,7 +6251,6 @@ impl<'r> Sequencer<'r> {
         // behind with the state directory.
         if let Some(refusal) = crate::commit_tree_refusal(true) {
             std::fs::write(repo.git_dir().join("MERGE_MSG"), &merge_msg)?;
-            crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", oid, "")?;
             let _ = refusal.die();
             return Ok(Step::Stop(128));
         }
@@ -6245,7 +6268,9 @@ impl<'r> Sequencer<'r> {
                 extra_headers: Default::default(),
             })?
             .detach();
-        set_head(
+        // `update_head_with_reflog(current_head, …)` (sequencer.c:1261-1297, :1693): the
+        // transaction carries the `HEAD` the pick was made on as its old value.
+        set_head_expecting(
             repo,
             Target::Object(new),
             &gix::reference::log::message(
@@ -6254,7 +6279,11 @@ impl<'r> Sequencer<'r> {
                 1,
             )
             .to_string(),
+            PreviousValue::MustExistAndMatch(Target::Object(head)),
         )?;
+        if is_pick_like(item.cmd) {
+            crate::sequencer::delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
+        }
         // ```c
         // if (!res) {
         //         refs_delete_ref(…, "CHERRY_PICK_HEAD", …);
@@ -8072,7 +8101,22 @@ fn is_pick_like(cmd: todo::Cmd) -> bool {
     matches!(cmd, todo::Cmd::Pick | todo::Cmd::Reword | todo::Cmd::Edit)
 }
 
+/// The old value `update_refs()` gives its `HEAD` update, the `HEAD` it read
+/// (reset.c:65-68), when `HEAD` resolved.
+fn head_old_value(repo: &gix::Repository) -> PreviousValue {
+    match repo.head_id() {
+        Ok(id) => PreviousValue::MustExistAndMatch(Target::Object(id.detach())),
+        Err(_) => PreviousValue::Any,
+    }
+}
+
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {
+    set_head_expecting(repo, target, message, PreviousValue::Any)
+}
+
+/// [`set_head`] for a caller that hands the transaction an old value, which the
+/// `reference-transaction` hook is shown.
+fn set_head_expecting(repo: &gix::Repository, target: Target, message: &str, expected: PreviousValue) -> Result<()> {
     // What `HEAD` resolved to before the move, and after it: the vendored `gix-ref`
     // writes a null old field for a `deref: false` update whose previous value was a
     // symref, and drops the entry entirely when the new target is symbolic. Both are
@@ -8109,7 +8153,7 @@ fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()>
                 force_create_reflog: false,
                 message: message.into(),
             },
-            expected: PreviousValue::Any,
+            expected,
             new: target,
         },
         name: full_name("HEAD")?,

@@ -1176,7 +1176,7 @@ fn move_head_reporting(repo: &gix::Repository, target: ObjectId, spec: &str) -> 
 
 /// Point `HEAD` (or the branch it references) at `target`, writing a reflog entry
 /// `reset: moving to <spec>` on both refs, exactly as `git reset` does.
-fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()> {
+pub(crate) fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()> {
     // `refs_update_ref(…, "HEAD", oid, orig, 0, …)` (builtin/reset.c:320-322): the old
     // value is what `HEAD` resolved to, when it did.
     let expected = match repo.head_id() {
@@ -1303,8 +1303,8 @@ pub(crate) fn save_autostash_ref(repo: &gix::Repository, refname: &str) -> Resul
         ),
         _ => eprintln!("error: cannot store {hex}"),
     }
-    // `refs_delete_ref(…, refname, &stash_oid, REF_NO_DEREF)`.
-    crate::sequencer::delete_state_ref(repo, refname)?;
+    // `refs_delete_ref(…, refname, &stash_oid, REF_NO_DEREF)` (sequencer.c:4939-4940).
+    crate::sequencer::delete_state_ref_expecting(repo, refname, Some(stash_oid))?;
     Ok(())
 }
 

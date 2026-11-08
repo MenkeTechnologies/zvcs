@@ -517,7 +517,7 @@ pub(crate) fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
             );
         }
     }
-    crate::sequencer::delete_state_ref(repo, "MERGE_AUTOSTASH")?;
+    crate::sequencer::delete_state_ref_expecting(repo, "MERGE_AUTOSTASH", Some(stash))?;
     Ok(())
 }
 

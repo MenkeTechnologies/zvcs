@@ -1244,12 +1244,6 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
 const MERGE_STATE_FILES: &[&str] = &["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE"];
 const MERGE_STATE_REFS: &[&str] = &["AUTO_MERGE"];
 
-/// The extra state `remove_branch_state()` drops on top of the merge state;
-/// `git merge --abort` reaches it by running `git reset --merge`: `SQUASH_MSG`,
-/// and the sequencer's state refs `sequencer_post_commit_cleanup()` deletes.
-const BRANCH_STATE_FILES: &[&str] = &["SQUASH_MSG"];
-const BRANCH_STATE_REFS: &[&str] = &["CHERRY_PICK_HEAD", "REVERT_HEAD"];
-
 /// `restore_state()` (builtin/merge.c:403-427): rewind the index and worktree to
 /// `head`, then put the `save_state()` snapshot back on top.
 ///
@@ -1642,22 +1636,13 @@ fn try_merge_strategy(
     }
 }
 
-fn remove_merge_state(repo: &gix::Repository, and_branch_state: bool) {
+fn remove_merge_state(repo: &gix::Repository) {
     let git_dir = repo.git_dir();
     for name in MERGE_STATE_FILES {
         let _ = std::fs::remove_file(git_dir.join(name));
     }
     for name in MERGE_STATE_REFS {
         let _ = crate::refstore::state_ref_delete(repo, name, "");
-    }
-    if and_branch_state {
-        for name in BRANCH_STATE_FILES {
-            let _ = std::fs::remove_file(git_dir.join(name));
-        }
-        for name in BRANCH_STATE_REFS {
-            let _ = crate::refstore::state_ref_delete(repo, name, "");
-        }
-        let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
     }
 }
 
@@ -1678,7 +1663,7 @@ fn quit() -> Result<ExitCode> {
         crate::sequencer::packed_refs_lock_timeout(&repo)?;
         crate::setup::ref_store_write_options_gate();
     }
-    remove_merge_state(&repo, false);
+    remove_merge_state(&repo);
     // `remove_merge_branch_state()` (builtin/merge.c:1452) ends in
     // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837).
     super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
@@ -1739,7 +1724,7 @@ fn abort() -> Result<ExitCode> {
         .ok()
         .and_then(|r| r.target().try_id().map(ToOwned::to_owned));
     if stash.is_some() {
-        crate::sequencer::delete_state_ref(&repo, MERGE_AUTOSTASH)?;
+        crate::sequencer::delete_state_ref_expecting(&repo, MERGE_AUTOSTASH, stash)?;
     }
 
     // `cmd_reset()` takes the index lock and reaches `reset_index()`, whose
@@ -1760,22 +1745,14 @@ fn abort() -> Result<ExitCode> {
     let should_interrupt = AtomicBool::new(false);
     update_worktree(&repo, &old_index, None, head_tree, &should_interrupt)?;
 
-    // git's `reset_refs()` records the pre-reset HEAD in ORIG_HEAD, and the reset it
-    // performs (`--merge` to HEAD) logs on `HEAD` even though the branch does not move.
-    set_orig_head(&repo, head_id)?;
-    // `append_head_log`, not `record_head_move`: nothing here edits `HEAD`
-    // through `gix-ref` — `set_orig_head` writes `ORIG_HEAD` and the worktree
-    // update touches no ref — so there is no half-written line to replace, and
-    // `record_head_move`'s replace-the-identical-tail rule would instead eat the
-    // line an *earlier* `merge --abort` left behind. `log_ref_write_fd()` appends
-    // unconditionally, so aborting twice leaves two `reset: moving to HEAD`
-    // entries. The reftable backend writes its own entry for the update.
-    if crate::refstore::is_reftable(&repo) {
-        crate::sequencer::update_head_reftable(&repo, head_id, "reset: moving to HEAD")?;
-    } else {
-        super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
-    }
-    remove_merge_state(&repo, true);
+    // The `git reset --merge` child's `reset_refs()` records the pre-reset HEAD in
+    // ORIG_HEAD and moves `HEAD` to itself, each in a transaction of its own with the
+    // old value it read (builtin/reset.c:308-322), so `HEAD` logs `reset: moving to
+    // HEAD` though the branch does not move; then `remove_branch_state()`
+    // (builtin/reset.c:542-543, branch.c:874-879).
+    super::reset::set_orig_head(&repo, head_id)?;
+    super::reset::move_head(&repo, head_id, "HEAD")?;
+    super::reset::remove_branch_state(&repo, false)?;
     // `apply_autostash_oid(stash_oid_hex)` (builtin/merge.c:1438-1441).
     if let Some(id) = stash {
         super::stash::apply_autostash(&repo, id, false)?;
@@ -2689,7 +2666,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // (builtin/merge.c:539), and *that* apply is a `git stash apply` child that
     // records its own `AUTO_MERGE`. Removing the merge state first would leave
     // the file behind, which is exactly what `git pull --autostash` was doing.
-    remove_merge_state(&repo, false);
+    remove_merge_state(&repo);
     // …whose last step is `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837);
     // `end_autostash()` above already consumed the ref, as `finish()` does.
     super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
@@ -3676,7 +3653,7 @@ fn finalize_clean(
     // 1038), in that order — `finish()` re-applies the autostash, whose `git
     // stash apply` child writes its own `AUTO_MERGE`, and only then is the merge
     // state cleared. Clearing first left that file behind.
-    remove_merge_state(repo, false);
+    remove_merge_state(repo);
     // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837), which finds the
     // ref already consumed by `end_autostash()`.
     super::reset::save_autostash_ref(repo, MERGE_AUTOSTASH)?;
@@ -4949,11 +4926,11 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
     if let crate::porcelain::stash::AutostashApply::Failed = applied {
         // Stored and reported by the apply; `apply_autostash_ref()` still deletes
         // the ref (sequencer.c:4939-4940).
-        crate::sequencer::delete_state_ref(repo, MERGE_AUTOSTASH)?;
+        crate::sequencer::delete_state_ref_expecting(repo, MERGE_AUTOSTASH, Some(id))?;
     } else if let crate::porcelain::stash::AutostashApply::Clean = applied {
         repo.edit_reference(RefEdit {
             change: Change::Delete {
-                expected: PreviousValue::Any,
+                expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(id)),
                 log: RefLog::AndReference,
                 message: Default::default(),
             },
@@ -4970,7 +4947,7 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
         crate::porcelain::stash::store_commit(repo, id, "autostash")?;
         repo.edit_reference(RefEdit {
             change: Change::Delete {
-                expected: PreviousValue::Any,
+                expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(id)),
                 log: RefLog::AndReference,
                 message: Default::default(),
             },

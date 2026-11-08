@@ -500,6 +500,15 @@ pub fn state_ref_write(repo: &gix::Repository, name: &str, value: &StateRef, msg
         })?;
         return Ok(());
     }
+    write_ref_file_with_hook(repo, name, value, &files_ref_path(repo, name.as_bytes().as_bstr()))
+}
+
+/// Write the files backend's loose reference `name` at `path` with `value`, as the one-update
+/// transaction `refs_update_ref()`/`refs_update_symref()` makes of it, with no old value, running
+/// the `reference-transaction` hook of `repo` around the write (refs.c:2700-2786). `path` is given
+/// for a worktree whose ref store `repo` cannot open yet: `add_worktree()` creates the new
+/// worktree's `HEAD` this way (builtin/worktree.c:556-563).
+pub(crate) fn write_ref_file_with_hook(repo: &gix::Repository, name: &str, value: &StateRef, path: &Path) -> Result<()> {
     let contents = match value {
         StateRef::Object(id) => format!("{id}\n"),
         StateRef::Symbolic(target) => format!("ref: {target}\n"),
@@ -511,9 +520,7 @@ pub fn state_ref_write(repo: &gix::Repository, name: &str, value: &StateRef, msg
     let mut lines = Vec::new();
     gix::refs::file::transaction::hook_line(&mut lines, repo.object_hash(), None, Some(new), name.as_bytes().as_bstr());
     let hook = (!is_pseudo_ref(name)).then_some(lines.as_slice());
-    with_transaction_hook(repo, hook, None, || {
-        std::fs::write(files_ref_path(repo, name.as_bytes().as_bstr()), contents)
-    })?;
+    with_transaction_hook(repo, hook, None, || std::fs::write(path, contents))?;
     Ok(())
 }
 
@@ -557,10 +564,17 @@ fn with_transaction_hook(
 /// - reftable: a deletion record in the stack of its worktree, written only if
 ///   the reference exists.
 pub fn state_ref_delete(repo: &gix::Repository, name: &str, msg: &str) -> Result<()> {
+    state_ref_delete_expecting(repo, name, msg, None)
+}
+
+/// [`state_ref_delete`] with the old value `refs_delete_ref()` is given, `old_oid`:
+/// the deletion then has `REF_HAVE_OLD`, which the `reference-transaction` hook is
+/// shown (refs.c:2620-2625).
+pub fn state_ref_delete_expecting(repo: &gix::Repository, name: &str, msg: &str, old: Option<ObjectId>) -> Result<()> {
     if is_reftable(repo) && !is_pseudo_ref(name) {
         repo.edit_reference(RefEdit {
             change: Change::Delete {
-                expected: PreviousValue::Any,
+                expected: old.map_or(PreviousValue::Any, |id| PreviousValue::MustExistAndMatch(Target::Object(id))),
                 log: RefLog::AndReference,
                 message: msg.into(),
             },
@@ -569,7 +583,7 @@ pub fn state_ref_delete(repo: &gix::Repository, name: &str, msg: &str) -> Result
         })?;
         return Ok(());
     }
-    root_ref_delete_with_hook(repo, name, || {
+    root_ref_delete_with_hook(repo, name, old, || {
         remove_root_ref_log(repo, name);
         match std::fs::remove_file(files_ref_path(repo, name.as_bytes().as_bstr())) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
@@ -579,21 +593,29 @@ pub fn state_ref_delete(repo: &gix::Repository, name: &str, msg: &str) -> Result
     Ok(())
 }
 
-/// Run `delete` as the files backend's `refs_delete_ref(…, name, NULL, REF_NO_DEREF)` of
-/// the root ref `name` runs it, with the hook its transaction runs: `<null> <null>
+/// Run `delete` as the files backend's `refs_delete_ref(…, name, old, REF_NO_DEREF)` of
+/// the root ref `name` runs it, with the hook its transaction runs: `<old> <null>
 /// <name>` at `preparing`, `aborted` for the nested `packed-refs` transaction, then
 /// `prepared` and `committed` (refs.c:2700-2786, refs/files-backend.c:3036-3118) —
 /// whether or not the reference exists. `FETCH_HEAD` and `MERGE_HEAD` are files git
-/// removes without a transaction.
+/// removes without a transaction. `old` is `REF_HAVE_OLD`'s value, the null id when the
+/// caller gives none; the nested `packed-refs` transaction's line carries none, as
+/// `files_transaction_prepare()` queues it with `REF_HAVE_NEW` alone
+/// (refs/files-backend.c:3055-3059).
 pub(crate) fn root_ref_delete_with_hook(
     repo: &gix::Repository,
     name: &str,
+    old: Option<ObjectId>,
     delete: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    let refname = name.as_bytes().as_bstr();
     let mut lines = Vec::new();
-    gix::refs::file::transaction::hook_line(&mut lines, repo.object_hash(), None, None, name.as_bytes().as_bstr());
-    let hook = (!is_pseudo_ref(name)).then_some(lines.as_slice());
-    with_transaction_hook(repo, hook, hook, delete)
+    let old = old.as_ref().map(|id| HookValue::Object(id));
+    gix::refs::file::transaction::hook_line(&mut lines, repo.object_hash(), old, None, refname);
+    let mut packed = Vec::new();
+    gix::refs::file::transaction::hook_line(&mut packed, repo.object_hash(), None, None, refname);
+    let pseudo = is_pseudo_ref(name);
+    with_transaction_hook(repo, (!pseudo).then_some(lines.as_slice()), (!pseudo).then_some(packed.as_slice()), delete)
 }
 
 /// `files_ref_path()` (refs/files-backend.c:266-290): where the files backend

@@ -1987,16 +1987,22 @@ pub fn update_head_reftable(repo: &gix::Repository, id: ObjectId, msg: &str) -> 
 /// [`crate::refstore::state_ref_delete`], after the `refs_ref_exists()` test
 /// the sequencer's callers make first (sequencer.c:3029-3047).
 pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> Result<bool> {
+    delete_state_ref_expecting(repo, name, None)
+}
+
+/// [`delete_state_ref`] given the old value, `refs_delete_ref(…, name, &old, REF_NO_DEREF)`
+/// (sequencer.c:4939-4940 for an autostash ref).
+pub fn delete_state_ref_expecting(repo: &gix::Repository, name: &str, old: Option<gix::ObjectId>) -> Result<bool> {
     if crate::refstore::is_reftable(repo) {
         let existed = crate::refstore::state_ref_exists(repo, name);
-        crate::refstore::state_ref_delete(repo, name, "")?;
+        crate::refstore::state_ref_delete_expecting(repo, name, "", old)?;
         return Ok(existed);
     }
     packed_refs_lock_timeout(repo)?;
     let mut removed = false;
     // One transaction, and so one run of the `reference-transaction` hook, however
     // the reference is stored.
-    crate::refstore::root_ref_delete_with_hook(repo, name, || {
+    crate::refstore::root_ref_delete_with_hook(repo, name, old, || {
         removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
         crate::refstore::remove_root_ref_log(repo, name);
         if let Ok(reference) = repo.find_reference(name) {

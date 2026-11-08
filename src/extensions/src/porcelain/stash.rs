@@ -1187,12 +1187,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     if opts.pathspecs.is_empty() && !opts.patch && (!opts.staged_only || !keep_index) {
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
-            // A detached `HEAD` is a plain ref whose unchanged value the update skips, so it logs
-            // nothing there; an attached one gets its entry through the branch it follows.
-            if repo.head_name()?.is_some() {
-                super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
-            }
-            // The same `reset --hard` also runs `reset_refs()`, which records
+            // The `reset --hard` runs `reset_refs()`, which records
             // the pre-reset `HEAD` in `ORIG_HEAD` (builtin/reset.c:314). The
             // reset names no revision, so the value is `HEAD` itself — but it
             // still *moves*, overwriting whatever an earlier operation left
@@ -1202,6 +1197,11 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             // mixed reset that writes it as well; a pathspec (`git apply -R`) or
             // `-S --keep-index` runs no ref-moving reset, and neither writes it.
             super::reset::set_orig_head(repo, id)?;
+            // …and then `refs_update_ref(…, "HEAD", oid, orig, 0, …)` (builtin/reset.c:320-322),
+            // a transaction of its own whatever `HEAD` is: an attached `HEAD` logs `reset:
+            // moving to HEAD` through the branch it follows, a detached one is a plain ref
+            // whose unchanged value logs nothing.
+            super::reset::move_head(repo, id, "HEAD")?;
         }
         // …and ends in `remove_branch_state()` (builtin/reset.c:542-543). A
         // `die()` there is the child's: its `fatal:` line is all that is printed,
@@ -4556,12 +4556,15 @@ fn clear(repo: &gix::Repository) -> Result<ExitCode> {
 /// the loose file leaves the packed one resolving to the cleared stash, so the
 /// commit stays reachable and `git rev-parse refs/stash` still answers.
 fn delete_stash_ref(repo: &gix::Repository) -> Result<()> {
-    if repo.try_find_reference("refs/stash")?.is_none() {
+    let Some(stash) = repo.try_find_reference("refs/stash")? else {
         return Ok(());
-    }
+    };
+    // `refs_delete_ref(…, ref_stash, &obj, 0)` (builtin/stash.c:307-315): the old value is
+    // the one `repo_get_oid()` read, which the `reference-transaction` hook is shown.
+    let current = stash.target().into_owned();
     repo.edit_reference(RefEdit {
         change: Change::Delete {
-            expected: PreviousValue::Any,
+            expected: PreviousValue::MustExistAndMatch(current),
             log: RefLog::AndReference,
             message: Default::default(),
         },

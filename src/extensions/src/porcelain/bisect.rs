@@ -390,20 +390,15 @@ impl Ctx {
         crate::refstore::state_ref_exists(&self.repo, name)
     }
 
-    /// `refs_update_ref(…, NULL, name, id, NULL, 0, …)` of the root ref `name`.
+    /// `refs_update_ref(…, NULL, name, id, NULL, 0, …)` of the root ref `name`, a ref
+    /// transaction in either backend, so the `reference-transaction` hook sees it.
     fn state_write(&self, name: &str, id: ObjectId) -> Result<()> {
-        if !self.reftable() {
-            return write_ref(&self.file(name), id);
-        }
         crate::sequencer::write_state_oid(&self.repo, name, id, "")
     }
 
-    /// `refs_delete_ref(…, NULL, name, NULL, REF_NO_DEREF)` of the root ref `name`.
+    /// `refs_delete_ref(…, NULL, name, NULL, REF_NO_DEREF)` of the root ref `name`, a ref
+    /// transaction in either backend.
     fn state_delete(&self, name: &str) -> Result<()> {
-        if !self.reftable() {
-            let _ = std::fs::remove_file(self.file(name));
-            return Ok(());
-        }
         crate::refstore::state_ref_delete(&self.repo, name, "")
     }
 
@@ -420,11 +415,9 @@ impl Ctx {
 
     /// `refs_update_ref(…, NULL, "refs/bisect/<leaf>", id, NULL, 0, …)`
     /// (builtin/bisect.c:395), which logs nothing for a name outside the
-    /// autocreated namespaces.
+    /// autocreated namespaces. A ref transaction in either backend, so the
+    /// `reference-transaction` hook sees it.
     fn bisect_ref_write(&self, leaf: &str, id: ObjectId) -> Result<()> {
-        if !self.reftable() {
-            return write_ref(&self.refs_dir().join(leaf), id);
-        }
         use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
         self.repo.edit_reference(RefEdit {
             change: Change::Update {
@@ -498,14 +491,6 @@ fn read_ref(path: &Path) -> Result<Option<ObjectId>> {
         return Ok(None);
     }
     Ok(Some(ObjectId::from_hex(text.as_bytes())?))
-}
-
-fn write_ref(path: &Path, id: ObjectId) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{}\n", id.to_hex()))?;
-    Ok(())
 }
 
 // --- terms -------------------------------------------------------------------

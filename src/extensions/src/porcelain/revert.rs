@@ -1565,11 +1565,12 @@ fn revert_one(
     // is dropped: git ignores a failing `post-commit`.
     let _ = crate::hooks::run(repo, "post-commit", &[], None);
 
-    // A committed revert clears the in-progress markers, as git does.
-    // `AUTO_MERGE` is *not* one of them: `sequencer_post_commit_cleanup()` only
-    // runs when a pick was stopped, and a revert that lands never was — so stock
-    // leaves the merge result behind for `git rev-parse AUTO_MERGE` to find.
-    let _ = crate::refstore::state_ref_delete(repo, "REVERT_HEAD", "");
+    // `do_commit()`'s success arm deletes `CHERRY_PICK_HEAD`, whatever the command
+    // (sequencer.c:1741-1744): a revert that lands never wrote `REVERT_HEAD`
+    // (sequencer.c:2512-2515), so there is none to remove. `AUTO_MERGE` is not
+    // touched either: `sequencer_post_commit_cleanup()` only runs when a pick was
+    // stopped, so stock leaves the merge result behind for `git rev-parse AUTO_MERGE`.
+    let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
     let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
 
     print_summary(

@@ -10379,7 +10379,11 @@ pub(crate) fn topo_sort_ordered(
 /// `None` when the commit has no author line or its date is malformed.
 fn author_date_of(repo: &gix::Repository, id: ObjectId) -> Option<i64> {
     let commit = repo.find_object(id).ok()?.try_into_commit().ok()?;
-    Some(commit.author().ok()?.time().ok()?.seconds)
+    let author = commit_ident(&commit.data, "author", HeaderPick::First)?;
+    // `parse_timestamp()` must end where `split_ident_line()`'s date span does,
+    // which the all-digit span always does.
+    let (date, _tz) = ident_date_spans(author.time)?;
+    Some(parse_timestamp(date) as i64)
 }
 
 /// The shared drain: `keys` is the priority the frontier is ordered by (highest
@@ -10644,14 +10648,18 @@ pub(super) fn email_body(
     style: EmailStyle,
     mailmap: Option<&Mailmap>,
 ) -> Result<()> {
-    let raw = commit.message_raw()?;
-    let author = commit.author()?;
-
+    let raw = commit_message(&commit.data);
     let mut sb: Vec<u8> = Vec::new();
     // `pp_header()` → `pp_user_info(pp, "Author", …)`, whose mail branch writes
     // `From:` and then the RFC2822 `Date:` (pretty.c:516-595). `add_merge_info()`
     // returns early for a mail format, so a merge has no `Merge:` line here.
-    write_identity_headers_for(&mut sb, &author, style.encode_headers, style.output_encoding, mailmap)?;
+    // It runs once per `author` line, and writes nothing for one that does not
+    // split (pretty.c:531-532).
+    for author in header_lines(&commit.data).filter_map(|line| header_value(line, "author")) {
+        if let Some(author) = split_ident(author) {
+            write_identity_headers_for(&mut sb, &author, style.encode_headers, style.output_encoding, mailmap)?;
+        }
+    }
 
     let msg = super::format_patch::skip_blank_lines(raw);
     let (title, rest) = super::format_patch::format_subject(msg);
@@ -11295,7 +11303,7 @@ fn expand_one(
             return Ok(false);
         };
         out.extend_from_slice(&super::interpret_trailers::format_pretty(
-            commit.message_raw()?,
+            commit_message(&commit.data),
             &opts,
         ));
         *i = next;
@@ -11338,9 +11346,9 @@ fn expand_one(
         }
         'P' => write_parents(out, false, ctx.abbrev, ctx.parents, ctx.repo),
         'p' => write_parents(out, true, ctx.abbrev, ctx.parents, ctx.repo),
-        's' => out.extend_from_slice(&subject(commit.message_raw()?)),
-        'b' => out.extend_from_slice(&body(commit.message_raw()?)),
-        'B' => out.extend_from_slice(commit.message_raw()?),
+        's' => out.extend_from_slice(&subject(commit_message(&commit.data))),
+        'b' => out.extend_from_slice(&body(commit_message(&commit.data))),
+        'B' => out.extend_from_slice(commit_message(&commit.data)),
         // `%N`: the raw note text — no header, no indent — which is the only
         // way a user format shows notes at all.
         //
@@ -11388,7 +11396,7 @@ fn expand_one(
         // line, up to `strchrnul(msg + c->subject_off, '\n')`, not the folded
         // subject `%s` prints.
         'f' => {
-            let subject = super::format_patch::skip_blank_lines(commit.message_raw()?);
+            let subject = super::format_patch::skip_blank_lines(commit_message(&commit.data));
             let eol = subject.iter().position(|&b| b == b'\n').unwrap_or(subject.len());
             out.extend_from_slice(&sanitized_subject(&subject[..eol]));
         }
@@ -11462,11 +11470,10 @@ fn expand_one(
         // left side) whether or not `--left-right` was given.
         'm' => out.extend_from_slice(ctx.revision_mark.as_bytes()),
         'a' | 'c' => {
-            let who = match p {
-                'a' => commit.author()?,
-                _ => commit.committer()?,
-            };
-            if !expand_person(out, &who, chars.get(*i).copied(), date_mode, ctx)? {
+            // `parse_commit_header()` keeps the last `author`/`committer` line
+            // (pretty.c:915-939); `format_person_part()` splits it itself.
+            let who = commit_ident(&commit.data, if p == 'a' { "author" } else { "committer" }, HeaderPick::Last);
+            if !expand_person(out, who.as_ref(), chars.get(*i).copied(), date_mode, ctx)? {
                 // `return 0; /* unknown placeholder */` (pretty.c:866): the
                 // letter was not consumed, so the driver prints `%a<x>` as typed.
                 return Ok(false);
@@ -12878,11 +12885,17 @@ pub(crate) fn fmt_time(seconds: i64, offset: i32, mode: DateMode, now: i64) -> S
 /// unformatted while the seven date letters each pin their own mode.
 fn expand_person(
     out: &mut Vec<u8>,
-    who: &gix::actor::SignatureRef<'_>,
+    who: Option<&gix::actor::SignatureRef<'_>>,
     part: Option<char>,
     date_mode: DateMode,
     ctx: &RenderCtx<'_>,
 ) -> Result<bool> {
+    // `if (split_ident_line(&s, msg, len) < 0) goto skip;` (pretty.c:798-799):
+    // `skip:` consumes `n e t d D r i` and prints nothing, and leaves every
+    // other letter unconsumed (pretty.c:856-866).
+    let Some(who) = who else {
+        return Ok(matches!(part, Some('n' | 'e' | 't' | 'd' | 'D' | 'r' | 'i')));
+    };
     let local_part = |mail: &[u8]| -> Vec<u8> {
         match mail.iter().position(|b| *b == b'@') {
             Some(at) => mail[..at].to_vec(),
@@ -13115,7 +13128,7 @@ pub(crate) fn rev_list_pretty_body(
     match pretty {
         // `pp_title_line()` only: `pretty_print_commit()` skips `pp_remainder()`
         // for oneline, so the body is the subject with no trailing newline.
-        Pretty::Oneline => out.extend_from_slice(&subject(commit.message_raw()?)),
+        Pretty::Oneline => out.extend_from_slice(&subject(commit_message(&commit.data))),
         // `builtin/rev-list.c` builds its `pretty_print_context` from scratch and
         // leaves `rev`/`print_email_subject`/`encode_email_headers` at zero, so
         // the mail formats come out with a bare `Subject:` and unencoded headers.
@@ -13127,15 +13140,14 @@ pub(crate) fn rev_list_pretty_body(
         }
         Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
         Pretty::Reference => {
-            let author = commit.author()?;
+            // `%ad` of an ident that does not split is empty (pretty.c:798-799).
+            let author = commit_ident(&commit.data, "author", HeaderPick::Last);
             out.extend_from_slice(abbrev.borrow_mut().get(commit.id()).as_bytes());
             out.extend_from_slice(b" (");
-            out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(&subject(commit_message(&commit.data)));
             out.extend_from_slice(b", ");
-            if ident_has_date(author.time) {
-                out.extend_from_slice(
-                    show_ident_date(author.time, DateMode::Short, ctx.now).as_bytes(),
-                );
+            if let Some(author) = author.filter(|a| ident_has_date(a.time)) {
+                out.extend_from_slice(show_ident_date(author.time, DateMode::Short, ctx.now).as_bytes());
             }
             out.push(b')');
         }
@@ -13153,10 +13165,9 @@ pub(crate) fn rev_list_pretty_body(
             // `pretty_print_commit()` adds the blank line, then `pp_remainder()`
             // indents the message four spaces with no tab expansion for `raw`.
             out.push(b'\n');
-            indent_message(&mut out, 0, commit.message_raw()?, false, ctx.expand_tabs.unwrap_or(0));
+            indent_message(&mut out, 0, commit_message(&commit.data), false, ctx.expand_tabs.unwrap_or(0));
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
-            let author = commit.author()?;
             // `pp_header()` folds the `parent` lines of a merge into one `Merge:`
             // line of abbreviated ids.
             let parents: Vec<_> = commit.parent_ids().collect();
@@ -13168,44 +13179,13 @@ pub(crate) fn rev_list_pretty_body(
                 }
                 out.push(b'\n');
             }
-            match pretty {
-                Pretty::Fuller => {
-                    let committer = commit.committer()?;
-                    write_person(&mut out, b"Author:     ", &author, None);
-                    writeln!(
-                        out,
-                        "AuthorDate: {}",
-                        show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
-                    )?;
-                    write_person(&mut out, b"Commit:     ", &committer, None);
-                    writeln!(
-                        out,
-                        "CommitDate: {}",
-                        show_ident_date(committer.time, ctx.date_mode.clone(), ctx.now)
-                    )?;
-                }
-                Pretty::Full => {
-                    let committer = commit.committer()?;
-                    write_person(&mut out, b"Author: ", &author, None);
-                    write_person(&mut out, b"Commit: ", &committer, None);
-                }
-                _ => {
-                    write_person(&mut out, b"Author: ", &author, None);
-                    if matches!(pretty, Pretty::Medium) {
-                        writeln!(
-                            out,
-                            "Date:   {}",
-                            show_ident_date(author.time, ctx.date_mode, ctx.now)
-                        )?;
-                    }
-                }
-            }
+            write_pp_idents(&mut out, &commit.data, pretty, None, &ctx.date_mode, ctx.now)?;
             out.push(b'\n');
             // `short` stops at the first blank line; its table entry has no tab
             // width, unlike `medium`, `full` and `fuller` (pretty.c:124-129).
             let short = matches!(pretty, Pretty::Short);
             let tabs = ctx.expand_tabs.unwrap_or(if short { 0 } else { 8 });
-            indent_message(&mut out, 0, commit.message_raw()?, short, tabs);
+            indent_message(&mut out, 0, commit_message(&commit.data), short, tabs);
         }
     }
     abbrev.into_inner().flush();
@@ -13589,7 +13569,7 @@ fn render_entry(
                 out.push(b'\n');
                 return Ok(());
             }
-            out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(&subject(commit_message(&commit.data)));
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Reference => {
@@ -13610,12 +13590,13 @@ fn render_entry(
                 true => ctx.date_mode.clone(),
                 false => DateMode::Short,
             };
-            let author = commit.author()?;
+            // `%ad` of an ident that does not split is empty (pretty.c:798-799).
+            let author = commit_ident(&commit.data, "author", HeaderPick::Last);
             out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.id()).as_bytes());
             out.extend_from_slice(b" (");
-            out.extend_from_slice(&subject(commit.message_raw()?));
+            out.extend_from_slice(&subject(commit_message(&commit.data)));
             out.extend_from_slice(b", ");
-            if ident_has_date(author.time) {
+            if let Some(author) = author.filter(|a| ident_has_date(a.time)) {
                 out.extend_from_slice(show_ident_date(author.time, date_mode, ctx.now).as_bytes());
             }
             out.push(b')');
@@ -13665,8 +13646,6 @@ fn render_entry(
             expand_format(out, commit, fmt, ctx)?;
         }
         Pretty::Raw => {
-            let author = commit.author()?;
-            let committer = commit.committer()?;
             // `show_log()` prints one `commit <name>` line for every non-mail,
             // non-user format (log-tree.c:810-834), so `raw` gets exactly what
             // `medium` gets: the `--abbrev-commit` name, `--parents`/`--children`
@@ -13691,8 +13670,6 @@ fn render_entry(
             for pid in commit.parent_ids() {
                 writeln!(out, "parent {pid}")?;
             }
-            write_raw_ident(out, b"author", &author)?;
-            write_raw_ident(out, b"committer", &committer)?;
             // ```c
             // if (pp->fmt == CMIT_FMT_RAW) {
             //         strbuf_add(sb, line, linelen);
@@ -13700,21 +13677,21 @@ fn render_entry(
             // }
             // ```
             //
-            // (`pp_header()`, pretty.c.) `raw` copies **every** header line of the
-            // commit through, so the ones this port does not reconstruct by name —
-            // `encoding`, `gpgsig`, `mergetag` — still have to be written. They come
-            // out in the order they are stored, which is behind the four above.
+            // (`pp_header()`, pretty.c:2073-2076.) `raw` copies **every** header line
+            // of the commit through, so the ones this port does not reconstruct by
+            // name — `author` and `committer` as stored, a malformed one included,
+            // `encoding`, `gpgsig`, `mergetag` — come out in the order they are
+            // stored, behind `tree` and `parent`.
             for line in extra_headers(commit.data.as_slice()) {
                 out.extend_from_slice(line);
                 out.push(b'\n');
             }
             out.push(b'\n');
             // `raw` prints the message as stored: its table entry has no tab width.
-            indent_message(out, msg_start, commit.message_raw()?, false, ctx.expand_tabs.unwrap_or(0));
+            indent_message(out, msg_start, commit_message(&commit.data), false, ctx.expand_tabs.unwrap_or(0));
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
-            let author = commit.author()?;
             write_commit_name(out, b"commit ", &id, ctx);
             write_source(out, ctx);
             // `--decorate`: ` (HEAD -> main, tag: v1)` after the commit id.
@@ -13746,46 +13723,14 @@ fn render_entry(
                 out.push(b'\n');
             }
 
-            match pretty {
-                Pretty::Fuller => {
-                    let committer = commit.committer()?;
-                    write_person(out, b"Author:     ", &author, ctx.mailmap);
-                    writeln!(
-                        out,
-                        "AuthorDate: {}",
-                        show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
-                    )?;
-                    write_person(out, b"Commit:     ", &committer, ctx.mailmap);
-                    writeln!(
-                        out,
-                        "CommitDate: {}",
-                        show_ident_date(committer.time, ctx.date_mode.clone(), ctx.now)
-                    )?;
-                }
-                Pretty::Full => {
-                    let committer = commit.committer()?;
-                    write_person(out, b"Author: ", &author, ctx.mailmap);
-                    write_person(out, b"Commit: ", &committer, ctx.mailmap);
-                }
-                _ => {
-                    // medium / short
-                    write_person(out, b"Author: ", &author, ctx.mailmap);
-                    if matches!(pretty, Pretty::Medium) {
-                        writeln!(
-                            out,
-                            "Date:   {}",
-                            show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
-                        )?;
-                    }
-                }
-            }
+            write_pp_idents(out, &commit.data, pretty, ctx.mailmap, &ctx.date_mode, ctx.now)?;
             out.push(b'\n');
 
             // `short` stops at the first blank line; its table entry has no tab
             // width, unlike `medium`, `full` and `fuller` (pretty.c:124-129).
             let short = matches!(pretty, Pretty::Short);
             let tabs = ctx.expand_tabs.unwrap_or(if short { 0 } else { 8 });
-            indent_message(out, msg_start, commit.message_raw()?, short, tabs);
+            indent_message(out, msg_start, commit_message(&commit.data), short, tabs);
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
     }
@@ -13909,20 +13854,44 @@ pub(crate) fn write_person(
 pub(crate) use crate::mailmap::Mailmap;
 
 
-/// Write a raw-format identity line: `<role> <name> <<email>> <date field>`.
-///
-/// `CMIT_FMT_RAW` reproduces the object's own header (`pp_header()`), so the
-/// date field goes back out exactly as recorded — a timestamp no integer type
-/// can hold, or a zone `gix` cannot round-trip, still round-trips here.
-fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRef<'_>) -> Result<()> {
-    out.extend_from_slice(role);
-    out.push(b' ');
-    out.extend_from_slice(sig.name);
-    out.extend_from_slice(b" <");
-    out.extend_from_slice(sig.email);
-    out.extend_from_slice(b"> ");
-    out.extend_from_slice(sig.time.as_bytes());
-    out.push(b'\n');
+/// The ident lines `pp_header()` writes for `medium`, `short`, `full` and
+/// `fuller` (pretty.c:2053-2107): `pp_user_info()` per `author` line, and per
+/// `committer` line under `full`/`fuller`, in the order the lines are stored.
+/// `pp_user_info()` returns without a word when `split_ident_line()` fails
+/// (pretty.c:531-532), so a malformed or missing ident drops its own lines,
+/// date included, and nothing else.
+fn write_pp_idents(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    pretty: &Pretty,
+    mailmap: Option<&Mailmap>,
+    date_mode: &DateMode,
+    now: i64,
+) -> Result<()> {
+    let both = matches!(pretty, Pretty::Full | Pretty::Fuller);
+    for line in header_lines(data) {
+        let (who, label, date_label) = if let Some(value) = header_value(line, "author") {
+            (value, "Author", "AuthorDate")
+        } else if let Some(value) = header_value(line, "committer").filter(|_| both) {
+            (value, "Commit", "CommitDate")
+        } else {
+            continue;
+        };
+        let Some(who) = split_ident(who) else { continue };
+        match pretty {
+            Pretty::Fuller => {
+                write_person(out, format!("{label}:     ").as_bytes(), &who, mailmap);
+                writeln!(out, "{date_label}: {}", show_ident_date(who.time, date_mode.clone(), now))?;
+            }
+            Pretty::Full => write_person(out, format!("{label}: ").as_bytes(), &who, mailmap),
+            _ => {
+                write_person(out, b"Author: ", &who, mailmap);
+                if matches!(pretty, Pretty::Medium) {
+                    writeln!(out, "Date:   {}", show_ident_date(who.time, date_mode.clone(), now))?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -17201,7 +17170,7 @@ fn format_date_tz(seconds: i64, tz: i32, mode: DateMode) -> String {
 /// parse, which is why `git rev-list --until=1980-01-01` lists a commit whose
 /// committer date is a lone vertical tab instead of erroring out.
 fn commit_date(commit: &gix::Commit<'_>) -> i64 {
-    commit.time().map_or(0, |t| t.seconds)
+    gix::objs::commit::walk::WalkInfo::from_bytes(&commit.data, commit.id().kind()).map_or(0, |info| info.date)
 }
 
 /// The `isspace()` C reads bytes with. Rust's `u8::is_ascii_whitespace` leaves
@@ -17262,6 +17231,90 @@ fn ident_date_spans(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((&raw[date_begin..date_end], &raw[tz_begin..tz_end]))
+}
+
+/// Which of several `author`/`committer` header lines a reader takes:
+/// `find_commit_header()` stops at the first (commit.c:1918-1937),
+/// `parse_commit_header()` keeps overwriting and ends on the last
+/// (pretty.c:915-939).
+#[derive(Clone, Copy)]
+pub(crate) enum HeaderPick {
+    First,
+    Last,
+}
+
+/// The ident of the commit's `field` header line, split as
+/// `split_ident_line()` splits it (ident.c:275-346), read off the raw object
+/// rather than a decoded commit: git never decodes an ident before printing
+/// it, so a malformed author line costs only its own placeholders, never the
+/// commit. `None` where the header is absent (`find_commit_header()` returns
+/// NULL, `parse_commit_header()` leaves `len` at 0) or split fails for want
+/// of a `<` or a `>` after it.
+///
+/// The name runs from the start of the line to the last non-space before
+/// `<`, the mail from past the first `<` to the first `>` after it, and
+/// `time` is everything after the *last* `>` of the line, the span
+/// [`ident_date_spans`] scans for the date and zone. Bytes from the first
+/// non-ASCII one on are left out of `time`: they could never be a digit, a
+/// sign or a space, so the date read is the same.
+pub(crate) fn commit_ident<'a>(
+    data: &'a [u8],
+    field: &str,
+    pick: HeaderPick,
+) -> Option<gix::actor::SignatureRef<'a>> {
+    let mut values = header_lines(data).filter_map(|line| header_value(line, field));
+    let line = match pick {
+        HeaderPick::First => values.next()?,
+        HeaderPick::Last => values.last()?,
+    };
+    split_ident(line)
+}
+
+/// The header lines of a commit object, up to the blank line that ends them.
+fn header_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.split(|&b| b == b'\n').take_while(|line| !line.is_empty())
+}
+
+/// The value of `line` when it is a `<field> ` header line (`skip_prefix(line,
+/// "author ", &name)`).
+fn header_value<'a>(line: &'a [u8], field: &str) -> Option<&'a [u8]> {
+    line.strip_prefix(field.as_bytes())?.strip_prefix(b" ")
+}
+
+/// `split_ident_line()` (ident.c:275-346) over one ident value; see
+/// [`commit_ident`].
+fn split_ident(line: &[u8]) -> Option<gix::actor::SignatureRef<'_>> {
+    use gix::bstr::ByteSlice;
+    // `for (cp = line; *cp && cp < line + len; cp++) if (*cp == '<')`: a NUL
+    // ends the scan.
+    let lt = line.iter().take_while(|&&b| b != 0).position(|&b| b == b'<')?;
+    let mail_begin = lt + 1;
+    // git's isspace() (ctype.c): space, '\t', '\n', '\r'.
+    let name_end = line[..lt]
+        .iter()
+        .rposition(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map_or(0, |at| at + 1);
+    let mail_end = mail_begin + line[mail_begin..].iter().position(|&b| b == b'>')?;
+    let last_gt = line.iter().rposition(|&b| b == b'>').expect("mail_end is a '>'");
+    let after = &line[last_gt + 1..];
+    let ascii = after.iter().position(|b| !b.is_ascii()).unwrap_or(after.len());
+    Some(gix::actor::SignatureRef {
+        name: line[..name_end].as_bstr(),
+        email: line[mail_begin..mail_end].as_bstr(),
+        time: std::str::from_utf8(&after[..ascii]).expect("ASCII is UTF-8"),
+    })
+}
+
+/// The commit message as `pp_remainder()` and the `%s`/`%b`/`%B` placeholders
+/// see it: everything after the blank line that ends the header
+/// (pretty.c:915-939, `message_off`), and nothing when there is none. Unlike
+/// a decoded commit's message this does not depend on the idents above it.
+pub(crate) fn commit_message(data: &[u8]) -> &gix::bstr::BStr {
+    use gix::bstr::ByteSlice;
+    match data.find(b"\n\n") {
+        Some(at) => data[at + 2..].as_bstr(),
+        None => b"".as_bstr(),
+    }
 }
 
 /// `parse_timestamp` is `strtoumax` (compat/posix.h:266), which *saturates* at
@@ -17715,13 +17768,15 @@ fn replace_encoding_header(data: &mut Vec<u8>, encoding: &str) {
 }
 
 /// The header lines of a commit that [`Pretty::Raw`] does not reconstruct from the
-/// parsed object: everything that is not `tree`, `parent`, `author` or `committer`,
-/// continuation lines (a leading space, as `gpgsig` uses) included.
+/// parsed object: everything that is not `tree` or `parent`, continuation lines (a
+/// leading space, as `gpgsig` uses) included. The idents are copied as stored, as
+/// `pp_header()` copies every line (pretty.c:2073-2076), so one that does not
+/// split still prints.
 ///
 /// The scan stops at the blank line that ends the header block, so a body line
 /// starting with one of those words is never mistaken for a header.
 fn extra_headers(data: &[u8]) -> Vec<&[u8]> {
-    const RECONSTRUCTED: [&[u8]; 4] = [b"tree ", b"parent ", b"author ", b"committer "];
+    const RECONSTRUCTED: [&[u8]; 2] = [b"tree ", b"parent "];
     let mut out = Vec::new();
     let mut in_reconstructed = false;
     for line in data.split(|b| *b == b'\n') {

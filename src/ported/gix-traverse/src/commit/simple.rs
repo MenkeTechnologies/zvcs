@@ -546,7 +546,8 @@ mod init {
         buf: &mut Vec<u8>,
     ) -> Result<(), Error> {
         let commit_iter = objects.find_commit_iter(&commit_id, buf)?;
-        let time = commit_iter.committer()?.seconds();
+        // `parse_commit_date()` (commit.c:128-194): an unreadable ident is date 0.
+        let time = commit_iter.walk_info()?.date;
         let key = to_queue_key(time, order);
         match (cutoff_time, order) {
             (Some(cutoff_time), _) if time >= cutoff_time => queue.insert(key, commit_id),
@@ -744,33 +745,32 @@ mod init {
                         }
                     }
                     Ok(Either::CommitRefIter(commit_iter)) => {
-                        for token in commit_iter {
-                            match token {
-                                Ok(gix_object::commit::ref_iter::Token::Tree { .. }) => continue,
-                                Ok(gix_object::commit::ref_iter::Token::Parent { id }) => {
-                                    parents.push(id);
-                                    if follow_first_parent_only && parents.len() > 1 {
-                                        // See the comment in the cached-commit arm above: the
-                                        // remaining parents are recorded but not walked.
-                                        continue;
-                                    }
-                                    insert_into_seen_and_queue(
-                                        &mut state.seen,
-                                        &state.hidden,
-                                        id,
-                                        &mut self.predicate,
-                                        next,
-                                        order,
-                                        cutoff,
-                                        || {
-                                            let (buf, unreadable) = (&mut state.parents_buf, &mut state.unreadable);
-                                            parent_commit_time(&self.objects, id, buf, unreadable)
-                                        },
-                                    );
-                                }
-                                Ok(_unused_token) => break,
-                                Err(err) => return Some(Err(err.into())),
+                        // `parse_commit_buffer()` (commit.c:556-575): the parents are read
+                        // whatever the idents behind them hold.
+                        let info = match commit_iter.walk_info() {
+                            Ok(info) => info,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        for id in info.parents {
+                            parents.push(id);
+                            if follow_first_parent_only && parents.len() > 1 {
+                                // See the comment in the cached-commit arm above: the
+                                // remaining parents are recorded but not walked.
+                                continue;
                             }
+                            insert_into_seen_and_queue(
+                                &mut state.seen,
+                                &state.hidden,
+                                id,
+                                &mut self.predicate,
+                                next,
+                                order,
+                                cutoff,
+                                || {
+                                    let (buf, unreadable) = (&mut state.parents_buf, &mut state.unreadable);
+                                    parent_commit_time(&self.objects, id, buf, unreadable)
+                                },
+                            );
                         }
                     }
                     Err(err) => return Some(Err(err.into())),
@@ -838,27 +838,20 @@ mod init {
                         }
                     }
                     Ok(Either::CommitRefIter(commit_iter)) => {
-                        for token in commit_iter {
-                            match token {
-                                Ok(gix_object::commit::ref_iter::Token::Tree { .. }) => continue,
-                                Ok(gix_object::commit::ref_iter::Token::Parent { id: pid }) => {
-                                    parents.push(pid);
-                                    if follow_first_parent_only && parents.len() > 1 {
-                                        // See the comment in the cached-commit arm above: the
-                                        // remaining parents are recorded but not walked.
-                                        continue;
-                                    }
-                                    insert_into_seen_and_next(
-                                        &mut state.seen,
-                                        &state.hidden,
-                                        pid,
-                                        &mut self.predicate,
-                                        next,
-                                    );
-                                }
-                                Ok(_a_token_past_the_parents) => break,
-                                Err(err) => return Some(Err(err.into())),
+                        // `parse_commit_buffer()` (commit.c:556-575): the parents are read
+                        // whatever the idents behind them hold.
+                        let info = match commit_iter.walk_info() {
+                            Ok(info) => info,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        for pid in info.parents {
+                            parents.push(pid);
+                            if follow_first_parent_only && parents.len() > 1 {
+                                // See the comment in the cached-commit arm above: the
+                                // remaining parents are recorded but not walked.
+                                continue;
                             }
+                            insert_into_seen_and_next(&mut state.seen, &state.hidden, pid, &mut self.predicate, next);
                         }
                     }
                     Err(err) => return Some(Err(err.into())),
@@ -923,7 +916,7 @@ fn parent_commit_time(
 ) -> SecondsSinceUnixEpoch {
     use gix_object::FindExt;
     match objects.find_commit_iter(&id, buf) {
-        Ok(parent) => parent.committer().ok().map(|committer| committer.seconds()).unwrap_or_default(),
+        Ok(parent) => parent.walk_info().map(|info| info.date).unwrap_or_default(),
         Err(err) => {
             if let Some(why) = Unreadable::of(&err) {
                 unreadable.insert(id, why);

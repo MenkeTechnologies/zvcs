@@ -95,7 +95,7 @@ impl Either<'_, '_> {
     /// present, or a [`gix_object::CommitRefIter`] otherwise.
     pub fn commit_time(self) -> Result<gix_date::SecondsSinceUnixEpoch, gix_object::decode::Error> {
         match self {
-            Self::CommitRefIter(commit_ref_iter) => commit_ref_iter.committer().map(|c| c.seconds()),
+            Self::CommitRefIter(commit_ref_iter) => commit_ref_iter.walk_info().map(|info| info.date),
             Self::CachedCommit(commit) => Ok(commit.committer_timestamp() as gix_date::SecondsSinceUnixEpoch),
         }
     }

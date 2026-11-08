@@ -4432,7 +4432,7 @@ pub(crate) fn bitmap_file(
         let Ok(commit) = repo.find_commit(entry.id) else {
             continue;
         };
-        let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+        let date = walk_date(&commit);
         let merge = commit.parent_ids().count() > 1;
         commits.push((entry.id, date, merge, preferred.contains(&entry.id)));
     }
@@ -4649,7 +4649,7 @@ fn select_pseudo_merges(
         let Ok(commit) = repo.find_commit(id) else {
             continue;
         };
-        let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+        let date = walk_date(&commit);
         let has_bitmap = bitmapped.contains(&id);
 
         for (group, matches) in groups.iter().zip(&mut matched) {
@@ -5757,11 +5757,12 @@ fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>, topo: bool) -> C
         let (id, _) = queue[at];
         at += 1;
         let Ok(object) = repo.find_object(id) else { continue };
-        let Ok(commit) = object.into_commit().decode().map(|c| (c.tree(), c.parents().collect::<Vec<_>>()))
-        else {
+        // `parse_commit_buffer()` reads the tree and the parents whatever the
+        // idents behind them hold (commit.c:516-598).
+        let Ok(info) = gix::objs::commit::walk::WalkInfo::from_bytes(&object.data, object.id.kind()) else {
             continue;
         };
-        let (tree, parents) = commit;
+        let (tree, parents) = (info.tree, info.parents.into_vec());
         if topo {
             parents_of.insert(id, parents.clone());
             trees.insert(id, tree);
@@ -5862,8 +5863,13 @@ fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
     repo.find_object(id)
         .ok()
         .and_then(|o| o.try_into_commit().ok())
-        .and_then(|c| c.committer().ok().map(|c| c.seconds()))
-        .unwrap_or(0)
+        .map_or(0, |c| walk_date(&c))
+}
+
+/// `commit->date` as `parse_commit_date()` reads it (commit.c:128-194): 0 when
+/// the author or committer line cannot be read, never a failed parse.
+fn walk_date(commit: &gix::Commit<'_>) -> i64 {
+    gix::objs::commit::walk::WalkInfo::from_bytes(&commit.data, commit.id().kind()).map_or(0, |info| info.date)
 }
 
 /// Add every valid cache-tree id, recursively. A section with no entry count is

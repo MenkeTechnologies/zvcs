@@ -57,6 +57,8 @@ impl From<SignedData<'_>> for BString {
 
 ///
 pub mod ref_iter;
+///
+pub mod walk;
 
 mod write;
 

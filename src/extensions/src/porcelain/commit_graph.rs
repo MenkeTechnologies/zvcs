@@ -1323,7 +1323,7 @@ fn generations(entries: &[Entry], parents: &[Vec<u32>], base: Option<&Base<'_>>)
             }
             if expanded {
                 let mut l = 1u32;
-                let mut c = entries[idx].time;
+                let mut max_gen = 0u64;
                 for &p in &parents[idx] {
                     let (pl, pc) = match (p < offset, base) {
                         (true, Some(b)) => (b.level(p), b.corrected(p)),
@@ -1333,10 +1333,17 @@ fn generations(entries: &[Entry], parents: &[Vec<u32>], base: Option<&Base<'_>>)
                         }
                     };
                     l = l.max(pl.saturating_add(1));
-                    c = c.max(pc.saturating_add(1));
+                    max_gen = max_gen.max(pc);
                 }
                 level[idx] = l.min(GENERATION_MAX);
-                corrected[idx] = c;
+                // `compute_generation_from_max()`, version 2
+                // (commit-graph.c:1637-1640): a date of 0 does not count, and
+                // the unsigned `timestamp_t` arithmetic wraps.
+                let date = entries[idx].time;
+                if date != 0 && date > max_gen {
+                    max_gen = date - 1;
+                }
+                corrected[idx] = max_gen.wrapping_add(1);
             } else {
                 stack.push((idx, true));
                 for &p in &parents[idx] {
@@ -1540,15 +1547,14 @@ fn close_over_ancestors(
         if object.kind != gix::objs::Kind::Commit {
             continue;
         }
-        let Ok(commit) = gix::objs::CommitRef::from_bytes(&object.data, id.kind()) else {
+        // `parse_commit_buffer()` (commit.c:516-598): only the tree and the
+        // parents can fail the parse; the date is `parse_commit_date()`'s, 0
+        // for idents it cannot read, kept as the unsigned `timestamp_t`.
+        let Ok(commit) = gix::objs::commit::walk::WalkInfo::from_bytes(&object.data, id.kind()) else {
             return Err(error_exit(&format!("unable to parse commit {id}")));
         };
-        let time = commit
-            .committer()
-            .ok()
-            .and_then(|sig| sig.time().ok())
-            .map_or(0, |t| t.seconds.max(0) as u64);
-        let parents: Vec<ObjectId> = commit.parents().collect();
+        let time = commit.date as u64;
+        let parents: Vec<ObjectId> = commit.parents.to_vec();
         for p in &parents {
             if !seen.contains(p) {
                 stack.push(*p);
@@ -1556,7 +1562,7 @@ fn close_over_ancestors(
         }
         out.push(Entry {
             id,
-            tree: commit.tree(),
+            tree: commit.tree,
             parents,
             time,
         });
@@ -1637,7 +1643,9 @@ fn serialize(
         let mut gda2 = Vec::with_capacity(n * 4);
         let mut gdo2: Vec<u8> = Vec::new();
         for (idx, e) in entries.iter().enumerate() {
-            let offset = corrected[idx].saturating_sub(e.time);
+            // `compute_generation_offset()` (commit-graph.c:1338-1348): the generation
+            // less the date masked to 34 bits, in wrapping `timestamp_t`.
+            let offset = corrected[idx].wrapping_sub(e.time & DATE_MASK);
             if offset > OFFSET_MAX {
                 let slot = (gdo2.len() / 8) as u32;
                 gdo2.extend_from_slice(&offset.to_be_bytes());

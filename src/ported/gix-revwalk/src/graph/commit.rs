@@ -8,10 +8,19 @@ impl<'graph, 'cache> LazyCommit<'graph, 'cache> {
     /// Return an iterator over the parents of this commit.
     pub fn iter_parents(&self) -> Parents<'graph, 'cache> {
         let backing = match &self.backing {
-            Either::Left(buf) => Either::Left(gix_object::CommitRefIter::from_bytes(buf, self.object_hash)),
+            // `parse_commit_buffer()` reads the parents and the date and leaves
+            // the idents alone (commit.c:556-591), so a malformed author never
+            // ends the parent list.
+            Either::Left(buf) => Either::Left(
+                gix_object::commit::walk::WalkInfo::from_bytes(buf, self.object_hash)
+                    .map(|info| info.parents.into_iter()),
+            ),
             Either::Right((cache, pos)) => Either::Right((*cache, cache.commit_at(*pos).iter_parents())),
         };
-        Parents { backing }
+        Parents {
+            backing,
+            _graph: std::marker::PhantomData,
+        }
     }
 
     /// Returns the timestamp at which this commit was created.
@@ -20,9 +29,9 @@ impl<'graph, 'cache> LazyCommit<'graph, 'cache> {
     /// Note that this can only fail if the commit is backed by the object database *and* parsing fails.
     pub fn committer_timestamp(&self) -> Result<SecondsSinceUnixEpoch, gix_object::decode::Error> {
         Ok(match &self.backing {
-            Either::Left(buf) => gix_object::CommitRefIter::from_bytes(buf, self.object_hash)
-                .committer()?
-                .seconds(),
+            // `parse_commit_date()` (commit.c:128-194): 0 where the idents
+            // cannot be read, never an error.
+            Either::Left(buf) => gix_object::commit::walk::WalkInfo::from_bytes(buf, self.object_hash)?.date,
             Either::Right((cache, pos)) => cache.commit_at(*pos).committer_timestamp() as SecondsSinceUnixEpoch, // a cast as we cannot represent the error and trying seems overkill
         })
     }
@@ -42,9 +51,7 @@ impl<'graph, 'cache> LazyCommit<'graph, 'cache> {
         Ok(match &self.backing {
             Either::Left(buf) => (
                 None,
-                gix_object::CommitRefIter::from_bytes(buf, self.object_hash)
-                    .committer()?
-                    .seconds(),
+                gix_object::commit::walk::WalkInfo::from_bytes(buf, self.object_hash)?.date,
             ),
             Either::Right((cache, pos)) => {
                 let commit = cache.commit_at(*pos);
@@ -63,29 +70,10 @@ impl<'graph, 'cache> LazyCommit<'graph, 'cache> {
         let data = new_data();
         Ok(match &self.backing {
             Either::Left(buf) => {
-                use gix_object::commit::ref_iter::Token;
-                let iter = gix_object::CommitRefIter::from_bytes(buf, self.object_hash);
-                let mut parents = SmallVec::default();
-                let mut timestamp = None;
-                for token in iter {
-                    match token? {
-                        Token::Tree { .. } => {}
-                        Token::Parent { id } => parents.push(id),
-                        Token::Author { .. } => {}
-                        Token::Committer { signature } => {
-                            timestamp = Some(signature.seconds());
-                            break;
-                        }
-                        _ => {
-                            unreachable!(
-                                "we break naturally after seeing the committer which is always at the same spot"
-                            )
-                        }
-                    }
-                }
+                let info = gix_object::commit::walk::WalkInfo::from_bytes(buf, self.object_hash)?;
                 Commit {
-                    parents,
-                    commit_time: timestamp.unwrap_or_default(),
+                    parents: info.parents.into_iter().collect(),
+                    commit_time: info.date,
                     generation: None,
                     data,
                 }
@@ -114,8 +102,9 @@ impl<'graph, 'cache> LazyCommit<'graph, 'cache> {
 
 /// An iterator over the parents of a commit.
 pub struct Parents<'graph, 'cache> {
+    _graph: std::marker::PhantomData<&'graph [u8]>,
     backing: Either<
-        gix_object::CommitRefIter<'graph>,
+        Result<smallvec::IntoIter<[gix_hash::ObjectId; 2]>, gix_object::decode::Error>,
         (
             &'cache gix_commitgraph::Graph,
             gix_commitgraph::file::commit::Parents<'cache>,
@@ -128,16 +117,12 @@ impl Iterator for Parents<'_, '_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.backing {
-            Either::Left(it) => {
-                for token in it {
-                    match token {
-                        Ok(gix_object::commit::ref_iter::Token::Tree { .. }) => continue,
-                        Ok(gix_object::commit::ref_iter::Token::Parent { id }) => return Some(Ok(id)),
-                        Ok(_unused_token) => break,
-                        Err(err) => return Some(Err(err.into())),
-                    }
-                }
-                None
+            Either::Left(Ok(it)) => it.next().map(Ok),
+            Either::Left(Err(err)) => {
+                let err = *err;
+                // The decode error is reported once, then the iteration ends.
+                self.backing = Either::Left(Ok(SmallVec::new().into_iter()));
+                Some(Err(err.into()))
             }
             Either::Right((cache, it)) => it
                 .next()

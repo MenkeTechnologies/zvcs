@@ -2547,6 +2547,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     {
         return Ok(fatal("-z option used with unsupported option"));
     }
+    // `--timestamp` reads each shown commit's date through the commit-graph,
+    // opened on first use.
+    let timestamp_graph: std::cell::OnceCell<Option<gix::commitgraph::Graph>> = std::cell::OnceCell::new();
 
     // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
     // is fatal here — before the walk, and on the paths that never build a
@@ -4040,12 +4043,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // object name, which is how a caller sorts a list without re-reading each
             // object.
             if show_timestamp {
-                let secs = repo
-                    .find_object(*id)
-                    .ok()
-                    .and_then(|o| o.try_into_commit().ok())
-                    .and_then(|c| c.committer().ok().map(|s| s.seconds()))
-                    .unwrap_or(0);
+                // `commit->date`, a `timestamp_t` printed with `PRItime`, unsigned.
+                // `repo_parse_commit()` takes it from the commit-graph when the
+                // commit is there, the 34 bits the graph keeps (commit-graph.c:876-905,
+                // fill_commit_graph_info()), and otherwise from the object with
+                // `parse_commit_date()` (commit.c:128-194).
+                let from_graph = timestamp_graph
+                    .get_or_init(|| repo.commit_graph_if_enabled().ok().flatten())
+                    .as_ref()
+                    .and_then(|graph| graph.commit_by_id(*id))
+                    .map(|commit| commit.committer_timestamp());
+                let secs = from_graph.unwrap_or_else(|| {
+                    repo.find_object(*id)
+                        .ok()
+                        .and_then(|o| o.try_into_commit().ok())
+                        .and_then(|c| gix::objs::commit::walk::WalkInfo::from_bytes(&c.data, c.id().kind()).ok())
+                        .map_or(0, |info| info.date as u64)
+                });
                 out.extend_from_slice(secs.to_string().as_bytes());
                 out.push(b' ');
             }

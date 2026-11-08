@@ -251,18 +251,12 @@ where
     let mut parents = SmallVec::<[(ObjectId, GenAndCommitTime); 1]>::new();
     match find(cache.as_ref(), &f, id, buf)? {
         Either::CommitRefIter(c) => {
-            for token in c {
-                use gix_object::commit::ref_iter::Token as T;
-                match token {
-                    Ok(T::Tree { .. }) => continue,
-                    Ok(T::Parent { id }) => {
-                        parents.push((id, (0, 0))); // Dummy numbers to be filled in
-                        if first_only {
-                            break;
-                        }
-                    }
-                    Ok(_past_parents) => break,
-                    Err(err) => return Err(err.into()),
+            // `parse_commit_buffer()` (commit.c:556-575): the parents are read
+            // whatever the idents behind them hold.
+            for id in c.walk_info()?.parents {
+                parents.push((id, (0, 0))); // Dummy numbers to be filled in
+                if first_only {
+                    break;
                 }
             }
             // Need to check the cache again. That a commit is not in the cache
@@ -299,22 +293,8 @@ where
 pub(super) fn gen_and_commit_time(c: Either<'_, '_>) -> Result<GenAndCommitTime, Error> {
     match c {
         Either::CommitRefIter(c) => {
-            let mut commit_time = 0;
-            for token in c {
-                use gix_object::commit::ref_iter::Token as T;
-                match token {
-                    Ok(T::Tree { .. }) => continue,
-                    Ok(T::Parent { .. }) => continue,
-                    Ok(T::Author { .. }) => continue,
-                    Ok(T::Committer { signature }) => {
-                        commit_time = signature.seconds();
-                        break;
-                    }
-                    Ok(_unused_token) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            }
-            Ok((gix_commitgraph::GENERATION_NUMBER_INFINITY, commit_time))
+            // `parse_commit_date()` (commit.c:128-194): an unreadable ident is date 0.
+            Ok((gix_commitgraph::GENERATION_NUMBER_INFINITY, c.walk_info()?.date))
         }
         Either::CachedCommit(c) => Ok((c.generation(), c.committer_timestamp() as i64)),
     }

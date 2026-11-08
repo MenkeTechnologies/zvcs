@@ -2470,7 +2470,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             let mut dates: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
             for node in &nodes {
                 if node.reflog.is_none() {
-                    dates.insert(node.id, repo.find_commit(node.id)?.time()?.seconds);
+                    dates.insert(node.id, commit_date(&repo.find_commit(node.id)?));
                 }
             }
             let date = |node: &super::log::Node| match &node.reflog {
@@ -2596,7 +2596,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 // `get_revision_1()`'s `max_age` test on the `REV_WALK_NO_WALK` pop
                 // (revision.c:4472-4476), then `get_commit_action()`'s two.
                 let ages = counts.ages();
-                let seconds = repo.find_commit(*id)?.time()?.seconds;
+                let seconds = commit_date(&repo.find_commit(*id)?);
                 if ages.below_max_age(seconds) || ages.ignores(seconds) {
                     continue;
                 }
@@ -5858,3 +5858,10 @@ fn change_path(change: &ChangeDetached) -> &[u8] {
 // by `git log`'s own `parse_date_mode`/`fmt_time` — a second copy here could only
 // drift from them.
 
+
+/// `commit->date` as `parse_commit_buffer()` leaves it: the committer date read
+/// by `parse_commit_date()` (commit.c:128-194), 0 when the author or committer
+/// line cannot be read, so a malformed ident never stops the walk.
+fn commit_date(commit: &gix::Commit<'_>) -> i64 {
+    gix::objs::commit::walk::WalkInfo::from_bytes(&commit.data, commit.id().kind()).map_or(0, |info| info.date)
+}

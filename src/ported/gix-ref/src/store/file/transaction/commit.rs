@@ -33,7 +33,13 @@ impl Transaction<'_, '_> {
         if let Some(backend) = self.store.reftable() {
             assert!(self.updates.is_some(), "BUG: must call prepare before commit");
             let data = self.reftable.take().expect("prepare keeps the reftable transaction");
-            return backend.transaction_finish(data, committer);
+            let edits = backend.transaction_finish(data, committer)?;
+            // `ref_transaction_commit()` runs the hook at `committed` once the backend
+            // has finished, whatever it exits with (refs.c:2783-2785).
+            if let Some(feed) = &self.hook {
+                crate::file::transaction_hook(self.store, "committed", &feed.lines);
+            }
+            return Ok(edits);
         }
         // `files_transaction_finish()` opens with `files_ref_store_write_options(refs)`
         // (refs/files-backend.c:3327, v2.56.0), the lazy config read that dies on a bad
@@ -223,14 +229,37 @@ impl Transaction<'_, '_> {
             }
         }
 
+        let mut hook = self.hook.take();
+        let packing = !matches!(self.packed_refs, PackedRefs::DeletionsOnly);
         if let Some(t) = self.packed_transaction {
             t.commit().map_err(Error::PackedTransactionCommit)?;
+            // `files_transaction_finish()` commits the nested `packed-refs` transaction
+            // before it removes the loose files (refs/files-backend.c:3420-3428).
+            if let Some(packed) = hook.as_ref().and_then(|feed| feed.packed.as_ref()) {
+                crate::file::transaction_hook(self.store, "committed", packed);
+            }
             // Always refresh ourselves right away to avoid races. We ignore errors as there may be many reasons this fails, and it's not
             // critical to be done here. In other words, the pack may be refreshed at a later time and then it might work.
             self.store.force_refresh_packed_buffer().ok();
         }
+        // `files_pack_refs()` commits its `packed-refs` transaction before it prunes
+        // the loose references (refs/files-backend.c:1555-1573).
+        if packing {
+            if let Some(feed) = hook.take() {
+                crate::file::transaction_hook(self.store, "committed", &feed.lines);
+            }
+        }
 
-        for change in &mut updates {
+        // `files_pack_refs()` prepends each reference to prune to its list
+        // (refs/files-backend.c:1557-1560), so `prune_refs()` removes them in the reverse
+        // of the order they were packed in.
+        let order: Vec<usize> = if delete_loose_refs {
+            (0..updates.len()).rev().collect()
+        } else {
+            (0..updates.len()).collect()
+        };
+        for idx in order {
+            let change = &mut updates[idx];
             let take_lock_and_delete = match &change.update.change {
                 Change::Update {
                     log: LogChange { mode, .. },
@@ -240,6 +269,28 @@ impl Transaction<'_, '_> {
                 Change::Delete { log: mode, .. } => *mode == RefLog::AndReference,
             };
             if take_lock_and_delete {
+                // `prune_ref()` removes each packed loose reference in a transaction of
+                // its own, `REF_HAVE_OLD | REF_HAVE_NEW | REF_IS_PRUNING` from its value to
+                // the null id, which runs the hook (refs/files-backend.c:1373-1395).
+                let mut prune_lines = Vec::new();
+                if let Change::Update {
+                    new: Target::Object(oid), ..
+                } = &change.update.change
+                {
+                    crate::file::transaction::hook_line(
+                        &mut prune_lines,
+                        self.store.object_hash,
+                        Some(crate::file::transaction::HookValue::Object(oid)),
+                        None,
+                        change.update.name.as_bstr(),
+                    );
+                    for state in ["preparing", "prepared"] {
+                        if !crate::file::transaction_hook(self.store, state, &prune_lines) {
+                            gix_tempfile::registry::cleanup_tempfiles();
+                            crate::file::transaction_hook_refused(self.store, state, &[&prune_lines]);
+                        }
+                    }
+                }
                 let lock = change.lock.take();
                 let reference_path = self.store.reference_path(change.update.name.as_ref());
                 if let Err(err) = std::fs::remove_file(reference_path) {
@@ -251,6 +302,9 @@ impl Transaction<'_, '_> {
                     }
                 }
                 drop(lock);
+                if !prune_lines.is_empty() {
+                    crate::file::transaction_hook(self.store, "committed", &prune_lines);
+                }
             }
         }
         // `files_transaction_finish()` marks every `REF_DELETING && !REF_LOG_ONLY`
@@ -290,6 +344,9 @@ impl Transaction<'_, '_> {
                 }
                 dir = d.parent();
             }
+        }
+        if let Some(feed) = &hook {
+            crate::file::transaction_hook(self.store, "committed", &feed.lines);
         }
         Ok(edits)
     }

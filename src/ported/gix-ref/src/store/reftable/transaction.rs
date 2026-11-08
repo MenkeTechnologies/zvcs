@@ -184,6 +184,31 @@ impl TransactionData {
         self.updates.iter().map(|u| u.edit.clone()).collect()
     }
 
+    /// The `reference-transaction` hook's stdin for the updates as they stand,
+    /// `transaction_hook_feed_stdin()` (refs.c:2602-2640): every update but a
+    /// `REF_LOG_ONLY` one, its old value only under `REF_HAVE_OLD` and its new
+    /// one only under `REF_HAVE_NEW`.
+    pub(crate) fn hook_stdin(&self) -> Vec<u8> {
+        let mut lines = Vec::new();
+        for u in self.updates.iter().filter(|u| !u.log_only) {
+            use crate::file::transaction::HookValue;
+            let old = match &u.old_target {
+                // "If it exists it must match" is no `REF_HAVE_OLD`, see
+                // `file::transaction::edit_hook_line()`.
+                _ if !u.have_old || u.old_may_be_missing => None,
+                Some(target) => Some(HookValue::Symbolic(target.as_bstr())),
+                None => Some(HookValue::Object(&u.old_oid)),
+            };
+            let new = match &u.new_target {
+                _ if !u.have_new => None,
+                Some(target) => Some(HookValue::Symbolic(target.as_bstr())),
+                None => Some(HookValue::Object(&u.new_oid)),
+            };
+            crate::file::transaction::hook_line(&mut lines, self.object_hash, old, new, u.refname.as_bstr());
+        }
+        lines
+    }
+
     /// The updates refused so far, see [`Rejection`].
     pub(crate) fn rejections(&self) -> &[Rejection] {
         &self.rejections

@@ -1177,6 +1177,12 @@ fn move_head_reporting(repo: &gix::Repository, target: ObjectId, spec: &str) -> 
 /// Point `HEAD` (or the branch it references) at `target`, writing a reflog entry
 /// `reset: moving to <spec>` on both refs, exactly as `git reset` does.
 fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()> {
+    // `refs_update_ref(…, "HEAD", oid, orig, 0, …)` (builtin/reset.c:320-322): the old
+    // value is what `HEAD` resolved to, when it did.
+    let expected = match repo.head_id() {
+        Ok(orig) => PreviousValue::MustExistAndMatch(Target::Object(orig.detach())),
+        Err(_) => PreviousValue::Any,
+    };
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1184,7 +1190,7 @@ fn move_head(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<()>
                 force_create_reflog: false,
                 message: reflog_message("updating HEAD", Some(spec)).into(),
             },
-            expected: PreviousValue::Any,
+            expected,
             new: Target::Object(target),
         },
         name: "HEAD"
@@ -1206,6 +1212,12 @@ pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> 
         .map_err(|e| anyhow!("invalid ref name ORIG_HEAD: {e}"))?;
     // `reset_refs()` writes `<GIT_REFLOG_ACTION or "reset">: updating ORIG_HEAD`.
     let action = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "reset".to_string());
+    // `refs_update_ref(…, "ORIG_HEAD", orig, old_orig, 0, …)` (builtin/reset.c:308-315):
+    // the old value is the one `ORIG_HEAD` holds, when it holds one.
+    let expected = match repo.try_find_reference("ORIG_HEAD").ok().flatten().map(|r| r.target().try_id().map(ToOwned::to_owned)) {
+        Some(Some(old_orig)) => PreviousValue::MustExistAndMatch(Target::Object(old_orig)),
+        _ => PreviousValue::Any,
+    };
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -1213,7 +1225,7 @@ pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> 
                 force_create_reflog: false,
                 message: format!("{action}: updating ORIG_HEAD").into(),
             },
-            expected: PreviousValue::Any,
+            expected,
             new: Target::Object(id),
         },
         name,
@@ -1250,6 +1262,8 @@ pub(crate) fn remove_branch_state(repo: &gix::Repository, verbose: bool) -> Resu
     for name in ["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
         let _ = std::fs::remove_file(git_dir.join(name));
     }
+    // `remove_merge_branch_state()` deletes `AUTO_MERGE` once more (branch.c:869-870).
+    crate::sequencer::delete_state_ref(repo, "AUTO_MERGE")?;
     save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
     Ok(())
 }

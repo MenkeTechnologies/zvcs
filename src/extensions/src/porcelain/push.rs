@@ -2502,7 +2502,6 @@ fn update_tracking_refs(
     outcome: &push_proto::Outcome,
     verbose: bool,
 ) {
-    let mut edits: Vec<RefEdit> = Vec::new();
     for s in &outcome.statuses {
         if s.result.is_err() {
             continue;
@@ -2547,14 +2546,14 @@ fn update_tracking_refs(
                 new: Target::Object(s.new),
             }
         };
-        edits.push(RefEdit {
+        // `refs_update_ref()` or `refs_delete_ref()` for each reference on its own
+        // (transport.c:629-637): one ref transaction, and one run of the
+        // `reference-transaction` hook, per tracking ref.
+        let _ = repo.edit_reference(RefEdit {
             change,
             name,
             deref: false,
         });
-    }
-    if !edits.is_empty() {
-        let _ = repo.edit_references(edits);
     }
 }
 

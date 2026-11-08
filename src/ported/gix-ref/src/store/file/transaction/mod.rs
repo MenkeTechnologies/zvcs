@@ -221,6 +221,7 @@ impl file::Store {
             packed_refs: PackedRefs::default(),
             reftable: None,
             options: Options::default(),
+            hook: None,
         }
     }
 }
@@ -276,6 +277,119 @@ impl<'p> Transaction<'_, 'p> {
     /// refused, in the order they were refused.
     pub fn rejections(&self) -> &[Rejection] {
         self.reftable.as_ref().map_or(&[], |data| data.rejections())
+    }
+}
+
+/// What the `reference-transaction` hook is fed for a prepared transaction.
+#[derive(Debug, Default)]
+pub(crate) struct HookFeed {
+    /// The lines of the transaction's updates as `prepared` saw them.
+    pub lines: Vec<u8>,
+    /// The lines of the files backend's nested `packed-refs` transaction, when
+    /// `files_transaction_prepare()` prepared one (refs/files-backend.c:3084-3103);
+    /// it is committed or aborted along with this one.
+    pub packed: Option<Vec<u8>>,
+}
+
+/// One line of the hook's stdin, `transaction_hook_feed_stdin()` (refs.c:2602-2640):
+/// `<old> <new> <refname>`, each value the null id when the update has none
+/// (no `REF_HAVE_OLD`, no `REF_HAVE_NEW`), and a symbolic value as `ref:<target>`.
+pub fn hook_line(
+    out: &mut Vec<u8>,
+    kind: gix_hash::Kind,
+    old: Option<HookValue<'_>>,
+    new: Option<HookValue<'_>>,
+    refname: &gix_object::bstr::BStr,
+) {
+    for value in [old, new] {
+        match value {
+            Some(HookValue::Symbolic(target)) => {
+                out.extend_from_slice(b"ref:");
+                out.extend_from_slice(target);
+            }
+            Some(HookValue::Object(oid)) => out.extend_from_slice(oid.to_hex().to_string().as_bytes()),
+            None => out.extend_from_slice(kind.null().to_hex().to_string().as_bytes()),
+        }
+        out.push(b' ');
+    }
+    out.extend_from_slice(refname);
+    out.push(b'\n');
+}
+
+/// A value on a [`hook_line()`]: `old_oid`/`new_oid`, or `old_target`/`new_target`.
+#[derive(Debug, Clone, Copy)]
+pub enum HookValue<'a> {
+    /// An object id.
+    Object(&'a gix_hash::oid),
+    /// The name a symbolic reference points to.
+    Symbolic(&'a gix_object::bstr::BStr),
+}
+
+impl<'a> From<crate::TargetRef<'a>> for HookValue<'a> {
+    fn from(target: crate::TargetRef<'a>) -> Self {
+        match target {
+            crate::TargetRef::Object(oid) => HookValue::Object(oid),
+            crate::TargetRef::Symbolic(name) => HookValue::Symbolic(name.as_bstr()),
+        }
+    }
+}
+
+/// The hook's stdin for `edits`, one [`edit_hook_line()`] each, for a writer
+/// that queues git's updates without a [`Transaction`].
+pub fn hook_stdin(kind: gix_hash::Kind, edits: &[RefEdit]) -> Vec<u8> {
+    let mut lines = Vec::new();
+    for edit in edits {
+        edit_hook_line(&mut lines, kind, edit, false);
+    }
+    lines
+}
+
+/// The hook line of `edit`, or nothing for a `REF_LOG_ONLY` update, which the
+/// feed skips (refs.c:2617-2618).
+///
+/// An expected value is git's `REF_HAVE_OLD`; [`PreviousValue::MustNotExist`]
+/// is `REF_HAVE_OLD` with the null id, which reads the same as none. A deletion
+/// has `REF_HAVE_NEW` with the null id, and a `verify` has no new value at all.
+///
+/// [`PreviousValue::MustNotExist`]: crate::transaction::PreviousValue::MustNotExist
+pub fn edit_hook_line(out: &mut Vec<u8>, kind: gix_hash::Kind, edit: &RefEdit, verify_only: bool) {
+    use crate::transaction::{Change, PreviousValue, RefLog};
+    let (log, expected, new) = match &edit.change {
+        Change::Update { log, expected, new } => (log.mode, expected, (!verify_only).then_some(new)),
+        Change::Delete { log, expected, .. } => (*log, expected, None),
+    };
+    if log == RefLog::Only {
+        return;
+    }
+    let old = match expected {
+        PreviousValue::MustExistAndMatch(t) => Some(t.to_ref().into()),
+        // "If it exists it must match" has no counterpart among git's flags: its callers
+        // create a reference git creates with no old value (fetch.c:676-678).
+        PreviousValue::ExistingMustMatch(_)
+        | PreviousValue::Any
+        | PreviousValue::MustExist
+        | PreviousValue::MustNotExist => None,
+    };
+    hook_line(out, kind, old, new.map(|t| t.to_ref().into()), edit.name.as_bstr());
+}
+
+impl<'s> Transaction<'s, '_> {
+    /// `ref_transaction_abort()` of a prepared transaction (refs.c:2730-2756): roll
+    /// it back — releasing the files backend's nested `packed-refs` transaction,
+    /// whose hook runs at `aborted` first — and run the hook at `aborted`.
+    ///
+    /// Dropping a transaction rolls it back too, but silently, as
+    /// `ref_transaction_free()` does.
+    pub fn abort(mut self) {
+        let store: &'s file::Store = self.store;
+        let feed = self.hook.take();
+        drop(self);
+        if let Some(feed) = feed {
+            if let Some(packed) = &feed.packed {
+                file::transaction_hook(store, "aborted", packed);
+            }
+            file::transaction_hook(store, "aborted", &feed.lines);
+        }
     }
 }
 

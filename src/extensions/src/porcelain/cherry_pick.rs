@@ -1662,6 +1662,13 @@ fn pick_one(
         return Ok(PickOutcome::Done);
     }
 
+    // `CHERRY_PICK_HEAD` "for the subsequent invocation of commit to use", written
+    // for a pick that merged cleanly or with conflicts and will be committed
+    // (sequencer.c:2500-2511) — before the empty-result check, which may delete it
+    // again, and the commit, which does (sequencer.c:1742-1744). Every stop below
+    // leaves it behind.
+    crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", pick_id, "")?;
+
     // --- empty-result guards -----------------------------------------
     //
     // `allow == 1` is what sets `ALLOW_EMPTY` in the commit flags
@@ -1717,8 +1724,8 @@ fn pick_one(
     //
     // `do_commit()` writes the object in-process only while neither `EDIT_MSG`
     // nor `VERIFY_MSG` is set (sequencer.c:1728); an editor sends it to
-    // `run_git_commit()` instead. `CHERRY_PICK_HEAD` is written first because
-    // that is where the child recovers everything the sequencer would otherwise
+    // `run_git_commit()` instead. `CHERRY_PICK_HEAD`, written above, is
+    // where the child recovers everything the sequencer would otherwise
     // have supplied — the original author (so the summary keeps its ` Date:`
     // line), the `You are currently cherry-picking commit …` status block, and
     // the "It looks like you may be committing a cherry-pick" warning. git writes
@@ -1731,11 +1738,9 @@ fn pick_one(
     //     refs_update_ref(…, "CHERRY_PICK_HEAD", &commit->object.oid, …))
     // ```
     //
-    // (sequencer.c:2474-2479); a landing pick has it removed again by the commit,
-    // which is why the non-editor path above can skip it.
+    // (sequencer.c:2474-2479); a landing pick has it removed again by the commit.
     if super::replay_commit::should_edit(opts.edit_given, super::replay_commit::Action::Pick) {
         state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
-        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
         let code = super::replay_commit::run_git_commit(
             super::replay_commit::Action::Pick,
             opts.gpg_sign,
@@ -1781,7 +1786,6 @@ fn pick_one(
     // `MERGE_MSG` and `AUTO_MERGE`.
     if let Some(refusal) = crate::commit_tree_refusal(true) {
         state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
-        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
         return Ok(PickOutcome::Stopped(refusal.die()));
     }
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
@@ -1809,7 +1813,6 @@ fn pick_one(
     // rather than returned, so a held branch lock is the command's own stop and not
     // lock contention for the dispatcher to re-run against that now-merged index.
     if let Some(message) = held_ref_lock(advance_head(&repo, head_id, new_id, reflog))? {
-        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
         eprintln!("error: {message}");
         return Ok(PickOutcome::Stopped(ExitCode::FAILURE));
     }
@@ -1825,9 +1828,7 @@ fn pick_one(
     {
         let git_dir = repo.git_dir();
         let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-        if merge.is_none() {
-            let _ = crate::refstore::state_ref_delete(&repo, "CHERRY_PICK_HEAD", "");
-        }
+        let _ = crate::refstore::state_ref_delete(&repo, "CHERRY_PICK_HEAD", "");
     }
 
     // --- summary, matching git's `print_commit_summary` ----------------
@@ -2433,7 +2434,6 @@ fn stop_empty(
     clean: bool,
 ) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
-    crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", pick_id, "")?;
     std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
     // The refusal below is the `git commit` child's, which looks the identity up
     // first. Its death is a 128 that `do_pick_commit()` folds to `res = !!res`

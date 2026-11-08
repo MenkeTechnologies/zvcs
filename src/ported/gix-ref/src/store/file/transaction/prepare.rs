@@ -316,7 +316,41 @@ impl Transaction<'_, '_> {
         if let Some(backend) = store.reftable() {
             return self.prepare_reftable(backend, edits.collect());
         }
+        let edits: Vec<RefEdit> = edits.collect();
+        // A transaction migrating values into `packed-refs` is git's `files_pack_refs()`,
+        // whose hook runs are those of the `packed-refs` transaction it commits
+        // (refs/files-backend.c:1478-1533): each reference as an update with no old value.
+        let packing_lines = (!matches!(self.packed_refs, PackedRefs::DeletionsOnly)).then(|| {
+            let mut lines = Vec::new();
+            for edit in &edits {
+                if let Change::Update {
+                    new: Target::Object(oid), ..
+                } = &edit.change
+                {
+                    file::transaction::hook_line(
+                        &mut lines,
+                        store.object_hash,
+                        None,
+                        Some(file::transaction::HookValue::Object(oid)),
+                        edit.name.as_bstr(),
+                    );
+                }
+            }
+            lines
+        });
+        // `ref_transaction_prepare()` runs the hook at `preparing` over the updates as
+        // the caller queued them, before the backend locks or splits anything
+        // (refs.c:2711-2717).
+        match &packing_lines {
+            Some(lines) => {
+                if !file::transaction_hook(store, "preparing", lines) {
+                    file::transaction_hook_refused(store, "preparing", &[lines]);
+                }
+            }
+            None => self.run_preparing_hook(&edits),
+        }
         let mut updates: Vec<_> = edits
+            .into_iter()
             .map(|update| Edit {
                 update,
                 lock: None,
@@ -649,6 +683,18 @@ impl Transaction<'_, '_> {
             .as_ref()
             .and_then(packed::Transaction::buffer)
             .or_else(|| self.packed_buffer.as_ref().map(|b| &***b));
+        // The updates as `files_transaction_prepare()` leaves them for the hook at
+        // `prepared`: split, with the caller's old values (`lock_ref_for_update()`
+        // records what it finds on disk in the lock, not the update).
+        let kind = self.store.object_hash;
+        let prepared_lines = packing_lines.unwrap_or_else(|| {
+            let mut lines = Vec::new();
+            for (idx, edit) in updates.iter().enumerate() {
+                let verify_only = self.options.verify_only.contains(&idx);
+                file::transaction::edit_hook_line(&mut lines, kind, &edit.update, verify_only);
+            }
+            lines
+        });
         for cid in 0..updates.len() {
             let change = &mut updates[cid];
             if let Err(err) = Self::lock_ref_and_apply_change(
@@ -685,6 +731,13 @@ impl Transaction<'_, '_> {
                     },
                     other => other,
                 };
+                // `files_transaction_cleanup()` aborts the nested `packed-refs`
+                // transaction holding the deletions locked so far
+                // (refs/files-backend.c:2930-2936).
+                let packed_lines = packed_deletion_lines(kind, &updates[..cid]);
+                if !packed_lines.is_empty() {
+                    file::transaction_hook(self.store, "aborted", &packed_lines);
+                }
                 return Err(err);
             }
 
@@ -711,8 +764,87 @@ impl Transaction<'_, '_> {
             }
         }
 
+        // The nested `packed-refs` transaction `files_transaction_prepare()` opens for
+        // the deletions (refs/files-backend.c:3036-3058, :3084-3118): prepared, and so
+        // seen by the hook at `preparing` and `prepared`, when `packed-refs` holds one of
+        // the references, and aborted straight away otherwise.
+        let packed_lines = packed_deletion_lines(kind, &updates);
+        let mut packed_feed = None;
+        if !packed_lines.is_empty() {
+            let needed = {
+                let snapshot;
+                let buffer = match packed_for_lookups {
+                    Some(buffer) => Some(buffer),
+                    None => {
+                        snapshot = self.store.assure_packed_refs_uptodate().ok().flatten();
+                        snapshot.as_ref().map(|b| &***b)
+                    }
+                };
+                buffer.is_some_and(|buffer| {
+                    updates.iter().any(|edit| {
+                        is_packed_deletion(edit)
+                            && possibly_adjust_name_for_prefixes(edit.update.name.as_ref())
+                                .is_some_and(|name| matches!(buffer.try_find(name.as_ref()), Ok(Some(_))))
+                    })
+                })
+            };
+            if needed {
+                for state in ["preparing", "prepared"] {
+                    if !file::transaction_hook(self.store, state, &packed_lines) {
+                        self.updates = Some(updates);
+                        let store = self.store;
+                        drop(self);
+                        file::transaction_hook_refused(store, state, &[&packed_lines]);
+                    }
+                }
+                packed_feed = Some(packed_lines);
+            } else {
+                file::transaction_hook(self.store, "aborted", &packed_lines);
+            }
+        }
+
         self.updates = Some(updates);
+        // `ref_transaction_prepare()` runs the hook at `prepared` once the backend has
+        // prepared, and a refusal aborts the transaction — the nested one first — and
+        // dies (refs.c:2723-2727).
+        if !file::transaction_hook(self.store, "prepared", &prepared_lines) {
+            let store = self.store;
+            drop(self);
+            let mut aborted: Vec<&[u8]> = packed_feed.iter().map(Vec::as_slice).collect();
+            aborted.push(&prepared_lines);
+            file::transaction_hook_refused(store, "prepared", &aborted);
+        }
+        self.hook = Some(file::transaction::HookFeed {
+            lines: prepared_lines,
+            packed: packed_feed,
+        });
         Ok(self)
+    }
+
+    /// The hook at `preparing` over the caller's `edits` (refs.c:2711-2717); a
+    /// refusal aborts the transaction, still open, and dies.
+    ///
+    /// `ref_update_reject_duplicates()` refuses a transaction naming a reference
+    /// twice before the hook runs (refs.c:2708-2709), so such a transaction does
+    /// not reach it here either.
+    fn run_preparing_hook(&self, edits: &[RefEdit]) {
+        let mut names: Vec<_> = edits
+            .iter()
+            .filter(|edit| log_mode_of(&edit.change) != RefLog::Only)
+            .map(|edit| &edit.name)
+            .collect();
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return;
+        }
+        let mut lines = Vec::new();
+        for (idx, edit) in edits.iter().enumerate() {
+            let verify_only = self.options.verify_only.contains(&idx);
+            file::transaction::edit_hook_line(&mut lines, self.store.object_hash, edit, verify_only);
+        }
+        if !file::transaction_hook(self.store, "preparing", &lines) {
+            file::transaction_hook_refused(self.store, "preparing", &[&lines]);
+        }
     }
 
     /// Rollback all intermediate state and return the `RefEdits` as we know them thus far.
@@ -744,6 +876,15 @@ impl Transaction<'_, '_> {
             | PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(objects) => Some(&**objects),
             PackedRefs::DeletionsOnly => None,
         };
+        // `transaction_refname_valid()` refuses a pseudoref when the update is
+        // queued (refs.c:1368-1394), so a transaction holding one never reaches
+        // the hook; the backend reports the refusal below.
+        if !edits
+            .iter()
+            .any(|edit| crate::store_impl::reftable::is_pseudo_ref(edit.name.as_bstr()))
+        {
+            self.run_preparing_hook(&edits);
+        }
         let data = backend.transaction_prepare(
             edits,
             self.store.object_hash,
@@ -765,6 +906,14 @@ impl Transaction<'_, '_> {
             })
             .collect();
         self.updates = Some(updates);
+        let lines = data.hook_stdin();
+        if !file::transaction_hook(self.store, "prepared", &lines) {
+            let store = self.store;
+            drop(data);
+            drop(self);
+            file::transaction_hook_refused(store, "prepared", &[&lines]);
+        }
+        self.hook = Some(file::transaction::HookFeed { lines, packed: None });
         self.reftable = Some(data);
         Ok(self)
     }
@@ -779,6 +928,24 @@ fn log_mode_of(change: &Change) -> RefLog {
         } => *mode,
         Change::Delete { log, .. } => *log,
     }
+}
+
+/// An update `files_transaction_prepare()` queues in its nested `packed-refs`
+/// transaction: `REF_DELETING && !REF_LOG_ONLY && !REF_IS_PRUNING`
+/// (refs/files-backend.c:3036-3039).
+fn is_packed_deletion(edit: &Edit) -> bool {
+    matches!(edit.update.change, Change::Delete { log, .. } if log != RefLog::Only)
+}
+
+/// The hook's lines for the nested `packed-refs` transaction of `updates`: each
+/// deletion queued as `REF_HAVE_NEW | REF_NO_DEREF` with the null id and no old
+/// value (refs/files-backend.c:3054-3058).
+fn packed_deletion_lines(kind: gix_hash::Kind, updates: &[Edit]) -> Vec<u8> {
+    let mut lines = Vec::new();
+    for edit in updates.iter().filter(|edit| is_packed_deletion(edit)) {
+        file::transaction::hook_line(&mut lines, kind, None, None, edit.update.name.as_bstr());
+    }
+    lines
 }
 
 /// Whether `idx` was split off (transitively) from an edit named `HEAD`.

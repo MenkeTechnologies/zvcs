@@ -178,6 +178,83 @@ pub(crate) fn files_ref_lock() {
     }
 }
 
+/// The host's runner of git's `reference-transaction` hook, `run_transaction_hook()`
+/// (refs.c:2663-2678, v2.56.0), and the `die()` that follows a refusal.
+///
+/// git runs the hook from the generic ref layer, so every transaction of every
+/// backend reaches it: `ref_transaction_prepare()` at `preparing` and
+/// `prepared`, `ref_transaction_commit()` at `committed`, and
+/// `ref_transaction_abort()` at `aborted` (refs.c:2713-2785). Executing a hook
+/// needs the host's configuration and process machinery, so the host installs
+/// this pair and the transaction code calls it at those four places.
+#[derive(Clone, Copy)]
+pub struct TransactionHook {
+    /// Run the hook with `state` as its argument and `stdin` fed to it; `true`
+    /// when there is no hook or it exited 0.
+    pub run: fn(store: &Store, state: &str, stdin: &[u8]) -> bool,
+    /// `die()` with the given message, after the transaction has been rolled back.
+    pub die: fn(message: &str) -> !,
+}
+
+static TRANSACTION_HOOK: std::sync::OnceLock<TransactionHook> = std::sync::OnceLock::new();
+
+/// Install the [`TransactionHook`]. Only the first installation takes effect.
+pub fn set_transaction_hook(hook: TransactionHook) {
+    let _ = TRANSACTION_HOOK.set(hook);
+}
+
+thread_local! {
+    /// Set while [`without_transaction_hook`] runs.
+    static TRANSACTION_HOOK_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the transactions of this crate not running the hook on this thread, for a
+/// writer that runs it itself over git's view of a transaction it carries out through
+/// several of these (`update-ref --stdin`).
+pub fn without_transaction_hook<T>(f: impl FnOnce() -> T) -> T {
+    let previous = TRANSACTION_HOOK_SUSPENDED.with(|s| s.replace(true));
+    let result = f();
+    TRANSACTION_HOOK_SUSPENDED.with(|s| s.set(previous));
+    result
+}
+
+/// [`run_transaction_hook`] from a transaction of this crate, unless suspended.
+pub(crate) fn transaction_hook(store: &Store, state: &str, stdin: &[u8]) -> bool {
+    TRANSACTION_HOOK_SUSPENDED.with(std::cell::Cell::get) || run_transaction_hook(store, state, stdin)
+}
+
+/// `run_transaction_hook(transaction, state)` (refs.c:2663-2678): run the
+/// `reference-transaction` hook of `store`'s repository with `stdin`, the lines
+/// [`transaction::hook_line()`] writes. `true` when there is no hook or it
+/// exited 0.
+///
+/// Public for the writers of a root ref that git updates through a ref
+/// transaction and this crate does not.
+pub fn run_transaction_hook(store: &Store, state: &str, stdin: &[u8]) -> bool {
+    match TRANSACTION_HOOK.get() {
+        Some(hook) => (hook.run)(store, state, stdin),
+        None => true,
+    }
+}
+
+/// The refusal of `ref_transaction_prepare()` once the hook failed at `state`
+/// (refs.c:2713-2727): `ref_transaction_abort()` runs the hook at `aborted` for
+/// each of `aborted` — the transactions the abort unwinds, innermost first — and
+/// git dies with `abort_by_ref_transaction_hook` (refs.c:65-66).
+///
+/// The caller must have released every lock first: `die()` exits the process
+/// without unwinding.
+pub fn transaction_hook_refused(store: &Store, state: &str, aborted: &[&[u8]]) -> ! {
+    for stdin in aborted {
+        run_transaction_hook(store, "aborted", stdin);
+    }
+    let message = format!("in '{state}' phase, update aborted by the reference-transaction hook");
+    match TRANSACTION_HOOK.get() {
+        Some(hook) => (hook.die)(&message),
+        None => unreachable!("a hook refused without a host to run it"),
+    }
+}
+
 mod access {
     use std::path::Path;
 
@@ -286,6 +363,9 @@ pub struct Transaction<'s, 'p> {
     reftable: Option<crate::store_impl::reftable::TransactionData>,
     /// git's transaction flags that have no spelling in a [`RefEdit`][crate::transaction::RefEdit].
     options: transaction::Options,
+    /// The `reference-transaction` hook's view of a prepared transaction, kept for
+    /// the `committed` or `aborted` run that ends it.
+    hook: Option<transaction::HookFeed>,
 }
 
 ///

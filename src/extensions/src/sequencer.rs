@@ -1806,12 +1806,14 @@ fn unquote_config_value(raw: &str) -> String {
 /// ```
 pub fn post_commit_cleanup(repo: &gix::Repository, verbose: bool) -> Result<()> {
     let git_dir = repo.git_dir();
-    let picking = delete_state_ref(repo, "CHERRY_PICK_HEAD")?;
-    if picking && verbose {
+    // Each pick head is deleted only when `refs_ref_exists()` finds it
+    // (sequencer.c:3029-3045), `AUTO_MERGE` unconditionally.
+    let picking = crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD");
+    if picking && delete_state_ref(repo, "CHERRY_PICK_HEAD")? && verbose {
         eprintln!("warning: cancelling a cherry picking in progress");
     }
-    let reverting = delete_state_ref(repo, "REVERT_HEAD")?;
-    if reverting && verbose {
+    let reverting = crate::refstore::state_ref_exists(repo, "REVERT_HEAD");
+    if reverting && delete_state_ref(repo, "REVERT_HEAD")? && verbose {
         eprintln!("warning: cancelling a revert in progress");
     }
     let need_cleanup = picking || reverting;
@@ -1991,22 +1993,29 @@ pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> Result<bool> {
         return Ok(existed);
     }
     packed_refs_lock_timeout(repo)?;
-    let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
-    crate::refstore::remove_root_ref_log(repo, name);
-    if let Ok(reference) = repo.find_reference(name) {
-        let current = reference.target().into_owned();
-        removed |= repo
-            .edit_reference(gix::refs::transaction::RefEdit {
-                change: gix::refs::transaction::Change::Delete {
-                    expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
-                    log: gix::refs::transaction::RefLog::AndReference,
-                    message: Default::default(),
-                },
-                name: reference.name().to_owned(),
-                deref: false,
+    let mut removed = false;
+    // One transaction, and so one run of the `reference-transaction` hook, however
+    // the reference is stored.
+    crate::refstore::root_ref_delete_with_hook(repo, name, || {
+        removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
+        crate::refstore::remove_root_ref_log(repo, name);
+        if let Ok(reference) = repo.find_reference(name) {
+            let current = reference.target().into_owned();
+            removed |= gix::refs::file::without_transaction_hook(|| {
+                repo.edit_reference(gix::refs::transaction::RefEdit {
+                    change: gix::refs::transaction::Change::Delete {
+                        expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(current),
+                        log: gix::refs::transaction::RefLog::AndReference,
+                        message: Default::default(),
+                    },
+                    name: reference.name().to_owned(),
+                    deref: false,
+                })
             })
             .is_ok();
-    }
+        }
+        Ok(())
+    })?;
     Ok(removed)
 }
 

@@ -3680,9 +3680,11 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             std::fs::rename(&from, &tmp_log)?;
             moved_log = true;
         }
+        // `refs_delete_ref(…, logmsg, oldrefname, &orig_oid, REF_NO_DEREF)`
+        // (refs/files-backend.c:1747-1748): the old value is the branch's tip.
         repo.edit_reference(RefEdit {
             change: Change::Delete {
-                expected: PreviousValue::Any,
+                expected: PreviousValue::MustExistAndMatch(Target::Object(target)),
                 log: RefLog::AndReference,
                 // `refs_delete_ref()` is passed `logmsg`, so when `HEAD` is
                 // symbolic to the branch being renamed this deletion's
@@ -3724,18 +3726,23 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         super::checkout::append_head_log(repo, Some(target), None, &message);
     }
 
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: o.create_reflog,
-                message: message.clone().into(),
+    // git writes the new name through `write_ref_to_lockfile()` and `commit_ref_update()`,
+    // outside any ref transaction (refs/files-backend.c:1788-1804), so the
+    // `reference-transaction` hook does not see it.
+    gix::refs::file::without_transaction_hook(|| {
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: o.create_reflog,
+                    message: message.clone().into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(target),
             },
-            expected: PreviousValue::Any,
-            new: Target::Object(target),
-        },
-        name: new_name.clone(),
-        deref: false,
+            name: new_name.clone(),
+            deref: false,
+        })
     })?;
     // The ref is new to the ref store, so gitoxide logs it as a creation; git renamed a
     // *ref that already pointed there*, and its entry reads `<tip> <tip>`.
@@ -4156,22 +4163,26 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     let message = format!("Branch: copied {old_full} to {new_full}");
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: o.create_reflog,
-                message: message.clone().into(),
+    // Written outside any ref transaction, as a rename's new name is
+    // (refs/files-backend.c:1788-1804): the `reference-transaction` hook does not see it.
+    gix::refs::file::without_transaction_hook(|| {
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: o.create_reflog,
+                    message: message.clone().into(),
+                },
+                expected: if o.force {
+                    PreviousValue::Any
+                } else {
+                    PreviousValue::MustNotExist
+                },
+                new: Target::Object(target),
             },
-            expected: if o.force {
-                PreviousValue::Any
-            } else {
-                PreviousValue::MustNotExist
-            },
-            new: Target::Object(target),
-        },
-        name: new_name.clone(),
-        deref: false,
+            name: new_name.clone(),
+            deref: false,
+        })
     })?;
     // Copying a branch onto its own name changes no value, so the update above logged
     // nothing; git's copy ends in the same unconditional `commit_ref_update()` a rename

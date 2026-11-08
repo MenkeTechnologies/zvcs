@@ -359,7 +359,13 @@ pub fn run_with_env(
     };
     if let Some(data) = stdin {
         if let Some(mut sink) = child.stdin.take() {
-            sink.write_all(data)?;
+            // A hook that exits without reading its input is no error: the feeders
+            // ignore `EPIPE` (refs.c:2635-2637, hook.c), as `SIGPIPE` is ignored here.
+            if let Err(e) = sink.write_all(data) {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(e.into());
+                }
+            }
         }
     }
     Ok(Outcome { invoked: true, ok: child.wait()?.success() })
@@ -383,4 +389,67 @@ fn git_dir_env(repo: &gix::Repository, workdir: &Path) -> Option<std::ffi::OsStr
         return Some(".".into());
     }
     Some(git_dir.into_os_string())
+}
+
+thread_local! {
+    /// The repositories the `reference-transaction` hook has been looked up for on this
+    /// thread, by the git directory of their ref store, each with the path the hook would
+    /// be found at — so that a repository without the hook pays one `stat()` per phase,
+    /// the `access()` `find_hook()` makes (hook.c:26-64).
+    static TRANSACTION_HOOK_REPOS: std::cell::RefCell<Vec<(PathBuf, gix::Repository, PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Make `repo` the repository the `reference-transaction` hook of a ref store with its
+/// git directory runs for, so the hook sees the configuration — command-line overrides
+/// included — that the command was set up with.
+pub(crate) fn remember_for_transaction_hook(repo: &gix::Repository) {
+    let Ok((hook, _)) = paths(repo, "reference-transaction") else {
+        return;
+    };
+    TRANSACTION_HOOK_REPOS.with(|repos| {
+        let mut repos = repos.borrow_mut();
+        repos.retain(|(git_dir, ..)| git_dir != repo.git_dir());
+        repos.push((repo.git_dir().to_owned(), repo.clone(), hook));
+    });
+}
+
+/// `run_transaction_hook()` (refs.c:2663-2678, v2.56.0) for gix-ref's transactions: run
+/// the `reference-transaction` hook of the repository `store` belongs to with `state` as
+/// its argument and the transaction's lines on stdin; `true` unless a hook ran and failed.
+pub(crate) fn run_reference_transaction(store: &gix::refs::file::Store, state: &str, stdin: &[u8]) -> bool {
+    let known = TRANSACTION_HOOK_REPOS.with(|repos| {
+        repos
+            .borrow()
+            .iter()
+            .find(|(git_dir, ..)| git_dir == store.git_dir())
+            .map(|(_, repo, hook)| (repo.clone(), hook.clone()))
+    });
+    let repo = match known {
+        Some((repo, hook)) => {
+            // A hook path that names nothing is the common case, answered here.
+            if std::fs::symlink_metadata(&hook).is_err() {
+                return true;
+            }
+            repo
+        }
+        None => {
+            let Ok(repo) = gix::open(store.git_dir()) else {
+                return true;
+            };
+            remember_for_transaction_hook(&repo);
+            repo
+        }
+    };
+    run(&repo, "reference-transaction", &[state], Some(stdin)).unwrap_or(false)
+}
+
+/// The `die()` of `ref_transaction_prepare()` once the hook refused (refs.c:2715-2727).
+/// The transaction has released its locks; any other tempfile goes with the process,
+/// as git's `atexit` handler removes it.
+pub(crate) fn reference_transaction_die(message: &str) -> ! {
+    gix::tempfile::registry::cleanup_tempfiles();
+    crate::trace2::error(message);
+    eprintln!("fatal: {message}");
+    std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
 }

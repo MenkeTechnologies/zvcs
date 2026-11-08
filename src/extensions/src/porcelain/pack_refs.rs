@@ -302,6 +302,15 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         ) {
             return Ok(packed_refs_lock_fatal(&packed_refs, &e));
         }
+        // The `packed-refs` transaction is committed with no update in it, and runs the
+        // `reference-transaction` hook with nothing on stdin (refs/files-backend.c:1555-1557,
+        // refs.c:2700-2786).
+        for state in ["preparing", "prepared"] {
+            if !gix::refs::file::run_transaction_hook(store, state, b"") {
+                gix::refs::file::transaction_hook_refused(store, state, &[&b""[..]]);
+            }
+        }
+        gix::refs::file::run_transaction_hook(store, "committed", b"");
     } else {
         let objects: Box<dyn gix::objs::Find + '_> = Box::new(&repo.objects);
         let mode = if opts.prune {

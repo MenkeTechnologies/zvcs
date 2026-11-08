@@ -403,6 +403,12 @@ fn arm_ref_store_refusal(repo: &gix::Repository) {
     FILES_REF_LOCK_TIMEOUT_REFUSAL
         .get_or_init(|| crate::config::config_int(repo, "core.filesreflocktimeout").err());
     gix::refs::file::set_files_ref_lock_hook(files_ref_lock_first_use);
+    // `run_transaction_hook()` (refs.c:2663-2678) for every ref transaction.
+    crate::hooks::remember_for_transaction_hook(repo);
+    gix::refs::file::set_transaction_hook(gix::refs::file::TransactionHook {
+        run: crate::hooks::run_reference_transaction,
+        die: crate::hooks::reference_transaction_die,
+    });
 }
 
 /// `files_ref_store_config()`'s verdict on one value: `None` when it parses.

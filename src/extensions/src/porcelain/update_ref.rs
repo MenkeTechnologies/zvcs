@@ -162,14 +162,17 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         if opts.delete || !opts.positionals.is_empty() {
             return usage();
         }
-        return run_stdin(
-            &repo,
-            opts.end_null,
-            deref,
-            opts.create_reflog,
-            opts.batch_updates,
-            opts.msg.as_deref(),
-        );
+        // The hook runs over the whole `--stdin` transaction, see [`StdinHook`].
+        return gix::refs::file::without_transaction_hook(|| {
+            run_stdin(
+                &repo,
+                opts.end_null,
+                deref,
+                opts.create_reflog,
+                opts.batch_updates,
+                opts.msg.as_deref(),
+            )
+        });
     }
 
     // Both of these outrank the argument-count check in git's source order.
@@ -1713,6 +1716,11 @@ fn run_stdin(
     let mut next_no_deref = false;
     // The transaction state machine; starts in the implicit open transaction.
     let mut state = TxnState::Open;
+    // The `reference-transaction` hook, when the repository has one.
+    let mut hook = crate::hooks::find(repo, "reference-transaction")
+        .ok()
+        .flatten()
+        .map(|_| StdinHook { prepared: None });
 
     // git's loop is `while (!strbuf_getwholeline(&input, stdin, line_termination))`,
     // so what it dispatches on — and interpolates into every diagnostic — is one
@@ -1781,22 +1789,43 @@ fn run_stdin(
                 state = TxnState::Started;
             }
             "prepare" => {
+                if hook.is_some() {
+                    StdinHook::preparing(repo, &batch);
+                }
                 if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
                     eprintln!("fatal: prepare: {e:#}");
                     return Ok(ExitCode::from(128));
+                }
+                if let Some(hook) = &mut hook {
+                    hook.prepared(repo, &batch);
                 }
                 report_ok("prepare");
                 state = TxnState::Prepared;
             }
             "commit" => {
+                // `ref_transaction_commit()` prepares a transaction `prepare` did not.
+                if let Some(hook) = hook.as_mut().filter(|h| h.prepared.is_none()) {
+                    StdinHook::preparing(repo, &batch);
+                    if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
+                        eprintln!("fatal: commit: {e:#}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    hook.prepared(repo, &batch);
+                }
                 if let Err(e) = apply(repo, std::mem::take(&mut batch), batch_updates) {
                     eprintln!("fatal: commit: {e:#}");
                     return Ok(ExitCode::from(128));
+                }
+                if let Some(hook) = &mut hook {
+                    hook.committed(repo);
                 }
                 report_ok("commit");
                 state = TxnState::Closed;
             }
             "abort" => {
+                if let Some(hook) = &mut hook {
+                    hook.aborted(repo, &batch);
+                }
                 batch = Batch::default();
                 report_ok("abort");
                 state = TxnState::Closed;
@@ -1864,10 +1893,24 @@ fn run_stdin(
 
     // End of input: the implicit transaction auto-commits; an explicit `start`
     // (or a `prepare` left uncommitted) auto-aborts; a closed one is already done.
-    if state == TxnState::Open {
-        if let Err(e) = apply(repo, batch, batch_updates) {
-            return fatal(e);
+    match (state, &mut hook) {
+        (TxnState::Open, hook) => {
+            if let Some(hook) = hook {
+                StdinHook::preparing(repo, &batch);
+                if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
+                    return fatal(e);
+                }
+                hook.prepared(repo, &batch);
+            }
+            if let Err(e) = apply(repo, batch, batch_updates) {
+                return fatal(e);
+            }
+            if let Some(hook) = hook {
+                hook.committed(repo);
+            }
         }
+        (TxnState::Started | TxnState::Prepared, Some(hook)) => hook.aborted(repo, &batch),
+        _ => {}
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -3340,4 +3383,190 @@ mod tests {
 /// `split_head_update()` owes) rather than an update the input asked for.
 fn log_only(edit: &RefEdit) -> bool {
     matches!(&edit.change, Change::Update { log, .. } if log.mode == RefLog::Only)
+}
+
+/// The `reference-transaction` hook of a `--stdin` transaction.
+///
+/// git queues every command into one `struct ref_transaction` and runs the hook from
+/// `ref_transaction_prepare()`, `_commit()` and `_abort()` (refs.c:2700-2786): at
+/// `preparing` and `prepared` when `prepare` — or a `commit` without one — prepares it,
+/// at `committed` once `commit` has written it, and at `aborted` for `abort` and for a
+/// started transaction the input leaves open (builtin/update-ref.c:621-660, :785-805).
+/// zvcs checks and writes a batch in several steps, so the hook runs here, over the
+/// updates the commands queued, and the transactions those steps make run none.
+struct StdinHook {
+    /// The lines of the prepared transaction and of the files backend's nested
+    /// `packed-refs` transaction, once `prepare` ran the hook at `prepared`.
+    prepared: Option<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl StdinHook {
+    /// The updates `batch` queued, in command order, as `ref_transaction_update()`
+    /// recorded them: a `verify` carries no new value (`ref_transaction_verify()`,
+    /// refs.c:1537-1554), and one of a missing or null old value — which stages no edit
+    /// here — still is an update with the null old id.
+    fn queued(repo: &gix::Repository, batch: &Batch) -> Vec<(RefEdit, bool)> {
+        let mut queued = Vec::new();
+        for at in 0..=batch.edits.len() {
+            for entry in batch.absent.iter().filter(|e| e.at == at && !e.guards_edit) {
+                let Ok(name) = refname(&entry.name) else { continue };
+                queued.push((
+                    RefEdit {
+                        change: Change::Update {
+                            log: LogChange::default(),
+                            expected: PreviousValue::MustNotExist,
+                            new: Target::Object(ObjectId::null(repo.object_hash())),
+                        },
+                        name,
+                        deref: false,
+                    },
+                    true,
+                ));
+            }
+            if let Some(edit) = batch.edits.get(at) {
+                queued.push((edit.clone(), batch.verify_edits.contains(&at)));
+            }
+        }
+        queued
+    }
+
+    fn lines(repo: &gix::Repository, updates: &[(RefEdit, bool)]) -> Vec<u8> {
+        let mut lines = Vec::new();
+        for (edit, verify) in updates {
+            gix::refs::file::transaction::edit_hook_line(&mut lines, repo.object_hash(), edit, *verify);
+        }
+        lines
+    }
+
+    /// The updates as the backend's prepare leaves them: `split_symref_update()`
+    /// (refs/files-backend.c:2555-2607, refs/reftable-backend.c) turns an update of a
+    /// symbolic reference into a log-only one and appends one of its referent, which
+    /// is prepared in turn.
+    fn split(repo: &gix::Repository, mut updates: Vec<(RefEdit, bool)>) -> Vec<(RefEdit, bool)> {
+        let mut at = 0;
+        while at < updates.len() {
+            let (edit, verify) = &mut updates[at];
+            at += 1;
+            if !std::mem::take(&mut edit.deref) {
+                continue;
+            }
+            let referent = match repo.refs.try_find(edit.name.as_ref()) {
+                Ok(Some(gix::refs::Reference {
+                    target: Target::Symbolic(referent),
+                    ..
+                })) => referent,
+                _ => continue,
+            };
+            let mut child = edit.clone();
+            child.name = referent;
+            child.deref = true;
+            match &mut edit.change {
+                Change::Update { log, .. } => log.mode = RefLog::Only,
+                Change::Delete { log, .. } => *log = RefLog::Only,
+            }
+            let verify = *verify;
+            updates.push((child, verify));
+        }
+        updates
+    }
+
+    /// `preparing` over the queued updates; a refusal aborts and dies. A transaction
+    /// naming a reference twice is refused by `ref_update_reject_duplicates()` before
+    /// the hook runs (refs.c:2708-2709).
+    fn preparing(repo: &gix::Repository, batch: &Batch) {
+        let queued = Self::queued(repo, batch);
+        let mut names: Vec<_> = queued
+            .iter()
+            .filter(|(edit, _)| !matches!(&edit.change, Change::Update { log, .. } if log.mode == RefLog::Only))
+            .map(|(edit, _)| &edit.name)
+            .collect();
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return;
+        }
+        let lines = Self::lines(repo, &queued);
+        if !gix::refs::file::run_transaction_hook(&repo.refs, "preparing", &lines) {
+            gix::refs::file::transaction_hook_refused(&repo.refs, "preparing", &[&lines]);
+        }
+    }
+
+    /// The rest of `ref_transaction_prepare()` once the backend has prepared: the
+    /// nested `packed-refs` transaction of the files backend's deletions
+    /// (refs/files-backend.c:3036-3118) — prepared when `packed-refs` holds one of the
+    /// references, aborted otherwise — and `prepared`.
+    fn prepared(&mut self, repo: &gix::Repository, batch: &Batch) {
+        let store = &repo.refs;
+        let updates = Self::split(repo, Self::queued(repo, batch));
+        let lines = Self::lines(repo, &updates);
+        let mut packed = None;
+        if !crate::refstore::is_reftable(repo) {
+            let deletions: Vec<&RefEdit> = updates
+                .iter()
+                .map(|(edit, _)| edit)
+                .filter(|edit| matches!(edit.change, Change::Delete { log, .. } if log != RefLog::Only))
+                .collect();
+            let mut packed_lines = Vec::new();
+            for edit in &deletions {
+                gix::refs::file::transaction::hook_line(
+                    &mut packed_lines,
+                    repo.object_hash(),
+                    None,
+                    None,
+                    edit.name.as_bstr(),
+                );
+            }
+            if !deletions.is_empty() {
+                let buffer = store.cached_packed_buffer().ok().flatten();
+                let needed = buffer.is_some_and(|buffer| {
+                    deletions
+                        .iter()
+                        .any(|edit| matches!(buffer.try_find(edit.name.as_ref()), Ok(Some(_))))
+                });
+                if needed {
+                    for state in ["preparing", "prepared"] {
+                        if !gix::refs::file::run_transaction_hook(store, state, &packed_lines) {
+                            gix::refs::file::transaction_hook_refused(store, state, &[&packed_lines]);
+                        }
+                    }
+                    packed = Some(packed_lines);
+                } else {
+                    gix::refs::file::run_transaction_hook(store, "aborted", &packed_lines);
+                }
+            }
+        }
+        if !gix::refs::file::run_transaction_hook(store, "prepared", &lines) {
+            let mut aborted: Vec<&[u8]> = packed.iter().map(Vec::as_slice).collect();
+            aborted.push(&lines);
+            gix::refs::file::transaction_hook_refused(store, "prepared", &aborted);
+        }
+        self.prepared = Some((lines, packed));
+    }
+
+    /// `committed`, the nested transaction's first (refs/files-backend.c:3420-3428).
+    fn committed(&mut self, repo: &gix::Repository) {
+        if let Some((lines, packed)) = self.prepared.take() {
+            if let Some(packed) = packed {
+                gix::refs::file::run_transaction_hook(&repo.refs, "committed", &packed);
+            }
+            gix::refs::file::run_transaction_hook(&repo.refs, "committed", &lines);
+        }
+    }
+
+    /// `ref_transaction_abort()`: `aborted` over the prepared updates, the nested
+    /// transaction's first, or over the queued ones of a transaction never prepared.
+    fn aborted(&mut self, repo: &gix::Repository, batch: &Batch) {
+        let store = &repo.refs;
+        match self.prepared.take() {
+            Some((lines, packed)) => {
+                if let Some(packed) = packed {
+                    gix::refs::file::run_transaction_hook(store, "aborted", &packed);
+                }
+                gix::refs::file::run_transaction_hook(store, "aborted", &lines);
+            }
+            None => {
+                let lines = Self::lines(repo, &Self::queued(repo, batch));
+                gix::refs::file::run_transaction_hook(store, "aborted", &lines);
+            }
+        }
+    }
 }

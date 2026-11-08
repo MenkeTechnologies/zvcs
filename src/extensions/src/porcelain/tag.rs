@@ -1479,10 +1479,12 @@ fn create_tag(
     if prev.is_some() && !force {
         return fatal(&format!("tag '{name}' already exists"));
     }
-    let constraint = if force {
-        PreviousValue::Any
-    } else {
-        PreviousValue::MustNotExist
+    // `ref_transaction_update(transaction, ref.buf, &object, &prev, …)` (builtin/tag.c:694):
+    // the old value is the tag's current one, or the null id for a new tag.
+    let constraint = match prev {
+        Some(prev) => PreviousValue::MustExistAndMatch(Target::Object(prev)),
+        None if force => PreviousValue::Any,
+        None => PreviousValue::MustNotExist,
     };
 
     if !messages.is_empty() && message_file.is_some() {

@@ -26,6 +26,7 @@ use gix::bstr::{BStr, BString, ByteSlice};
 use gix::refs::reftable::{parse_worktree_ref, WorktreeType};
 use gix::refs::store::RefStorage;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+use gix::refs::file::transaction::HookValue;
 use gix::refs::{FullName, Target};
 use gix::ObjectId;
 
@@ -503,7 +504,48 @@ pub fn state_ref_write(repo: &gix::Repository, name: &str, value: &StateRef, msg
         StateRef::Object(id) => format!("{id}\n"),
         StateRef::Symbolic(target) => format!("ref: {target}\n"),
     };
-    std::fs::write(files_ref_path(repo, name.as_bytes().as_bstr()), contents)?;
+    let new = match value {
+        StateRef::Object(id) => HookValue::Object(id),
+        StateRef::Symbolic(target) => HookValue::Symbolic(target.as_bstr()),
+    };
+    let mut lines = Vec::new();
+    gix::refs::file::transaction::hook_line(&mut lines, repo.object_hash(), None, Some(new), name.as_bytes().as_bstr());
+    let hook = (!is_pseudo_ref(name)).then_some(lines.as_slice());
+    with_transaction_hook(repo, hook, None, || {
+        std::fs::write(files_ref_path(repo, name.as_bytes().as_bstr()), contents)
+    })?;
+    Ok(())
+}
+
+/// Run `write` as the files backend's transaction for a root ref, with the
+/// `reference-transaction` hook that transaction runs (refs.c:2700-2786): `lines` at
+/// `preparing`, `packed` — the nested `packed-refs` transaction of a deletion, which a
+/// root ref never needs and which is therefore aborted at once
+/// (refs/files-backend.c:3108-3118) — at `aborted`, `lines` at `prepared`, `write`, and
+/// `lines` at `committed`. A refusal dies as `ref_transaction_prepare()` does. `None`
+/// is a write git makes without a transaction (`FETCH_HEAD`, `MERGE_HEAD`).
+fn with_transaction_hook(
+    repo: &gix::Repository,
+    lines: Option<&[u8]>,
+    packed: Option<&[u8]>,
+    write: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use gix::refs::file::{run_transaction_hook, transaction_hook_refused};
+    let Some(lines) = lines else {
+        return write();
+    };
+    let store = &repo.refs;
+    if !run_transaction_hook(store, "preparing", lines) {
+        transaction_hook_refused(store, "preparing", &[lines]);
+    }
+    if let Some(packed) = packed {
+        run_transaction_hook(store, "aborted", packed);
+    }
+    if !run_transaction_hook(store, "prepared", lines) {
+        transaction_hook_refused(store, "prepared", &[lines]);
+    }
+    write()?;
+    run_transaction_hook(store, "committed", lines);
     Ok(())
 }
 
@@ -527,11 +569,31 @@ pub fn state_ref_delete(repo: &gix::Repository, name: &str, msg: &str) -> Result
         })?;
         return Ok(());
     }
-    remove_root_ref_log(repo, name);
-    match std::fs::remove_file(files_ref_path(repo, name.as_bytes().as_bstr())) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-        _ => Ok(()),
-    }
+    root_ref_delete_with_hook(repo, name, || {
+        remove_root_ref_log(repo, name);
+        match std::fs::remove_file(files_ref_path(repo, name.as_bytes().as_bstr())) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        }
+    })?;
+    Ok(())
+}
+
+/// Run `delete` as the files backend's `refs_delete_ref(…, name, NULL, REF_NO_DEREF)` of
+/// the root ref `name` runs it, with the hook its transaction runs: `<null> <null>
+/// <name>` at `preparing`, `aborted` for the nested `packed-refs` transaction, then
+/// `prepared` and `committed` (refs.c:2700-2786, refs/files-backend.c:3036-3118) —
+/// whether or not the reference exists. `FETCH_HEAD` and `MERGE_HEAD` are files git
+/// removes without a transaction.
+pub(crate) fn root_ref_delete_with_hook(
+    repo: &gix::Repository,
+    name: &str,
+    delete: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut lines = Vec::new();
+    gix::refs::file::transaction::hook_line(&mut lines, repo.object_hash(), None, None, name.as_bytes().as_bstr());
+    let hook = (!is_pseudo_ref(name)).then_some(lines.as_slice());
+    with_transaction_hook(repo, hook, hook, delete)
 }
 
 /// `files_ref_path()` (refs/files-backend.c:266-290): where the files backend

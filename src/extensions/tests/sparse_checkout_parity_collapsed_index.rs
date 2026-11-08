@@ -18,7 +18,12 @@
 //! (version 3, extended flags for skip-worktree, `sdir`, and a null trailing hash,
 //! which `verify_hdr()` accepts, read-cache.c:1721-1722).
 //!
-//! Expectations measured from stock git 2.55.0 under the same environment.
+//! The fixture's entries carry zero stat data, so a `set` that drops `a` and `top`
+//! from the patterns finds them not up to date — `verify_uptodate_1()` compares
+//! with `ie_match_stat()`, which has no `sd_size == 0` content fallback — and
+//! leaves them on disk with the `WARNING_SPARSE_NOT_UPTODATE_FILE` block.
+//!
+//! Expectations measured from stock git 2.56.0 under the same environment.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -194,11 +199,23 @@ fn reapply_and_set_keep_the_hidden_directories_hidden() {
     f.assert_collapsed(&["c/", "d/"]);
 
     let f = Fixture::new("set");
-    assert_eq!(f.run(&["sparse-checkout", "set", "d"]), (String::new(), String::new(), 0));
-    assert_eq!(f.ls_files_t(), "S a/b/y\nS a/x\nS c/z\nH d/e/w\nH top\n");
+    assert_eq!(
+        f.run(&["sparse-checkout", "set", "d"]),
+        (String::new(), not_uptodate(&["a/b/y", "a/x"]), 0)
+    );
+    assert_eq!(f.ls_files_t(), "H a/b/y\nH a/x\nS c/z\nH d/e/w\nH top\n");
     assert_eq!(std::fs::read_to_string(f.work.join("d/e/w")).unwrap(), "d/e/w\n");
-    assert!(!f.work.join("a").exists());
-    f.assert_collapsed(&["a/", "c/"]);
+    assert!(f.work.join("a/x").exists() && f.work.join("a/b/y").exists());
+    f.assert_collapsed(&["c/"]);
+}
+
+/// The `WARNING_SPARSE_NOT_UPTODATE_FILE` block (unpack-trees.c:242-259).
+fn not_uptodate(paths: &[&str]) -> String {
+    let list: String = paths.iter().map(|p| format!("\t{p}\n")).collect();
+    format!(
+        "warning: The following paths are not up to date and were left despite sparse patterns:\n{list}\n\
+         After fixing the above paths, you may want to run `git sparse-checkout reapply`.\n"
+    )
 }
 
 #[test]
@@ -215,13 +232,17 @@ fn disable_restores_every_file_without_advice() {
 
 #[test]
 fn a_full_expansion_prints_the_advice() {
-    for (tag, args) in [
-        ("nosi", &["sparse-checkout", "reapply", "--no-sparse-index"][..]),
-        ("nocone", &["sparse-checkout", "set", "--no-cone", "d"][..]),
+    for (tag, args, want) in [
+        ("nosi", &["sparse-checkout", "reapply", "--no-sparse-index"][..], EXPANDED_ADVICE.to_owned()),
+        (
+            "nocone",
+            &["sparse-checkout", "set", "--no-cone", "d"][..],
+            EXPANDED_ADVICE.to_owned() + &not_uptodate(&["a/b/y", "a/x", "top"]),
+        ),
     ] {
         let f = Fixture::new(tag);
         let (out, err, code) = f.run(args);
-        assert_eq!((out.as_str(), err.as_str(), code), ("", EXPANDED_ADVICE, 0), "{tag}");
+        assert_eq!((out.as_str(), err.as_str(), code), ("", want.as_str(), 0), "{tag}");
         f.assert_full_index();
     }
 }

@@ -83,12 +83,19 @@ where
                             } => {
                                 let current_mode = *mode;
                                 *mode = RefLog::Only;
+                                // "Change the symbolic ref update to log only. Also, it doesn't
+                                // need to check its old OID value, as that will be done when
+                                // new_update is processed." (`split_symref_update()`,
+                                // refs/files-backend.c:2599-2604): the old value moves to the
+                                // referent, as it does for an update below, so a delete through
+                                // a symref compares it against the ref the symref points at.
+                                let previous = std::mem::replace(previous, PreviousValue::Any);
                                 // `split_symref_update()` hands the referent the same `update->msg`
                                 // the symbolic half keeps, so either half can be the one whose log
                                 // survives to record it.
                                 RefEdit {
                                     change: Change::Delete {
-                                        expected: previous.clone(),
+                                        expected: previous,
                                         log: current_mode,
                                         message: message.clone(),
                                     },

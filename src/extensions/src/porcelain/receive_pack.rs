@@ -102,7 +102,19 @@
 //!     to a ref another command of the push also writes is skipped when the two
 //!     agree, and both are refused with `inconsistent aliased update` when they do
 //!     not; a symref that does not resolve is `broken symref`. A lone update
-//!     through a symref writes the ref it points at.
+//!     through a symref writes the ref it points at, and a delete through one
+//!     deletes that ref and logs on the symref and on `HEAD`
+//!     (`split_symref_update()`, refs/files-backend.c:2555-2607).
+//!   * **Shallow pushes** (`prepare_shallow_info()`, `update_shallow_info()`,
+//!     shallow.c:516-892): the `shallow <oid>` lines a shallow client sends are
+//!     split into the commits this repository has and lacks, each pushed tip is
+//!     painted down to them, and a ref that needs one is refused with `shallow
+//!     update not allowed`. Under `receive.shallowUpdate` the hooks and children
+//!     are handed `GIT_SHALLOW_FILE` (a `shallow_XXXXXX` tempfile) and
+//!     `update_shallow_ref()` adds the commits to `.git/shallow` before the ref
+//!     moves, with the quirks of git 2.56's code: its connectivity check reads
+//!     the *next* command's tip and cuts the command list after this one, and a
+//!     push of deletes alone from a shallow client dies of SIGSEGV.
 //!   * **`receive.updateServerInfo`** refreshes `info/refs` and
 //!     `objects/info/packs` after the refs move.
 //!   * **`receive.autogc`** hands the repository to
@@ -156,19 +168,16 @@
 //! `.keep` is deleted after the commands ran; a push that is declined, refused in
 //! full or rejected by `--strict` leaves nothing behind.
 //!
-//! ### Not ported (bailed on with a precise message, never silently ignored)
+//! ### Not ported
 //!
-//!   1. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
-//!      consumed and dropped, and the shallow-update switch that governs them is
-//!      deliberately left unread rather than named here: grafting
-//!      the pushed history onto the receiving repository's shallow boundary is
-//!      not implemented, so a push whose history ends at a shallow commit this
-//!      repository lacks fails the connectivity check (`missing necessary
-//!      objects`) where git says `shallow update not allowed`, or, under
-//!      `receive.shallowUpdate`, extends `shallow`. A shallow push whose
-//!      boundary this repository already has is served in full.
-//!   2. **A delete through a symref** is refused rather than deleting the ref
-//!      the symref points at.
+//!   1. **A stale old value through a symref, outside `--atomic`.** git's batched
+//!      transaction keys its rejections by the name of the ref that failed, which
+//!      for an update through a symref is the ref it points at, so the command
+//!      is still reported `ok` and the symref and `HEAD` still get their log-only
+//!      entries (builtin/receive-pack.c:1873-1883, :1952-1962). This port refuses
+//!      the command with `incorrect old value provided` and logs nothing; gix-ref
+//!      has no `REF_TRANSACTION_ALLOW_FAILURE` that would let the symref's half
+//!      commit without its referent.
 //!
 //! Object alternates (git appends one `<oid> .have` line per alternate ref) bail
 //! rather than producing a short advertisement.
@@ -670,6 +679,11 @@ struct Command {
     /// as well as) the ref the client asked for. Only `report-status-v2` can
     /// carry these.
     reports: Vec<PushReport>,
+    /// `cmd->index`: where `update_shallow_info()` put this command's new value
+    /// in `si->ref` (builtin/receive-pack.c:2386-2391). A delete keeps the `0` its
+    /// zeroed allocation gave it, so `si->shallow_ref[cmd->index]` asks a delete
+    /// about the first ref that is not one.
+    shallow_index: usize,
 }
 
 impl Command {
@@ -847,6 +861,10 @@ struct Config {
     /// `receive.autogc`: run `git maintenance run --auto` once the refs have
     /// moved and the report has been written.
     auto_gc: bool,
+    /// `receive.shallowUpdate`: accept a push that needs shallow commits this
+    /// repository lacks, extending `.git/shallow` with them, instead of refusing
+    /// it with `shallow update not allowed`.
+    shallow_update: bool,
 }
 
 impl Config {
@@ -908,6 +926,8 @@ impl Config {
                 .collect(),
             keep_alive: config.integer("receive.keepAlive").unwrap_or(5),
             auto_gc: config.boolean("receive.autogc").unwrap_or(true),
+            // `receive_pack_config()` (builtin/receive-pack.c:213-216).
+            shallow_update: config.boolean("receive.shallowUpdate").unwrap_or(false),
         })
     }
 
@@ -1187,6 +1207,8 @@ fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<E
     let mut cmds: Vec<Command> = Vec::new();
     let mut caps: Vec<u8> = Vec::new();
     let mut cert: Vec<u8> = Vec::new();
+    // `read_head_info(&reader, &shallow)`: the client's `shallow <oid>` lines.
+    let mut shallow: Vec<gix::ObjectId> = Vec::new();
     loop {
         // git's `packet_read()` failures are `die()`s, so they print `fatal: `
         // on receive-pack's own stderr and stop the session there.
@@ -1203,13 +1225,17 @@ fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<E
             .map_err(|_| anyhow!("protocol error: non-utf8 command"))?
             .trim_end();
 
-        // A shallow client announces its grafts before the commands. The shallow
-        // machinery is not ported, so the list is consumed and dropped rather
-        // than mis-parsed as a command.
-        if let Some(rest) = text.strip_prefix("shallow ") {
-            if gix::ObjectId::from_hex(rest.as_bytes()).is_err() {
-                eprintln!("fatal: protocol error: expected shallow sha, got '{rest}'");
-                return Ok(ExitCode::from(128));
+        // A shallow client announces its grafts before the commands
+        // (builtin/receive-pack.c:2204-2211). `get_oid_hex()` reads the leading
+        // hash and ignores whatever follows it.
+        if let Some(rest) = text.strip_prefix("shallow ").filter(|_| line.len() > 8) {
+            let hexsz = hash.len_in_hex();
+            match rest.get(..hexsz).map(|hex| gix::ObjectId::from_hex(hex.as_bytes())) {
+                Some(Ok(id)) => shallow.push(id),
+                _ => {
+                    eprintln!("fatal: protocol error: expected shallow sha, got '{rest}'");
+                    return Ok(ExitCode::from(128));
+                }
             }
             continue;
         }
@@ -1304,7 +1330,15 @@ fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<E
     // quarantine lives as long as git's process does, so it is dropped only on the
     // way out of this function.
     let mut transaction: Option<Transaction> = None;
+    // `prepare_shallow_info(&si, &shallow)`, and `shallow_update` cleared when the
+    // client listed nothing to consider (builtin/receive-pack.c:2578-2580).
+    let mut si = ShallowInfo::prepare(repo, shallow, config.shallow_update);
     if cmds.iter().any(|c| c.new != zero) {
+        // `alt_shallow_file = setup_temporary_shallow(si.shallow)` when there are
+        // shallow commits at all (:2582-2585). It is the unpack child's
+        // `--shallow-file`, which only a `--strict` link check would consult, and
+        // the in-process ingest here does not walk links.
+        let alt_shallow_file = if si.has_any() { si.setup_temporary_shallow(repo) } else { String::new() };
         match Transaction::begin(repo) {
             None => unpack = Err("unable to start object transaction".into()),
             Some(mut t) => {
@@ -1317,6 +1351,16 @@ fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<E
                 transaction = Some(t);
             }
         }
+        // `update_shallow_info(commands, &si, &ref, alt_shallow_file)` (:2592), which
+        // reads the objects the pack brought from the quarantine.
+        let incoming = transaction
+            .as_ref()
+            .and_then(|t| t.quarantine.as_ref())
+            .and_then(|q| Incoming::open(repo, q.path()).ok());
+        let in_repo = find_in_repo(repo);
+        let find_incoming = |id| incoming.as_ref().and_then(|i| i.find(id));
+        let find: FindObject<'_> = if incoming.is_some() { &find_incoming } else { &in_repo };
+        si.update_shallow_info(repo, find, &mut cmds, zero, &alt_shallow_file);
     }
 
     // `prepare_push_cert_sha1()`: store the certificate as a blob, check its
@@ -1337,8 +1381,14 @@ fn receive(repo: &mut gix::Repository, config: &Config, opts: &Opts) -> Result<E
         transaction.as_mut(),
         !opts.skip_connectivity_check,
         quiet,
+        &mut si,
         &mut band,
     );
+    // The commands `update_shallow_ref()` cut off the list are gone from the
+    // report and the post hooks as well.
+    if let Some(n) = si.cut_at {
+        cmds.truncate(n);
+    }
     // `odb_transaction_finalize()` (object-file.c:1452-1464).
     if let Some(t) = &mut transaction {
         t.finalize();
@@ -1452,6 +1502,7 @@ fn parse_command(text: &str) -> Result<Command> {
         proc_receive: false,
         proc_receive_returned: false,
         reports: Vec::new(),
+        shallow_index: 0,
     })
 }
 
@@ -1471,6 +1522,7 @@ fn execute_commands(
     transaction: Option<&mut Transaction>,
     check_connectivity: bool,
     quiet: bool,
+    si: &mut ShallowInfo,
     band: &mut Band,
 ) {
     if unpack.is_err() {
@@ -1486,17 +1538,19 @@ fn execute_commands(
     // band 2 when there is one (`opt.err_fd = muxer.in`), and the meter only
     // there and only unquiet (`opt.progress = err_fd && !quiet`). When it fails,
     // `set_connectivity_errors()` asks again one command at a time.
+    // A command `update_shallow_ref()` will check is left out of both
+    // (`shallow_update && si->shallow_ref[cmd->index]`, :1784-1786, :1813-1815).
     if check_connectivity {
         let env = odb_transaction_env(transaction.as_deref());
         let tips: Vec<gix::ObjectId> = cmds
             .iter()
-            .filter(|c| c.new != zero && !c.skip_update)
+            .filter(|c| !si.deferred(c) && c.new != zero && !c.skip_update)
             .map(|c| c.new)
             .collect();
         let progress = band.sideband && !quiet;
         let relay = band.sideband.then_some(&mut *band);
-        if check_connected(repo, &tips, env, true, relay, progress) {
-            set_connectivity_errors(repo, cmds, zero, env);
+        if check_connected(repo, &tips, env, true, relay, progress, None) {
+            set_connectivity_errors(repo, cmds, zero, env, si);
         }
     }
 
@@ -1585,9 +1639,27 @@ fn execute_commands(
     }
 
     if use_atomic {
-        execute_commands_atomic(repo, config, cmds, zero, head.as_deref(), band);
+        execute_commands_atomic(repo, config, cmds, zero, head.as_deref(), si, band);
     } else {
-        execute_commands_non_atomic(repo, config, cmds, zero, head.as_deref(), band);
+        execute_commands_non_atomic(repo, config, cmds, zero, head.as_deref(), si, band);
+    }
+
+    // `if (shallow_update) BUG_if_skipped_connectivity_check(commands, si);`
+    // (:2129-2130, :1856-1867), over the list as `update_shallow_ref()` left it.
+    // The `__LINE__` stock 2.56 (clang) reports for the two-line `bug()` call is 1864.
+    if si.update {
+        let live = si.cut_at.unwrap_or(cmds.len());
+        let mut bugged = false;
+        for cmd in &cmds[..live] {
+            if cmd.should_process() && si.deferred(cmd) {
+                eprintln!("BUG: builtin/receive-pack.c:1864: connectivity check has not been run on ref {}", cmd.name);
+                bugged = true;
+            }
+        }
+        if bugged {
+            eprintln!("BUG: builtin/receive-pack.c:1866: connectivity check skipped???");
+            std::process::abort();
+        }
     }
 }
 
@@ -1597,8 +1669,10 @@ fn check_command(
     repo: &gix::Repository,
     config: &Config,
     cmd: &Command,
+    next: Option<&Command>,
     zero: gix::ObjectId,
     head: Option<&str>,
+    si: &mut ShallowInfo,
     band: &mut Band,
 ) -> Result<RefEdit, String> {
     // `update()`'s first test (receive-pack.c:1094-1098): the name must live under
@@ -1679,6 +1753,14 @@ fn check_command(
     // as the status (receive-pack.c:1635-1650). The name it judges is
     // `namespaced_name`, so under a namespace no ref is a branch to
     // `is_branch()`.
+    //
+    // Ahead of it, `if (shallow_update && si->shallow_ref[cmd->index] &&
+    // update_shallow_ref(cmd, si)) ret = "shallow error";` (:1629-1633): a ref that
+    // needs shallow commits extends `.git/shallow` first, and is refused when its
+    // tip is not connected even then.
+    if cmd.new != zero && si.deferred(cmd) && !si.update_shallow_ref(repo, cmd, next, zero) {
+        return Err("shallow error".into());
+    }
     if cmd.new != zero {
         let namespaced = format!(
             "{}{}",
@@ -1760,6 +1842,7 @@ fn execute_commands_non_atomic(
     cmds: &mut [Command],
     zero: gix::ObjectId,
     head: Option<&str>,
+    si: &mut ShallowInfo,
     band: &mut Band,
 ) {
     // Deletions go first, in a transaction of their own, so a delete and a
@@ -1772,13 +1855,17 @@ fn execute_commands_non_atomic(
     for deletions in [true, false] {
         let mut queued = Vec::new();
         for i in 0..cmds.len() {
+            if si.cut_at.is_some_and(|n| i >= n) {
+                break;
+            }
             if !cmds[i].should_process() || cmds[i].proc_receive || (cmds[i].new == zero) != deletions {
                 continue;
             }
-            match check_command(repo, config, &cmds[i], zero, head, band) {
+            match check_command(repo, config, &cmds[i], cmds.get(i + 1), zero, head, si, band) {
                 Ok(edit) => queued.push((i, edit)),
                 Err(reason) => cmds[i].error = Some(reason),
             }
+            si.note_cut(i);
         }
         for (i, edit) in queued {
             // The transaction is what refuses a bad old value, so its diagnostic
@@ -1806,16 +1893,22 @@ fn execute_commands_atomic(
     cmds: &mut [Command],
     zero: gix::ObjectId,
     head: Option<&str>,
+    si: &mut ShallowInfo,
     band: &mut Band,
 ) {
     let mut edits = Vec::new();
     let mut reported: Option<&str> = None;
 
     for i in 0..cmds.len() {
+        if si.cut_at.is_some_and(|n| i >= n) {
+            break;
+        }
         if !cmds[i].should_process() || cmds[i].proc_receive {
             continue;
         }
-        match check_command(repo, config, &cmds[i], zero, head, band) {
+        let checked = check_command(repo, config, &cmds[i], cmds.get(i + 1), zero, head, si, band);
+        si.note_cut(i);
+        match checked {
             Ok(edit) => edits.push(edit),
             Err(reason) => {
                 cmds[i].error = Some(reason);
@@ -1858,7 +1951,7 @@ fn odb_transaction_env(transaction: Option<&Transaction>) -> &[(String, std::ffi
 }
 
 /// `check_connected()` (connected.c:76-200) as receive-pack calls it, with no
-/// transport and no shallow file: `git rev-list --objects --stdin --not
+/// transport: `git [--shallow-file <file>] rev-list --objects --stdin --not
 /// [--exclude-hidden=receive] --all --quiet --alternate-refs` fed `tips`, which
 /// fails when anything they reach is missing from the repository. Returns
 /// whether it failed — the C function's non-zero.
@@ -1866,6 +1959,7 @@ fn odb_transaction_env(transaction: Option<&Transaction>) -> &[(String, std::ffi
 /// `relay` is `opt.err_fd`: the child's stderr goes to band 2 through
 /// [`relay_child_output`] when it is set, and is inherited otherwise
 /// (`rev_list.no_stderr = opt->quiet`, which receive-pack never sets).
+/// `shallow_file` is `opt.shallow_file`, which only `update_shallow_ref()` sets.
 fn check_connected(
     repo: &gix::Repository,
     tips: &[gix::ObjectId],
@@ -1873,6 +1967,7 @@ fn check_connected(
     exclude_hidden: bool,
     relay: Option<&mut Band>,
     progress: bool,
+    shallow_file: Option<&str>,
 ) -> bool {
     // `oid = fn(cb_data); if (!oid) return err;`
     let mut tips = tips;
@@ -1899,6 +1994,10 @@ fn check_connected(
             return true;
         }
     };
+    // `opt->shallow_file` goes ahead of the subcommand (connected.c:115-118).
+    if let Some(file) = shallow_file {
+        cmd.args(["--shallow-file", file]);
+    }
     cmd.args(["rev-list", "--objects", "--stdin"]);
     if promisor {
         cmd.arg("--exclude-promisor-objects");
@@ -1960,12 +2059,569 @@ fn set_connectivity_errors(
     cmds: &mut [Command],
     zero: gix::ObjectId,
     env: &[(String, std::ffi::OsString)],
+    si: &ShallowInfo,
 ) {
     for cmd in cmds.iter_mut() {
+        // "to be checked in update_shallow_ref()" (:1784-1786).
+        if si.deferred(cmd) {
+            continue;
+        }
         let tip: &[gix::ObjectId] = if cmd.new == zero { &[] } else { std::slice::from_ref(&cmd.new) };
-        if check_connected(repo, tip, env, false, None, false) {
+        if check_connected(repo, tip, env, false, None, false, None) {
             cmd.error = Some("missing necessary objects".into());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shallow pushes (shallow.c:516-892, builtin/receive-pack.c:1332-1366, :2329-2409)
+// ---------------------------------------------------------------------------
+
+/// An object as receive-pack's own process sees it: before the migrate that is
+/// the quarantine with the real store behind it (`tmp_objdir_replace_primary_odb()`,
+/// object-file.c:514-518), after it the real store alone.
+type FindObject<'a> = &'a dyn Fn(gix::ObjectId) -> Option<(gix::object::Kind, Vec<u8>)>;
+
+/// The real store, for the lookups that come after the migrate.
+fn find_in_repo(repo: &gix::Repository) -> impl Fn(gix::ObjectId) -> Option<(gix::object::Kind, Vec<u8>)> + '_ {
+    move |id| {
+        let object = repo.find_object(id).ok()?;
+        Some((object.kind, object.data.clone()))
+    }
+}
+
+/// `struct shallow_info` (shallow.h:64-76) together with the receive-pack state
+/// around it: `shallow_update`, the commit-graft table the process parses
+/// commits with, the stat data `is_repository_shallow()` took of `.git/shallow`,
+/// and the temporary shallow file `setup_temporary_shallow()` made.
+#[derive(Default)]
+struct ShallowInfo {
+    /// `si->shallow`: the `shallow <oid>` lines the client sent, in wire order.
+    shallow: Vec<gix::ObjectId>,
+    /// `si->ours`: indices into `shallow` of the commits this repository has.
+    ours: Vec<usize>,
+    /// `si->theirs`: indices into `shallow` of the commits it lacks.
+    theirs: Vec<usize>,
+    /// `si->ref`: the new value of every command that is not a delete, which
+    /// `cmd->index` points into.
+    refs: Vec<gix::ObjectId>,
+    /// `si->used_shallow`: per shallow commit, the bitmap of the refs that reach
+    /// it, or `None` when none does.
+    used_shallow: Vec<Option<Vec<u32>>>,
+    /// `si->need_reachability_test`.
+    need_reachability_test: Vec<bool>,
+    /// `si->reachable`.
+    reachable: Vec<bool>,
+    /// `si->shallow_ref`: per ref, how many shallow commits it needs.
+    shallow_ref: Vec<u32>,
+    /// Whether `prepare_shallow_update()` allocated `shallow_ref` at all.
+    shallow_ref_allocated: bool,
+    /// `si->commits`: the ref tips `delayed_reachability_test()` collects once.
+    commits: Option<Vec<gix::ObjectId>>,
+    /// `shallow_update`: `receive.shallowUpdate`, cleared when the push brings no
+    /// shallow commit to consider.
+    update: bool,
+    /// `the_repository->parsed_objects->grafts`: `info/grafts` and `.git/shallow`,
+    /// plus every commit `update_shallow_ref()` registered.
+    grafts: gix::revwalk::graft::Table,
+    /// `shallow_stat`: what `.git/shallow` looked like when it was read, `None`
+    /// when there was no such file.
+    shallow_stat: Option<(u64, u64, i64, i64, i64, i64)>,
+    /// The `shallow_XXXXXX` tempfile, removed when receive-pack exits.
+    alt_shallow_file: Option<std::path::PathBuf>,
+    /// `update_shallow_ref()` cut the command list after the command it ran for
+    /// (see [`ShallowInfo::update_shallow_ref`]).
+    cut: bool,
+    /// How many commands the list still holds once it was cut.
+    cut_at: Option<usize>,
+}
+
+impl Drop for ShallowInfo {
+    /// The tempfile machinery removes `setup_temporary_shallow()`'s file at exit.
+    fn drop(&mut self) {
+        if let Some(path) = self.alt_shallow_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// `stat_validity_update()`'s view of a file: device, inode, size, mtime and ctime.
+fn shallow_stat(path: &std::path::Path) -> Option<(u64, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino(), m.size() as i64, m.mtime() * 1_000_000_000 + m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+}
+
+impl ShallowInfo {
+    /// `prepare_shallow_info()` (shallow.c:518-544), "Step 1, split sender
+    /// shallow commits into "ours" and "theirs" / Step 2, clean "ours" based on
+    /// .git/shallow": a commit this repository has goes to `ours` unless its own
+    /// `.git/shallow` already lists it, one it lacks to `theirs`. Then
+    /// `if (!si.nr_ours && !si.nr_theirs) shallow_update = 0;` (receive-pack.c:2579-2580).
+    fn prepare(repo: &gix::Repository, shallow: Vec<gix::ObjectId>, shallow_update: bool) -> Self {
+        let mut si = ShallowInfo::default();
+        if shallow.is_empty() {
+            return si;
+        }
+        si.grafts = (**repo.commit_grafts()).clone();
+        si.shallow_stat = shallow_stat(&repo.common_dir().join("shallow"));
+        for (i, id) in shallow.iter().enumerate() {
+            if repo.has_object(id) {
+                if matches!(si.grafts.get(id), Some(gix::revwalk::graft::Graft::Shallow)) {
+                    continue;
+                }
+                si.ours.push(i);
+            } else {
+                si.theirs.push(i);
+            }
+        }
+        si.shallow = shallow;
+        si.update = shallow_update && !(si.ours.is_empty() && si.theirs.is_empty());
+        si
+    }
+
+    /// `si.nr_ours || si.nr_theirs`.
+    fn has_any(&self) -> bool {
+        !(self.ours.is_empty() && self.theirs.is_empty())
+    }
+
+    /// `shallow_update && si->shallow_ref[cmd->index]`: the command is left to
+    /// `update_shallow_ref()`, which checks its connectivity itself.
+    ///
+    /// `si->shallow_ref` is only allocated by `prepare_shallow_update()`, which a
+    /// push of deletes alone never reaches (`if (!delete_only(commands))`, :2581),
+    /// while `shallow_update` stays set when the client listed shallow commits. The
+    /// read then goes through a NULL pointer and receive-pack dies of SIGSEGV —
+    /// before `pre-receive` when the connectivity check runs, after the refs moved
+    /// when `--skip-connectivity-check` leaves it to
+    /// `BUG_if_skipped_connectivity_check()`.
+    fn deferred(&self, cmd: &Command) -> bool {
+        if !self.update {
+            return false;
+        }
+        if !self.shallow_ref_allocated {
+            // The Rust runtime's own SIGSEGV handler (stack-overflow detection)
+            // would swallow a raised signal, so the default action is restored first.
+            unsafe {
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            }
+        }
+        self.shallow_ref[cmd.shallow_index] != 0
+    }
+
+    /// Record that the list now ends after command `i` when `update_shallow_ref()`
+    /// cut it while `update()` ran for that command.
+    fn note_cut(&mut self, i: usize) {
+        if std::mem::take(&mut self.cut) {
+            self.cut_at = Some(i + 1);
+        }
+    }
+
+    /// `die()` with the tempfile cleanup git's exit handlers do.
+    fn die(&mut self, msg: &str) -> ! {
+        eprintln!("fatal: {msg}");
+        if let Some(path) = self.alt_shallow_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::process::exit(128);
+    }
+
+    /// The parents `repo_parse_commit()` gives `id`, with the graft table
+    /// applied (`parse_commit_buffer()`, commit.c:554-590); `None` for a missing
+    /// object or one that is not a commit.
+    fn parents(&self, repo: &gix::Repository, find: FindObject<'_>, id: gix::ObjectId) -> Option<Vec<gix::ObjectId>> {
+        let (kind, data) = find(id)?;
+        if kind != gix::object::Kind::Commit {
+            return None;
+        }
+        let commit = gix::objs::CommitRef::from_bytes(&data, repo.object_hash()).ok()?;
+        Some(match self.grafts.get(&id) {
+            Some(graft) => graft.parents().to_vec(),
+            None => commit.parents().collect(),
+        })
+    }
+
+    /// `lookup_commit_reference_gently()`: `id` with tags peeled, if that is a commit.
+    fn peel_to_commit(find: FindObject<'_>, mut id: gix::ObjectId) -> Option<gix::ObjectId> {
+        loop {
+            let (kind, data) = find(id)?;
+            match kind {
+                gix::object::Kind::Commit => return Some(id),
+                gix::object::Kind::Tag => {
+                    id = gix::objs::TagRefIter::from_bytes(&data, id.kind()).target_id().ok()?;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The commits `refs_head_ref()` and `refs_for_each_ref()` hand `add_ref()` and
+    /// `mark_uninteresting()`: `HEAD` first, then every ref of the whole store
+    /// (no namespace), symrefs resolved and tags peeled, broken refs skipped.
+    fn ref_commits(repo: &gix::Repository, find: FindObject<'_>) -> Vec<gix::ObjectId> {
+        let mut raw = repo.clone();
+        raw.clear_namespace();
+        let mut tips = Vec::new();
+        if let Ok(Some(mut head)) = raw.try_find_reference("HEAD") {
+            if let Ok(id) = head.follow_to_object() {
+                tips.push(id.detach());
+            }
+        }
+        if let Ok(platform) = raw.references() {
+            if let Ok(all) = platform.all() {
+                for reference in all.flatten() {
+                    let mut reference = reference;
+                    if let Ok(id) = reference.follow_to_object() {
+                        tips.push(id.detach());
+                    }
+                }
+            }
+        }
+        tips.into_iter().filter_map(|id| Self::peel_to_commit(find, id)).collect()
+    }
+
+    /// `repo_in_merge_bases_many(r, commit, n, reference, 1)` (commit-reach.c:682-719):
+    /// whether `commit` is reachable from any of `references`, parents read with
+    /// the graft table and a missing commit ignored.
+    fn in_merge_bases_many(
+        &self,
+        repo: &gix::Repository,
+        find: FindObject<'_>,
+        commit: gix::ObjectId,
+        references: &[gix::ObjectId],
+    ) -> bool {
+        if self.parents(repo, find, commit).is_none() {
+            return false;
+        }
+        let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+        let mut stack: Vec<gix::ObjectId> = references.to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if id == commit {
+                return true;
+            }
+            if let Some(parents) = self.parents(repo, find, id) {
+                stack.extend(parents.into_iter().filter(|p| !seen.contains(p)));
+            }
+        }
+        false
+    }
+
+    /// `setup_temporary_shallow(si.shallow)` (shallow.c:414-436): every shallow
+    /// graft of this repository, then every commit the client listed, in a
+    /// `shallow_XXXXXX` tempfile in the git directory, whose path the unpack
+    /// child and (under `receive.shallowUpdate`) every later child is handed.
+    fn setup_temporary_shallow(&mut self, repo: &gix::Repository) -> String {
+        let mut sb = String::new();
+        for (id, graft) in self.grafts.iter() {
+            if matches!(graft, gix::revwalk::graft::Graft::Shallow) {
+                sb.push_str(&format!("{id}\n"));
+            }
+        }
+        for id in &self.shallow {
+            sb.push_str(&format!("{id}\n"));
+        }
+        if sb.is_empty() {
+            // "is_repository_shallow() sees empty string as "no shallow file"."
+            return String::new();
+        }
+        let git_dir = std::fs::canonicalize(repo.git_dir()).unwrap_or_else(|_| crate::hooks::absolutize(repo.git_dir()));
+        let template = git_dir.join("shallow_XXXXXX");
+        match crate::tmp_objdir::git_mkstemp_mode(template.as_os_str(), 0o600) {
+            Ok((path, mut file)) => {
+                self.alt_shallow_file = Some(path.clone());
+                if let Err(e) = file.write_all(sb.as_bytes()) {
+                    self.die(&format!("failed to write to {}: {}", path.display(), crate::external::strerror(&e)));
+                }
+                path.to_string_lossy().into_owned()
+            }
+            Err(e) => self.die(&format!(
+                "Unable to create temporary file '{}': {}",
+                template.display(),
+                crate::external::strerror(&e)
+            )),
+        }
+    }
+
+    /// `update_shallow_info()` (builtin/receive-pack.c:2373-2409), run once the
+    /// pack is in: "Step 4, remove non-existent ones in "theirs" after getting the
+    /// pack" (`remove_nonexistent_theirs_shallow()`, shallow.c:564-577), number the
+    /// commands that are not deletes, then either prepare the per-ref shallow
+    /// updates or, without `receive.shallowUpdate`, refuse every ref that needs
+    /// a shallow commit with `shallow update not allowed`.
+    fn update_shallow_info(
+        &mut self,
+        repo: &gix::Repository,
+        find: FindObject<'_>,
+        cmds: &mut [Command],
+        zero: gix::ObjectId,
+        shallow_file: &str,
+    ) {
+        let shallow = &self.shallow;
+        self.theirs.retain(|&i| find(shallow[i]).is_some());
+        if !self.has_any() {
+            self.update = false;
+            return;
+        }
+        for cmd in cmds.iter_mut() {
+            if cmd.new == zero {
+                continue;
+            }
+            self.refs.push(cmd.new);
+            cmd.shallow_index = self.refs.len() - 1;
+        }
+        if self.update {
+            self.prepare_shallow_update(repo, find, shallow_file);
+            return;
+        }
+        let ref_status = self.assign_shallow_commits_to_refs(repo, find, false);
+        for cmd in cmds.iter_mut() {
+            if cmd.new == zero {
+                continue;
+            }
+            if ref_status[cmd.shallow_index] != 0 {
+                cmd.error = Some("shallow update not allowed".into());
+                cmd.skip_update = true;
+            }
+        }
+    }
+
+    /// `prepare_shallow_update()` (builtin/receive-pack.c:2329-2371).
+    fn prepare_shallow_update(&mut self, repo: &gix::Repository, find: FindObject<'_>, shallow_file: &str) {
+        self.assign_shallow_commits_to_refs(repo, find, true);
+        let n = self.shallow.len();
+        let mut need = vec![0u32; n];
+        self.reachable = vec![false; n];
+        self.shallow_ref = vec![0; self.refs.len()];
+        self.shallow_ref_allocated = true;
+        for &i in &self.ours {
+            need[i] = 1;
+        }
+        for i in 0..n {
+            let Some(used) = &self.used_shallow[i] else { continue };
+            for (j, &word) in used.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                need[i] += 1;
+                for k in 0..32 {
+                    if word & (1 << k) != 0 {
+                        self.shallow_ref[j * 32 + k] += 1;
+                    }
+                }
+            }
+            // "true for those associated with some refs and belong in "ours" list
+            // aka "step 7 not done yet""
+            need[i] = u32::from(need[i] > 1);
+        }
+        self.need_reachability_test = need.into_iter().map(|v| v != 0).collect();
+        // "keep hooks happy by forcing a temporary shallow file via env variable
+        // because we can't add --shallow-file to every command. check_connected()
+        // will be done with true .git/shallow though."
+        std::env::set_var("GIT_SHALLOW_FILE", shallow_file);
+    }
+
+    /// `assign_shallow_commits_to_refs()` (shallow.c:711-788), "Step 6(+7),
+    /// associate shallow commits with new refs": every ref's new value is painted
+    /// down to the shallow commits (`paint_down()`, :616-681), stopping at what the
+    /// existing refs already reach and at the shallow commits themselves. With
+    /// `used` the bitmaps land in `used_shallow`; without it `ours` and `theirs` are
+    /// narrowed (`post_assign_shallow()`) and the per-ref status is returned.
+    fn assign_shallow_commits_to_refs(&mut self, repo: &gix::Repository, find: FindObject<'_>, used: bool) -> Vec<u32> {
+        let candidates: Vec<usize> = self.ours.iter().chain(self.theirs.iter()).copied().collect();
+        let words = self.refs.len().div_ceil(32);
+
+        // "--not --all" to cut short the traversal if new refs connect to old
+        // refs: `mark_uninteresting()` parses each ref's commit and marks it and
+        // its parents UNINTERESTING (`mark_parents_uninteresting()` goes no deeper
+        // than what is parsed, and only the ref commits are).
+        let mut uninteresting: HashSet<gix::ObjectId> = HashSet::new();
+        for tip in Self::ref_commits(repo, find) {
+            uninteresting.insert(tip);
+            if let Some(parents) = self.parents(repo, find, tip) {
+                uninteresting.extend(parents);
+            }
+        }
+        // "Mark potential bottoms so we won't go out of bound"
+        let bottom: HashSet<gix::ObjectId> = candidates.iter().map(|&i| self.shallow[i]).collect();
+
+        let mut painted: std::collections::HashMap<gix::ObjectId, Vec<u32>> = std::collections::HashMap::new();
+        for (id, tip) in self.refs.clone().into_iter().enumerate() {
+            let Some(start) = Self::peel_to_commit(find, tip) else { continue };
+            let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+            let mut head = vec![start];
+            while let Some(c) = head.pop() {
+                if seen.contains(&c) || uninteresting.contains(&c) {
+                    continue;
+                }
+                seen.insert(c);
+                painted.entry(c).or_insert_with(|| vec![0; words])[id / 32] |= 1 << (id % 32);
+                if bottom.contains(&c) {
+                    continue;
+                }
+                let Some(parents) = self.parents(repo, find, c) else {
+                    self.die(&format!("unable to parse commit {c}"));
+                };
+                head.extend(parents.into_iter().filter(|p| !seen.contains(p)));
+            }
+        }
+
+        if used {
+            self.used_shallow = vec![None; self.shallow.len()];
+            for &i in &candidates {
+                if let Some(map) = painted.get(&self.shallow[i]) {
+                    self.used_shallow[i] = Some(map.clone());
+                }
+            }
+            return Vec::new();
+        }
+        self.post_assign_shallow(repo, find, &painted)
+    }
+
+    /// `post_assign_shallow()` (shallow.c:812-872), "Step 7, reachability test on
+    /// "ours" at commit level": a commit of `theirs` stays when some ref reaches it,
+    /// one of `ours` when some ref reaches it and no existing ref does; every ref
+    /// that reaches one that stays gets a non-zero status.
+    fn post_assign_shallow(
+        &mut self,
+        repo: &gix::Repository,
+        find: FindObject<'_>,
+        painted: &std::collections::HashMap<gix::ObjectId, Vec<u32>>,
+    ) -> Vec<u32> {
+        let mut ref_status = vec![0u32; self.refs.len()];
+        let mut update_refstatus = |bitmap: &[u32]| {
+            for (i, status) in ref_status.iter_mut().enumerate() {
+                if bitmap[i / 32] & (1 << (i % 32)) != 0 {
+                    *status += 1;
+                }
+            }
+        };
+        let reached = |id: &gix::ObjectId| painted.get(id).filter(|map| map.iter().any(|&w| w != 0));
+
+        let theirs = std::mem::take(&mut self.theirs);
+        for i in theirs {
+            if let Some(bitmap) = reached(&self.shallow[i]) {
+                update_refstatus(bitmap);
+                self.theirs.push(i);
+            }
+        }
+
+        let cs = Self::ref_commits(repo, find);
+        let ours = std::mem::take(&mut self.ours);
+        for i in ours {
+            let c = self.shallow[i];
+            let Some(bitmap) = reached(&c) else { continue };
+            if !self.in_merge_bases_many(repo, find, c, &cs) {
+                update_refstatus(bitmap);
+                self.ours.push(i);
+            }
+        }
+        ref_status
+    }
+
+    /// `delayed_reachability_test()` (shallow.c:874-892), "(Delayed) step 7,
+    /// reachability test at commit level".
+    fn delayed_reachability_test(&mut self, repo: &gix::Repository, c: usize) -> bool {
+        if self.need_reachability_test[c] {
+            let find = find_in_repo(repo);
+            if self.commits.is_none() {
+                self.commits = Some(Self::ref_commits(repo, &find));
+            }
+            let commits = self.commits.clone().unwrap_or_default();
+            self.reachable[c] = self.in_merge_bases_many(repo, &find, self.shallow[c], &commits);
+            self.need_reachability_test[c] = false;
+        }
+        self.reachable[c]
+    }
+
+    /// `update_shallow_ref()` (builtin/receive-pack.c:1332-1366): the shallow
+    /// commits this ref needs and no existing ref reaches are added to
+    /// `.git/shallow` — written to `shallow.lock` with the current list, a tip
+    /// checked for connectivity against it, then committed, or rolled back when
+    /// the check fails. Returns whether the ref may be written.
+    ///
+    /// The tip is not this command's: `check_connected(command_singleton_iterator,
+    /// cmd, &opt)` (:1349) hands the iterator `cmd` where it expects a `struct command **`
+    /// (:1762-1771), so it reads the command's first member, `next`, as the list.
+    /// The check is therefore of the *next* command's new value, and it stores
+    /// NULL through `next`, cutting every later command out of the list — they are
+    /// never run, reported or handed to the post hooks. When there is no next
+    /// command, or it is a delete, nothing is checked and the list stays whole.
+    fn update_shallow_ref(
+        &mut self,
+        repo: &gix::Repository,
+        cmd: &Command,
+        next: Option<&Command>,
+        zero: gix::ObjectId,
+    ) -> bool {
+        let index = cmd.shallow_index;
+        let mask = 1u32 << (index % 32);
+        let mut extra = Vec::new();
+        for i in 0..self.shallow.len() {
+            let uses = self.used_shallow[i].as_ref().is_some_and(|map| map[index / 32] & mask != 0);
+            if uses && !self.delayed_reachability_test(repo, i) {
+                extra.push(self.shallow[i]);
+            }
+        }
+
+        // `setup_alternate_shallow()` (shallow.c:438-461).
+        let shallow_path = repo.common_dir().join("shallow");
+        let lock_path = repo.common_dir().join("shallow.lock");
+        let mut lock = match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(e) => self.die(&gix::lock::pid::unable_to_lock_message(&shallow_path, &e)),
+        };
+        // `check_shallow_file_for_update()` (shallow.c:336-344).
+        if shallow_stat(&shallow_path) != self.shallow_stat {
+            let _ = std::fs::remove_file(&lock_path);
+            self.die("shallow file has changed since we read it");
+        }
+        let mut sb = String::new();
+        for (id, graft) in self.grafts.iter() {
+            if matches!(graft, gix::revwalk::graft::Graft::Shallow) {
+                sb.push_str(&format!("{id}\n"));
+            }
+        }
+        for id in &extra {
+            sb.push_str(&format!("{id}\n"));
+        }
+        let shallow_file = if sb.is_empty() {
+            String::new()
+        } else {
+            if let Err(e) = lock.write_all(sb.as_bytes()) {
+                let _ = std::fs::remove_file(&lock_path);
+                self.die(&format!("failed to write to {}: {}", lock_path.display(), crate::external::strerror(&e)));
+            }
+            lock_path.to_string_lossy().into_owned()
+        };
+        drop(lock);
+
+        let tips: Vec<gix::ObjectId> = match next {
+            Some(next) if next.new != zero => {
+                self.cut = true;
+                vec![next.new]
+            }
+            _ => Vec::new(),
+        };
+        if check_connected(repo, &tips, &[], false, None, false, Some(&shallow_file)) {
+            // `rollback_shallow_file()`.
+            let _ = std::fs::remove_file(&lock_path);
+            return false;
+        }
+
+        // `commit_shallow_file()`, whose `is_repository_shallow()` re-reads the
+        // file and its stat data; "Make sure setup_alternate_shallow() for the
+        // next ref does not lose these new roots.."
+        let _ = std::fs::rename(&lock_path, &shallow_path);
+        self.shallow_stat = shallow_stat(&shallow_path);
+        for id in extra {
+            self.grafts.register(id, gix::revwalk::graft::Graft::Shallow, false);
+        }
+        self.shallow_ref[index] = 0;
+        true
     }
 }
 
@@ -2817,11 +3473,11 @@ fn ref_edit(
     };
     // `update()` passes no `REF_NO_DEREF` (builtin/receive-pack.c:1603-1648), so an
     // update naming a symref writes the ref it points at, and the symref keeps only
-    // a log entry (`split_symref_update()`, refs/files-backend.c:2499-2610). A
-    // delete through a symref is not followed here: gix compares the old value
-    // against the symref itself and refuses it.
-    let deref = new != zero;
-    Ok(RefEdit { change, name: full, deref })
+    // a log entry (`split_symref_update()`, refs/files-backend.c:2555-2607). A
+    // delete through a symref likewise deletes the ref it points at, checked
+    // against the old value, and logs on the symref and (through
+    // `split_head_update()`) on `HEAD`.
+    Ok(RefEdit { change, name: full, deref: true })
 }
 
 // ---------------------------------------------------------------------------

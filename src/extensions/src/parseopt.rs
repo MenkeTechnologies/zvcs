@@ -760,7 +760,7 @@ fn claimed(c: char, table: Shorts<'_>) -> bool {
 ///
 /// Returns whether the word ran out on an option that still owes a value, i.e.
 /// whether `get_arg()` would take the *next* argv word.
-fn expand_word(body: &str, table: Shorts<'_>, out: &mut Vec<String>) -> bool {
+pub(crate) fn expand_word(body: &str, table: Shorts<'_>, out: &mut Vec<String>) -> bool {
     let mut at = 0;
     while at < body.len() {
         let c = body[at..].chars().next().expect("a char boundary");

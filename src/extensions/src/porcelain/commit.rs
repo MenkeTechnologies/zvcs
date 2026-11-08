@@ -3037,6 +3037,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // stdin. Both are notifications: the hook's exit status is ignored.
     if amend && post_rewrite {
         if let Some(prev) = head_tip {
+            // `determine_author_info()` exported the commit's author
+            // (builtin/commit.c:686-688), and the notes commit below takes it.
+            if let Some(author) = commit_id
+                .object()
+                .ok()
+                .and_then(|o| o.try_into_commit().ok())
+                .and_then(|c| c.author().ok().and_then(|a| a.to_owned().ok()))
+            {
+                super::notes::export_author(author);
+            }
             if let Some(cfg) = super::notes::RewriteCfg::init(&repo, "amend")? {
                 cfg.copy(
                     &repo,

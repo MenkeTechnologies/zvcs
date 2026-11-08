@@ -174,15 +174,30 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
             // table before it counts what is left, so a dashed word is an
             // unknown option rather than an extra argument — and `-h` is a
             // question the empty table still answers.
-            for a in sub_args {
+            let sub_args = match normalize_sub_args(sub_args, &EMPTY_TABLE) {
+                Ok(v) => v,
+                Err(code) => return Ok(code),
+            };
+            let mut operands = 0;
+            let mut literal = false;
+            for a in &sub_args {
+                if literal {
+                    operands += 1;
+                    continue;
+                }
+                if a == "--" {
+                    literal = true;
+                    continue;
+                }
                 if is_help(a, "") {
                     return Ok(sub_help(GET_REF_USAGE, &[]));
                 }
                 if a.starts_with('-') && a != "-" {
                     return sub_usage(&unknown_opt(a), GET_REF_USAGE, &[]);
                 }
+                operands += 1;
             }
-            if !sub_args.is_empty() {
+            if operands != 0 {
                 return sub_usage("too many arguments", GET_REF_USAGE, &[]);
             }
             println!("{notes_ref}");
@@ -305,6 +320,13 @@ pub(crate) fn load(repo: &gix::Repository, notes_ref: &str) -> Result<(Notes, Op
         Err(e) => return Err(e.into()),
     };
     let notes = match tip {
+        // `get_tree_entry(&object_oid, "")` (notes.c:1048-1050) peels what the
+        // ref names to a tree, and dies when it cannot: a notes ref pointing at
+        // a blob is not an empty notes tree.
+        Some(tip) if repo.find_object(tip).ok().and_then(|o| o.peel_to_tree().ok()).is_none() => {
+            eprintln!("fatal: Failed to read notes tree referenced by {notes_ref} ({tip})");
+            return Err(crate::parseopt::silent(128));
+        }
         Some(tip) => load_from_commit(repo, tip)?,
         None => Notes {
             map: BTreeMap::new(),
@@ -805,10 +827,36 @@ fn notes_commit(
     tree: ObjectId,
     parents: impl IntoIterator<Item = impl Into<ObjectId>>,
 ) -> Result<ObjectId> {
-    if let Some(refusal) = crate::commit_tree_refusal(false) {
+    let exported = EXPORTED_AUTHOR.get();
+    if let Some(refusal) = crate::commit_tree_refusal(exported.is_some()) {
         return Err(refusal.clone().into_fatal());
     }
-    Ok(repo.new_commit(message, tree, parents)?.id().detach())
+    Ok(match exported {
+        Some(author) => {
+            let committer = repo
+                .committer()
+                .ok_or_else(|| anyhow!("committer identity unknown"))??;
+            repo.new_commit_as(committer, author.to_ref(&mut gix::date::parse::TimeBuf::default()), message, tree, parents)?
+                .id()
+                .detach()
+        }
+        None => repo.new_commit(message, tree, parents)?.id().detach(),
+    })
+}
+
+/// The author `git commit` exported for the rest of the process.
+///
+/// `determine_author_info()` ends in `export_one("GIT_AUTHOR_NAME", …)`,
+/// `"GIT_AUTHOR_EMAIL"` and `"GIT_AUTHOR_DATE"` (builtin/commit.c:686-688), so
+/// every later `git_author_info()` in the same process — the notes commit
+/// `commit_post_rewrite()` writes for `--amend` among them — takes the author of
+/// the commit just made, the amended commit's original author and date included,
+/// rather than the environment the command started with.
+static EXPORTED_AUTHOR: std::sync::OnceLock<gix::actor::Signature> = std::sync::OnceLock::new();
+
+/// [`EXPORTED_AUTHOR`]'s setter, for `git commit`.
+pub(crate) fn export_author(author: gix::actor::Signature) {
+    let _ = EXPORTED_AUTHOR.set(author);
 }
 
 /// `notes-utils.c:commit_notes()` — write the tree, commit it on top of the
@@ -823,6 +871,17 @@ fn commit_notes(
 ) -> Result<()> {
     let tree_id = write_tree(repo, notes)?;
     let commit = notes_commit(repo, format!("{msg}\n"), tree_id, parent)?;
+    // `refs_update_ref(…, t->update_ref, &commit_oid, NULL, 0,
+    // UPDATE_REFS_DIE_ON_ERR)` (notes-utils.c:64-66): no expected old value and
+    // no `REF_NO_DEREF`, so a symbolic notes ref moves its referent and both
+    // reflogs record the change; a name `check_refname_format()` refuses dies
+    // with refs.c's `refusing to update ref with bad name`.
+    let Ok(name) = notes_ref.try_into() else {
+        eprintln!(
+            "fatal: update_ref failed for ref '{notes_ref}': refusing to update ref with bad name '{notes_ref}'"
+        );
+        return Err(crate::parseopt::silent(128));
+    };
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -830,16 +889,11 @@ fn commit_notes(
                 force_create_reflog: false,
                 message: format!("notes: {msg}").into(),
             },
-            expected: match parent {
-                Some(p) => PreviousValue::MustExistAndMatch(Target::Object(p)),
-                None => PreviousValue::MustNotExist,
-            },
+            expected: PreviousValue::Any,
             new: Target::Object(commit),
         },
-        name: notes_ref
-            .try_into()
-            .map_err(|e| anyhow!("invalid notes ref {notes_ref:?}: {e}"))?,
-        deref: false,
+        name,
+        deref: true,
     })?;
     Ok(())
 }
@@ -1013,6 +1067,15 @@ fn parse_msg_opts(
     args: &[String],
     sub: &str,
 ) -> Result<std::result::Result<MsgOpts, ExitCode>> {
+    let table = match sub {
+        "append" => &APPEND_TABLE,
+        "edit" => &EDIT_TABLE,
+        _ => &ADD_TABLE,
+    };
+    let args = &match normalize_sub_args(args, table) {
+        Ok(v) => v,
+        Err(code) => return Ok(Err(code)),
+    };
     let mut o = MsgOpts::default();
     let mut extra: Vec<String> = Vec::new();
     let mut i = 0;
@@ -1042,8 +1105,11 @@ fn parse_msg_opts(
             // stays an unknown option, as `parse_options_step()`'s exact
             // `strcmp()` leaves it.
             _ if is_help(a, msg_shorts(sub)) => return Ok(Err(msg_sub_help(sub))),
-            "-f" | "--force" => o.force = true,
+            // `OPT__FORCE` is in `add()`'s table alone.
+            "-f" | "--force" if sub == "add" => o.force = true,
+            "--no-force" if sub == "add" => o.force = false,
             "--allow-empty" => o.allow_empty = true,
+            "--no-allow-empty" => o.allow_empty = false,
             "--stripspace" => o.stripspace = Some(true),
             "--no-stripspace" => o.stripspace = Some(false),
             "--separator" => o.separator = Some("\n".to_string()),
@@ -1385,6 +1451,176 @@ fn is_help(tok: &str, shorts: &str) -> bool {
     super::asks_for_help(tok, shorts)
 }
 
+/// One subcommand's `struct option options[]`: the long entries in the C
+/// table's order (abbreviation and `--no-` resolution read it), the short
+/// characters `parse_short_opt()` knows, and the usage block a refusal prints.
+struct SubTable {
+    longs: &'static [super::LongOpt],
+    shorts: crate::parseopt::Shorts<'static>,
+    usage: fn() -> String,
+}
+
+/// `parse_options()`'s spelling rules applied to a subcommand's argv, so that
+/// the exact-match loop each subcommand runs afterwards sees what
+/// `parse_options_step()` would have handed its table:
+///
+/// * a clump of short options is split as `parse_short_opt()` walks it, a
+///   value-taking character swallowing the rest of the word or the next word
+///   (parse-options.c:426-461, `get_arg()` at :47-62);
+/// * a long name is expanded from its unique abbreviation, `--no-<name>`
+///   included, and an ambiguous one refused with the usage block
+///   (`parse_long_opt()`, parse-options.c:519-594); a `PARSE_OPT_NOARG` entry
+///   given `=<value>` is ``option `x' takes no value`` (:62-70); the next word
+///   after a value-taking long option is its value and is copied untouched;
+/// * `--end-of-options` ends option parsing as `--` does (:1113-1124); both
+///   come out as `--` followed by every remaining word, verbatim.
+///
+/// A word no entry claims is left as typed, for the subcommand's own
+/// ``unknown option`` arm.
+fn normalize_sub_args(args: &[String], t: &SubTable) -> std::result::Result<Vec<String>, ExitCode> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
+        if a == "--" || a == "--end-of-options" {
+            out.push("--".to_string());
+            out.extend(rest.cloned());
+            break;
+        }
+        if !a.starts_with('-') || a == "-" || a == "--help-all" {
+            out.push(a.clone());
+            continue;
+        }
+        if let Some(body) = a.strip_prefix("--") {
+            if let Some(code) = super::long_takes_no_value(a, t.longs) {
+                return Err(code);
+            }
+            match super::canonical_long(a, t.longs) {
+                super::Long::Ambiguous(first, second) => {
+                    return Err(super::ambiguous_option(a, &first, &second, &(t.usage)()))
+                }
+                super::Long::Name(name) => out.push(name.into_owned()),
+            }
+            if !body.contains('=') {
+                if let super::Resolved::One(opt, false) = super::resolve_long(t.longs, body) {
+                    if opt.arg == super::Arg::Required {
+                        if let Some(v) = rest.next() {
+                            out.push(v.clone());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if crate::parseopt::expand_word(&a[1..], t.shorts, &mut out) {
+            if let Some(v) = rest.next() {
+                out.push(v.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+use super::{Arg, LongOpt};
+
+/// `add()`'s table (builtin/notes.c:488-513).
+const ADD_LONGS: &[LongOpt] = &[
+    LongOpt { name: "message", neg: false, arg: Arg::Required },
+    LongOpt { name: "file", neg: false, arg: Arg::Required },
+    LongOpt { name: "reedit-message", neg: false, arg: Arg::Required },
+    LongOpt { name: "edit", neg: true, arg: Arg::None },
+    LongOpt { name: "reuse-message", neg: false, arg: Arg::Required },
+    LongOpt { name: "allow-empty", neg: true, arg: Arg::None },
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "separator", neg: true, arg: Arg::Optional },
+    LongOpt { name: "stripspace", neg: true, arg: Arg::None },
+];
+/// `append_edit()`'s table (builtin/notes.c:667-691): no `-f`, `-C` before `-e`.
+const APPEND_LONGS: &[LongOpt] = &[
+    LongOpt { name: "message", neg: false, arg: Arg::Required },
+    LongOpt { name: "file", neg: false, arg: Arg::Required },
+    LongOpt { name: "reedit-message", neg: false, arg: Arg::Required },
+    LongOpt { name: "reuse-message", neg: false, arg: Arg::Required },
+    LongOpt { name: "edit", neg: true, arg: Arg::None },
+    LongOpt { name: "allow-empty", neg: true, arg: Arg::None },
+    LongOpt { name: "separator", neg: true, arg: Arg::Optional },
+    LongOpt { name: "stripspace", neg: true, arg: Arg::None },
+];
+/// `copy()`'s table (builtin/notes.c:587-594).
+const COPY_LONGS: &[LongOpt] = &[
+    LongOpt { name: "force", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+    LongOpt { name: "for-rewrite", neg: true, arg: Arg::Required },
+];
+/// `remove_cmd()`'s table (builtin/notes.c:1039-1046).
+const REMOVE_LONGS: &[LongOpt] = &[
+    LongOpt { name: "ignore-missing", neg: true, arg: Arg::None },
+    LongOpt { name: "stdin", neg: true, arg: Arg::None },
+];
+/// `prune()`'s table (builtin/notes.c:1083-1087).
+const PRUNE_LONGS: &[LongOpt] = &[
+    LongOpt { name: "dry-run", neg: true, arg: Arg::None },
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+];
+/// `merge()`'s table (builtin/notes.c:897-913); `--commit` and `--abort` are
+/// `PARSE_OPT_NONEG`.
+const MERGE_LONGS: &[LongOpt] = &[
+    LongOpt { name: "verbose", neg: true, arg: Arg::None },
+    LongOpt { name: "quiet", neg: true, arg: Arg::None },
+    LongOpt { name: "strategy", neg: true, arg: Arg::Required },
+    LongOpt { name: "commit", neg: false, arg: Arg::None },
+    LongOpt { name: "abort", neg: false, arg: Arg::None },
+];
+const MSG_SHORTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "e", values: "mFcC", optargs: "", number: false };
+const ADD_SHORTS: crate::parseopt::Shorts<'static> =
+    crate::parseopt::Shorts { flags: "ef", values: "mFcC", optargs: "", number: false };
+
+const ADD_TABLE: SubTable = SubTable {
+    longs: ADD_LONGS,
+    shorts: ADD_SHORTS,
+    usage: || rendered(ADD_USAGE, ADD_OPTS),
+};
+const APPEND_TABLE: SubTable = SubTable {
+    longs: APPEND_LONGS,
+    shorts: MSG_SHORTS,
+    usage: || rendered(APPEND_USAGE, APPEND_OPTS),
+};
+const EDIT_TABLE: SubTable = SubTable {
+    longs: APPEND_LONGS,
+    shorts: MSG_SHORTS,
+    usage: || rendered(EDIT_USAGE, APPEND_OPTS),
+};
+const COPY_TABLE: SubTable = SubTable {
+    longs: COPY_LONGS,
+    shorts: crate::parseopt::Shorts::flags("f"),
+    usage: || rendered(COPY_USAGE, COPY_OPTS),
+};
+const REMOVE_TABLE: SubTable = SubTable {
+    longs: REMOVE_LONGS,
+    shorts: crate::parseopt::Shorts::flags(""),
+    usage: || rendered(REMOVE_USAGE, REMOVE_OPTS),
+};
+const PRUNE_TABLE: SubTable = SubTable {
+    longs: PRUNE_LONGS,
+    shorts: crate::parseopt::Shorts::flags("nv"),
+    usage: || rendered(PRUNE_USAGE, PRUNE_OPTS),
+};
+const MERGE_TABLE: SubTable = SubTable {
+    longs: MERGE_LONGS,
+    shorts: crate::parseopt::Shorts { flags: "vq", values: "s", optargs: "", number: false },
+    usage: || {
+        let mut buf = Vec::new();
+        let _ = merge_print_usage(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    },
+};
+/// `list()`, `show()` and `get_ref()` run `parse_options()` over an empty table.
+const EMPTY_TABLE: SubTable = SubTable {
+    longs: &[],
+    shorts: crate::parseopt::Shorts::flags(""),
+    usage: String::new,
+};
+
 /// `usage_with_options_internal()`'s layout, stream-independent.
 fn rendered(lines: &[&str], options: &[&str]) -> String {
     let mut out = String::new();
@@ -1499,8 +1735,21 @@ fn msg_sub_help(sub: &str) -> ExitCode {
 fn list(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
     // git runs parse-options first, so an unknown switch is reported before any
     // "too many arguments"; `list` itself has no options of its own.
+    let args = &match normalize_sub_args(args, &EMPTY_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
     let mut positional: Vec<&String> = Vec::new();
+    let mut literal = false;
     for a in args {
+        if literal {
+            positional.push(a);
+            continue;
+        }
+        if a == "--" {
+            literal = true;
+            continue;
+        }
         if is_help(a, "") {
             return Ok(sub_help(LIST_USAGE, &[]));
         }
@@ -1548,8 +1797,21 @@ fn list(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
 }
 
 fn show(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
+    let args = &match normalize_sub_args(args, &EMPTY_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
     let mut positional: Vec<&String> = Vec::new();
+    let mut literal = false;
     for a in args {
+        if literal {
+            positional.push(a);
+            continue;
+        }
+        if a == "--" {
+            literal = true;
+            continue;
+        }
         if is_help(a, "") {
             return Ok(sub_help(SHOW_USAGE, &[]));
         }
@@ -1808,13 +2070,27 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     let mut stdin = false;
     let mut for_rewrite: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();
+    let args = &match normalize_sub_args(args, &COPY_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let mut literal = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        if literal {
+            positional.push(a);
+            i += 1;
+            continue;
+        }
         match a {
+            "--" => literal = true,
             _ if is_help(a, "f") => return Ok(sub_help(COPY_USAGE, COPY_OPTS)),
             "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "--stdin" => stdin = true,
+            "--no-stdin" => stdin = false,
+            "--no-for-rewrite" => for_rewrite = None,
             "--for-rewrite" => {
                 i += 1;
                 match args.get(i) {
@@ -2272,6 +2548,10 @@ fn prune(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
     let mut dry_run = false;
     let mut verbose = false;
     let mut literal = false;
+    let args = &match normalize_sub_args(args, &PRUNE_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
     for a in args {
         if literal {
             return sub_usage("too many arguments", PRUNE_USAGE, PRUNE_OPTS);
@@ -2282,7 +2562,9 @@ fn prune(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
             "--" => literal = true,
             s if is_help(s, "nv") => return Ok(sub_help(PRUNE_USAGE, PRUNE_OPTS)),
             "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
             "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
             s if s.starts_with('-') && s != "-" => {
                 return sub_usage(&unknown_opt(s), PRUNE_USAGE, PRUNE_OPTS)
             }
@@ -2327,11 +2609,23 @@ fn remove(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
     let mut ignore_missing = false;
     let mut from_stdin = false;
     let mut specs: Vec<String> = Vec::new();
+    let args = &match normalize_sub_args(args, &REMOVE_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let mut literal = false;
     for a in args {
+        if literal {
+            specs.push(a.clone());
+            continue;
+        }
         match a.as_str() {
+            "--" => literal = true,
             s if is_help(s, "") => return Ok(sub_help(REMOVE_USAGE, REMOVE_OPTS)),
             "--ignore-missing" => ignore_missing = true,
+            "--no-ignore-missing" => ignore_missing = false,
             "--stdin" => from_stdin = true,
+            "--no-stdin" => from_stdin = false,
             s if s.starts_with('-') && s != "-" => {
                 return sub_usage(&unknown_opt(s), REMOVE_USAGE, REMOVE_OPTS)
             }
@@ -2468,67 +2762,51 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
     let mut do_commit = false;
     let mut do_abort = false;
     let mut positional: Vec<String> = Vec::new();
+    let args = &match normalize_sub_args(args, &MERGE_TABLE) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let mut literal = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        if literal {
+            positional.push(a.to_string());
+            i += 1;
+            continue;
+        }
         match a {
-            "--verbose" => bump_verbosity(&mut verbosity, true),
+            "--" => literal = true,
+            "-v" | "--verbose" => bump_verbosity(&mut verbosity, true),
             "--no-verbose" | "--no-quiet" => verbosity = 0,
-            "--quiet" => bump_verbosity(&mut verbosity, false),
+            "-q" | "--quiet" => bump_verbosity(&mut verbosity, false),
             "--commit" => do_commit = true,
             "--abort" => do_abort = true,
-            "--strategy" => {
+            "-s" | "--strategy" => {
                 i += 1;
                 match args.get(i) {
                     Some(v) => strategy = Some(v.clone()),
                     None => return missing_value(a),
                 }
             }
+            "--no-strategy" => strategy = None,
             s if s.starts_with("--strategy=") => {
                 strategy = Some(s["--strategy=".len()..].to_string())
             }
-            // `--help-all` joins `-h`: parse_options_step() tests that name with
-            // a `strcmp()` of its own ahead of parse_long_opt() and renders
-            // `USAGE_FULL`, identical here because the merge option table has no
-            // `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a` and
-            // `--help-all=x` stay unknown-option reports.
-            "--help-all" => {
+            // `-h` and `--help-all`: parse_options_step() answers both itself
+            // and renders `USAGE_FULL`, identical here because the merge
+            // option table has no `PARSE_OPT_HIDDEN` entry. The `--help-all`
+            // compare is exact, so `--help-a` and `--help-all=x` stay
+            // unknown-option reports.
+            _ if is_help(a, "vq") => {
                 return merge_help();
             }
             s if s.starts_with("--") => {
                 return merge_usage(&format!("unknown option `{}'", &s[2..]))
             }
-            // A short-option cluster, the way `parse_short_opt()` walks it
-            // (`parse-options.c`): each character is its own switch, and the
-            // first one that takes a value swallows the rest of the word — or,
-            // when it is the last character, the next argument.
             s if s.starts_with('-') && s != "-" => {
-                let cluster: Vec<char> = s[1..].chars().collect();
-                let mut c = 0;
-                while c < cluster.len() {
-                    match cluster[c] {
-                        'v' => bump_verbosity(&mut verbosity, true),
-                        'q' => bump_verbosity(&mut verbosity, false),
-                        'h' => {
-                            return merge_help();
-                        }
-                        's' => {
-                            let rest: String = cluster[c + 1..].iter().collect();
-                            if rest.is_empty() {
-                                i += 1;
-                                match args.get(i) {
-                                    Some(v) => strategy = Some(v.clone()),
-                                    None => return missing_value("-s"),
-                                }
-                            } else {
-                                strategy = Some(rest);
-                            }
-                            break;
-                        }
-                        sw => return merge_usage(&format!("unknown switch `{sw}'")),
-                    }
-                    c += 1;
-                }
+                let sw = s[1..].chars().next().unwrap_or(' ');
+                return merge_usage(&format!("unknown switch `{sw}'"));
             }
             s => positional.push(s.to_string()),
         }
@@ -2646,13 +2924,11 @@ fn notes_strategy_config(repo: &gix::Repository, subsection: Option<&str>) -> Op
 }
 
 /// Move a notes ref, writing git's `notes: `-prefixed reflog line.
-fn move_notes_ref(
-    repo: &gix::Repository,
-    notes_ref: &str,
-    from: Option<ObjectId>,
-    to: ObjectId,
-    reflog: &str,
-) -> Result<()> {
+fn move_notes_ref(repo: &gix::Repository, notes_ref: &str, to: ObjectId, reflog: &str) -> Result<()> {
+    // `refs_update_ref(…, notes_ref, &result_oid, NULL, 0, UPDATE_REFS_DIE_ON_ERR)`
+    // (builtin/notes.c:979-981, and :875-878 once `merge_commit()` has checked the
+    // old value itself): no `REF_NO_DEREF`, so a symbolic notes ref moves its
+    // referent.
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -2660,16 +2936,13 @@ fn move_notes_ref(
                 force_create_reflog: false,
                 message: format!("notes: {reflog}").into(),
             },
-            expected: match from {
-                Some(p) => PreviousValue::MustExistAndMatch(Target::Object(p)),
-                None => PreviousValue::MustNotExist,
-            },
+            expected: PreviousValue::Any,
             new: Target::Object(to),
         },
         name: notes_ref
             .try_into()
             .map_err(|e| anyhow!("invalid notes ref {notes_ref:?}: {e}"))?,
-        deref: false,
+        deref: true,
     })?;
     Ok(())
 }
@@ -2727,7 +3000,7 @@ fn do_merge(
         (Some(_), None) => return Ok(ExitCode::SUCCESS),
         // Local is unborn: adopt the remote notes wholesale.
         (None, Some(r)) => {
-            move_notes_ref(repo, local_ref, None, r, &reflog)?;
+            move_notes_ref(repo, local_ref, r, &reflog)?;
             return Ok(ExitCode::SUCCESS);
         }
         (Some(l), Some(r)) => (l, r),
@@ -2768,7 +3041,7 @@ fn do_merge(
         if verbosity >= 0 {
             println!("Fast-forward");
         }
-        move_notes_ref(repo, local_ref, Some(l), r, &reflog)?;
+        move_notes_ref(repo, local_ref, r, &reflog)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -2963,7 +3236,7 @@ fn do_merge(
         // *not* added here.
         let tree_id = write_tree(repo, &out_notes)?;
         let commit = notes_commit(repo, reflog.clone(), tree_id, vec![l, r])?;
-        move_notes_ref(repo, local_ref, Some(l), commit, &reflog)?;
+        move_notes_ref(repo, local_ref, commit, &reflog)?;
         Ok(ExitCode::SUCCESS)
     } else {
         // Manual strategy with conflicts: stage the partial merge on disk.
@@ -2986,6 +3259,16 @@ fn do_merge(
             &crate::refstore::StateRef::Object(partial),
             &format!("notes: {reflog}"),
         )?;
+        // `find_shared_symref(worktrees, "NOTES_MERGE_REF", notes_ref)`
+        // (builtin/notes.c:992-997): a worktree already merging into this ref,
+        // this one included, refuses the second merge after its partial commit.
+        if let Some(path) = super::worktree::find_shared_symref(repo, "NOTES_MERGE_REF", local_ref) {
+            eprintln!(
+                "fatal: a notes merge into {local_ref} is already in-progress at {}",
+                path.display()
+            );
+            return Ok(ExitCode::from(128));
+        }
         crate::refstore::state_ref_write(
             repo,
             "NOTES_MERGE_REF",
@@ -3495,7 +3778,7 @@ fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     }
-    move_notes_ref(repo, &local_ref, local_tip, commit, &reflog)?;
+    move_notes_ref(repo, &local_ref, commit, &reflog)?;
 
     // Clear the staged merge.
     let _ = crate::refstore::state_ref_delete(repo, "NOTES_MERGE_PARTIAL", "");

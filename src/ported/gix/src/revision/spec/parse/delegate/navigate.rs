@@ -68,14 +68,20 @@ impl delegate::Navigate for Delegate<'_> {
                         }
                     };
                     let id = commit.id().detach().attach(repo);
-                    match id
-                        .ancestors()
-                        .first_parent_only()
-                        .all()
-                        .expect("cannot fail without sorting")
-                        .skip(num)
-                        .find_map(Result::ok)
-                    {
+                    // `while (generation--) commit = commit->parents->item;`
+                    // (object-name.c:873-877): the first parent is followed
+                    // `num` times with no seen-set, so a replacement that makes
+                    // the chain revisit a commit (`refs/replace/<c1>` naming a
+                    // commit whose parent is `<c1>`) still yields an ancestor,
+                    // where a deduplicating revision walk ran dry.
+                    let mut cur = Some(commit);
+                    for _ in 0..num {
+                        cur = cur
+                            .and_then(|c| c.parent_ids().next())
+                            .and_then(|p| repo.find_object(p).ok())
+                            .and_then(|o| o.try_into_commit().ok());
+                    }
+                    match cur {
                         Some(commit) => replacements.push((*obj, commit.id)),
                         None => errors.push((
                             *obj,

@@ -449,7 +449,7 @@ fn edit_and_replace(object_ref: &str, force: bool, raw: bool) -> Result<ExitCode
     }
 
     let new = if launch_editor(&repo, &tmpfile) {
-        import_object(&repo, &tmpfile, kind, raw)
+        import_object(&repo, &tmpfile, kind, raw)?
     } else {
         error_line("editing object file failed");
         None
@@ -527,14 +527,23 @@ fn export_object(filename: &std::path::Path, oid: ObjectId, kind: Kind, raw: boo
 
 /// `import_object()`: hash the edited file back in as `kind`. A pretty-printed
 /// tree goes through `git mktree`; everything else is written verbatim.
-/// `None` is git's -1 return, with the `error:` line already printed.
+/// `None` is git's -1 return, with the `error:` line already printed; `Err` is
+/// the format check's `die()`.
 fn import_object(
     repo: &gix::Repository,
     filename: &std::path::Path,
     kind: Kind,
     raw: bool,
-) -> Option<ObjectId> {
-    if !raw && kind == Kind::Tree {
+) -> Result<Option<ObjectId>> {
+    if raw || kind != Kind::Tree {
+        return import_object_fd(repo, filename, kind);
+    }
+    Ok(import_object_mktree(filename))
+}
+
+/// [`import_object`]'s `git mktree` half (builtin/replace.c:269-303).
+fn import_object_mktree(filename: &std::path::Path) -> Option<ObjectId> {
+    {
         let listing = std::fs::File::open(filename).ok()?;
         // `cmd.in = fd; cmd.out = -1;` (builtin/replace.c:278-279) — only stdout
         // is a pipe, so mktree's own diagnostics reach the terminal.
@@ -564,17 +573,45 @@ fn import_object(
             }
         };
     }
+}
 
-    let data = std::fs::read(filename)
+/// [`import_object`]'s `index_fd(…, type, NULL, INDEX_FORMAT_CHECK |
+/// INDEX_WRITE_OBJECT)` half (builtin/replace.c:304-316).
+fn import_object_fd(repo: &gix::Repository, filename: &std::path::Path, kind: Kind) -> Result<Option<ObjectId>> {
+    let Ok(data) = std::fs::read(filename)
         .map_err(|e| error_line(&format!("unable to fstat {}: {e}", filename.display())))
-        .ok()?;
-    match repo.objects.write_buf(kind, &data) {
+    else {
+        return Ok(None);
+    };
+    // `index_mem()`'s `INDEX_FORMAT_CHECK` (object-file.c:1007-1016): a strict
+    // `fsck_buffer()` whose `hash_format_check_report()` prints `error: object
+    // fails fsck: <id>: <text>` for the first finding of any severity and dies,
+    // so an edit that breaks the object writes nothing. A blob has nothing to
+    // check. This is `hash-object`'s check, without `--literally`.
+    if kind != Kind::Blob {
+        let checked = super::fsck::check_object(kind, &data, true, repo.object_hash().len_in_hex());
+        for line in &checked.raw {
+            eprintln!("{line}");
+        }
+        if let Some(finding) = checked
+            .findings
+            .iter()
+            .find(|f| !matches!(f.msg.default, super::fsck::Severity::Ignore))
+        {
+            eprintln!("error: object fails fsck: {}: {}", finding.msg.id, finding.text);
+            crate::git_fatal!("refusing to create malformed object");
+        }
+        if !checked.raw.is_empty() {
+            crate::git_fatal!("refusing to create malformed object");
+        }
+    }
+    Ok(match repo.objects.write_buf(kind, &data) {
         Ok(id) => Some(id),
         Err(_) => {
             error_line("unable to write object to database");
             None
         }
-    }
+    })
 }
 
 /// `launch_editor(tmpfile, NULL, NULL)`: open the file and wait, without reading
@@ -852,7 +889,22 @@ fn list_replace_refs(pattern: Option<&str>, format: Option<&str>) -> Result<Exit
 /// its own line, so both appear; that pair is what `git replace --graft <tree>`
 /// prints.
 fn lookup_commit_reference(repo: &gix::Repository, oid: ObjectId) -> Option<gix::Commit<'_>> {
-    let object = repo.find_object(oid).ok()?.peel_tags_to_end().ok()?;
+    let Ok(object) = repo.find_object(oid) else {
+        // `register_commit_graft()` ends in `unparse_commit()`, whose
+        // `lookup_commit()` gives every graft's id a commit object
+        // (commit.c:209-218, :245). Once `prepare_commit_graft()` has run — the
+        // first commit `parse_commit_buffer()` parsed (commit.c:554) — a missing
+        // graft id is therefore a commit to `peel_object_ext()` (object.c:
+        // 217-227), and `repo_parse_commit_gently()` reports it cannot be read
+        // (commit.c:641-645); before that it peels to nothing, silently.
+        if GRAFTS_PREPARED.load(std::sync::atomic::Ordering::Relaxed)
+            && repo.commit_grafts().get(&oid).is_some()
+        {
+            error_line(&format!("Could not read {oid}"));
+        }
+        return None;
+    };
+    let object = object.peel_tags_to_end().ok()?;
     if object.kind != Kind::Commit {
         error_line(&format!(
             "object {} is a {}, not a commit",
@@ -860,8 +912,13 @@ fn lookup_commit_reference(repo: &gix::Repository, oid: ObjectId) -> Option<gix:
         ));
         return None;
     }
+    GRAFTS_PREPARED.store(true, std::sync::atomic::Ordering::Relaxed);
     Some(object.into_commit())
 }
+
+/// git's `parsed_objects->commit_graft_prepared`, as far as [`lookup_commit_reference`]
+/// can observe it: set once a commit has been parsed.
+static GRAFTS_PREPARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `create_graft` — rewrite `<commit>`'s parents and replace it with the result.
 ///

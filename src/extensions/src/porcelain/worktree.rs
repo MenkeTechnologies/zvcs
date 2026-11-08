@@ -3782,6 +3782,33 @@ pub(super) fn find_shared_head(repo: &gix::Repository, target: &str) -> Option<S
     None
 }
 
+/// `find_shared_symref(get_worktrees(), symref, target)` (worktree.c:527-537)
+/// for a per-worktree symref other than `HEAD`, which `is_shared_symref()`
+/// (:500-525) reads from each non-bare worktree's own ref store and matches
+/// when it is a symref to `target`: the path of the first such worktree, the
+/// current one included.
+pub(super) fn find_shared_symref(repo: &gix::Repository, symref: &str, target: &str) -> Option<PathBuf> {
+    let common = gix::path::realpath(repo.common_dir()).ok()?;
+    for wt in collect(repo, u64::MAX).ok()? {
+        if wt.is_bare {
+            continue;
+        }
+        let wt_gitdir = match &wt.id {
+            Some(id) => common.join("worktrees").join(id),
+            None => common.clone(),
+        };
+        let Ok(store) = gix::open_opts(&wt_gitdir, repo.open_options().clone()) else {
+            continue;
+        };
+        if let Ok(Some(crate::refstore::StateRef::Symbolic(t))) = crate::refstore::state_ref_read(&store, symref) {
+            if t == target.as_bytes() {
+                return Some(wt.path);
+            }
+        }
+    }
+    None
+}
+
 /// `struct checked_out_branch` (branch.c:395-399).
 struct CheckedOut {
     refname: String,

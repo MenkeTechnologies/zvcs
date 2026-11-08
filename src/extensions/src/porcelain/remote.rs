@@ -472,9 +472,10 @@ fn effective_urls(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> 
         .collect()
 }
 
-/// The fetch URL list git would use, which falls back to the remote's own name
-/// when nothing is configured.
-fn fetch_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
+/// The URLs `remote_get()` reads for `name` before any rewriting: the configured
+/// ones, else a legacy file's, else the name itself (`add_url_alias()`,
+/// remote.c:823-824).
+fn raw_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
     let urls = effective_urls(repo, name, "url");
     if urls.is_empty() {
         if let Some(legacy) = legacy(repo, name).filter(|l| !l.urls.is_empty()) {
@@ -486,14 +487,81 @@ fn fetch_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
     }
 }
 
+/// `remote->url` and `push_url_of_remote(remote)` once `alias_all_urls()`
+/// (remote.c:604-634) has run over `raw`: every URL and every configured push URL
+/// through `url.<base>.insteadOf`; with no push URL configured, the push list is
+/// each URL a `url.<base>.pushInsteadOf` rewrites (`add_pushurl_alias()`, :91-98),
+/// and with none of those either it is the URL list (:959-962).
+fn url_lists(repo: &gix::Repository, name: &str, raw: &[String]) -> (Vec<String>, Vec<String>) {
+    use super::remote_http::{alias_url, alias_url_by};
+    let snapshot = repo.config_snapshot();
+    let file = snapshot.plumbing();
+    let rewrite = |u: &String| alias_url(file, BStr::new(u)).to_str_lossy().into_owned();
+    let configured_push = effective_urls(repo, name, "pushurl");
+    let push: Vec<String> = match configured_push.is_empty() {
+        false => configured_push.iter().map(rewrite).collect(),
+        true => raw
+            .iter()
+            .filter_map(|u| alias_url_by(file, BStr::new(u), "pushInsteadOf"))
+            .map(|u| u.to_str_lossy().into_owned())
+            .collect(),
+    };
+    let urls: Vec<String> = raw.iter().map(rewrite).collect();
+    let push = if push.is_empty() { urls.clone() } else { push };
+    (urls, push)
+}
+
+/// The fetch URL list git would use, which falls back to the remote's own name
+/// when nothing is configured.
+fn fetch_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
+    url_lists(repo, name, &raw_urls_or_name(repo, name)).0
+}
+
 /// The push URL list: explicit `pushurl` entries, else the fetch URLs.
 fn push_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
-    let push = effective_urls(repo, name, "pushurl");
-    if push.is_empty() {
-        fetch_urls_or_name(repo, name)
-    } else {
-        push
+    url_lists(repo, name, &raw_urls_or_name(repo, name)).1
+}
+
+/// The edit `repo_config_set_multivar(key, NULL, <pattern>, CONFIG_FLAGS_MULTI_REPLACE)`
+/// makes to the repository's file (config.c:3028-3290): every value of
+/// `remote.<name>.<key>` that `matches` accepts goes, line and all, where it stands,
+/// and a section left with no entries goes with it (`maybe_remove_section()`,
+/// :2823-2893). Returns how many values were removed — none is the caller's
+/// `CONFIG_NOTHING_SET`.
+fn unset_matching(file: &mut ConfigFile, name: &str, key: &str, matches: impl Fn(&[u8]) -> bool) -> usize {
+    let ids: Vec<_> = file
+        .sections_and_ids_by_name("remote")
+        .map(|sections| {
+            sections
+                .filter(|(section, _)| section.header().subsection_name() == Some(BStr::new(name)))
+                .map(|(_, id)| id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut removed = 0;
+    for id in ids {
+        let emptied = {
+            let Some(mut section) = file.section_mut_by_id(id) else {
+                continue;
+            };
+            let hits: Vec<usize> = section
+                .values(key)
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| matches(v))
+                .map(|(i, _)| i)
+                .collect();
+            for &i in hits.iter().rev() {
+                section.remove_at(key, i);
+            }
+            removed += hits.len();
+            !hits.is_empty() && section.num_values() == 0
+        };
+        if emptied {
+            file.remove_section_by_id(id);
+        }
     }
+    removed
 }
 
 /// Open the repository-local config for writing (`<common_dir>/config`).
@@ -816,7 +884,7 @@ fn list(repo: &gix::Repository, verbose: bool) -> Result<ExitCode> {
     let mut lines: Vec<String> = Vec::new();
     for name in repo.remote_names() {
         let name = name.to_str_lossy();
-        let fetch = effective_urls(repo, &name, "url");
+        let (fetch, push) = url_lists(repo, &name, &effective_urls(repo, &name, "url"));
         let filter = fetch.first().and_then(|_| {
             crate::config::config_get_string(Some(repo), &format!("remote.{name}.partialclonefilter"))
         });
@@ -824,7 +892,6 @@ fn list(repo: &gix::Repository, verbose: bool) -> Result<ExitCode> {
             lines.push(name.into_owned());
             continue;
         }
-        let push = effective_urls(repo, &name, "pushurl");
         match fetch.first() {
             Some(url) => {
                 let filter = filter.map(|f| format!(" [{f}]")).unwrap_or_default();
@@ -832,14 +899,10 @@ fn list(repo: &gix::Repository, verbose: bool) -> Result<ExitCode> {
             }
             None => lines.push(format!("{name}\t")),
         }
-        if push.is_empty() {
-            if let Some(url) = fetch.first() {
-                lines.push(format!("{name}\t{url} (push)"));
-            }
-        } else {
-            for url in &push {
-                lines.push(format!("{name}\t{url} (push)"));
-            }
+        // `url = push_url_of_remote(remote);` and a line for each of them
+        // (builtin/remote.c:1386-1391).
+        for url in &push {
+            lines.push(format!("{name}\t{url} (push)"));
         }
     }
     for line in lines {
@@ -920,12 +983,15 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 }
                 None => return usage(USAGE_ADD),
             },
+            // `parse_mirror_opt()` returns `error()`, which `parse_options()` turns
+            // into exit 129 with no usage block (builtin/remote.c:144-159,
+            // parse-options.c:1210-1211).
             _ if a.starts_with("--mirror=") => {
                 eprintln!(
                     "error: unknown --mirror argument: {}",
                     &a["--mirror=".len()..]
                 );
-                return usage(USAGE_ADD);
+                return Ok(ExitCode::from(129));
             }
             _ if a.starts_with("--track=") => tracks.push(a["--track=".len()..].to_string()),
             _ if a.starts_with("--master=") => master = Some(a["--master=".len()..].to_string()),
@@ -952,6 +1018,9 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // builtin/remote.c:213-225 in order: the mirror refusal, `remote_get()`
     // (whose `read_config()` is the ref store's first use), the collision, and
     // only then the name check.
+    if mirror != Mirror::No && master.is_some() {
+        return fatal("specifying a master branch makes no sense with --mirror");
+    }
     if !tracks.is_empty() && mirror == Mirror::Push {
         return fatal("specifying branches to track makes sense only with fetch mirrors");
     }
@@ -1017,24 +1086,28 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         // (`add()`, builtin/remote.c:232-241.) A push-only mirror gets no fetch refspec at
         // all — the remote exists to be pushed to, and `git fetch up` on it fetches nothing
         // rather than the whole branch namespace.
-        if mirror.fetches() {
-            section.push("fetch", "+refs/*:refs/*")?;
-        } else if mirror.pushes() {
-            // No fetch refspec.
-        } else if tracks.is_empty() {
-            let spec = format!("+refs/heads/*:refs/remotes/{name}/*");
-            section.push("fetch", spec.as_str())?;
-        } else {
-            for branch in &tracks {
-                let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
+        //
+        // `add_branch()` (builtin/remote.c:126-138) maps each tracked branch — `*` when none
+        // is named — to `+refs/<branch>:refs/<branch>` for a mirror and to
+        // `+refs/heads/<branch>:refs/remotes/<name>/<branch>` otherwise.
+        if mirror == Mirror::No || mirror.fetches() {
+            let all = ["*".to_owned()];
+            let branches = if tracks.is_empty() { &all[..] } else { &tracks[..] };
+            for branch in branches {
+                let spec = match mirror {
+                    Mirror::No => format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}"),
+                    _ => format!("+refs/{branch}:refs/{branch}"),
+                };
                 section.push("fetch", spec.as_str())?;
             }
         }
-        if let Some(t) = tag_opt {
-            section.push("tagOpt", t)?;
-        }
+        // `remote.<name>.mirror` is written before `remote.<name>.tagOpt`
+        // (builtin/remote.c:243-254).
         if mirror.pushes() {
             section.push("mirror", "true")?;
+        }
+        if let Some(t) = tag_opt {
+            section.push("tagOpt", t)?;
         }
     }
     persist(&path, &file)?;
@@ -1099,7 +1172,7 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// edit, so the line is appended here, after the edit that resolved the target.
 ///
 /// `previous` is what the ref resolved to *before* the edit, so the caller reads it first.
-fn log_symref_update(
+pub(super) fn log_symref_update(
     repo: &gix::Repository,
     name: &str,
     previous: Option<gix::ObjectId>,
@@ -1118,7 +1191,7 @@ fn log_symref_update(
 }
 
 /// The object a ref resolves to, or `None` when it does not exist or does not peel.
-fn resolved_id(repo: &gix::Repository, name: &str) -> Result<Option<gix::ObjectId>> {
+pub(super) fn resolved_id(repo: &gix::Repository, name: &str) -> Result<Option<gix::ObjectId>> {
     let Some(mut reference) = repo.try_find_reference(name)? else {
         return Ok(None);
     };
@@ -1196,6 +1269,20 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     // `oldremote = remote_get(rename.old_name)` (builtin/remote.c:882).
     read_config(repo);
+    // ```c
+    // for (int i = 0; i < oldremote->fetch.nr && !refspecs_need_update; i++)
+    //         refspecs_need_update = !!strstr(oldremote->fetch.items[i].raw,
+    //                                         old_remote_context.buf);
+    // ```
+    //
+    // (builtin/remote.c:910-912.) Only a remote whose fetch refspecs write into
+    // `refs/remotes/<old>/` has its references there renamed and
+    // `remote.pushDefault` followed (`handle_push_default()` sits in the same
+    // `if (refspecs_need_update)`, :985-992); any other keeps both.
+    let old_context = format!(":refs/remotes/{old}/");
+    let refspecs_need_update = effective_specs(repo, old, "fetch")
+        .iter()
+        .any(|spec| spec.contains(&old_context));
     if !remote_exists_or_legacy(repo, old) {
         return error(format!("No such remote: '{old}'"), 2);
     }
@@ -1252,14 +1339,8 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if let Ok(mut section) = file.section_mut("remote", None::<&BStr>) {
-        if section
-            .value("pushDefault")
-            .map(|v| v == old)
-            .unwrap_or(false)
-        {
-            section.set("pushDefault", new)?;
-        }
+    if refspecs_need_update {
+        handle_push_default(repo, &mut file, old, Some(new))?;
     }
     persist(&path, &file)?;
 
@@ -1273,7 +1354,7 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
     }
-    let refs = match reftable {
+    let refs = match reftable || !refspecs_need_update {
         true => Vec::new(),
         false => tracking_refs(repo, old)?,
     };
@@ -1343,10 +1424,15 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             name: new_name.clone(),
             deref: false,
         })?;
-        // `files_copy_or_rename_ref()` moves the ref's reflog with the ref, so the
-        // carried-over history is what the line below appends to.
+        // `rename_one_reflog()` (builtin/remote.c:672-711) copies the ref's reflog to
+        // the new name and appends the `remote: renamed` entry — and does neither for a
+        // ref that has no reflog (`if (!refs_reflog_exists(...)) return 0;`).
+        // A symbolic ref is queued with a NULL `oid` (builtin/remote.c:724-736), so its entry is
+        // null to null.
+        let had_reflog = crate::refstore::reflog_exists(repo, &old_text);
         move_reflog(repo, &old_text, &dst)?;
-        if let Some(id) = logged {
+        if had_reflog {
+            let id = logged.unwrap_or_else(|| repo.object_hash().null());
             super::symbolic_ref::append_reflog(repo, new_name.as_ref().as_bstr(), Some(id), &id, &message)?;
         }
         delete_ref(repo, old_name)?;
@@ -1569,9 +1655,10 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let name = pos[0];
 
-    // `remote = remote_get(argv[0])` (builtin/remote.c:1030).
+    // `remote = remote_get(argv[0])` (builtin/remote.c:1030), which a
+    // `remotes/` or `branches/` file satisfies as well.
     read_config(repo);
-    if !remote_exists(repo, name) {
+    if !remote_exists_or_legacy(repo, name) {
         return error(format!("No such remote: '{name}'"), 2);
     }
 
@@ -1633,10 +1720,13 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
 
     let (path, mut file) = open_local(repo)?;
+    let mut section_removed = false;
     while file
         .remove_section("remote", Some(BStr::new(name)))
         .is_some()
-    {}
+    {
+        section_removed = true;
+    }
 
     for branch in branch_subsections(&file) {
         let now_empty;
@@ -1667,23 +1757,102 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let mut drop_remote_section = false;
-    if let Ok(mut section) = file.section_mut("remote", None::<&BStr>) {
-        if section
-            .value("pushDefault")
-            .map(|v| v == name)
-            .unwrap_or(false)
-        {
-            while section.remove("pushDefault").is_some() {}
-            drop_remote_section = section.num_values() == 0;
-        }
+    // ```c
+    // if (repo_config_rename_section(the_repository, buf.buf, NULL) < 1) {
+    //         result = error(_("Could not remove config section '%s'"), buf.buf);
+    //         goto out;
+    // }
+    // ```
+    //
+    // (builtin/remote.c:1092-1096.) A remote read from a legacy file has no section
+    // to remove: the `branch.*` settings are gone by then, `remote.pushDefault` stays.
+    if !section_removed {
+        persist(&path, &file)?;
+        return error(format!("Could not remove config section 'remote.{name}'"), 1);
     }
-    if drop_remote_section {
-        let _ = file.remove_section("remote", None::<&BStr>);
-    }
+
+    handle_push_default(repo, &mut file, name, None)?;
     persist(&path, &file)?;
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// `handle_push_default()` (builtin/remote.c:816-845) for a remote renamed to `new`, or
+/// removed when `new` is `None`. `config_read_push_default()` (:798-814) remembers the
+/// scope and line of the last `remote.pushDefault` naming `old`: one from the command
+/// line or the environment is left alone, one in the repository's own files is set to
+/// the new name or unset in the repository's file (`local`, the file being edited
+/// here), and one in a system or global file draws a warning that it now names a remote
+/// that is gone.
+fn handle_push_default(repo: &gix::Repository, file: &mut ConfigFile, old: &str, new: Option<&str>) -> Result<()> {
+    let snapshot = repo.config_snapshot();
+    let mut found: Option<(Source, Option<std::path::PathBuf>)> = None;
+    if let Some(sections) = snapshot.plumbing().sections_by_name("remote") {
+        for section in sections.filter(|s| s.header().subsection_name().is_none()) {
+            if section.values("pushDefault").iter().any(|v| v == old) {
+                found = Some((section.meta().source, section.meta().path.clone()));
+            }
+        }
+    }
+    let Some((source, origin_path)) = found else {
+        return Ok(());
+    };
+    let scope = match source {
+        Source::Local | Source::Worktree => {
+            let drop_section = {
+                let Ok(mut section) = file.section_mut("remote", None::<&BStr>) else {
+                    return Ok(());
+                };
+                match new {
+                    Some(new) => {
+                        section.set("pushDefault", new)?;
+                        false
+                    }
+                    None => {
+                        while section.remove("pushDefault").is_some() {}
+                        section.num_values() == 0
+                    }
+                }
+            };
+            if drop_section {
+                let _ = file.remove_section("remote", None::<&BStr>);
+            }
+            return Ok(());
+        }
+        Source::System | Source::GitInstallation => "system",
+        Source::Git | Source::User => "global",
+        _ => return Ok(()),
+    };
+    // `kvi->linenr` of that key: the last line in its file that sets it to `old`.
+    let linenr = origin_path
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|bytes| push_default_line(&bytes, old))
+        .unwrap_or(-1);
+    eprintln!(
+        "warning: The {scope} configuration remote.pushDefault in:\n\tfile:{linenr}\nnow names the non-existent remote '{old}'"
+    );
+    Ok(())
+}
+
+/// The 1-based line of the last `pushDefault = <old>` inside a bare `[remote]`
+/// section of a config file, or -1.
+fn push_default_line(bytes: &[u8], old: &str) -> i64 {
+    let mut in_remote = false;
+    let mut found = -1;
+    for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        let line = line.trim();
+        if line.starts_with(b"[") {
+            in_remote = line.eq_ignore_ascii_case(b"[remote]");
+            continue;
+        }
+        let Some((key, value)) = line.split_once_str("=") else {
+            continue;
+        };
+        if in_remote && key.trim().eq_ignore_ascii_case(b"pushdefault") && value.trim().trim_with(|c| c == '"') == old.as_bytes() {
+            found = i as i64 + 1;
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,10 +1891,22 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             _ => pos.push(orig.as_str()),
         }
     }
-    if pos.is_empty() || (!auto && !delete && pos.len() != 2) {
+    // `/* All modes require at least a remote name. */` — then `remote_get(argv[0])`,
+    // whose read of a legacy file warns, and only then the three modes, each with its
+    // own argument count (builtin/remote.c:1565-1592).
+    if pos.is_empty() {
         return usage(USAGE_SET_HEAD);
     }
     let name = pos[0];
+    let _ = legacy(repo, name);
+    let one_mode = match (auto, delete) {
+        (false, false) => pos.len() == 2,
+        (true, false) | (false, true) => pos.len() == 1,
+        (true, true) => false,
+    };
+    if !one_mode {
+        return usage(USAGE_SET_HEAD);
+    }
     let head = format!("refs/remotes/{name}/HEAD");
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -1834,20 +2015,39 @@ fn set_branches(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     };
     // `set_remote_branches()` → `remote_get(remotename)` (builtin/remote.c:1768).
     read_config(repo);
-    if !remote_exists(repo, name) {
+    if !remote_exists_or_legacy(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
+    let mirror = repo
+        .config_snapshot()
+        .boolean(format!("remote.{name}.mirror").as_str())
+        .unwrap_or(false);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let (path, mut file) = open_local(repo)?;
+    // ```c
+    // if (!add_mode && remove_all_fetch_refspecs(key.buf)) {
+    //         strbuf_release(&key);
+    //         return 1;
+    // }
+    // ```
+    //
+    // (builtin/remote.c:1774-1777.) `remove_all_fetch_refspecs()` is the gently
+    // `MULTI_REPLACE` unset, which answers `CONFIG_NOTHING_SET` when the repository's
+    // file holds no `remote.<name>.fetch`: exit 1, nothing said, nothing added.
+    if !append && unset_matching(&mut file, name, "fetch", |_| true) == 0 {
+        return Ok(ExitCode::from(1));
+    }
+    // `add_branches()` hands `remote->mirror` to `add_branch()` (builtin/remote.c:126-138,
+    // :1747-1758), so a mirror's branches map onto themselves.
     {
         let mut section = file.section_mut_or_create_new("remote", Some(BStr::new(name)))?;
-        if !append {
-            while section.remove("fetch").is_some() {}
-        }
         for branch in &pos[1..] {
-            let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
+            let spec = match mirror {
+                true => format!("+refs/{branch}:refs/{branch}"),
+                false => format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}"),
+            };
             section.push("fetch", spec.as_str())?;
         }
     }
@@ -1936,8 +2136,10 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             _ => pos.push(a.as_str()),
         }
     }
+    // `if (add_mode && delete_mode) die(_("--add --delete doesn't make sense"));`, ahead
+    // of the argument count (builtin/remote.c:1869-1870).
     if append && delete {
-        return usage(USAGE_SET_URL);
+        return fatal("--add --delete doesn't make sense");
     }
     let well_formed = if append || delete {
         pos.len() == 2
@@ -1949,9 +2151,10 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     let name = pos[0];
     let value = pos[1];
-    // `remote = remote_get(remotename)` (builtin/remote.c:1883).
+    // `remote = remote_get(remotename)` (builtin/remote.c:1883), which a legacy
+    // `remotes/` or `branches/` file satisfies as well.
     read_config(repo);
-    if !remote_exists(repo, name) {
+    if !remote_exists_or_legacy(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
 
@@ -2003,96 +2206,88 @@ fn set_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         false => pos.get(2).copied(),
     };
 
-    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-
-    let (path, mut file) = open_local(repo)?;
-    {
-        let mut section = file.section_mut_or_create_new("remote", Some(BStr::new(name)))?;
-        let current: Vec<String> = section
-            .values(key)
-            .into_iter()
-            .map(|v| v.to_str_lossy().into_owned())
-            .collect();
-
-        let Some(oldurl) = oldurl else {
-            // `repo_config_set()` / the `add_mode` multivar append: neither
-            // reads the existing list, and neither can fail.
-            if append {
-                section.push(key, value)?;
-            } else {
-                section.set(key, value)?;
-            }
-            drop(section);
-            persist(&path, &file)?;
-            return Ok(ExitCode::SUCCESS);
+    // `regcomp(&old_regex, oldurl, REG_EXTENDED)` and `regexec()` over `urlset`:
+    // `remote->url` / `remote->pushurl`, the merged configuration's list.
+    if let Some(oldurl) = oldurl.filter(|_| !append) {
+        let Some(re) = super::pack_objects::PosixRegex::extended(oldurl) else {
+            return fatal(format!("Invalid old URL pattern: {oldurl}"));
         };
-        if append {
-            section.push(key, value)?;
-            drop(section);
-            persist(&path, &file)?;
-            return Ok(ExitCode::SUCCESS);
-        }
-
-        let re = match regex::bytes::RegexBuilder::new(oldurl).unicode(false).build() {
-            Ok(re) => re,
-            Err(_) => {
-                drop(section);
-                return fatal(format!("Invalid old URL pattern: {oldurl}"));
-            }
-        };
-        // `urlset` is `remote->url` / `remote->pushurl`, the *merged*
-        // configuration's list, which is what `effective_urls()` computes.
         let urlset = effective_urls(repo, name, key);
         let matches = urlset.iter().filter(|u| re.is_match(u.as_bytes())).count();
         let negative_matches = urlset.len() - matches;
         if !delete && matches == 0 {
-            drop(section);
             return fatal(format!("No such URL found: {oldurl}"));
         }
         if delete && negative_matches == 0 && !push {
-            drop(section);
             return fatal("Will not delete all non-push URLs");
         }
+    }
 
-        let updated: Vec<String> = match delete {
-            true => current
-                .clone()
-                .into_iter()
-                .filter(|u| !re.is_match(u.as_bytes()))
-                .collect(),
-            false => current
-                .clone()
-                .into_iter()
-                .map(|u| match re.is_match(u.as_bytes()) {
-                    true => value.to_string(),
-                    false => u,
-                })
-                .collect(),
-        };
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-        // git writes through `repo_config_set*`, which edits the value where it already
-        // stands (config.c) — so `remote.<name>.url` keeps its place ahead of the `fetch`
-        // line the remote was created with. Rebuilding the key from scratch moved it to
-        // the end of the section.
-        if updated == current {
-            // Nothing matched, so there is nothing to write.
-        } else if updated.len() == current.len() && current.len() == 1 {
-            // `repo_config_set()`: replace the one value in place.
-            section.set(key, updated[0].as_str())?;
-        } else {
-            while section.remove(key).is_some() {}
-            for url in &updated {
-                section.push(key, url.as_str())?;
+    // The write is `repo_config_set_multivar()` (config.c:3028-3290) on the repository's
+    // own file: `--add` appends (value pattern `^$`), the others edit the values that
+    // match the value pattern where they stand — `repo_config_set()` has none and so
+    // matches every value — and a value pattern opening with `!` matches what the rest
+    // does not. Without `CONFIG_FLAGS_MULTI_REPLACE` a second match is
+    // `warning: <key> has multiple values` (`store_aux()`, :2686-2689) and nothing is
+    // written; a delete is the `MULTI_REPLACE` unset of every match, and one that
+    // matches nothing is `CONFIG_NOTHING_SET`. Both refusals die in the non-gently
+    // wrapper (:3295-3302).
+    let full_key = format!("remote.{name}.{key}");
+    let (path, mut file) = open_local(repo)?;
+    let value_pattern: Option<(bool, super::pack_objects::PosixRegex)> = match (append, oldurl) {
+        (false, Some(pattern)) => {
+            let (negate, pattern) = match pattern.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, pattern),
+            };
+            match super::pack_objects::PosixRegex::extended(pattern) {
+                Some(re) => Some((negate, re)),
+                None => {
+                    eprintln!("error: invalid pattern: {pattern}");
+                    return fatal(format!("could not set '{full_key}' to '{value}'"));
+                }
             }
         }
-
-        // `repo_config_set_multivar()` is the non-gently form, so a delete that matched
-        // nothing is `die(_("could not unset '%s'"), key)` — which is what
-        // `git remote set-url --push --delete <name> <url>` hits on a remote that never
-        // had a `pushurl`.
-        if delete && updated.len() == current.len() {
-            drop(section);
-            return fatal(format!("could not unset 'remote.{name}.{key}'"));
+        _ => None,
+    };
+    let matching: Vec<usize> = match (append, file.raw_values_mut_by("remote", Some(BStr::new(name)), key)) {
+        (false, Ok(values)) => values
+            .get()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| match &value_pattern {
+                Some((negate, re)) => re.is_match(v) != *negate,
+                None => true,
+            })
+            .map(|(i, _)| i)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if delete {
+        let removed = unset_matching(&mut file, name, key, |v| match &value_pattern {
+            Some((negate, re)) => re.is_match(v) != *negate,
+            None => true,
+        });
+        if removed == 0 {
+            return fatal(format!("could not unset '{full_key}'"));
+        }
+    } else {
+        match matching.as_slice() {
+            [] => {
+                file.section_mut_or_create_new("remote", Some(BStr::new(name)))?
+                    .push(key, value)?;
+            }
+            [one] => {
+                file.raw_values_mut_by("remote", Some(BStr::new(name)), key)?
+                    .set_at(*one, value)?;
+            }
+            _ => {
+                eprintln!("warning: remote.{name}.{} has multiple values", key.to_ascii_lowercase());
+                return fatal(format!("could not set '{full_key}' to '{value}'"));
+            }
         }
     }
     persist(&path, &file)?;
@@ -2268,13 +2463,24 @@ fn show_one(
             .map(|(b, _, _)| b.chars().count())
             .max()
             .unwrap_or(0);
-        let any_rebase = pulls.iter().any(|(_, rebase, _)| *rebase);
+        // `branch_info->rebase >= REBASE_TRUE` (builtin/remote.c:1246-1247, :1261-1282).
+        use super::pull::RebaseMode;
+        let rebases = |mode: &Option<RebaseMode>| {
+            matches!(mode, Some(RebaseMode::Plain | RebaseMode::Merges | RebaseMode::Interactive))
+        };
+        let any_rebase = pulls.iter().any(|(_, rebase, _)| rebases(rebase));
 
         for (bname, rebase, merges) in &pulls {
             let first = merges.first().map(String::as_str).unwrap_or("");
-            if *rebase {
-                // rebase requires a single merge ref; git errors on more.
-                println!("    {bname:<width$} rebases onto remote {first}");
+            if rebases(rebase) && merges.len() > 1 {
+                eprintln!("error: invalid branch.{bname}.merge; cannot rebase onto > 1 branch");
+            } else if rebases(rebase) {
+                let msg = match rebase {
+                    Some(RebaseMode::Interactive) => "rebases interactively onto remote",
+                    Some(RebaseMode::Merges) => "rebases interactively (with merges) onto remote",
+                    _ => "rebases onto remote",
+                };
+                println!("    {bname:<width$} {msg} {first}");
             } else if any_rebase {
                 // When any listed branch rebases, git shifts the merge verb by one column.
                 println!("    {bname:<width$}  merges with remote {first}");
@@ -2472,9 +2678,17 @@ fn push_states(
             }
             let full_src = full_head_name(&src);
             let full_dst = full_head_name(&dst);
-            let new = local.iter().find(|(n, _)| *n == full_src).map(|(_, id)| *id);
             let old = remote.get(&full_dst).copied();
-            let shown = abbrev_branch(full_src.as_bytes().as_bstr());
+            // `match_explicit_lhs()` (remote.c:1181-1203): a source no local branch
+            // names is `try_explicit_object_name()` (:1130-1149) — any object name
+            // `repo_get_oid()` resolves, `HEAD` included — shown as it was written.
+            let (new, shown) = match local.iter().find(|(n, _)| *n == full_src) {
+                Some((_, id)) => (Some(*id), abbrev_branch(full_src.as_bytes().as_bstr())),
+                None => match repo.rev_parse_single(src.as_str()) {
+                    Ok(id) => (Some(id.detach()), src.clone()),
+                    Err(_) => (None, abbrev_branch(full_src.as_bytes().as_bstr())),
+                },
+            };
             rows.push(PushRow {
                 sort: full_src.clone(),
                 width_key: shown.clone(),
@@ -2650,7 +2864,40 @@ fn remote_branch_states(
 /// Local branches (sorted) whose `branch.<b>.remote` is `<name>` and that have
 /// at least one `branch.<b>.merge`, returned as `(branch, rebase, merges)` with
 /// merge refs shortened (`refs/heads/` stripped).
-fn pull_config(repo: &gix::Repository, name: &str) -> Result<Vec<(String, bool, Vec<String>)>> {
+/// Each branch's `info->rebase` as `read_branches()` leaves it: `config_read_branches()`
+/// (builtin/remote.c:346-355) runs `rebase_parse_value()` on every `branch.<name>.rebase`
+/// in configuration order, the last one standing, and warns about each value it cannot
+/// read — once, as `read_branches()` reads the configuration only once. `None` is
+/// `REBASE_INVALID`, which the `>= REBASE_TRUE` tests read as false.
+fn branch_rebase_modes(repo: &gix::Repository) -> &'static std::collections::HashMap<BString, Option<super::pull::RebaseMode>> {
+    static MODES: std::sync::OnceLock<std::collections::HashMap<BString, Option<super::pull::RebaseMode>>> =
+        std::sync::OnceLock::new();
+    MODES.get_or_init(|| {
+        let mut modes = std::collections::HashMap::new();
+        let snapshot = repo.config_snapshot();
+        if let Some(sections) = snapshot.plumbing().sections_by_name("branch") {
+            for section in sections {
+                let Some(name) = section.header().subsection_name() else {
+                    continue;
+                };
+                for value in section.values("rebase") {
+                    let value = value.to_str_lossy();
+                    let mode = super::pull::rebase_parse_value(&value);
+                    if mode.is_none() {
+                        eprintln!("warning: unhandled branch.{name}.rebase={value}; assuming 'true'");
+                    }
+                    modes.insert(name.to_owned(), mode);
+                }
+            }
+        }
+        modes
+    })
+}
+
+fn pull_config(
+    repo: &gix::Repository,
+    name: &str,
+) -> Result<Vec<(String, Option<super::pull::RebaseMode>, Vec<String>)>> {
     let cfg = repo.config_snapshot();
     let file = cfg.plumbing();
 
@@ -2677,11 +2924,10 @@ fn pull_config(repo: &gix::Repository, name: &str) -> Result<Vec<(String, bool, 
             Some(m) if !m.is_empty() => m,
             _ => continue,
         };
-        let rebase = file
-            .boolean_by("branch", Some(bn.as_bstr()), "rebase")
-            .ok()
-            .flatten()
-            .unwrap_or(false);
+        let rebase = branch_rebase_modes(repo)
+            .get(&bn)
+            .copied()
+            .unwrap_or(Some(super::pull::RebaseMode::Disabled));
 
         let merges: Vec<String> = merges
             .iter()
@@ -2725,13 +2971,17 @@ fn prune(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             _ => pos.push(a.as_str()),
         }
     }
-    if pos.len() != 1 {
+    // `if (argc < 1) usage_with_options(...)`, then `prune_remote()` for each name in
+    // turn (builtin/remote.c:1681-1685); a remote that cannot be reached dies there.
+    if pos.is_empty() {
         return usage(USAGE_PRUNE);
     }
-    match prune_one(repo, pos[0], dry_run)? {
-        true => Ok(ExitCode::SUCCESS),
-        false => Ok(ExitCode::from(128)),
+    for name in pos {
+        if !prune_one(repo, name, dry_run)? {
+            return Ok(ExitCode::from(128));
+        }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Prune `<name>`, returning `false` when the remote could not be contacted
@@ -2789,7 +3039,13 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
 /// `remote show` and `remote prune` fail to reach a local remote, as it does
 /// under stock git.
 fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetch::RefMap> {
-    let remote = repo.find_remote(name)?;
+    // `remote_get()` never fails for a well-formed name: one nothing configures is
+    // made up with the name itself as its URL (`remotes_remote_get_1()`, remote.c:823-824),
+    // so contacting it is contacting that path.
+    let remote = match repo.find_remote(name) {
+        Err(gix::remote::find::existing::Error::NotFound { .. }) => repo.remote_at(name)?,
+        found => found?,
+    };
     let upload_pack = repo
         .config_snapshot()
         .plumbing()

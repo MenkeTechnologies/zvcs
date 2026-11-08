@@ -4914,6 +4914,7 @@ fn set_head_from_remote(
     let create_only = follow != FollowRemoteHead::Always && !bare_mirror;
     let (previous, was_detached) = super::remote::symref_prev(repo, head_ref.as_str())?;
     if !(create_only && previous.is_some()) {
+        let previous_id = super::remote::resolved_id(repo, head_ref.as_str())?;
         repo.edit_reference(RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -4927,6 +4928,10 @@ fn set_head_from_remote(
             name: full_ref_name(&head_ref)?,
             deref: false,
         })?;
+        // `refs_update_symref_extended(..., "fetch", ...)` (builtin/fetch.c:1802-1803) logs
+        // the symref update with the object its new target resolves to, which gitoxide's
+        // symbolic edit does not write.
+        super::remote::log_symref_update(repo, head_ref.as_str(), previous_id, "fetch")?;
     }
 
     // `warn_set_head()`, gated on `verbosity >= 0` exactly as git gates it.

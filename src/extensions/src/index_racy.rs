@@ -157,6 +157,22 @@ pub(crate) fn ie_match_stat_unchanged(
     if entry.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID) {
         return true;
     }
+    ie_match_stat_unchanged_ignoring_valid(index, entry, full, opts, trust_executable_bit, has_symlinks)
+}
+
+/// `!ie_match_stat(istate, ce, &st, CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE)`
+/// (read-cache.c:388-402): [`ie_match_stat_unchanged`] without the assume-valid and
+/// skip-worktree shortcut, which is how `verify_uptodate_1()` (unpack-trees.c:2244-2245) asks
+/// about an entry whose bits it does not trust.
+pub(crate) fn ie_match_stat_unchanged_ignoring_valid(
+    index: &gix::index::File,
+    entry: &gix::index::Entry,
+    full: &std::path::Path,
+    opts: gix::index::entry::stat::Options,
+    trust_executable_bit: bool,
+    has_symlinks: bool,
+) -> bool {
+    use gix::index::entry::Flags;
     // "Intent-to-add entries have not been added, so the index entry by definition never
     // matches what is in the work tree until it actually gets added."
     if entry.flags.contains(Flags::INTENT_TO_ADD) {

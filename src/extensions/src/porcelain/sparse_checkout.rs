@@ -8,7 +8,6 @@ use std::sync::atomic::AtomicBool;
 use gix::bstr::{BString, ByteSlice};
 use gix::config::{File as ConfigFile, Source};
 use gix::glob::{pattern::Case, wildmatch::Mode as WildMode, Pattern};
-use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode};
 
 /// `git sparse-checkout` — restrict the worktree to a subset of tracked files.
@@ -190,21 +189,41 @@ fn cmd_list(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let lines = read_pattern_file(&repo)?;
-    let mut out = String::new();
-    if is_cone(&repo)? {
-        for d in cone_dirs(&lines) {
-            out.push_str(&quote_path(d.as_bytes()));
-            out.push('\n');
+    // A cone definition lists its recursive directories, sorted and quoted; a
+    // non-cone one — or a cone-mode file `add_pattern_to_hashsets()` gave up on,
+    // after its warnings — is written back by `write_patterns_to_file()`, which
+    // prints the patterns as `add_patterns_from_buffer()` kept them
+    // (builtin/sparse-checkout.c:87-108).
+    let Ok(bytes) = std::fs::read(pattern_path(&repo)) else {
+        eprintln!("warning: this worktree is not sparse (sparse-checkout file may not exist)");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let patterns = file_patterns(&bytes);
+    let mut warnings = String::new();
+    let cone_dirs = match is_cone(&repo)? {
+        true => {
+            let ignore_case = repo.config_snapshot().boolean("core.ignoreCase").unwrap_or(false);
+            cone_hashsets(&patterns, ignore_case, &mut warnings)
         }
-    } else {
-        // Non-cone worktrees list the raw patterns verbatim.
-        for l in &lines {
-            out.push_str(l);
-            out.push('\n');
+        false => None,
+    };
+    eprint!("{warnings}");
+    let mut out = Vec::new();
+    match cone_dirs {
+        Some(cone) => {
+            for d in &cone.recursive {
+                out.extend_from_slice(quote_path(d.as_bytes()).as_bytes());
+                out.push(b'\n');
+            }
+        }
+        None => {
+            for p in &patterns {
+                out.extend_from_slice(p);
+                out.push(b'\n');
+            }
         }
     }
-    print!("{out}");
+    std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -233,7 +252,8 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
     let mut cone: Option<bool> = None;
     let mut sparse_index: Option<bool> = None;
     let mut positional: Vec<&str> = Vec::new();
-    for a in args {
+    let (opts, after_dashdash) = split_at_end_of_options(args);
+    for a in opts {
         match a.as_str() {
             "--stdin" => stdin = true,
             "--no-stdin" if add => stdin = false,
@@ -246,14 +266,12 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
             _ => positional.push(a.as_str()),
         }
     }
-
-    let mut inputs: Vec<String> = Vec::new();
-    if stdin {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        inputs.extend(buf.lines().map(str::to_owned));
-    }
-    inputs.extend(positional.into_iter().map(str::to_owned));
+    positional.extend(after_dashdash.iter().map(String::as_str));
+    // The arguments left after `parse_options()`. They are sanitized whether or not
+    // `--stdin` is given, but with `--stdin` the patterns come from standard input
+    // alone: `add_patterns_from_input()` reads `file` and never looks at `argv`
+    // (builtin/sparse-checkout.c:577-633).
+    let inputs: Vec<String> = positional.into_iter().map(str::to_owned).collect();
 
     // `add` never switches dialects; `set` honours an explicit flag and
     // otherwise keeps whatever the worktree is already configured for.
@@ -306,27 +324,46 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
     // from a pipe really does empty the definition. `sanitize_paths` is only
     // reached by the other branch, so the defaults are never vetted.
     let default_non_cone = !add && !cone && !stdin && inputs.is_empty();
-    if default_non_cone {
-        inputs = vec!["/*".to_owned(), "!/*/".to_owned()];
+    let inputs = if default_non_cone {
+        vec!["/*".to_owned(), "!/*/".to_owned()]
     } else {
         // `sanitize_paths()` runs over the whole list first, before any argument
         // is turned into a pattern (builtin/sparse-checkout.c:822, :889).
         if let Some(code) = sanitize_paths(&repo, &inputs, &prefix, cone, skip_checks)? {
             return Ok(code);
         }
-    }
+        inputs
+    };
+    // `strbuf_getline()` over standard input: one pattern per line, a `\r` before
+    // the newline dropped, a final line without one kept.
+    let stdin_lines = if stdin {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        let mut lines: Vec<Vec<u8>> = buf.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect();
+        if buf.is_empty() || buf.ends_with(b"\n") {
+            lines.pop();
+        }
+        for line in &mut lines {
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+        }
+        Some(lines)
+    } else {
+        None
+    };
 
     let sparsity = if cone {
-        let mut dirs: BTreeSet<String> = if add {
-            match read_pattern_file_for_add(&repo) {
-                Ok(lines) => cone_dirs(&lines),
-                Err(code) => return Ok(code),
-            }
-        } else {
-            BTreeSet::new()
+        // `add_patterns_from_input()`'s cone arm turns each line or argument into a
+        // pattern with `strbuf_to_cone_pattern()`; only a standard-input line that
+        // opens with a double quote is unquoted first (builtin/sparse-checkout.c:591-612).
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        let converted = match &stdin_lines {
+            Some(lines) => lines.iter().map(|l| cone_argument(&l.to_str_lossy(), "", skip_checks)).collect::<Vec<_>>(),
+            None => inputs.iter().map(|a| cone_argument_verbatim(a, &prefix)).collect(),
         };
-        for raw in &inputs {
-            match cone_argument(raw, &prefix, skip_checks)? {
+        for result in converted {
+            match result? {
                 Ok(Some(d)) => {
                     dirs.insert(d);
                 }
@@ -335,20 +372,45 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
                 Err(code) => return Ok(code),
             }
         }
+        // `add_patterns_cone_mode()` loads the existing definition after the new
+        // patterns and refuses one that is not a cone (builtin/sparse-checkout.c:651-658).
+        if add {
+            match load_pattern_file(&repo, true)? {
+                None => {
+                    eprintln!("fatal: unable to load existing sparse-checkout patterns");
+                    return Ok(ExitCode::from(128));
+                }
+                Some((Sparsity::Cone(existing), _)) => dirs.extend(existing.recursive),
+                Some((_, warnings)) => {
+                    eprint!("{warnings}");
+                    eprintln!("fatal: existing sparse-checkout patterns do not use cone mode");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
         let cone = Cone::new(dedup_nested(dirs));
         write_pattern_file(&repo, &cone_lines(&cone))?;
         Sparsity::Cone(cone)
     } else {
-        // Non-cone patterns are stored exactly as typed, appended in order.
+        // `add_patterns_literal()` loads the existing list first (dir.c's
+        // `add_patterns_from_buffer()` rules), then `add_pattern()` takes every new
+        // line or argument as it is, an empty one included; `write_patterns_to_file()`
+        // writes each back as it was parsed (builtin/sparse-checkout.c:31-48, :675-685).
         let mut lines: Vec<String> = if add {
-            match read_pattern_file_for_add(&repo) {
-                Ok(lines) => lines,
-                Err(code) => return Ok(code),
+            match std::fs::read(pattern_path(&repo)) {
+                Ok(bytes) => file_patterns(&bytes).iter().map(|p| p.to_str_lossy().into_owned()).collect(),
+                Err(_) => {
+                    eprintln!("fatal: unable to load existing sparse-checkout patterns");
+                    return Ok(ExitCode::from(128));
+                }
             }
         } else {
             Vec::new()
         };
-        lines.extend(inputs.iter().filter(|l| !l.is_empty()).cloned());
+        match &stdin_lines {
+            Some(new) => lines.extend(new.iter().map(|l| c_string(l))),
+            None => lines.extend(inputs.iter().cloned()),
+        }
         write_pattern_file(&repo, &lines)?;
         Sparsity::Patterns(parse_patterns(&lines))
     };
@@ -390,15 +452,10 @@ fn cmd_init(args: &[String]) -> Result<ExitCode> {
     if !pattern_path(&repo).exists() {
         write_pattern_file(&repo, &cone_lines(&Cone::new(BTreeSet::new())))?;
     }
-    let lines = read_pattern_file(&repo)?;
-    let sparsity = if cone {
-        Sparsity::Cone(Cone::new(cone_dirs(&lines)))
-    } else {
-        Sparsity::Patterns(parse_patterns(&lines))
-    };
+    let (sparsity, warnings) = load_for_update(&repo, cone)?;
 
     enable_config(&repo, cone, sparse_index, record_mode)?;
-    apply(&repo, &sparsity)?;
+    apply_reloaded(&repo, &sparsity, &warnings)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -425,14 +482,9 @@ fn cmd_reapply(args: &[String]) -> Result<ExitCode> {
     let record_mode = cone.is_some();
     let cone = update_cone_mode(&repo, cone)?;
 
-    let lines = read_pattern_file(&repo)?;
-    let sparsity = if cone {
-        Sparsity::Cone(Cone::new(cone_dirs(&lines)))
-    } else {
-        Sparsity::Patterns(parse_patterns(&lines))
-    };
+    let (sparsity, warnings) = load_for_update(&repo, cone)?;
     enable_config(&repo, cone, sparse_index, record_mode)?;
-    apply(&repo, &sparsity)?;
+    apply_reloaded(&repo, &sparsity, &warnings)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -509,7 +561,7 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
             // carries the errno, and the `unable to load existing sparse-checkout
             // patterns` wording belongs to the *other* branch, where the file read
             // is the worktree's own definition.
-            let text = match std::fs::read_to_string(p) {
+            let text = match std::fs::read(p) {
                 Ok(text) => text,
                 Err(e) => {
                     eprintln!(
@@ -520,7 +572,8 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             };
-            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            // `strbuf_getline()` over the file, each line a C string from there on.
+            let lines: Vec<String> = getlines(&text, b'\n').iter().map(|l| c_string(l)).collect();
             // ```c
             //      if (check_rules_opts.rules_file && check_rules_opts.cone_mode < 0)
             //              check_rules_opts.cone_mode = 1;
@@ -532,8 +585,12 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
             if cone.unwrap_or(true) {
                 let mut dirs = BTreeSet::new();
                 for line in &lines {
-                    if let Ok(Some(d)) = cone_argument(line, "", true)? {
-                        dirs.insert(d);
+                    match cone_argument(line, "", true)? {
+                        Ok(Some(d)) => {
+                            dirs.insert(d);
+                        }
+                        Ok(None) => {}
+                        Err(code) => return Ok(code),
                     }
                 }
                 Sparsity::Cone(Cone::new(dedup_nested(dirs)))
@@ -550,7 +607,9 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
             // `pl.use_cone_patterns = cfg->core_sparse_checkout_cone` *after*
             // `update_cone_mode()` has had its say (builtin/sparse-checkout.c:1162-1163).
             let cone = update_cone_mode(&repo, cone)?;
-            load_sparsity_with(&repo, cone)?
+            let (sparsity, warnings) = load_for_update(&repo, cone)?;
+            eprint!("{warnings}");
+            sparsity
         }
     };
 
@@ -559,13 +618,14 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
     let sep = if nul { b'\0' } else { b'\n' };
 
     let mut out = Vec::new();
-    for raw in input.split(|&b| b == sep) {
-        if raw.is_empty() {
-            continue;
-        }
+    // `check_rules()` (builtin/sparse-checkout.c:1105-1134): every line, an empty
+    // one included, is asked about; `path_in_sparse_checkout()` takes an empty path
+    // as inside (dir.c:1588-1592).
+    for raw in getlines(&input, sep) {
         // Without -z, a leading double quote marks a C-style quoted path.
-        let path = if nul { BString::from(raw) } else { unquote_c(raw)? };
-        if sparsity.includes(&path.to_str_lossy()) {
+        let path = if nul { BString::from(raw) } else { unquote_c(&raw)? };
+        let path = BString::from(c_string(&path));
+        if path.is_empty() || sparsity.includes(&path.to_str_lossy()) {
             if nul {
                 out.extend_from_slice(&path);
                 out.push(0);
@@ -1161,6 +1221,12 @@ struct Cone {
     recursive: BTreeSet<String>,
     /// Strict ancestors of `recursive`, plus the repository root as `""`.
     parents: BTreeSet<String>,
+    /// `pl->full_cone`: a `/*` the file never took back with `!/*/`, which
+    /// matches every path (dir.c:1505-1506).
+    full: bool,
+    /// `core.ignoreCase`, under which `pl_hashmap_cmp()` compares the names in both
+    /// hashmaps with `fspathncmp()`.
+    ignore_case: bool,
 }
 
 impl Cone {
@@ -1181,7 +1247,15 @@ impl Cone {
                 }
             }
         }
-        Cone { recursive, parents }
+        Cone { recursive, parents, full: false, ignore_case: false }
+    }
+
+    /// `name` is in `set` as `pl_hashmap_cmp()` compares.
+    fn set_contains(&self, set: &BTreeSet<String>, name: &str) -> bool {
+        match self.ignore_case {
+            false => set.contains(name),
+            true => set.iter().any(|s| s.eq_ignore_ascii_case(name)),
+        }
     }
 
     /// Port of `path_matches_pattern_list()`'s cone branch (dir.c:1502-1546).
@@ -1219,6 +1293,9 @@ impl Cone {
     /// The cone branch of `path_matches_pattern_list()` itself, with the answer it
     /// gives rather than whether that answer includes the path.
     fn match_result(&self, path: &str) -> PatternMatch {
+        if self.full {
+            return PatternMatch::Matched;
+        }
         let mut parent = String::with_capacity(path.len() + 2);
         parent.push('/');
         parent.push_str(path);
@@ -1249,7 +1326,7 @@ impl Cone {
     /// `hashmap_contains_path(&pl->recursive_hashmap, …)` for a name carrying
     /// git's leading slash; the set here holds the same names without it.
     fn has_recursive(&self, slashed: &str) -> bool {
-        slashed.strip_prefix('/').is_some_and(|n| self.recursive.contains(n))
+        slashed.strip_prefix('/').is_some_and(|n| self.set_contains(&self.recursive, n))
     }
 
     /// `hashmap_contains_path(&pl->parent_hashmap, …)`. The root is never an
@@ -1259,7 +1336,7 @@ impl Cone {
     fn has_parent(&self, slashed: &str) -> bool {
         slashed
             .strip_prefix('/')
-            .is_some_and(|n| !n.is_empty() && self.parents.contains(n))
+            .is_some_and(|n| !n.is_empty() && self.set_contains(&self.parents, n))
     }
 
     /// `hashmap_contains_parent()` (dir.c:945-968): every proper directory prefix
@@ -1290,14 +1367,74 @@ fn cone_argument(raw: &str, prefix: &str, _skip_checks: bool) -> Result<Result<O
     // a pattern — see [`sanitize_paths`].
     // A leading double quote marks a C-style quoted path.
     let unquoted = unquote_c(raw.as_bytes())?;
-    let s = unquoted.to_str_lossy().into_owned();
-    match normalize_dir(prefix, &s) {
-        Some(d) if d.is_empty() => Ok(Ok(None)),
-        Some(d) => Ok(Ok(Some(d))),
+    let s = c_string(&unquoted);
+    let joined = match prefix.is_empty() {
+        true => s,
+        false => normalize_dir(prefix, &s).unwrap_or(s),
+    };
+    Ok(cone_pattern(&joined))
+}
+
+/// A cone-mode `set`/`add` argument from the command line, which
+/// `add_patterns_from_input()` hands to `strbuf_to_cone_pattern()` as it is — no
+/// C-style unquoting, that is for standard-input lines only
+/// (builtin/sparse-checkout.c:608-612) — after `sanitize_paths()` put the prefix
+/// in front of it (`prefix_path()`, :739-749).
+fn cone_argument_verbatim(raw: &str, prefix: &str) -> Result<Result<Option<String>, ExitCode>> {
+    let joined = match prefix.is_empty() {
+        true => raw.to_owned(),
+        false => normalize_dir(prefix, raw).unwrap_or_else(|| raw.to_owned()),
+    };
+    Ok(cone_pattern(&joined))
+}
+
+/// `strbuf_to_cone_pattern()` (builtin/sparse-checkout.c:559-575): trim the
+/// whitespace around the path (`strbuf_trim()`, git's `isspace()` being space,
+/// tab, newline and carriage return), drop trailing slashes, normalize, and die
+/// on a path that climbs out of the worktree. `None` for the root.
+fn cone_pattern(line: &str) -> Result<Option<String>, ExitCode> {
+    let trimmed = line.trim_matches([' ', '\t', '\n', '\r']).trim_end_matches('/');
+    match normalize_dir("", trimmed) {
+        Some(d) if d.is_empty() => Ok(None),
+        Some(d) => Ok(Some(d)),
         None => {
-            eprintln!("fatal: could not normalize path {raw}");
-            Ok(Err(ExitCode::from(128)))
+            eprintln!("fatal: could not normalize path {trimmed}");
+            Err(ExitCode::from(128))
         }
+    }
+}
+
+/// The lines `strbuf_getline()` (`sep == b'\n'`, which also drops a `\r` before the
+/// newline) or `strbuf_getline_nul()` reads: a final line without a terminator is
+/// kept, nothing after a final terminator is a line.
+fn getlines(input: &[u8], sep: u8) -> Vec<Vec<u8>> {
+    let mut lines: Vec<Vec<u8>> = input.split(|&b| b == sep).map(<[u8]>::to_vec).collect();
+    if input.is_empty() || input.ends_with(&[sep]) {
+        lines.pop();
+    }
+    if sep == b'\n' {
+        for line in &mut lines {
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+        }
+    }
+    lines
+}
+
+/// `line.buf` read as the C string git hands on: everything up to the first NUL.
+fn c_string(line: &[u8]) -> String {
+    let end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    line[..end].to_str_lossy().into_owned()
+}
+
+/// `parse_options()` ends option parsing at the first `--` or `--end-of-options`
+/// and drops it (parse-options.c:1113-1124): the arguments before it are options
+/// and arguments mixed, the ones after it are all arguments.
+fn split_at_end_of_options(args: &[String]) -> (&[String], &[String]) {
+    match args.iter().position(|a| a == "--" || a == "--end-of-options") {
+        Some(at) => (&args[..at], &args[at + 1..]),
+        None => (args, &[]),
     }
 }
 
@@ -1450,33 +1587,6 @@ fn read_pattern_file(repo: &gix::Repository) -> Result<Vec<String>> {
     Ok(text.lines().map(str::to_owned).collect())
 }
 
-/// The same read, but with `add`'s refusal when the file is not there.
-///
-/// Both of `add`'s arms load the existing definition through
-/// `add_patterns_from_file_to_list()` and die on a non-zero return:
-///
-/// ```c
-///     if (add_patterns_from_file_to_list(sparse_filename, "", 0,
-///                                        &existing, NULL, 0))
-///             die(_("unable to load existing sparse-checkout patterns"));
-/// ```
-///
-/// (`add_patterns_cone_mode()`, builtin/sparse-checkout.c:651-653, and
-/// `add_patterns_literal()`, :679-681.) `add_patterns()` is handed a NULL
-/// `istate`, so a failed `open()` — a missing `info/sparse-checkout` included —
-/// returns -1 straight away (dir.c:1164-1170). An *empty* file is not an error:
-/// it returns 0 at dir.c:1178-1186, which is what the `read_to_string` success
-/// arm above reproduces.
-fn read_pattern_file_for_add(repo: &gix::Repository) -> std::result::Result<Vec<String>, ExitCode> {
-    match std::fs::read_to_string(pattern_path(repo)) {
-        Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
-        Err(_) => {
-            eprintln!("fatal: unable to load existing sparse-checkout patterns");
-            Err(ExitCode::from(128))
-        }
-    }
-}
-
 /// Recover the recursive directory set from a cone pattern file.
 ///
 /// Positive `/<dir>/` lines name both parents and recursive directories; the
@@ -1499,6 +1609,265 @@ fn cone_dirs(lines: &[String]) -> BTreeSet<String> {
         }
     }
     positive.difference(&parent).cloned().collect()
+}
+
+/// The pattern list `add_patterns_from_buffer()` (dir.c:1231-1259) builds from a
+/// pattern file's bytes, each pattern as `add_pattern()` was handed it: an empty
+/// file is no pattern at all (dir.c:1183-1191), a missing final newline is
+/// supplied (:1198), a UTF-8 BOM is skipped, empty lines and `#` lines are
+/// dropped, a `\r` before the newline is cut, and `trim_trailing_spaces()` runs
+/// over what is left. The line is a C string from there on, so it ends at its
+/// first NUL.
+fn file_patterns(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut buf = bytes.to_vec();
+    buf.push(b'\n');
+    let start = if buf.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
+    let mut out = Vec::new();
+    let mut entry = start;
+    for i in start..buf.len() {
+        if buf[i] != b'\n' {
+            continue;
+        }
+        if entry != i && buf[entry] != b'#' {
+            let end = if buf[i - 1] == b'\r' { i - 1 } else { i };
+            let mut line = buf[entry..end].to_vec();
+            if let Some(nul) = line.iter().position(|&b| b == 0) {
+                line.truncate(nul);
+            }
+            trim_trailing_spaces(&mut line);
+            out.push(line);
+        }
+        entry = i + 1;
+    }
+    out
+}
+
+/// `trim_trailing_spaces()` (dir.c:1034-1055): drop a run of trailing spaces that
+/// no backslash escapes.
+fn trim_trailing_spaces(line: &mut Vec<u8>) {
+    let mut last_space: Option<usize> = None;
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            b' ' => {
+                last_space.get_or_insert(i);
+            }
+            b'\\' => {
+                i += 1;
+                if i >= line.len() {
+                    return;
+                }
+                last_space = None;
+            }
+            _ => last_space = None,
+        }
+        i += 1;
+    }
+    if let Some(at) = last_space {
+        line.truncate(at);
+    }
+}
+
+/// `is_glob_special()`: the characters `GIT_GLOB_SPECIAL` marks.
+fn is_glob_special(b: u8) -> bool {
+    matches!(b, b'*' | b'?' | b'[' | b'\\')
+}
+
+/// `dup_and_filter_pattern()` (dir.c:757-785): the pattern with each escaping
+/// backslash dropped, and a trailing `/*` cut once more than two characters remain.
+fn dup_and_filter_pattern(pattern: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < pattern.len() {
+        if pattern[i] == b'\\' {
+            i += 1;
+        }
+        if i >= pattern.len() {
+            // `*read` is the terminating NUL: copied, and the loop ends there.
+            break;
+        }
+        out.push(pattern[i]);
+        i += 1;
+    }
+    if out.len() > 2 && out.ends_with(b"/*") {
+        out.truncate(out.len() - 2);
+    }
+    out
+}
+
+/// One of `pl->recursive_hashmap` / `pl->parent_hashmap`: entries compared by
+/// `pl_hashmap_cmp()`, which is `fspathncmp()` and so folds case under
+/// `core.ignoreCase`. `hashmap_add()` keeps duplicates and
+/// `hashmap_remove_entry()` takes one away, hence the count; the stored spelling
+/// is the first one added.
+#[derive(Default)]
+struct PatternMap {
+    entries: std::collections::BTreeMap<Vec<u8>, (Vec<u8>, usize)>,
+    ignore_case: bool,
+}
+
+impl PatternMap {
+    fn key(&self, pattern: &[u8]) -> Vec<u8> {
+        if self.ignore_case {
+            pattern.to_ascii_lowercase()
+        } else {
+            pattern.to_vec()
+        }
+    }
+    fn contains(&self, pattern: &[u8]) -> bool {
+        self.entries.contains_key(&self.key(pattern))
+    }
+    fn add(&mut self, pattern: Vec<u8>) {
+        let key = self.key(&pattern);
+        self.entries.entry(key).or_insert((pattern, 0)).1 += 1;
+    }
+    fn remove_one(&mut self, pattern: &[u8]) {
+        let key = self.key(pattern);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            slot.1 -= 1;
+            if slot.1 == 0 {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+/// The cone half of loading a pattern list, `add_pattern_to_hashsets()`
+/// (dir.c:798-936) run over each pattern `add_pattern()` parses
+/// (`parse_path_pattern()`, dir.c:702-738): the recursive directories of a
+/// well-formed cone file, or `None` once a pattern is not one — after the
+/// warnings git prints for it, which are appended to `warnings`. From that pattern
+/// on the list is matched as a non-cone list (`pl->use_cone_patterns = 0`), and the
+/// patterns after it are not looked at.
+fn cone_hashsets(patterns: &[Vec<u8>], ignore_case: bool, warnings: &mut String) -> Option<Cone> {
+    let mut full = false;
+    let mut recursive = PatternMap { ignore_case, ..Default::default() };
+    let mut parent = PatternMap { ignore_case, ..Default::default() };
+    for raw in patterns {
+        // `parse_path_pattern()`.
+        let (negative, p) = match raw.strip_prefix(b"!") {
+            Some(rest) => (true, rest),
+            None => (false, raw.as_slice()),
+        };
+        let (mustbedir, pattern) = match p.strip_suffix(b"/") {
+            Some(rest) => (true, rest),
+            None => (false, p),
+        };
+        let nodir = !pattern.contains(&b'/');
+        let endswith = p.first() == Some(&b'*') && !p[1..].iter().any(|&b| is_glob_special(b));
+        let no_flags = !negative && !mustbedir && !nodir && !endswith;
+        let shown = pattern.to_str_lossy();
+
+        if negative && mustbedir && pattern == b"/*" {
+            full = false;
+            continue;
+        }
+        if no_flags && pattern == b"/*" {
+            full = true;
+            continue;
+        }
+        let unrecognized = |warnings: &mut String, what: &str| {
+            warnings.push_str(&format!("warning: {what}: '{shown}'\n"));
+            warnings.push_str("warning: disabling cone pattern matching\n");
+        };
+        if pattern.len() < 2 || pattern[0] != b'/' || pattern.find(b"**").is_some() {
+            unrecognized(warnings, "unrecognized pattern");
+            return None;
+        }
+        if !mustbedir && pattern != b"/*" {
+            unrecognized(warnings, "unrecognized pattern");
+            return None;
+        }
+        // Glob characters are refused unless escaped, an escaping `\` itself, or the
+        // trailing `/*`.
+        for i in 1..pattern.len() {
+            let (prev, cur) = (pattern[i - 1], pattern[i]);
+            let next = pattern.get(i + 1).copied().unwrap_or(0);
+            if !is_glob_special(cur)
+                || prev == b'\\'
+                || (cur == b'\\' && is_glob_special(next))
+                || (prev == b'/' && cur == b'*' && next == 0)
+            {
+                continue;
+            }
+            unrecognized(warnings, "unrecognized pattern");
+            return None;
+        }
+        if pattern.len() > 2 && pattern.ends_with(b"/*") {
+            if !negative {
+                unrecognized(warnings, "unrecognized pattern");
+                return None;
+            }
+            let truncated = dup_and_filter_pattern(pattern);
+            if !recursive.contains(&truncated) {
+                unrecognized(warnings, "unrecognized negative pattern");
+                return None;
+            }
+            recursive.remove_one(&truncated);
+            parent.add(truncated);
+            continue;
+        }
+        if negative {
+            unrecognized(warnings, "unrecognized negative pattern");
+            return None;
+        }
+        let translated = dup_and_filter_pattern(pattern);
+        let repeated = parent.contains(&translated);
+        recursive.add(translated);
+        if repeated {
+            warnings.push_str(&format!(
+                "warning: your sparse-checkout file may have issues: pattern '{shown}' is repeated\n"
+            ));
+            warnings.push_str("warning: disabling cone pattern matching\n");
+            return None;
+        }
+    }
+    let dirs = recursive
+        .entries
+        .into_values()
+        .map(|(pattern, _)| pattern[1..].to_str_lossy().into_owned())
+        .collect();
+    let mut cone = Cone::new(dirs);
+    cone.full = full;
+    cone.ignore_case = ignore_case;
+    Some(cone)
+}
+
+/// The worktree's pattern file loaded as `get_sparse_checkout_patterns()`
+/// (dir.c:3512-3523) loads it, with `use_cone_patterns` set to `cone`: a cone
+/// file becomes its directories, anything else the list of patterns, and the
+/// warnings a non-cone file draws in cone mode are returned for the caller to
+/// print where git prints them. `None` when the file cannot be read.
+fn load_pattern_file(repo: &gix::Repository, cone: bool) -> Result<Option<(Sparsity, String)>> {
+    let Ok(bytes) = std::fs::read(pattern_path(repo)) else {
+        return Ok(None);
+    };
+    let patterns = file_patterns(&bytes);
+    let mut warnings = String::new();
+    if cone {
+        let ignore_case = repo.config_snapshot().boolean("core.ignoreCase").unwrap_or(false);
+        if let Some(cone) = cone_hashsets(&patterns, ignore_case, &mut warnings) {
+            return Ok(Some((Sparsity::Cone(cone), warnings)));
+        }
+    }
+    let lines: Vec<String> = patterns.iter().map(|p| p.to_str_lossy().into_owned()).collect();
+    Ok(Some((Sparsity::Patterns(parse_patterns(&lines)), warnings)))
+}
+
+/// The definition `update_working_directory(repo, NULL)` works from: `update_sparsity()`
+/// loads the recorded patterns (`populate_from_existing_patterns()`), and the warnings
+/// that load draws are returned with them, for [`apply_reloaded`] to print a second
+/// time where `clean_tracked_sparse_directories()` loads the file again
+/// (builtin/sparse-checkout.c:129-131).
+fn load_for_update(repo: &gix::Repository, cone: bool) -> Result<(Sparsity, String)> {
+    Ok(match load_pattern_file(repo, cone)? {
+        Some(loaded) => loaded,
+        None if cone => (Sparsity::Cone(Cone::new(BTreeSet::new())), String::new()),
+        None => (Sparsity::Patterns(Vec::new()), String::new()),
+    })
 }
 
 /// Render `cone` in git's cone layout: the root pair, then a
@@ -1735,8 +2104,6 @@ fn disable_config(repo: &gix::Repository) -> Result<()> {
 /// borrow on the path backing.
 struct Snapshot {
     path: BString,
-    id: ObjectId,
-    mode: Mode,
     unmerged: bool,
     was_skipped: bool,
 }
@@ -1744,6 +2111,15 @@ struct Snapshot {
 /// Reconcile the index `SKIP_WORKTREE` bits and the worktree files with
 /// `sparsity`.
 fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
+    apply_reloaded(repo, sparsity, "")
+}
+
+/// [`apply`] for a definition `update_working_directory()` loaded from the pattern
+/// file itself: `load_warnings` is what each of its two loads prints, the first
+/// before the index is touched and the second where
+/// `clean_tracked_sparse_directories()` reloads the file. An unborn index loads
+/// nothing.
+fn apply_reloaded(repo: &gix::Repository, sparsity: &Sparsity, load_warnings: &str) -> Result<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| crate::fatal::need_work_tree())?
@@ -1788,6 +2164,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     if index.entries().is_empty() && !index_file_exists {
         return Ok(());
     }
+    eprint!("{load_warnings}");
 
     // A sparse index written by stock git stores each wholly-excluded directory as one
     // `040000` entry. `update_sparsity()` expands it before marking anything
@@ -1820,8 +2197,6 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
             .iter()
             .map(|e| Snapshot {
                 path: e.path_in(backing).to_owned(),
-                id: e.id,
-                mode: e.mode,
                 unmerged: e.stage_raw() != 0,
                 was_skipped: e.flags.contains(Flags::SKIP_WORKTREE),
             })
@@ -1835,6 +2210,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     // about to hide (unpack-trees.c:565-571, :2282): the skip bit is put back and
     // the path is queued for `WARNING_SPARSE_NOT_UPTODATE_FILE`.
     let mut not_uptodate: Vec<BString> = Vec::new();
+    let stat_check = StatCheck::new(repo)?;
 
     for (i, snap) in snapshot.iter().enumerate() {
         // git never sparsifies an unmerged path: it leaves the conflict alone
@@ -1852,6 +2228,13 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
             .as_ref()
             .map(|p| p.symlink_metadata().is_ok())
             .unwrap_or(false);
+        // `if (!was_skip_worktree && ce_skip_worktree(ce))` asks `verify_uptodate_sparse()`
+        // (unpack-trees.c:566-580) before the entry may leave the worktree.
+        let rejected = !included
+            && !snap.was_skipped
+            && disk
+                .as_ref()
+                .is_some_and(|p| verify_uptodate_sparse(&index, i, p, &stat_check));
 
         let entry = &mut index.entries_mut()[i];
         if included {
@@ -1864,25 +2247,28 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
             if snap.was_skipped && !exists {
                 to_materialize.push(snap.path.clone());
             }
+        } else if snap.was_skipped {
+            // ```c
+            // if (was_skip_worktree && ce_skip_worktree(ce)) {
+            //         ce->ce_flags &= ~CE_UPDATE;
+            //         [...]
+            //                 ce->ce_flags &= ~CE_WT_REMOVE;
+            // }
+            // ```
+            //
+            // (`apply_sparse_checkout()`, unpack-trees.c:553-564.) An entry that was
+            // already outside the worktree area is left alone, and so is whatever file
+            // sits at its path.
+            entry.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
         } else {
-            // git refuses to sparsify a path with local modifications: the file
-            // stays, and so does its cleared skip bit.
-            let dirty = exists
-                && disk
-                    .as_ref()
-                    .map(|p| is_modified(repo, p, snap.id, snap.mode))
-                    .unwrap_or(false);
-            if dirty {
+            // git refuses to sparsify a path `verify_uptodate_sparse()` rejects: the
+            // file stays, and so does its cleared skip bit (unpack-trees.c:568-572).
+            if rejected {
                 entry.flags.remove(Flags::SKIP_WORKTREE);
                 if !entry.flags.contains(Flags::INTENT_TO_ADD) {
                     entry.flags.remove(Flags::EXTENDED);
                 }
-                // Only a path that was *newly* being hidden is reported: an entry
-                // that already carried the bit never reaches
-                // `verify_uptodate_sparse()` (unpack-trees.c:565).
-                if !snap.was_skipped {
-                    not_uptodate.push(snap.path.clone());
-                }
+                not_uptodate.push(snap.path.clone());
             } else {
                 // EXTENDED is what makes the skip bit survive serialization
                 // (and forces index version 3, exactly as git does).
@@ -1979,6 +2365,7 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     // `clean_tracked_sparse_directories()` runs *after* the working directory has
     // been updated (builtin/sparse-checkout.c:251), so every tracked file it would
     // have removed is already gone.
+    eprint!("{load_warnings}");
     if let Sparsity::Cone(cone) = sparsity {
         clean_tracked_sparse_directories(&workdir, &index, cone);
     }
@@ -2171,24 +2558,51 @@ fn write_cache_tree(repo: &gix::Repository, index: &gix::index::File) -> Result<
     Ok(())
 }
 
-/// Whether the worktree file at `full` differs from the index blob `id`.
-fn is_modified(repo: &gix::Repository, full: &Path, id: ObjectId, mode: Mode) -> bool {
-    let content = if mode.to_tree_entry_mode().is_some_and(|m| m.is_link()) {
-        match std::fs::read_link(full) {
-            Ok(t) => gix::path::into_bstr(t).into_owned().into(),
-            Err(_) => return false,
-        }
-    } else {
-        match std::fs::read(full) {
-            Ok(c) => c,
-            Err(_) => return false,
-        }
-    };
-    match gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &content) {
-        Ok(actual) => actual != id,
-        // If we cannot hash it we must not delete it.
-        Err(_) => true,
+/// The configuration `ie_match_stat()` consults: `core.trustctime` / `core.checkStat`,
+/// `core.fileMode` and `core.symlinks`.
+struct StatCheck {
+    opts: gix::index::entry::stat::Options,
+    trust_executable_bit: bool,
+    has_symlinks: bool,
+}
+
+impl StatCheck {
+    fn new(repo: &gix::Repository) -> Result<Self> {
+        let snapshot = repo.config_snapshot();
+        Ok(StatCheck {
+            opts: repo.stat_options()?,
+            trust_executable_bit: snapshot.boolean("core.fileMode").unwrap_or(true),
+            has_symlinks: snapshot.boolean("core.symlinks").unwrap_or(true),
+        })
     }
+}
+
+/// `verify_uptodate_sparse()`, which is `verify_uptodate_1()` (unpack-trees.c:2224-2270)
+/// with `WARNING_SPARSE_NOT_UPTODATE_FILE`: true when the entry at `idx` must stay in the
+/// worktree. `ce_uptodate()` is an in-core mark a freshly read index never carries, so the
+/// answer is the `lstat()` and `ie_match_stat()` under `CE_MATCH_IGNORE_VALID |
+/// CE_MATCH_IGNORE_SKIP_WORKTREE`: a stat difference rejects the entry whatever the file
+/// holds, and the content is compared only for a racily clean entry. A missing file is fine
+/// (`errno == ENOENT`), any other `lstat()` failure is a rejection, and a gitlink never is
+/// (`submodule_from_ce()` is NULL without submodule recursion, then the `S_ISGITLINK`
+/// return).
+fn verify_uptodate_sparse(index: &gix::index::File, idx: usize, full: &Path, check: &StatCheck) -> bool {
+    match std::fs::symlink_metadata(full) {
+        Ok(_) => {}
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    }
+    let entry = &index.entries()[idx];
+    if entry.mode == Mode::COMMIT {
+        return false;
+    }
+    !crate::index_racy::ie_match_stat_unchanged_ignoring_valid(
+        index,
+        entry,
+        full,
+        check.opts,
+        check.trust_executable_bit,
+        check.has_symlinks,
+    )
 }
 
 /// Write every entry of `index` into the worktree (same helper shape the other

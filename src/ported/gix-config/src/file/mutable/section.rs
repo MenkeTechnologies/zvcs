@@ -245,6 +245,33 @@ impl SectionMut<'_> {
         Some(self.remove_internal(key_range, true))
     }
 
+    /// Removes the `index`-th value named `value_name` (counting from the first in
+    /// this section) together with the whitespace before it and the newline after
+    /// it, as [`Self::remove`] does for the last one, and returns it.
+    pub fn remove_at(&mut self, value_name: &str, index: usize) -> Option<BString> {
+        let events = &self.section.body.0;
+        let key_start = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(e, Event::SectionValueName(k) if k.as_bstr_in(self.backing).eq_ignore_ascii_case(value_name.as_bytes()))
+            })
+            .map(|(i, _)| i)
+            .nth(index)?;
+        let mut end = key_start + 1;
+        while let Some(event) = events.get(end) {
+            match event {
+                Event::Value(_) | Event::ValueDone(_) => {
+                    end += 1;
+                    break;
+                }
+                Event::Newline(_) | Event::SectionValueName(_) => break,
+                _ => end += 1,
+            }
+        }
+        Some(self.remove_internal(key_start..end, true))
+    }
+
     /// Adds a new line event. Note that you don't need to call this unless
     /// you've disabled implicit newlines.
     pub fn push_newline(&mut self) -> Result<&mut Self, parse::span::Error> {

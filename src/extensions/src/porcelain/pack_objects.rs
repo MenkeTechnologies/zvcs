@@ -3685,10 +3685,10 @@ const ISLAND_MATCHES: usize = 16;
 /// `island_config_callback()` uses: POSIX leftmost-longest matching decides
 /// which text each group captures, and a pattern the library refuses is the
 /// one git dies over.
-struct PosixRegex(Box<libc::regex_t>);
+pub(crate) struct PosixRegex(Box<libc::regex_t>);
 
 impl PosixRegex {
-    fn extended(pattern: &str) -> Option<Self> {
+    pub(crate) fn extended(pattern: &str) -> Option<Self> {
         let pattern = std::ffi::CString::new(pattern.split('\0').next().unwrap_or_default()).ok()?;
         // SAFETY: `regex_t` is plain data that `regcomp()` initialises in place;
         // it is boxed so the address the library may have recorded stays put.
@@ -3699,6 +3699,13 @@ impl PosixRegex {
             }
             Some(PosixRegex(regex))
         }
+    }
+
+    /// `!regexec(&rx, text, 0, NULL, 0)`: whether the pattern matches anywhere in
+    /// `text`, which is read as the C string it would be.
+    pub(crate) fn is_match(&self, text: &[u8]) -> bool {
+        let text = text.split(|&b| b == 0).next().unwrap_or_default();
+        self.exec(text).is_some()
     }
 
     /// `regexec(&rx, name, ARRAY_SIZE(matches), matches, 0)`: the byte range of

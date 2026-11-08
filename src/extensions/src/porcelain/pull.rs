@@ -347,7 +347,7 @@ Options related to fetching
 /// Which integration step `pull` runs after the fetch, mirroring git's
 /// `enum rebase_type` as selected by `config_get_rebase()`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RebaseMode {
+pub(super) enum RebaseMode {
     Disabled,
     Plain,
     Merges,
@@ -407,7 +407,7 @@ fn set_reflog_message(args: &[String]) {
 /// `0x10` select a rebase and `0` declines one. The four mode names are `strcmp`
 /// and each has a one-letter form. `preserve`/`p` prints its own `error()` line
 /// and then falls through to invalid, which is why a refusal for it is two lines.
-fn rebase_parse_value(v: &str) -> Option<RebaseMode> {
+pub(super) fn rebase_parse_value(v: &str) -> Option<RebaseMode> {
     match crate::optint::maybe_bool(v) {
         Some(false) => return Some(RebaseMode::Disabled),
         Some(true) => return Some(RebaseMode::Plain),

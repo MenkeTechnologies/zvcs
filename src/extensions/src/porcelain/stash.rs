@@ -527,10 +527,29 @@ fn explicit_status(result: Result<ExitCode>) -> Result<ExitCode> {
     }
 }
 
+thread_local! {
+    /// The user's cwd, and the work tree root above it, when a push emptied it: see
+    /// [`sync_worktree`]. Both are realpaths, taken while the cwd still existed.
+    static EMPTIED_CWD: std::cell::RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub fn stash(args: &[String]) -> Result<ExitCode> {
     let result = stash_main(args);
     // An index a step held for the next one is never written behind the command's back.
     crate::held_index::discard();
+    // The `rmdir` of the cwd stock's `reset --hard` child makes, and of each parent it
+    // empties (symlinks.c:284-298), made once every relative path this process still
+    // needed has been used.
+    if let Some((cwd, root)) = EMPTIED_CWD.with(|slot| slot.borrow_mut().take()) {
+        let mut dir = Some(cwd.as_path());
+        while let Some(d) = dir.filter(|d| *d != root && d.starts_with(&root)) {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
     result
 }
 
@@ -963,8 +982,11 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `-S` with an empty index diff. git distinguishes the two.
     if affected.is_empty() && untracked_paths.is_empty() {
         if opts.staged_only {
-            // `stash_staged()`: stderr, unprefixed.
-            eprintln!("No staged changes");
+            // `stash_staged()`: stderr, unprefixed, and silent under -q
+            // (builtin/stash.c:1361-1364).
+            if !opts.quiet {
+                eprintln!("No staged changes");
+            }
             return Ok(ExitCode::FAILURE);
         }
         if !opts.quiet {
@@ -1006,12 +1028,16 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // patch it built the stash from back through `git apply -R`, which leaves
     // every *unselected* edit on disk untouched — a tree-level reset could not,
     // since two hunks of one file can land on opposite sides of the selection.
+    //
+    // Both children start in the top-level directory the parent moved to (builtin/stash.c:
+    // 1868-1893, no `cp.dir`): `apply` run from a subdirectory skips every patch outside it,
+    // and the reset reads `add_pathspecs()`' `:(prefix:N)` originals there.
     if let Some(patch) = &patch {
         let (ok, _) = super::add_patch::run_git(
             &["apply".to_string(), "-R".to_string()],
             Some(patch),
             false,
-            None,
+            repo.workdir(),
         )?;
         if !ok {
             if !opts.quiet {
@@ -1024,8 +1050,9 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         if !keep_index {
             let mut args: Vec<String> =
                 ["reset", "-q", "--refresh", "--"].iter().map(|s| (*s).to_string()).collect();
-            args.extend(opts.pathspecs.iter().cloned());
-            let (ok, _) = super::add_patch::run_git(&args, None, false, None)?;
+            let prefix = crate::setup::prefix_bytes(repo);
+            args.extend(opts.pathspecs.iter().map(|spec| original(spec, &prefix)));
+            let (ok, _) = super::add_patch::run_git(&args, None, false, repo.workdir())?;
             if !ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -1120,10 +1147,10 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `reset --hard` (builtin/stash.c:1762-1780, 1819-1829): an untracked file that
     // `HEAD` tracks — one the index had dropped — is removed and then checked out again.
     if opts.pathspecs.is_empty() {
-        remove_stashed_untracked(repo, &untracked_paths);
+        remove_stashed_untracked(repo, &untracked_paths, true);
     }
     let should_interrupt = AtomicBool::new(false);
-    let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt)?;
+    let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt, true)?;
     let old_index = repo.open_index()?;
     // Which of `do_push_stash`'s three tails ran decides the extension it leaves behind.
     //
@@ -1173,7 +1200,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         let head = tree_map(repo, head_tree_id)?;
         let created: Vec<BString> =
             untracked_paths.iter().filter(|path| !head.contains_key(*path)).cloned().collect();
-        remove_stashed_untracked(repo, &created);
+        remove_stashed_untracked(repo, &created, false);
     }
 
     // `do_push_stash()` clears the worktree with `reset --hard`, which logs
@@ -1239,13 +1266,13 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
 /// The untracked files now live in the stash's third parent, so git removes
 /// them from the worktree — with `git clean --force --quiet -d`, whose `-d`
 /// also takes the directories they leave empty.
-fn remove_stashed_untracked(repo: &gix::Repository, untracked_paths: &[BString]) {
+fn remove_stashed_untracked(repo: &gix::Repository, untracked_paths: &[BString], by_clean: bool) {
     let Some(root) = repo.workdir() else { return };
     for path in untracked_paths {
         let abs = root.join(gix::path::from_bstr(path.as_bstr()).as_ref());
         let _ = std::fs::remove_file(&abs);
     }
-    remove_emptied_dirs(repo, untracked_paths);
+    remove_emptied_dirs(repo, untracked_paths, by_clean);
 }
 
 /// The first two children of `do_push_stash()`'s pathspec reset and the refusals of the
@@ -2148,7 +2175,11 @@ fn build_stash_commit(
 /// An empty patch is git's "nothing was selected", which the caller turns into
 /// `No changes selected` without storing anything.
 fn stash_patch(repo: &gix::Repository, opts: &PushOpts) -> Result<(ObjectId, Vec<u8>)> {
-    let index_file = repo.git_dir().join(format!("index.stash.{}", std::process::id()));
+    // git's `stash_index_path` is `<index_file>.stash.<pid>` (builtin/stash.c:2495-2496),
+    // resolved against the top-level directory setup moved to, where the selector's
+    // children also start; the `../.git` a subdirectory discovers names nothing there,
+    // so the path is made absolute.
+    let index_file = std::path::absolute(repo.git_dir().join(format!("index.stash.{}", std::process::id())))?;
     let head_tree = repo.head_commit()?.tree_id()?.detach();
     // `create_index_from_tree()`; `write_ondisk_index` also clears a stale file
     // an interrupted run left behind, which is git's `remove_path()` on entry.
@@ -3427,7 +3458,31 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     } else {
         ShowUntracked::No
     };
+    // `PARSE_OPT_KEEP_DASHDASH | PARSE_OPT_KEEP_UNKNOWN_OPT` (builtin/stash.c:1056-1058)
+    // keeps a `--` or `--end-of-options` in argv and stops there; the loop after it
+    // still sorts every word by its first byte (:1060-1066), so the marker and each
+    // dashed word reach `revision_args` and skip the config defaults. There
+    // `setup_revisions()` takes the dashed words after a `--` as paths, and after an
+    // `--end-of-options` as revisions, which `verify_filename()` refuses
+    // (setup.c:285-286) once `get_stash_info()` has resolved the stash.
+    let mut end_marker: Option<&str> = None;
+    let mut after_dashdash: Vec<String> = Vec::new();
+    let mut revision_after_end: Option<String> = None;
     for a in args {
+        if end_marker.is_none() && (a == "--" || a == "--end-of-options") {
+            end_marker = Some(a.as_str());
+            continue;
+        }
+        if let Some(marker) = end_marker {
+            if !a.starts_with('-') {
+                stash_specs.push(a.clone());
+            } else if marker == "--" {
+                after_dashdash.push(a.clone());
+            } else if revision_after_end.is_none() {
+                revision_after_end = Some(a.clone());
+            }
+            continue;
+        }
         match a.as_str() {
             // `show_stash()` parses under `PARSE_OPT_KEEP_UNKNOWN_OPT`, where
             // `register_abbrev()` returns without recording
@@ -3451,6 +3506,10 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         Ok(spec) => spec.id,
         Err(code) => return Ok(code),
     };
+
+    if let Some(word) = revision_after_end {
+        crate::git_fatal!("option '{word}' must come before non-option arguments");
+    }
 
     // What `setup_revisions()` declines is `show_stash`'s problem, not the diff
     // parser's. git pushes every dashed word into `revision_args`, runs
@@ -3477,7 +3536,7 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let b_commit = parents[0];
 
     // No diff options given → apply config defaults (git: revision_args.nr == 1).
-    if diff_flags.is_empty() {
+    if diff_flags.is_empty() && end_marker.is_none() {
         if !show_stat && !show_patch {
             return Ok(ExitCode::SUCCESS);
         }
@@ -3520,11 +3579,23 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             // object *names* — so the union is built in a memory-backed handle,
             // the objects it needs are persisted only for as long as the diff
             // runs, and `scratch` removes them again afterwards.
+            let w_tree = commit.tree_id()?.detach();
+            // `diff_include_untracked()` merges the two trees with
+            // `stash_worktree_untracked_merge()`, which refuses a path both carry —
+            // `-u` over a path the index had dropped records it on both sides — and the
+            // failed `unpack_trees()` dies (builtin/stash.c:1015-1022, unpack-trees.c:3069-3071).
+            let u_map = tree_map(repo, u)?;
+            let w_map = tree_map(repo, w_tree)?;
+            let mut duplicates: Vec<&BString> = u_map.keys().filter(|path| w_map.contains_key(*path)).collect();
+            duplicates.sort();
+            if let Some(path) = duplicates.first() {
+                eprintln!("error: worktree and untracked commit have duplicate entries: {path}");
+                crate::git_fatal!("failed to unpack trees");
+            }
             let mut mem = repo.clone();
             mem.objects.enable_object_memory();
-            let w_tree = commit.tree_id()?.detach();
             let mut editor = mem.edit_tree(w_tree)?;
-            for (path, (id, mode)) in tree_map(repo, u)? {
+            for (path, (id, mode)) in u_map {
                 let kind = mode
                     .to_tree_entry_mode()
                     .ok_or_else(|| anyhow!("untracked entry `{path}` has an unrepresentable mode"))?
@@ -3546,6 +3617,10 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     };
     diff_flags.push(left);
     diff_flags.push(right);
+    if !after_dashdash.is_empty() {
+        diff_flags.push("--".to_string());
+        diff_flags.extend(after_dashdash);
+    }
     let code = super::diff::diff(&diff_flags);
     let objects = repo.objects.store_ref().path().to_path_buf();
     for id in &scratch {
@@ -3632,7 +3707,18 @@ enum ShowUntracked {
 /// changed branch applies cleanly), then drop it. Port of `branch_stash`.
 fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<&str> = Vec::new();
+    let mut no_more_opts = false;
     for a in args {
+        if no_more_opts {
+            positionals.push(a);
+            continue;
+        }
+        // `parse_options(..., 0)` (builtin/stash.c:925-926): `--` and
+        // `--end-of-options` end the options and are dropped (parse-options.c:1113-1124).
+        if a == "--" || a == "--end-of-options" {
+            no_more_opts = true;
+            continue;
+        }
         // `branch_stash()`'s table is `OPT_END()` alone, so nothing resolves and
         // every dashed word is git's own `unknown option`/`unknown switch` with
         // the block on stderr at 129.
@@ -4261,7 +4347,7 @@ fn restore_stash_commit(
             eprintln!("{path} already exists, no checkout");
             untracked_ok = false;
         }
-        let _ = sync_worktree(repo, u_tree, &writable, &u_map, &should_interrupt)?;
+        let _ = sync_worktree(repo, u_tree, &writable, &u_map, &should_interrupt, false)?;
     }
     // `ret = clean >= 0 ? !clean : clean;` (builtin/stash.c:726): a merge that
     // `unclean()` or `unpack_trees()` refused is `merge_ort_nonrecursive()`'s -1,
@@ -4333,7 +4419,7 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
     // exactly as `push` does after storing the stash.
     let head_map = tree_map(repo, head_tree_id)?;
     let should_interrupt = AtomicBool::new(false);
-    let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt)?;
+    let fresh = sync_worktree(repo, head_tree_id, &affected, &head_map, &should_interrupt, false)?;
     let old_index = repo.open_index()?;
     // `create_autostash()` is `git stash create` followed by `reset_head(RESET_HEAD_HARD)`
     // in-process (sequencer.c) — no `add`/`apply` child, so there is no path to invalidate
@@ -4612,6 +4698,7 @@ fn sync_worktree(
     affected: &HashSet<BString>,
     target_map: &HashMap<BString, (ObjectId, Mode)>,
     should_interrupt: &AtomicBool,
+    in_child: bool,
 ) -> Result<HashMap<BString, (ObjectId, Mode, Stat)>> {
     let workdir = repo
         .workdir()
@@ -4621,10 +4708,47 @@ fn sync_worktree(
     // Affected paths absent from the target tree are deletions, made first: the
     // `reset --hard` this stands for unlinks every `CE_WT_REMOVE` entry before it
     // checks out a single `CE_UPDATE` one (`check_updates()`, unpack-trees.c:455-469).
+    //
+    // `unlink_entry()` then schedules the file's directory for removal (entry.c:603-607),
+    // `unlink_or_warn()` counting a file already gone as removed, and `check_updates()`
+    // ends in `remove_scheduled_dirs()` (unpack-trees.c:471): `push -k` over a path the
+    // index dropped takes the directory it emptied with it.
+    //
+    // `in_child`: `do_push_stash()` runs that reset (and `checkout --no-overlay`) as a
+    // child with no `cp.dir` (builtin/stash.c:1816-1863), so it starts in the top-level
+    // directory the parent moved to and its `original_cwd` is the root
+    // (`setup_original_cwd()`, setup.c:513-545): the user's own cwd gets no protection
+    // from `do_remove_scheduled_dirs()` (symlinks.c:288-291) there.
     for path in affected {
         if !target_map.contains_key(path) {
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
-                let _ = std::fs::remove_file(full);
+                let gone = match std::fs::remove_file(&full) {
+                    Ok(()) => true,
+                    Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+                };
+                if gone && in_child {
+                    // Every path this process uses is relative to the cwd, so the cwd itself
+                    // goes last, from [`stash`], once nothing needs it any more.
+                    let cwd = crate::worktree::original_cwd();
+                    let mut dir = full.parent();
+                    while let Some(d) = dir.filter(|d| *d != workdir && d.starts_with(&workdir)) {
+                        let real = gix::path::realpath(d).ok();
+                        if cwd.is_some() && real.as_deref() == cwd {
+                            if std::fs::read_dir(d).is_ok_and(|mut it| it.next().is_none()) {
+                                let root = gix::path::realpath(&workdir).unwrap_or_else(|_| workdir.clone());
+                                let real = real.expect("compared equal to the cwd");
+                                EMPTIED_CWD.with(|slot| *slot.borrow_mut() = Some((real, root)));
+                            }
+                            break;
+                        }
+                        if std::fs::remove_dir(d).is_err() {
+                            break;
+                        }
+                        dir = d.parent();
+                    }
+                } else if gone {
+                    crate::worktree::prune_empty_dirs(&workdir, &full);
+                }
             }
         }
     }
@@ -4702,7 +4826,15 @@ fn sync_worktree(
 /// the worktree copy of it is. A sparse checkout is where that shows: `outside/`
 /// carries two entries the cone leaves unwritten, so stock stashes the stray file
 /// inside it and leaves the empty directory standing (verified on git 2.50.1).
-fn remove_emptied_dirs(repo: &gix::Repository, paths: &[BString]) {
+///
+/// The user's cwd is the one directory treated apart. `by_clean`: the `clean` child
+/// runs in it (`cp.dir = startup_info->original_cwd`, builtin/stash.c:1766-1771), and
+/// its `remove_dirs()` keeps it with `Refusing to remove current working directory`
+/// on stdout, `--quiet` or not (builtin/clean.c:247-265). Otherwise the paths leave
+/// through the `apply --index -R` child, which starts at the top level and so takes
+/// the cwd too; that `rmdir` waits for [`stash`] because every path here is relative
+/// to the cwd.
+fn remove_emptied_dirs(repo: &gix::Repository, paths: &[BString], by_clean: bool) {
     let Some(root) = repo.workdir().and_then(|r| r.canonicalize().ok()) else { return };
     let tracked_dirs = index_dir_prefixes(repo);
     // Canonical throughout, so the root comparison holds on a workdir reached
@@ -4717,6 +4849,8 @@ fn remove_emptied_dirs(repo: &gix::Repository, paths: &[BString]) {
     // Deepest first, so a nested directory is gone before its parent is tried.
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     dirs.dedup();
+    let cwd = crate::worktree::original_cwd();
+    let mut refused_cwd = false;
     for dir in dirs {
         let mut current = dir;
         // `remove_dir` refuses a non-empty directory, which is exactly the stop
@@ -4724,8 +4858,21 @@ fn remove_emptied_dirs(repo: &gix::Repository, paths: &[BString]) {
         while current != root
             && current.starts_with(&root)
             && !holds_index_entries(&tracked_dirs, &root, &current)
-            && std::fs::remove_dir(&current).is_ok()
         {
+            if Some(current.as_path()) == cwd {
+                if std::fs::read_dir(&current).is_ok_and(|mut it| it.next().is_none()) {
+                    if !by_clean {
+                        EMPTIED_CWD.with(|slot| *slot.borrow_mut() = Some((current.clone(), root.clone())));
+                    } else if !refused_cwd {
+                        refused_cwd = true;
+                        println!("Refusing to remove current working directory");
+                    }
+                }
+                break;
+            }
+            if std::fs::remove_dir(&current).is_err() {
+                break;
+            }
             let Some(parent) = current.parent().map(std::path::Path::to_path_buf) else { break };
             current = parent;
         }
@@ -5625,7 +5772,10 @@ fn parse_push_options(
         match a {
             "-m" | "--message" => {
                 i += 1;
-                let m = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
+                // `get_arg()`: ``switch `m' requires a value``, exit 129 (parse-options.c:47-62).
+                let Some(m) = args.get(i) else {
+                    return Ok(Err(super::missing_option_value(a)));
+                };
                 o.message = Some(m.clone());
             }
             // `OPT_STRING`/`OPT_FILENAME`/`OPT_BOOL` negations: git NULLs the
@@ -5649,11 +5799,38 @@ fn parse_push_options(
             "--pathspec-file-nul" => nul = true,
             "--pathspec-from-file" => {
                 i += 1;
-                let f = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
+                let Some(f) = args.get(i) else {
+                    return Ok(Err(super::missing_option_value(a)));
+                };
                 // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
                 crate::parseopt::opt_filename(&mut from_file, f, crate::parseopt::discovered_prefix)?;
             }
-            "--" => rest_are_paths = true,
+            // `PARSE_OPT_KEEP_DASHDASH` (builtin/stash.c:1945-1952) leaves the `--` in argv
+            // after the operands already read, and `push_stash()` drops it only when it
+            // comes first (:1956-1959): `push a -- b` has the pathspec `--` too.
+            "--" => {
+                if !o.pathspecs.is_empty() {
+                    o.pathspecs.push(orig.to_string());
+                }
+                rest_are_paths = true;
+            }
+            // `--end-of-options` ends the parse and is dropped (parse-options.c:1119-1124),
+            // so a `--` right after it is the first word left and `push_stash()` drops
+            // that; under `PARSE_OPT_STOP_AT_NON_OPTION` any other first word is the
+            // operand `push` cannot be assumed over.
+            "--end-of-options" => {
+                rest_are_paths = true;
+                if o.pathspecs.is_empty() {
+                    match args.get(i + 1).map(String::as_str) {
+                        Some("--") => i += 1,
+                        Some(_) if push_assumed => {
+                            stopped_at = Some(i + 1);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             other => {
                 if let Some(f) = other.strip_prefix("--pathspec-from-file=") {
                     crate::parseopt::opt_filename(&mut from_file, f, crate::parseopt::discovered_prefix)?;
@@ -5861,7 +6038,14 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
                 o.message = Some(m.clone());
             }
             "--no-message" => o.message = None,
-            "--" => rest_are_words = true,
+            // `save_stash()` parses with `PARSE_OPT_KEEP_DASHDASH` (builtin/stash.c:2048-2050),
+            // so the `--` stays in argv (parse-options.c:1113-1117) and joins the message.
+            "--" => {
+                rest_are_words = true;
+                words.push(orig.to_string());
+            }
+            // `--end-of-options` ends the parse and is dropped (parse-options.c:1119-1124).
+            "--end-of-options" => rest_are_words = true,
             other => {
                 if let Some(m) = other.strip_prefix("--message=") {
                     o.message = Some(m.to_string());
@@ -5915,7 +6099,11 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
         match a {
             "-m" | "--message" => {
                 i += 1;
-                let m = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
+                // `get_arg()` (parse-options.c:47-62): the one line, then exit 129.
+                let Some(m) = args.get(i) else {
+                    let _ = super::missing_option_value(a);
+                    return Err(anyhow::Error::new(crate::fatal::Silent(129)));
+                };
                 message = Some(m.clone());
             }
             "-q" | "--quiet" => quiet = true,
@@ -6016,6 +6204,13 @@ fn parse_apply_options(
     while i < args.len() {
         let orig = args[i].as_str();
         i += 1;
+        // `apply_stash()` and `pop_stash()` parse with no flags (builtin/stash.c:796-797,
+        // :896-897): `--` and `--end-of-options` end the options and are dropped
+        // (parse-options.c:1113-1124), and every word after them is an operand.
+        if orig == "--" || orig == "--end-of-options" {
+            specs.extend(args[i..].iter().cloned());
+            break;
+        }
         let resolved = match canonical(orig, table, usage) {
             Ok(name) => name,
             Err(code) => return Ok(Err(code)),

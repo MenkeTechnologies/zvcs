@@ -73,7 +73,9 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
             p.pathspecs.push(a);
             continue;
         }
-        if a == "--" {
+        // `--end-of-options` ends option parsing like `--`, and without
+        // `PARSE_OPT_KEEP_UNKNOWN_OPT` it is dropped too (parse-options.c:1113-1124).
+        if a == "--" || a == "--end-of-options" {
             no_more_opts = true;
             continue;
         }
@@ -228,8 +230,8 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 ///                          protection back up.
 ///   * `--no-quiet`, `--no-dry-run`, `--no-force`, `--no-interactive`, and
 ///     unique-prefix abbreviations such as `--dry` or `--no-dr`.
-///   * `--` and `<pathspec>...` — as with git, any pathspec implies `-d`, and
-///     options may be given after pathspecs.
+///   * `--`, `--end-of-options` and `<pathspec>...` — as with git, any pathspec
+///     implies `-d`, and options may be given after pathspecs.
 ///   * grouped short flags (`-ndx`, `-ffd`, …).
 /// ```
 ///
@@ -863,25 +865,17 @@ fn correct_untracked_entries(entries: Vec<BString>, ignored: &[BString]) -> Vec<
 /// Render a repository-relative path as git does for display: relative to the
 /// current working directory, walking up with `../` for each prefix component
 /// the path does not share.
+///
+/// `cmd_clean()` stores `relative_path(ent->name, prefix, &buf)` in `del_list`
+/// (builtin/clean.c:1044-1045), so the untracked directory that *is* the cwd
+/// shows as `./` (path.c:1012-1014) in every `-i` listing.
 fn relative_to_prefix(path: &BStr, prefix_parts: &[&[u8]]) -> BString {
-    let comps: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
-    let mut shared = 0;
-    while shared < prefix_parts.len() && shared < comps.len() && prefix_parts[shared] == comps[shared]
-    {
-        shared += 1;
+    let mut prefix = Vec::new();
+    for part in prefix_parts {
+        prefix.extend_from_slice(part);
+        prefix.push(b'/');
     }
-
-    let mut outp = BString::default();
-    for _ in shared..prefix_parts.len() {
-        outp.extend_from_slice(b"../");
-    }
-    for (i, c) in comps[shared..].iter().enumerate() {
-        if i > 0 {
-            outp.push(b'/');
-        }
-        outp.extend_from_slice(c);
-    }
-    outp
+    crate::path::relative_path(path, Some(&prefix)).into()
 }
 
 /// The message text of an I/O error without Rust's ` (os error N)` suffix, so
@@ -1347,7 +1341,13 @@ fn select_by_numbers_cmd(
     stdin: &mut impl std::io::BufRead,
     c: &CleanColors,
 ) {
-    let shown = shown_paths(del, prefix_parts);
+    // `MENU_STUFF_TYPE_STRING_LIST` prints and `find_unique()` matches each `del_list`
+    // string as stored, unquoted (builtin/clean.c:389-399, :442-453): only
+    // `pretty_print_dels()` and `ask_each_cmd()` run it through `quote_path()`.
+    let shown: Vec<String> = del
+        .iter()
+        .map(|(key, _, _)| relative_to_prefix(key.as_bstr(), prefix_parts).to_string())
+        .collect();
     let keep: std::collections::HashSet<usize> =
         list_and_choose_strings(&shown, "Select items to delete", stdin, c)
             .into_iter()

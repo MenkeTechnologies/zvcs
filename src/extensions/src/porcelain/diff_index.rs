@@ -2163,12 +2163,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         true => Vec::new(),
         false => {
             let prefix = repo_prefix(&repo)?;
+            // `prefix_path_gently()` joins each element to the prefix and normalises the
+            // result (setup.c:117-147), so `.`, `./c` and `../a` from `sub/` are `sub`,
+            // `sub/c` and `a`; `parse_pathspec_fatal()` above has already died on one
+            // that climbs out of the work tree.
             paths
                 .iter()
                 .map(|p| {
                     let mut full = prefix.clone();
                     full.extend_from_slice(p);
-                    full
+                    crate::pathspec::normalize_path(full.as_bstr()).unwrap_or(full)
                 })
                 .collect()
         }
@@ -2178,7 +2182,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         let in_pathspec = match &mut ps {
             _ if paths.is_empty() => true,
             Some(ps) => ps.is_included(path.as_bstr(), Some(false)),
-            None => lifted.iter().any(|p| path_matches(path, p)),
+            // An element that normalises to the empty string (`.` at the top, `..` from
+            // one level down) is the whole tree, as an empty `match` is in
+            // `match_pathspec_item()` (dir.c:441-442).
+            None => lifted.iter().any(|p| p.is_empty() || path_matches(path, p)),
         };
         in_pathspec && relative.as_ref().is_none_or(|rel| path.starts_with(rel))
     };

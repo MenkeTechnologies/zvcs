@@ -186,6 +186,18 @@ impl PrepareCheckout {
             .as_ref()
             .expect("present as checkout operation isn't complete")
     }
+
+    /// Get mutable access to the repository while the checkout isn't yet completed, as to reopen its
+    /// reference store after the caller changed its format.
+    ///
+    /// # Panics
+    ///
+    /// If the checkout is completed and the [`Repository`] was already passed on to the caller.
+    pub fn repo_mut(&mut self) -> &mut Repository {
+        self.repo
+            .as_mut()
+            .expect("present as checkout operation isn't complete")
+    }
 }
 
 /// Consumption

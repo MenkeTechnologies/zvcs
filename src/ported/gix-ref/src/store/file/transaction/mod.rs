@@ -105,6 +105,9 @@ pub(crate) struct Options {
     pub skip_create_reflog: std::collections::BTreeSet<usize>,
     /// Reflog entries written as they are given.
     pub reflog_updates: Vec<ReflogUpdate>,
+    /// Log an update to a symbolic value as the files backend does; see
+    /// [`Transaction::log_symref_updates()`].
+    pub log_symref_updates: bool,
 }
 
 /// One reflog entry written as given, git's `ref_transaction_update_reflog()`
@@ -265,6 +268,17 @@ impl<'p> Transaction<'_, 'p> {
         self
     }
 
+    /// Log each update that makes a reference symbolic as `parse_and_write_reflog()` does
+    /// (refs/files-backend.c:3154-3170): under the value its new target resolves to, and not at all
+    /// when that target is dangling. Without it a symbolic update writes no reflog entry, which the
+    /// callers that predate this write themselves.
+    ///
+    /// Only a store with the files backend reads it.
+    pub fn log_symref_updates(mut self) -> Self {
+        self.options.log_symref_updates = true;
+        self
+    }
+
     /// Add reflog entries to write as they are given, see [`ReflogUpdate`].
     ///
     /// Only a store with the reftable backend honours it.
@@ -407,3 +421,6 @@ pub mod prepare;
 
 ///
 pub mod commit;
+
+///
+pub mod initial;

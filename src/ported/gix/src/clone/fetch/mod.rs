@@ -445,6 +445,7 @@ impl PrepareFetch {
             .with_shallow_update(remote::fetch::ShallowUpdate::Cloning)
             // `transport_set_option(transport, TRANS_OPT_KEEP, "yes")` (builtin/clone.c:1362).
             .with_keep_pack(true)
+            .with_write_refs(self.write_refs)
             .receive(&repo, &mut progress, should_interrupt)
             .await?;
 
@@ -466,7 +467,9 @@ impl PrepareFetch {
         if let Some(config) = config {
             util::append_config_to_repo_config(&mut repo, config)?;
         }
-        if self.revision.is_some() {
+        if !self.write_refs {
+            // The caller writes the refs, `HEAD` and the branch configuration itself.
+        } else if self.revision.is_some() {
             let (name, id) = revision_mapping(&outcome.ref_map).expect("checked before the pack was received");
             util::detach_head(&mut repo, name, id, reflog_message.as_ref())?;
         } else {

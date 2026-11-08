@@ -460,6 +460,10 @@ where
                 return Err(Error::NotConnected);
             }
         }
+        // The caller writes the refs; what the updates would be is still worked out and reported.
+        if !self.write_refs {
+            self.dry_run = fetch::DryRun::Yes;
+        }
 
         let update_refs = refs::update_queued(
             repo,

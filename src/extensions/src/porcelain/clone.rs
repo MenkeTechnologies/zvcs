@@ -84,11 +84,18 @@ use gix::remote::fetch::{Shallow, Tags};
 /// branch `HEAD` points at, or the `--branch` argument, which may name a tag and
 /// then maps onto itself) — the same ls-refs round trip git makes.
 ///
-/// Two leftovers of gitoxide's clone are cleaned up afterwards so a bare or
-/// mirrored clone matches stock git byte-for-byte: the `HEAD:refs/remotes/<name>/HEAD`
-/// refspec gitoxide always adds implicitly (removed unless the remote really
-/// advertised that ref), and the `remote.<name>.fetch` / `remote.<name>.tagOpt` /
-/// `branch.<name>.*` entries git does not persist for those modes.
+/// The `remote.<name>.fetch` / `remote.<name>.tagOpt` / `branch.<name>.*` entries
+/// git does not persist for a bare or mirrored clone are removed afterwards.
+///
+/// # Refs
+///
+/// gitoxide only fetches; the refs are written as `cmd_clone()` writes them once the
+/// pack is in (see [`write_clone_refs`]): the mapped refs in one
+/// `REF_TRANSACTION_FLAG_INITIAL` transaction, which puts them into `packed-refs`
+/// without reflogs, then the tags a `--single-branch` clone follows,
+/// `refs/remotes/<name>/HEAD` and `HEAD` in transactions of their own, each
+/// running the `reference-transaction` hook as git's does. A reftable clone's
+/// store is laid down just before, while it still holds no ref.
 ///
 /// # Deviations (surfaced honestly, never faked)
 /// ```text
@@ -100,10 +107,10 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `--dissociate` writes no alternate at all. The pack is fetched in full,
 ///     which is the state git reaches by copying the borrowed objects in, so the
 ///     resulting repository is self-contained either way.
-///   * A reftable clone is fetched and settled through the files ref store first;
-///     its refs are then written into a reftable stack in the transactions git's
-///     clone makes (see `adopt_reftable`). Any `--ref-format` other than `files`
-///     and `reftable` reproduces git's exact `unknown ref storage format '<v>'`.
+///   * A reftable clone is fetched through the files ref store it was laid down
+///     with, which the fetch writes no ref into; the reftable stack replaces it
+///     before the refs are written. Any `--ref-format` other than `files` and
+///     `reftable` reproduces git's exact `unknown ref storage format '<v>'`.
 ///   * `--depth` combined with `--no-single-branch` costs one extra ls-refs round
 ///     trip, because gitoxide has already resolved its implicit single-branch
 ///     refspec by the time the replacement wildcard remote is installed.
@@ -114,9 +121,6 @@ use gix::remote::fetch::{Shallow, Tags};
 ///     anywhere in the vendored crates, so an unreachable tag — and the history
 ///     it pins — is transferred too. Pruning the extra tag refs afterwards would
 ///     hide the over-fetch rather than fix it, so they are left visible.
-///   * Fetched refs are written packed (gitoxide's clone sets
-///     `with_write_packed_refs_only`), where stock git leaves some of them loose.
-///     The ref set is identical; only the loose/packed split differs.
 /// ```
 /// `git clone`'s usage block, byte-for-byte from stock git 2.55.0. Printed on
 /// stdout for `-h` and on stderr for a usage error, both exiting 129.
@@ -1502,6 +1506,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `run_transaction_hook()` (refs.c:2663-2678) runs for every ref transaction of the new
+    // repository, the template's `reference-transaction` hook included. Commands that find their
+    // repository through setup have it installed there; a clone makes its own.
+    gix::refs::file::set_transaction_hook(gix::refs::file::TransactionHook {
+        run: crate::hooks::run_reference_transaction,
+        die: crate::hooks::reference_transaction_die,
+    });
+
+    // `refs_create_refdir_stubs()` (refs.c:2202-2223), which `cmd_clone()` runs so the half-made
+    // repository can be discovered before the remote's object format is known
+    // (builtin/clone.c:1219-1234): `HEAD` names `refs/heads/.invalid`. `create_reference_database()`
+    // then finds `HEAD` there and leaves it (setup.c:2541), so until `update_head()` it resolves to
+    // nothing, and the reflog entry of the transaction that links it records the null id as its old
+    // value.
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/.invalid\n")?;
+
     // `-s`/`--shared` and `--reference`/`--reference-if-able`: record the object
     // stores to borrow from in `objects/info/alternates` *before* the fetch, which
     // is where git writes them. `--dissociate` records them too — it borrows for the
@@ -1633,6 +1653,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         prepare = prepare.with_default_branch(default_branch);
     }
     prepare = prepare.with_revision(revision_spec);
+    // The refs, `HEAD` and the branch configuration are written below, as `cmd_clone()` writes them
+    // once the pack is in: see [`write_clone_refs`].
+    prepare = prepare.with_write_refs(false);
     // "ignored in local clones" is literal: git never puts the filter on the wire
     // for a local source, because there is no wire — `clone_local()` copies the
     // object store whole. Sending it anyway reaches a server that does not
@@ -1768,6 +1791,25 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if matches!(plan, Some(Refspecs::Mirror)) {
         prepare = prepare.with_fetch_options(gix::remote::ref_map::Options {
             prefix_from_spec_as_filter_on_remote: false,
+            ..Default::default()
+        });
+    } else if tags == Some(Tags::None) && branch.is_some() && single_branch != Some(true) && revision.is_none() {
+        // ```c
+        // if (option_tags || option_branch)
+        //         /*
+        //          * Add tags refspec when user asked for tags (implicitly) or
+        //          * specified --branch, whose argument might be a tag.
+        //          */
+        //         refspec_append(&remote->fetch, TAG_REFSPEC);
+        // ```
+        //
+        // (builtin/clone.c:1414-1419.) `--no-tags --branch` still fetches and maps every tag,
+        // after `remote.<name>.tagOpt = --no-tags` was written (:1308-1312): the refspec is
+        // the fetch's own and never reaches the configuration, as an extra refspec here.
+        prepare = prepare.with_fetch_options(gix::remote::ref_map::Options {
+            extra_refspecs: vec![gix::refspec::parse("refs/tags/*:refs/tags/*".into(), gix::refspec::parse::Operation::Fetch)
+                .expect("valid")
+                .to_owned()],
             ..Default::default()
         });
     }
@@ -1923,21 +1965,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         });
     }
 
-    // Whether the remote advertised a `refs/remotes/<name>/HEAD` of its own. gitoxide
-    // always fetches `HEAD:refs/remotes/<name>/HEAD`, so for a bare or mirrored clone —
-    // where git creates no remote-tracking refs at all — that ref has to be removed again.
-    // The one way it may legitimately survive is a `--mirror`, whose `+refs/*:refs/*`
-    // copies the source's own ref of that exact name; the source's `HEAD` is not under
-    // `refs/` and so maps to nothing.
-    let mut remote_advertised_tracking_head = false;
-
     // Whether the server accepted `--filter`. git keeps going when it did not, warning that the
     // filter was ignored, so the warning is emitted from what the handshake advertised.
     let mut filter_supported = true;
-
-    // git's `remote_head_points_at`: the branch the remote's `HEAD` names, which
-    // `update_remote_refs()` makes `refs/remotes/<name>/HEAD` a symbolic ref to.
-    let mut remote_head_branch: Option<String> = None;
 
     // ```c
     // if (!mapped_refs) {
@@ -1951,16 +1981,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // there — a `--single-branch` clone follows that `HEAD`, and its refspec then matches
     // nothing. Either way the clone succeeds and checks nothing out.
     let mut cloned_empty = false;
-    // git's `refs` — whether `transport_get_remote_refs()` returned anything at all.
-    // `process_ref_v2()` hands an `unborn HEAD` line to `unborn_head_target` and adds no
-    // ref for it (connect.c:417-435), so a remote with no commits yields `refs == NULL`,
-    // and `update_remote_refs()` then skips `write_remote_refs()` (builtin/clone.c:554-558).
+    // git's `refs` for a fetch gitoxide refused for mapping nothing — whether
+    // `transport_get_remote_refs()` returned anything at all. `process_ref_v2()` hands an
+    // `unborn HEAD` line to `unborn_head_target` and adds no ref for it (connect.c:417-435), so a
+    // remote with no commits yields `refs == NULL`, and `update_remote_refs()` then skips
+    // `write_remote_refs()` (builtin/clone.c:554-558).
     let mut remote_advertised_refs = false;
-    // git's `transport_ls_refs_options.unborn_head_target`: protocol v2's `unborn`
-    // extension reports the branch the remote's own HEAD names even when that branch does
-    // not exist yet, and `update_head()` makes the clone's HEAD a symref to it
-    // (builtin/clone.c:1565-1572, 603-611).
-    let mut unborn_head: Option<String> = None;
+    // Set when gitoxide refused the fetch for mapping nothing, which leaves the refs to be written
+    // after it.
+    let mut fetch_mapped_nothing = false;
     // ```c
     //         copy_or_link_directory(&src, &dest, src_repo);
     //         [...]
@@ -2035,16 +2064,88 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     };
     // Run the clone, capturing the result so a `remote: ` line the stream left
     // unterminated is flushed before any error is propagated.
+    // `reflog_msg`: `clone: from <repo>`, where `repo` is `absolute_pathdup(repo_name)` for a path,
+    // a bundle's included, and the url as given otherwise (builtin/clone.c:1054-1060, :1087-1088).
+    let reflog_msg = match &bundle_transport {
+        Some(bt) => format!("clone: from {}", bt.shown),
+        None => {
+            let mut shown = url.clone();
+            shown.absolutize(Path::new(""));
+            format!("clone: from {}", shown.to_bstring())
+        }
+    };
+    // `opts.wants_head`, cleared by `--revision` and by `--single-branch --branch`
+    // (builtin/clone.c:1380-1385, :1405-1409).
+    let wants_head = revision.is_none() && !(single_branch == Some(true) && branch.is_some());
+    // `option_tags` once `--mirror` and `--revision` cleared it (builtin/clone.c:1036-1038, :1406).
+    let option_tags = tags != Some(Tags::None) && !mirror && revision.is_none();
+    // `repo_default_branch_name(the_repository, REMOTE_GUESS_HEAD_QUIET)`, which `guess_remote_head()` asks.
+    let quiet_default_branch =
+        clone_default_branch_name(&git_dir, &config_pairs, true).unwrap_or_else(|| "master".to_string());
+    // What `update_remote_refs()` and `update_head()` are handed. A single-branch fetch whose refspec
+    // came out empty sent ls-refs no `refs/heads/` prefix, so what the remote had under it — whether
+    // `refs` is NULL — is known only from the probe.
+    let ref_writes = |advertised: bool| RefWrites {
+        remote_name: &effective_remote_name,
+        bare,
+        single_branch: single_branch == Some(true),
+        tags: option_tags,
+        branch: branch.as_deref(),
+        revision: revision.is_some(),
+        msg: &reflog_msg,
+        refs_advertised: advertised
+            || single_outcome.lock().expect("clone is single-threaded here").as_ref().is_some_and(|probe| {
+                probe.advertised_head_or_branch || (probe.advertised_tag && tags != Some(Tags::None))
+            }),
+        default_branch: &quiet_default_branch,
+    };
+    // `update_remote_refs()` and `update_head()` once the pack is in (builtin/clone.c:1604-1608), into a
+    // reftable store laid down first for a reftable clone.
+    let write_refs = |repo: &mut gix::Repository, outcome: &gix::remote::fetch::Outcome| -> Result<()> {
+        if reftable {
+            create_reftable_ref_store(repo.git_dir())?;
+            reopen_as_reftable(repo);
+        }
+        let probe = single_outcome.lock().expect("clone is single-threaded here").clone();
+        let plan = ref_writes(advertises_refs(&outcome.ref_map));
+        let v2 = outcome.handshake.server_protocol_version == gix::protocol::transport::Protocol::V2;
+        // The branch `HEAD` is left unborn on: a single-branch clone's probe already asked the
+        // remote what its `HEAD` names, and `repo_default_branch_name(the_repository, 0)` comes
+        // last, whose advice a clone that mapped refs gave already (see [`advise_default_branch`]).
+        let fallback = || {
+            probe
+                .as_ref()
+                .and_then(|probe| probe.head_target.clone())
+                .filter(|target| target.starts_with("refs/heads/"))
+                .or_else(|| {
+                    clone_default_branch_name(&git_dir, &config_pairs, !mapped_refs_empty(&outcome.ref_map, wants_head))
+                        .map(|branch| format!("refs/heads/{branch}"))
+                })
+        };
+        // A bundle's refs are advertised in the reverse of the header's order (`get_refs_from_bundle()`
+        // prepends, transport.c:163-172), which is the order `get_fetch_map()` maps them in. The
+        // scratch repository standing in for the bundle advertises them sorted.
+        let bundle_order = bundle_transport.as_ref().and_then(|bt| {
+            let (header, _) = super::bundle::open_bundle(&bt.path.to_string_lossy()).ok()?;
+            Some(header.refs.iter().rev().map(|(_, name)| name.clone()).collect::<Vec<_>>())
+        });
+        let reordered;
+        let ref_map = match &bundle_order {
+            Some(order) => {
+                let position = |name: &[u8]| order.iter().position(|n| n.as_slice() == name).unwrap_or(usize::MAX);
+                let mut map = outcome.ref_map.clone();
+                map.remote_refs.sort_by_key(|r| position(r.unpack().0));
+                map.mappings.sort_by_key(|m| m.remote.as_name().map_or(usize::MAX, |name| position(name)));
+                reordered = map;
+                &reordered
+            }
+            None => &outcome.ref_map,
+        };
+        write_clone_refs(&*repo, ref_map, v2, &plan, fallback)
+    };
     let result = (|| -> Result<()> {
         // git's `transport.c` warns as soon as it has the capability list and then transfers
         // everything, leaving the promisor configuration in place regardless.
-        // `guess_remote_head()`, shared with `git remote set-head` and the fetch path. Anything but a
-        // single answer leaves the remote's `HEAD` undetermined, which git treats as nothing to link.
-        let mut note_remote_head = |ref_map: &gix::remote::fetch::RefMap| {
-            if let [head] = super::remote::remote_head_names(ref_map).as_slice() {
-                remote_head_branch = Some(head.clone());
-            }
-        };
         let mut note_filter_support = |handshake: &gix::protocol::Handshake| {
             filter_supported = gix::protocol::fetch::filter::is_supported(
                 handshake.server_protocol_version,
@@ -2074,10 +2175,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // fetches the pack and writes the refs/`HEAD` but leaves the worktree
             // (and index) empty. Fetching is the whole job in both cases.
             let fetched = prepare.fetch_only(meters.clone(), &should_interrupt);
-            let outcome = match fetched {
+            let (mut repo, outcome) = match fetched {
                 Ok((repo, outcome)) => {
                     check_pack(&repo, &outcome)?;
-                    outcome
+                    (repo, outcome)
                 }
                 // gitoxide refuses a fetch whose refspecs matched nothing; git calls that an
                 // empty clone and carries on, so the refusal is turned back into one. The
@@ -2087,6 +2188,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     gix::remote::fetch::Error::NoMapping { num_remote_refs, .. },
                 )) if branch.is_none() => {
                     cloned_empty = true;
+                    fetch_mapped_nothing = true;
                     remote_advertised_refs = num_remote_refs > 0;
                     warn_empty();
                     say_done();
@@ -2103,28 +2205,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
                 }
             };
-            let tracking_head = format!("refs/remotes/{effective_remote_name}/HEAD");
-            remote_advertised_tracking_head = outcome
-                .ref_map
-                .remote_refs
-                .iter()
-                .any(|r| r.unpack().0 == tracking_head.as_bytes());
-            remote_advertised_refs = advertises_refs(&outcome.ref_map);
-            if mapped_refs_empty(&outcome.ref_map) {
+            if mapped_refs_empty(&outcome.ref_map, wants_head) {
                 cloned_empty = true;
-                unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty();
             } else if branch.is_none() && revision.is_none() {
                 advise_default_branch(&git_dir, &config_pairs, &outcome.ref_map);
             }
             say_done();
-            note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
-            if revision.is_some() {
-                if let Ok(repo) = gix::open(&git_dir) {
-                    report_revision_head(&repo, &outcome.ref_map);
-                }
-            }
+            write_refs(&mut repo, &outcome)?;
             // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
             // before touching the worktree, but `junk_mode` has already moved on.
             junk.leave();
@@ -2140,6 +2229,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     gix::remote::fetch::Error::NoMapping { num_remote_refs, .. },
                 )) if branch.is_none() => {
                     cloned_empty = true;
+                    fetch_mapped_nothing = true;
                     remote_advertised_refs = num_remote_refs > 0;
                     warn_empty();
                     say_done();
@@ -2156,20 +2246,15 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
                 }
             };
-            remote_advertised_refs = advertises_refs(&outcome.ref_map);
-            if mapped_refs_empty(&outcome.ref_map) {
+            if mapped_refs_empty(&outcome.ref_map, wants_head) {
                 cloned_empty = true;
-                unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty();
             } else if branch.is_none() && revision.is_none() {
                 advise_default_branch(&git_dir, &config_pairs, &outcome.ref_map);
             }
             say_done();
-            note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
-            if revision.is_some() {
-                report_revision_head(checkout.repo(), &outcome.ref_map);
-            }
+            write_refs(checkout.repo_mut(), &outcome)?;
             // `--sparse` is set up before anything is checked out:
             //
             // ```c
@@ -2331,87 +2416,44 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         None => git_dir,
     };
 
-    // `update_remote_refs()` writes the refs a clone stores through
-    // `initial_ref_transaction_commit()`, which puts them straight into `packed-refs` — so
-    // the files backend creates that file even for a clone that stored no ref at all,
-    // leaving it with nothing but the header. gitoxide runs no transaction when there is
-    // nothing to write, so the empty file is written here. A remote that advertised no
-    // ref at all never reaches `write_remote_refs()` (`if (refs)`, builtin/clone.c:554),
-    // so it gets no file. A `--revision` clone stores no ref either — its refspec has no
-    // destination — but its remote did advertise the revision.
-    let packed = git_dir.join("packed-refs");
-    if revision.is_some() && !packed.exists() {
-        std::fs::write(&packed, "# pack-refs with: peeled fully-peeled sorted \n")?;
-    }
-    if cloned_empty {
-        // A single-branch fetch whose refspec came out empty sent ls-refs no `refs/heads/`
-        // prefix, so what the remote had under it is known only from the probe.
-        let probe_advertised_refs = single_outcome
+    // gitoxide refuses a fetch whose refspecs matched nothing before any ref is written, so the
+    // refs of such a clone are written here: `write_remote_refs()` with no mapped ref when the
+    // remote advertised anything (`if (refs)`, builtin/clone.c:554-558), and `update_head()` with
+    // neither `our` nor `remote`:
+    //
+    // ```c
+    // } else if (unborn && skip_prefix(unborn, "refs/heads/", &head)) {
+    //         /*
+    //          * Unborn head from remote; same as "our" case above except
+    //          * that we have no ref to update.
+    //          */
+    //         if (refs_update_symref(get_main_ref_store(the_repository), "HEAD", unborn, NULL) < 0)
+    //                 die(_("unable to update HEAD"));
+    //         if (!option_bare)
+    //                 install_branch_config(0, head, remote_name, unborn);
+    // }
+    // ```
+    //
+    // (`update_head()`, builtin/clone.c:603-611.) The clone adopts the remote's idea of the default
+    // branch even though no ref was fetched. A single-branch plan already asked the remote what its
+    // HEAD names while building its refspec, so that probe supplies the target; a remote that sent
+    // no `unborn` line leaves the clone on this machine's default branch (builtin/clone.c:1569-1572).
+    if fetch_mapped_nothing {
+        if reftable {
+            create_reftable_ref_store(&git_dir)?;
+        }
+        let repo = gix::open(&git_dir)?;
+        let plan = ref_writes(remote_advertised_refs);
+        update_remote_refs(&repo, &[], &[], None, &plan)?;
+        let unborn_head = single_outcome
             .lock()
             .expect("clone is single-threaded here")
             .as_ref()
-            .is_some_and(|probe| {
-                probe.advertised_head_or_branch || (probe.advertised_tag && tags != Some(Tags::None))
-            });
-        if (remote_advertised_refs || probe_advertised_refs) && !packed.exists() {
-            std::fs::write(&packed, "# pack-refs with: peeled fully-peeled sorted \n")?;
-        }
-        // ```c
-        // } else if (unborn && skip_prefix(unborn, "refs/heads/", &head)) {
-        //         /*
-        //          * Unborn head from remote; same as "our" case above except
-        //          * that we have no ref to update.
-        //          */
-        //         if (refs_update_symref(get_main_ref_store(the_repository), "HEAD", unborn, NULL) < 0)
-        //                 die(_("unable to update HEAD"));
-        //         if (!option_bare)
-        //                 install_branch_config(0, head, remote_name, unborn);
-        // }
-        // ```
-        //
-        // (`update_head()`, builtin/clone.c:603-611.) The clone adopts the remote's idea of
-        // the default branch even though no ref was fetched, so a later commit lands on the
-        // branch the remote is waiting for rather than on this machine's default.
-        // A single-branch plan already asked the remote what its HEAD names — including the
-        // `unborn` answer — while building its refspec, so that probe supplies the target
-        // when the fetch itself never got far enough to report one.
-        //
-        // ```c
-        // } else {
-        //         branch = to_free = repo_default_branch_name(the_repository, 0);
-        //         unborn_head = xstrfmt("refs/heads/%s", branch);
-        // }
-        // ```
-        //
-        // (builtin/clone.c:1569-1572.) A remote that sent no `unborn` line — protocol v0/v1,
-        // or `lsrefs.unborn` turned off — leaves the clone on this machine's default branch,
-        // and the branch config is installed for it all the same.
-        let unborn_head = unborn_head
-            .or_else(|| {
-                single_outcome
-                    .lock()
-                    .expect("clone is single-threaded here")
-                    .as_ref()
-                    .and_then(|probe| probe.head_target.clone())
-            })
+            .and_then(|probe| probe.head_target.clone())
             .or_else(|| {
                 clone_default_branch_name(&git_dir, &config_pairs, false).map(|branch| format!("refs/heads/{branch}"))
             });
-        if let Some(target) = unborn_head.as_deref().filter(|t| t.starts_with("refs/heads/")) {
-            std::fs::write(git_dir.join("HEAD"), format!("ref: {target}\n"))?;
-            if !bare {
-                if let Ok(repo) = gix::open(&git_dir) {
-                    let head = target.trim_start_matches("refs/heads/").to_string();
-                    let remote = resolve_remote_name(&repo, origin.as_deref());
-                    super::branch::install_tracking(
-                        &repo,
-                        &head,
-                        &(remote, target.to_string(), head.clone()),
-                        true,
-                    )?;
-                }
-            }
-        }
+        update_head(&repo, None, None, unborn_head.as_deref(), &plan)?;
     }
 
     // `clone_local()`: with a local source, git never runs the transport at all — it
@@ -2488,84 +2530,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `write_remote_refs()` commits the remote-tracking refs through
-    // `initial_ref_transaction_commit()`, which writes no reflog at all — a fresh clone
-    // has logs for `HEAD`, the checked-out branch and `refs/remotes/<remote>/HEAD`, and
-    // nothing else. gitoxide logs every ref it writes, so the extra files are removed.
-    remove_initial_remote_reflogs(&git_dir, origin.as_deref().unwrap_or("origin"));
-    let checked_out_branch = (!bare)
-        .then(|| std::fs::read_to_string(git_dir.join("HEAD")).ok())
-        .flatten()
-        .and_then(|head| {
-            head.trim_end()
-                .strip_prefix("ref: refs/heads/")
-                .map(str::to_string)
-        });
-    remove_initial_branch_reflogs(&git_dir, checked_out_branch.as_deref());
-
-    // ```c
-    // if (our && skip_prefix(our->name, "refs/heads/", &head)) {
-    //         /* Local default branch link */
-    //         if (create_symref("HEAD", our->name, NULL) < 0)
-    //                 die(_("unable to update HEAD"));
-    //         if (!option_bare) {
-    //                 update_ref(msg, "HEAD", &our->old_oid, NULL, 0,
-    //                            UPDATE_REFS_DIE_ON_ERR);
-    //                 install_branch_config(0, head, remote_name, our->name);
-    //         }
-    // }
-    // ```
-    //
-    // (`update_head()`, builtin/clone.c:619-627.) A bare clone whose `HEAD` names
-    // a branch never reaches the `update_ref(msg, …)` line: the only write is the
-    // symref creation, and it is passed a NULL reflog message. So with
-    // `core.logAllRefUpdates` on, `logs/HEAD` gets the entry without the
-    // `clone: from <url>` text. The detached arms below (`--branch <tag>`, a
-    // remote `HEAD` on a non-branch) do call `update_ref(msg, …)` and keep it,
-    // which is why this is scoped to a bare clone still on a branch.
-    if bare {
-        strip_head_reflog_message(&git_dir);
-    }
-
-    // The tags of a `--single-branch` clone are written by `write_followtags()`,
-    // which runs *after* `write_remote_refs()` and outside its transaction, so
-    // they land as loose files while the mapped refs are packed. See
-    // [`unpack_followed_tags`] for why gitoxide cannot make that split itself.
-    if included_tags {
-        // ```c
-        // else {
-        //         local_refs = NULL;
-        //         tail = &local_refs;
-        //         remote_head = copy_ref(find_remote_branch(refs, option_branch));
-        // }
-        // …
-        // /* if --branch=tag, pull the requested tag explicitly */
-        // get_fetch_map(remote_head, tag_refspec, &tail, 0);
-        // ```
-        //
-        // (`wanted_peer_refs()`, builtin/clone.c:483-500.) `--branch` may name a
-        // tag, and when it does the tag *is* the mapped ref: it goes through
-        // `write_remote_refs()` into `packed-refs` like any branch would, and
-        // `write_followtags()` then finds it already at that value and writes
-        // nothing loose for it. Only the tags the clone picked up on the side
-        // become loose files, so the `-b` target is held back here.
-        let mapped_tag = single_outcome
-            .lock()
-            .expect("clone is single-threaded here")
-            .as_ref()
-            .and_then(|probe| probe.fetched.clone())
-            .filter(|name| name.starts_with("refs/tags/"));
-        unpack_followed_tags(&git_dir, mapped_tag.as_deref())?;
-    }
-
-    // `init_db()` creates `refs/heads` and `refs/tags` for every repository it
-    // makes, clone included (`create_default_files()`, setup.c:2073). gitoxide
-    // leaves out whichever of the two the clone had no loose ref to write, and a
-    // bare clone whose refs all landed in `packed-refs` ends up with no `refs`
-    // directory at all — which stock git then refuses to open, because
-    // `is_git_directory()` requires it (setup.c:397).
-    ensure_ref_directories(&git_dir)?;
-
     // Reconcile `.git/config` with what stock git leaves behind: strip the entries
     // gitoxide persisted that git does not, add the ones git writes itself, and
     // apply the `-c` pairs last so gitoxide's own config rewrites cannot drop them.
@@ -2590,42 +2554,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         },
     )?;
 
-    // ... and so is the `clone: from <url>` the reflogs carry, which gitoxide
-    // wrote from the url it fetched through (`gix/src/clone/fetch/mod.rs`).
-    if let Some(bt) = &bundle_transport {
-        rewrite_clone_reflog_source(&git_dir, &bt.reflog_from, &bt.shown)?;
-    }
-
-    // Drop gitoxide's implicit `refs/remotes/<name>/HEAD` wherever git would not
-    // have written it: a bare or mirrored clone has no remote-tracking hierarchy at
-    // all, and a `--single-branch` clone only gets the symbolic head when the branch
-    // the remote's `HEAD` points at is the one that was fetched.
-    let drop_head_tracking = if bare {
-        !(mirror && remote_advertised_tracking_head)
-    } else {
-        match &*single_outcome.lock().expect("clone is single-threaded here") {
-            Some(probe) => probe.head_target.as_deref() != probe.fetched.as_deref(),
-            // `update_remote_refs()` writes `refs/remotes/<name>/HEAD` from
-            // `remote_head_points_at`, which `guess_remote_head()` leaves NULL when the
-            // remote's HEAD names a branch it does not advertise — so there is no ref for
-            // the symref to point at and git writes none.
-            None => remote_head_branch.is_none(),
-        }
-    };
-    if drop_head_tracking {
-        remove_remote_tracking_head(&git_dir)?;
-    } else if !bare {
-        // `update_remote_refs()` writes `refs/remotes/<name>/HEAD` with `refs_update_symref()`,
-        // pointing at the *tracking ref* of the branch the remote's `HEAD` names — not at its object
-        // id. That is what lets a clone's `origin/HEAD` keep following `origin/<default>` as later
-        // fetches move it. gitoxide's implicit `HEAD:refs/remotes/<name>/HEAD` mapping resolves the
-        // symref to the object instead (`new_value_by_remote()` in `update_refs`), so it is relinked
-        // here. git writes nothing at all for a bare clone, which the branch above already handles.
-        if let Some(branch) = remote_head_branch.as_deref() {
-            link_remote_tracking_head(&git_dir, branch)?;
-        }
-    }
-
     // `init.defaultSubmodulePathConfig=true` opts every new repository into the
     // submodule-path extension; git applies it to `git clone` exactly as it does
     // to `git init` (verified against stock git 2.55.0, which writes
@@ -2638,96 +2566,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         == Some(true)
     {
         super::init::enable_submodule_path_config(&git_dir)?;
-    }
-
-    // `--mirror` together with `--branch` maps every tag twice, and the ref
-    // transaction that would write them refuses:
-    //
-    // ```text
-    // $ git clone --bare --mirror -b feature . mirror.git
-    // Cloning into bare repository 'mirror.git'...
-    // done.
-    // fatal: multiple updates for ref 'refs/tags/v0.1.0' not allowed
-    // ```
-    //
-    // The mirror refspec `+refs/*:refs/*` already maps `refs/tags/<t>` onto
-    // itself, and `wanted_peer_refs()` appends `tag_refspec`
-    // (`refs/tags/*:refs/tags/*`) a second time when `--branch` is given, so each
-    // tag reaches `ref_transaction_commit()` as two updates of one name and
-    // `ref_update_reject_duplicates()` (refs.c) reports the first of them in
-    // sorted order.
-    //
-    // The vendored spec tree is git v2.39, whose `wanted_peer_refs()` guards that
-    // append with `if (!option_mirror && !option_single_branch && !option_no_tags)`
-    // (builtin/clone.c:510-511) and so cannot produce the duplicate. The
-    // condition below is therefore taken from the *binaries*, not from that
-    // source: git 2.55.0 and git 2.50.1 both die here, and both accept the same
-    // invocation once `--single-branch` is added (which takes the branch down the
-    // `if (option_single_branch)` arm, where the tag refspec is applied to the one
-    // fetched head only) or once the source carries no `refs/tags/*` at all.
-    // Measured on four fixtures: no tags is clean, `refs/namespaces/*/refs/tags/*`
-    // is clean (the refspec is literal), and a source with seven tags names the
-    // alphabetically first.
-    if mirror && branch.is_some() && single_branch != Some(true) {
-        let first_tag = gix::open(&git_dir).ok().and_then(|repo| {
-            let mut names: Vec<String> = repo
-                .references()
-                .ok()?
-                .prefixed("refs/tags/")
-                .ok()?
-                .filter_map(Result::ok)
-                .map(|r| r.name().as_bstr().to_string())
-                .collect();
-            names.sort();
-            names.into_iter().next()
-        });
-        if let Some(name) = first_tag {
-            eprintln!("fatal: multiple updates for ref '{name}' not allowed");
-            junk.remove_now();
-            return Ok(ExitCode::from(128));
-        }
-    }
-
-    // ```c
-    // if (our && skip_prefix(our->name, "refs/heads/", &head)) {
-    //         /* Local default branch link */
-    //         refs_update_symref(get_main_ref_store(the_repository), "HEAD", our->name, NULL);
-    //         [...]
-    // } else if (our) {
-    //         struct commit *c = lookup_commit_reference(the_repository, &our->old_oid);
-    //         /* --branch specifies a non-branch (i.e. tags), detach HEAD */
-    //         refs_update_ref(get_main_ref_store(the_repository), msg, "HEAD", &c->object.oid,
-    //                         NULL, REF_NO_DEREF, UPDATE_REFS_DIE_ON_ERR);
-    // }
-    // ```
-    //
-    // (`update_head()`, builtin/clone.c:594-620.) `-b` naming a *tag* does not
-    // point `HEAD` at the tag: it detaches at the commit the tag resolves to, so
-    // the clone comes out on a detached `HEAD` with no branch at all. gitoxide
-    // writes the symref for any checked-out ref, which leaves `HEAD` naming
-    // `refs/tags/…` — a state `fsck` rejects (`badHeadTarget: HEAD points to
-    // non-branch`).
-    //
-    // The id written is `lookup_commit_reference()`'s, the *peeled* one, so an
-    // annotated tag detaches at its commit and not at the tag object; the
-    // `clone: from …` reflog entry records that same id. Measured against stock
-    // 2.55.0, a ref whose own target is not a commit is announced first —
-    // `warning: refs/tags/v0.2.0 <tag-object> is not a commit!`, naming the ref
-    // and the unpeeled id — and the clone then carries on and detaches anyway.
-    if branch.is_some() {
-        detach_head_from_non_branch(&git_dir)?;
-    }
-
-    // Every ref this clone wrote has now been written, so the two ref stores can
-    // be reconciled — see [`drop_doubly_written_refs`] for which entries stock
-    // git leaves in `packed-refs` and why a ref that is in both files is one
-    // gitoxide wrote twice.
-    drop_doubly_written_refs(&git_dir)?;
-
-    // A reftable clone: the refs the files pipeline above settled are written into a reftable
-    // stack in the transactions git's clone makes — see [`adopt_reftable`].
-    if reftable {
-        adopt_reftable(&git_dir)?;
     }
 
     // `--sparse`: git initializes a cone-mode sparse-checkout containing only the
@@ -3159,182 +2997,8 @@ struct ConfigFixups<'a> {
 /// Apply [`ConfigFixups`] to `<git_dir>/config`.
 ///
 /// The `-c` values are written here, after the clone, rather than before the
-/// fetch: gitoxide re-serializes the whole local configuration from its own
-/// in-memory snapshot when it records `branch.<name>.*`, which would drop
-/// anything written to the file behind its back. The fetch and checkout still
-/// observe them, because they are also handed to gitoxide as in-memory overrides.
-/// Move `refs/tags/*` out of `packed-refs` and into loose ref files.
-///
-/// `update_remote_refs()` writes a single-branch clone's refs in two passes
-/// (clone.c:553-558):
-///
-/// ```c
-/// write_remote_refs(mapped_refs);
-/// if (option_single_branch && option_tags)
-///         write_followtags(refs, msg);
-/// ```
-///
-/// The first opens a `REF_TRANSACTION_FLAG_INITIAL` transaction, whose whole
-/// point is to write `packed-refs` in one shot. The second is a plain
-/// `refs_update_ref()` per tag, which writes an ordinary loose ref. The split is
-/// not cosmetic bookkeeping — it is why a `git clone --single-branch` leaves
-/// `refs/tags/v1` on disk while `refs/heads/main` is packed.
-///
-/// gitoxide has no equivalent split: `--single-branch` restricts which *branch*
-/// is mapped, and every ref the fetch produced — tags included — goes through
-/// the one transaction that writes `packed-refs`. Rather than reach into the
-/// fetch to split it, the two-pass result is reconstructed here, which lands the
-/// same bytes in the same files.
-///
-/// A tag that already has a loose file keeps it; only the `packed-refs` entry
-/// (and its `^peeled` line) is dropped, since the loose ref is the one git
-/// resolves anyway.
-fn unpack_followed_tags(git_dir: &Path, mapped_tag: Option<&str>) -> Result<()> {
-    let packed_path = git_dir.join("packed-refs");
-    let Ok(body) = std::fs::read_to_string(&packed_path) else {
-        return Ok(());
-    };
-
-    let mut kept = String::with_capacity(body.len());
-    let mut unpacked: Vec<(String, String)> = Vec::new();
-    // A `^<oid>` line belongs to the ref line above it, so it travels with it:
-    // dropped when that ref moves out, kept when it stays.
-    let mut dropping_peel = false;
-    for line in body.lines() {
-        if let Some(peeled) = line.strip_prefix('^') {
-            if dropping_peel {
-                // The peeled value is an accelerator for the packed store only;
-                // a loose ref file holds the tag object's id and nothing else.
-                let _ = peeled;
-                continue;
-            }
-            kept.push_str(line);
-            kept.push('\n');
-            continue;
-        }
-        dropping_peel = false;
-        match line.split_once(' ') {
-            // `mapped_tag` is `write_remote_refs()`'s own ref, not a followed
-            // one, so it keeps the packed entry the initial transaction gave it.
-            Some((oid, name)) if name.starts_with("refs/tags/") && Some(name) != mapped_tag => {
-                unpacked.push((name.to_string(), oid.to_string()));
-                dropping_peel = true;
-            }
-            _ => {
-                kept.push_str(line);
-                kept.push('\n');
-            }
-        }
-    }
-
-    if unpacked.is_empty() {
-        return Ok(());
-    }
-
-    for (name, oid) in &unpacked {
-        let path = git_dir.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("could not create {}", parent.display()))?;
-        }
-        std::fs::write(&path, format!("{oid}\n"))
-            .with_context(|| format!("could not write {}", path.display()))?;
-    }
-    std::fs::write(&packed_path, kept)
-        .with_context(|| format!("could not write {}", packed_path.display()))?;
-    Ok(())
-}
-
-/// Drop a `packed-refs` entry that also exists as a loose ref file.
-///
-/// A clone writes its refs in two disjoint passes, and which pass a ref went
-/// through decides which of the two ref stores holds it:
-///
-/// ```c
-/// t = ref_store_transaction_begin(get_main_ref_store(the_repository),
-///                                 REF_TRANSACTION_FLAG_INITIAL, &err);
-/// [...]
-/// if (initial_ref_transaction_commit(t, &err))
-///         die("%s", err.buf);
-/// ```
-///
-/// (`write_remote_refs()`, builtin/clone.c.) `REF_TRANSACTION_FLAG_INITIAL` is
-/// the flag that writes straight into `packed-refs` in one shot, and the only
-/// refs it is given are the *mapped* ones — the fetch's local destinations.
-/// Everything the clone writes afterwards goes through an ordinary
-/// `refs_update_ref()`/`refs_update_symref()` and lands loose: the local branch
-/// `update_head()` creates, the `refs/remotes/<origin>/HEAD` symref
-/// `set_remote_head()` writes, and the followed tags [`unpack_followed_tags`]
-/// covers. So in a stock clone the packed set and the loose set never overlap —
-/// measured against 2.55.0, a plain clone packs `refs/remotes/origin/main` alone
-/// and leaves `refs/heads/main` and `refs/remotes/origin/HEAD` loose, while a
-/// `--bare` clone packs `refs/heads/main` and leaves nothing loose.
-///
-/// gitoxide draws the line elsewhere: the same ref can come out of the clone
-/// both packed *and* loose, which left a plain clone's `packed-refs` naming
-/// `refs/heads/main` and `refs/remotes/origin/HEAD` on top of the one entry
-/// stock writes. Nothing resolves differently for it — a loose file wins over
-/// the packed entry — but the file is part of the repository stock git reads
-/// back, so the duplicates are removed here rather than left as a spurious
-/// difference.
-///
-/// Only the `packed-refs` side is touched, and only where a loose file already
-/// holds the same name: the ref itself, its value and its reflog are untouched,
-/// so this can never remove a ref from the repository.
-fn drop_doubly_written_refs(git_dir: &Path) -> Result<()> {
-    let packed_path = git_dir.join("packed-refs");
-    let Ok(body) = std::fs::read_to_string(&packed_path) else {
-        return Ok(());
-    };
-
-    let mut kept = String::with_capacity(body.len());
-    let mut dropped = false;
-    // A `^<oid>` line belongs to the ref line above it and travels with it.
-    let mut dropping_peel = false;
-    for line in body.lines() {
-        if line.starts_with('^') {
-            if dropping_peel {
-                continue;
-            }
-            kept.push_str(line);
-            kept.push('\n');
-            continue;
-        }
-        dropping_peel = false;
-        match line.split_once(' ') {
-            Some((_, name))
-                if name.starts_with("refs/") && git_dir.join(name).is_file() =>
-            {
-                dropped = true;
-                dropping_peel = true;
-            }
-            _ => {
-                kept.push_str(line);
-                kept.push('\n');
-            }
-        }
-    }
-
-    if !dropped {
-        return Ok(());
-    }
-    std::fs::write(&packed_path, kept)
-        .with_context(|| format!("could not write {}", packed_path.display()))?;
-    Ok(())
-}
-
-/// The two ref directories every git repository has, whether or not anything was
-/// ever written into them. Missing them is not cosmetic: `is_git_directory()`
-/// tests for `refs`, so a bare clone without it is not a repository as far as
-/// stock git is concerned.
-fn ensure_ref_directories(git_dir: &Path) -> Result<()> {
-    for sub in ["refs/heads", "refs/tags"] {
-        std::fs::create_dir_all(git_dir.join(sub))
-            .with_context(|| format!("could not create {}", git_dir.join(sub).display()))?;
-    }
-    Ok(())
-}
-
+/// fetch; the fetch and checkout observe them all the same, because they are
+/// also handed to gitoxide as in-memory overrides.
 fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     if !fixups.set_mirror
         && !fixups.drop_fetch
@@ -3508,45 +3172,6 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Delete `refs/remotes/*/HEAD`, the remote-tracking ref gitoxide always creates
-/// from its implicit `HEAD:refs/remotes/<name>/HEAD` refspec. Callers invoke this
-/// only where git writes no such ref, so the only candidate present is gitoxide's
-/// own. The ref is removed whether it is loose or packed; nothing else under
-/// `refs/remotes/` is touched.
-fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
-    let repo = match gix::open(git_dir) {
-        Ok(r) => r,
-        // A repository we cannot reopen has nothing for us to clean up; the clone
-        // itself already succeeded.
-        Err(_) => return Ok(()),
-    };
-    let names: Vec<gix::refs::FullName> = repo
-        .references()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .prefixed("refs/remotes/")
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .filter_map(Result::ok)
-        .map(|r| r.name().to_owned())
-        .filter(|n| n.as_bstr().ends_with(b"/HEAD"))
-        .collect();
-    for name in names {
-        repo.edit_reference(gix::refs::transaction::RefEdit {
-            change: gix::refs::transaction::Change::Delete {
-                expected: gix::refs::transaction::PreviousValue::Any,
-                log: gix::refs::transaction::RefLog::AndReference,
-                message: Default::default(),
-            },
-            name,
-            deref: false,
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    // A deleted loose ref leaves its directories behind; git's clone never creates
-    // them at all, so prune the empty ones back to (and excluding) `refs/`.
-    prune_empty_dirs(&git_dir.join("refs").join("remotes"));
-    Ok(())
-}
-
 /// `get_pack()`'s death of a pack stream that ended early, for a clone: `transport_set_option(transport,
 /// TRANS_OPT_KEEP, "yes")` (builtin/clone.c:1362) with the `unpack_limit` `fetch_pack_setup()` read
 /// (fetch-pack.c:2015-2026), and `index-pack` required by a filter's `--from-promisor` or by
@@ -3648,72 +3273,6 @@ fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: 
         }
         other => other.into(),
     }
-}
-
-/// Turn the `refs/remotes/<name>/HEAD` a clone just wrote into a symbolic ref to
-/// `refs/remotes/<name>/<branch>`, as `update_remote_refs()` does with `refs_update_symref()`.
-///
-/// The tracking ref has to be there: git derives the symref from `remote_head_points_at->peer_ref`,
-/// which by construction is one of the refs the clone stored. When it is not — a `--branch` clone of
-/// a tag, say — there is nothing to point at and the ref is left as the object it already names.
-fn link_remote_tracking_head(git_dir: &Path, branch: &str) -> Result<()> {
-    let repo = match gix::open(git_dir) {
-        Ok(r) => r,
-        Err(_) => return Ok(()),
-    };
-    let names: Vec<gix::refs::FullName> = repo
-        .references()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .prefixed("refs/remotes/")
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .filter_map(Result::ok)
-        .map(|r| r.name().to_owned())
-        .filter(|n| n.as_bstr().ends_with(b"/HEAD"))
-        .collect();
-    for name in names {
-        let Some(remote) = name
-            .as_bstr()
-            .to_str()
-            .ok()
-            .and_then(|n| n.strip_prefix("refs/remotes/"))
-            .and_then(|n| n.strip_suffix("/HEAD"))
-        else {
-            continue;
-        };
-        let target = format!("refs/remotes/{remote}/{branch}");
-        if repo.try_find_reference(target.as_str())?.is_none() {
-            continue;
-        }
-        repo.edit_reference(gix::refs::transaction::RefEdit {
-            change: gix::refs::transaction::Change::Update {
-                log: gix::refs::transaction::LogChange {
-                    mode: gix::refs::transaction::RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: "clone: from remote".into(),
-                },
-                expected: gix::refs::transaction::PreviousValue::Any,
-                new: gix::refs::Target::Symbolic(gix::refs::FullName::try_from(target.as_str())?),
-            },
-            name,
-            deref: false,
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    Ok(())
-}
-
-/// Remove `dir` and every empty directory inside it, deepest first. Non-empty
-/// directories, and anything that is not a directory, are left alone.
-fn prune_empty_dirs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.path().is_dir() {
-            prune_empty_dirs(&entry.path());
-        }
-    }
-    let _ = std::fs::remove_dir(dir);
 }
 
 /// Split a `-c <key>=<value>` argument the way git's `git_config_parse_parameter`
@@ -3878,9 +3437,6 @@ struct BundleTransport {
     dir_str: String,
     /// `dir` as the clone's url.
     url: gix::Url,
-    /// The `clone: from <url>` message gitoxide writes for `url`, which names the
-    /// scratch repository and has to be rewritten to name the bundle.
-    reflog_from: String,
 }
 
 impl BundleTransport {
@@ -3888,19 +3444,12 @@ impl BundleTransport {
         let dir = git_dir.join("zvcs-bundle-transport");
         let dir_str = dir.to_string_lossy().into_owned();
         let url = gix::url::parse(dir_str.as_str().into())?;
-        // `PrepareFetch::new_inner` absolutizes the url before it becomes the
-        // reflog message (`gix/src/clone/mod.rs`), so absolutize the same way here
-        // rather than guessing at the rendering.
-        let mut absolute = url.clone();
-        absolute.absolutize(Path::new(""));
-        let reflog_from = format!("clone: from {}", absolute.to_bstring());
         Ok(BundleTransport {
             path,
             shown,
             dir,
             dir_str,
             url,
-            reflog_from,
         })
     }
 
@@ -4007,38 +3556,6 @@ fn guess_remote_head(
                 .find(|(oid, name)| *oid == head.0 && name.starts_with(b"refs/heads/"))
                 .and_then(|(_, name)| String::from_utf8(name.clone()).ok())
         })
-}
-
-/// Rewrite the `clone: from <url>` message every reflog this clone wrote carries,
-/// from the url the fetch really ran against to the one the caller named. Only
-/// a bundle clone needs it: it is the one source whose objects arrive from
-/// somewhere other than the recorded remote.
-fn rewrite_clone_reflog_source(git_dir: &Path, from: &str, to: &str) -> Result<()> {
-    let mut stack = vec![git_dir.join("logs")];
-    let replacement = format!("clone: from {to}");
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let path = entry.path();
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                stack.push(path);
-                continue;
-            }
-            // Reflog lines are bytes, not text: a ref name or a committer name
-            // need not be UTF-8, and decoding one lossily would rewrite it.
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if !bytes.contains_str(from) {
-                continue;
-            }
-            let rewritten = bytes.replace(from.as_bytes(), replacement.as_bytes());
-            std::fs::write(&path, rewritten)?;
-        }
-    }
-    Ok(())
 }
 
 /// The object store `clone_local()` copies from.
@@ -4524,15 +4041,23 @@ fn unborn_head_target(ref_map: &gix::remote::fetch::RefMap) -> Option<String> {
     })
 }
 
-/// Whether git's `mapped_refs` is empty: `wanted_peer_refs()` runs `get_fetch_map()` over
-/// the remote's own `fetch` refspecs only (builtin/clone.c:443-471). The
+/// Whether git's `mapped_refs` is empty: `wanted_peer_refs()` starts the list with the
+/// remote's `HEAD` when `opts->wants_head` and the remote advertised one, and runs
+/// `get_fetch_map()` over the remote's own `fetch` refspecs (builtin/clone.c:443-471). The
 /// `HEAD:refs/remotes/<name>/HEAD` refspec gitoxide adds for itself is implicit and maps
-/// even an unborn `HEAD`, so its mappings do not count.
-fn mapped_refs_empty(ref_map: &gix::remote::fetch::RefMap) -> bool {
-    !ref_map
-        .mappings
-        .iter()
-        .any(|m| matches!(m.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)))
+/// even an unborn `HEAD`, which protocol v2 reports apart from the refs (connect.c:417-435),
+/// so its mappings do not count.
+fn mapped_refs_empty(ref_map: &gix::remote::fetch::RefMap, wants_head: bool) -> bool {
+    let head = wants_head
+        && ref_map
+            .remote_refs
+            .iter()
+            .any(|r| r.unpack().0 == "HEAD" && !matches!(r, Ref::Unborn { .. }));
+    !head
+        && !ref_map
+            .mappings
+            .iter()
+            .any(|m| matches!(m.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)))
 }
 
 /// The advice `repo_default_branch_name(the_repository, 0)` gives when `cmd_clone()` falls back to it for a
@@ -4588,71 +4113,6 @@ fn first_unreachable_component(path: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// `update_head()`'s `else if (our)` arm: `HEAD` naming something that is not a
-/// branch becomes a detached `HEAD` at the commit that ref resolves to.
-///
-/// Nothing happens unless `HEAD` is a symbolic ref outside `refs/heads/`, which
-/// is the state `--branch <tag>` leaves behind — every other clone already has
-/// the branch link git wants.
-///
-/// Two things move together, and a port that does only the first leaves a
-/// repository `fsck` rejects:
-///
-/// * `HEAD` itself, rewritten from `ref: refs/tags/<name>` to the object id.
-/// * The `clone: from <url>` reflog entry, whose new-value field gitoxide filled
-///   with the ref's own target — the *tag object* for an annotated tag, where git
-///   records the peeled commit.
-fn detach_head_from_non_branch(git_dir: &Path) -> Result<()> {
-    let head_path = git_dir.join("HEAD");
-    let Ok(text) = std::fs::read_to_string(&head_path) else { return Ok(()) };
-    let Some(target) = text.trim_end().strip_prefix("ref: ") else { return Ok(()) };
-    if target.starts_with("refs/heads/") {
-        return Ok(());
-    }
-    let target = target.to_string();
-    let Ok(repo) = gix::open(git_dir) else { return Ok(()) };
-    let Ok(mut reference) = repo.find_reference(target.as_str()) else { return Ok(()) };
-    let unpeeled = reference.target().try_id().map(ToOwned::to_owned);
-    // `lookup_commit_reference()` peels through tag objects; a ref whose own
-    // target is already a commit peels to itself and earns no warning.
-    let Ok(peeled) = reference.peel_to_id() else { return Ok(()) };
-    let peeled = peeled.detach();
-    if let Some(unpeeled) = unpeeled.filter(|id| *id != peeled) {
-        eprintln!("warning: {target} {unpeeled} is not a commit!");
-    }
-    std::fs::write(&head_path, format!("{peeled}\n"))?;
-
-    // The reflog is a single `clone: from <url>` line at this point; only its
-    // new-value field can be wrong, and only when the tag was annotated.
-    let log = git_dir.join("logs").join("HEAD");
-    if let Ok(body) = std::fs::read_to_string(&log) {
-        let fixed: String = body
-            .lines()
-            .map(|line| match line.split_once(' ') {
-                Some((old, rest)) => match rest.split_once(' ') {
-                    Some((_new, tail)) => format!("{old} {peeled} {tail}\n"),
-                    None => format!("{line}\n"),
-                },
-                None => format!("{line}\n"),
-            })
-            .collect();
-        std::fs::write(&log, fixed)?;
-    }
-
-    Ok(())
-}
-
-/// The warning `lookup_commit_or_die()` (commit.c:81-91) gives from `update_head()`
-/// (builtin/clone.c:587) when the `clone --revision` ref named a tag it had to peel:
-/// `<name> <oid> is not a commit!`.
-fn report_revision_head(repo: &gix::Repository, ref_map: &gix::remote::fetch::RefMap) {
-    let Some((name, advertised)) = gix::clone::fetch::revision_mapping(ref_map) else { return };
-    let Ok(head) = repo.head_id() else { return };
-    if head.detach() != advertised {
-        eprintln!("warning: {name} {advertised} is not a commit!");
-    }
 }
 
 /// Remove whatever the local fetch wrote into `objects/pack`.
@@ -4753,150 +4213,378 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
     Ok(())
 }
 
-/// Drop the per-branch reflogs under `logs/refs/remotes/<remote>/`, which
-/// `initial_ref_transaction_commit()` never creates. `HEAD` is kept: git writes that one
-/// through the ordinary ref machinery when it records where the remote points.
-/// The same cleanup for `refs/heads/`.
-///
-/// `write_remote_refs()` stores the branches through
-/// `initial_ref_transaction_commit()` too, so none of them gets a reflog however
-/// `core.logAllRefUpdates` is set. The one branch log a clone does leave behind
-/// belongs to the branch `HEAD` names in a worktree-bearing clone — and
-/// `--no-checkout` keeps it, since it is written on the way to pointing `HEAD` at
-/// the branch and not by the checkout. A bare clone therefore ends with
-/// `logs/HEAD` and nothing else, and so does a `-b <tag>` clone, whose `HEAD` is
-/// detached and names no branch at all.
-///
-/// Measured against stock 2.55.0: `git -c core.logAllRefUpdates=true clone --bare`
-/// writes `logs/HEAD` alone, where gitoxide logs every ref it wrote.
-fn remove_initial_branch_reflogs(git_dir: &Path, keep: Option<&str>) {
-    let root = git_dir.join("logs").join("refs").join("heads");
-    let keep_path = keep.map(|branch| root.join(branch));
-    fn walk(dir: &Path, keep: Option<&Path>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                walk(&path, keep);
-                let _ = std::fs::remove_dir(&path);
-                continue;
-            }
-            if keep.is_some_and(|k| k == path) {
-                continue;
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    walk(&root, keep_path.as_deref());
-    let _ = std::fs::remove_dir(&root);
+/// One entry of `wanted_peer_refs()`'s list (builtin/clone.c:443-471): a remote ref the clone's
+/// refspecs selected, and the local ref it is written to when it has a `peer_ref`.
+struct MappedRef {
+    /// The remote's name for it, or the hex id a `--revision` refspec spelled out.
+    name: gix::bstr::BString,
+    /// `old_oid`, as advertised.
+    id: gix::ObjectId,
+    /// `peer_ref->name`.
+    peer: Option<gix::refs::FullName>,
 }
 
-/// Drop the reflog message from `logs/HEAD` when `HEAD` is a symbolic ref to a
-/// branch — the state `create_symref("HEAD", our->name, NULL)` leaves in a bare
-/// clone, where no `update_ref()` with a message follows it.
-fn strip_head_reflog_message(git_dir: &Path) {
-    let head = git_dir.join("HEAD");
-    let points_at_branch = std::fs::read_to_string(&head)
-        .is_ok_and(|text| text.trim_end().starts_with("ref: refs/heads/"));
-    if !points_at_branch {
-        return;
-    }
-    let log = git_dir.join("logs").join("HEAD");
-    let Ok(body) = std::fs::read_to_string(&log) else {
-        return;
-    };
-    // The message is everything after the TAB that closes the committer field;
-    // git writes the line without one at all.
-    let stripped: String = body
-        .lines()
-        .map(|line| format!("{}\n", line.split_once('\t').map_or(line, |(head, _)| head)))
-        .collect();
-    if stripped != body {
-        let _ = std::fs::write(&log, stripped);
-    }
+/// What `cmd_clone()` has settled by the time it calls `update_remote_refs()` and
+/// `update_head()` (builtin/clone.c:1604-1608).
+struct RefWrites<'a> {
+    /// `remote_name`.
+    remote_name: &'a str,
+    /// `option_bare`.
+    bare: bool,
+    /// `option_single_branch`, as `cmd_clone()` resolved it.
+    single_branch: bool,
+    /// `option_tags`: cleared by `--no-tags`, `--mirror` and `--revision`
+    /// (builtin/clone.c:1036-1038, :1406).
+    tags: bool,
+    /// `option_branch`.
+    branch: Option<&'a str>,
+    /// `option_rev` given, which also sets `opts.detach` (builtin/clone.c:1405-1409).
+    revision: bool,
+    /// `reflog_msg`: `clone: from <repo>` (builtin/clone.c:1087-1088).
+    msg: &'a str,
+    /// `refs != NULL`: the remote advertised anything at all.
+    refs_advertised: bool,
+    /// `repo_default_branch_name(the_repository, REMOTE_GUESS_HEAD_QUIET)`, which `guess_remote_head()` asks.
+    default_branch: &'a str,
 }
 
-fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {
-    let dir = git_dir.join("logs").join("refs").join("remotes").join(remote);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() == "HEAD" {
-            continue;
-        }
-        let path = entry.path();
-        let _ = match entry.file_type().map(|t| t.is_dir()) {
-            Ok(true) => std::fs::remove_dir_all(&path),
-            _ => std::fs::remove_file(&path),
-        };
-    }
-}
-
-/// Store a finished clone's references in reftables, written in the transactions git's clone
-/// makes against a reftable ref store (builtin/clone.c, v2.56.0):
+/// `wanted_peer_refs()` (builtin/clone.c:443-471) over the refs the fetch mapped: `get_fetch_map()`
+/// for each refspec of `remote->fetch` in turn, which is the clone's own refspec followed by
+/// `TAG_REFSPEC` when `option_tags || option_branch` appended it (builtin/clone.c:1414-1419).
 ///
-/// 1. `write_remote_refs()` (:473-498): one `REF_TRANSACTION_FLAG_INITIAL` transaction creating
-///    every mapped ref — the files backend puts exactly these into `packed-refs`;
-/// 2. `write_followtags()` (:500-514): one `refs_update_ref(msg, …)` per tag a `--single-branch`
-///    clone follows — the loose `refs/tags/*` files;
-/// 3. `update_remote_refs()` (:556-568): `refs_update_symref(<branch_top>HEAD, …, msg)` — the
-///    loose `refs/remotes/<name>/HEAD` symref;
-/// 4. `update_head()` (:572-613): `HEAD` as a symref with no message and, outside a bare clone,
-///    the branch created through it with `msg` — the loose `refs/heads/<branch>` — or a detached
-///    `HEAD` written with `msg`.
-///
-/// `msg` is the `clone: from <url>` the files pipeline logged. Each transaction logs what the
-/// backend's `should_write_log()` asks for, and tags carry their peeled value
-/// (`ref_transaction_update()`, refs.c:1450-1454). The files ref store is removed and the
-/// reftable one laid down first (`ref_store_create_on_disk()`, refs.c:2226-2244), and the config
-/// gets what `initialize_repository_version()` (setup.c:2444-2512) writes into a clone's
-/// still-empty config before anything else: an `[extensions]` section ahead of `[core]`, and
-/// version 1.
-fn adopt_reftable(git_dir: &Path) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
-    use gix::refs::Target;
-
-    let files = gix::open(git_dir)?;
-    let bare = files.is_bare();
-    let head = std::fs::read(git_dir.join("HEAD"))?;
-    let head = match head.trim().strip_prefix(b"ref:") {
-        Some(target) => Target::Symbolic(target.trim().as_bstr().try_into()?),
-        None => Target::Object(gix::ObjectId::from_hex(head.trim())?),
-    };
-    let msg = std::fs::read(git_dir.join("logs").join("HEAD"))
-        .ok()
-        .and_then(|log| {
-            let last = log.lines().last()?.to_owned();
-            Some(last.find_byte(b'\t').map_or_else(Vec::new, |tab| last[tab + 1..].to_vec()))
+/// gitoxide maps `TAG_REFSPEC` as an implicit refspec of its own (`Tags::All`) where it maps it at
+/// all, so those entries are taken from the advertisement instead: every `refs/tags/*` maps onto
+/// itself. A `--single-branch` clone applies the refspecs to its one ref only, which its explicit
+/// refspec already names, tag or branch. A `--mirror --branch` clone maps every tag twice, once
+/// through `+refs/*:refs/*` and once through `TAG_REFSPEC`.
+fn wanted_peer_refs(ref_map: &gix::remote::fetch::RefMap, plan: &RefWrites<'_>) -> Vec<MappedRef> {
+    use gix::protocol::fetch::refmap::SpecIndex;
+    let mut explicit: Vec<(usize, &gix::remote::fetch::refmap::Mapping)> = ref_map
+        .mappings
+        .iter()
+        .filter_map(|m| match m.spec_index {
+            SpecIndex::ExplicitInRemote(idx) => Some((idx, m)),
+            SpecIndex::Implicit(_) => None,
         })
-        .unwrap_or_default();
-
-    let mut initial = Vec::new();
-    let mut followtags = Vec::new();
-    let mut remote_heads = Vec::new();
-    let mut created_branch = None;
-    for reference in files.references()?.all()? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let name = reference.name().to_owned();
-        let target = reference.target().into_owned();
-        let loose = git_dir.join(gix::path::from_bstr(name.as_bstr())).is_file();
-        let full = name.as_bstr();
-        if !loose {
-            initial.push((name, target));
-        } else if full.starts_with(b"refs/tags/") {
-            followtags.push((name, target));
-        } else if full.starts_with(b"refs/remotes/") && full.ends_with(b"/HEAD") && target.try_name().is_some() {
-            remote_heads.push((name, target));
-        } else if !bare && matches!(&head, Target::Symbolic(h) if h == &name) {
-            created_branch = target.try_id().map(ToOwned::to_owned);
-        } else {
-            initial.push((name, target));
+        .collect();
+    explicit.sort_by_key(|(idx, _)| *idx);
+    let mut mapped: Vec<MappedRef> = explicit
+        .into_iter()
+        .filter_map(|(_, m)| {
+            let id = m.remote.as_id()?.to_owned();
+            Some(MappedRef {
+                name: m.remote.as_name().map_or_else(|| id.to_string().into(), ToOwned::to_owned),
+                id,
+                peer: m.local.as_ref().and_then(|local| gix::refs::FullName::try_from(local.clone()).ok()),
+            })
+        })
+        .collect();
+    if (plan.tags || plan.branch.is_some()) && !plan.revision && !plan.single_branch {
+        for r in &ref_map.remote_refs {
+            let (name, Some(id), _) = r.unpack() else { continue };
+            if !name.starts_with(b"refs/tags/") {
+                continue;
+            }
+            mapped.push(MappedRef {
+                name: name.to_owned(),
+                id: id.to_owned(),
+                peer: gix::refs::FullName::try_from(name.to_owned()).ok(),
+            });
         }
     }
-    drop(files);
+    mapped
+}
 
-    // The files ref store goes, the reftable one comes.
+/// `find_remote_branch()` (builtin/clone.c:422-441): `refs/heads/<branch>`, else `refs/tags/<branch>`.
+fn find_remote_branch<'m>(mapped: &'m [MappedRef], branch: &str) -> Option<&'m MappedRef> {
+    let find = |full: String| mapped.iter().find(|r| r.name == full.as_bytes());
+    find(format!("refs/heads/{branch}")).or_else(|| find(format!("refs/tags/{branch}")))
+}
+
+/// `guess_remote_head(head, refs, REMOTE_GUESS_HEAD_QUIET)` (remote.c:2583-2638) over the mapped refs:
+/// the branch a symbolic `HEAD` names, else the default branch, then `master`, then the first other
+/// branch at `HEAD`'s object.
+fn guess_mapped_head<'m>(head: Option<&Ref>, mapped: &'m [MappedRef], default_branch: &str) -> Option<&'m MappedRef> {
+    let find = |name: &[u8]| mapped.iter().find(|r| r.name == name);
+    match head? {
+        Ref::Symbolic { target, .. } => find(target),
+        Ref::Direct { object, .. } => {
+            let at = |name: &str| find(name.as_bytes()).filter(|r| r.id == *object);
+            at(&format!("refs/heads/{default_branch}"))
+                .or_else(|| at("refs/heads/master"))
+                .or_else(|| {
+                    mapped
+                        .iter()
+                        .find(|r| r.name.starts_with(b"refs/heads/") && r.id == *object)
+                })
+        }
+        Ref::Peeled { .. } | Ref::Unborn { .. } => None,
+    }
+}
+
+/// Commit `edit` as a transaction of its own, the way `refs_update_ref()` and
+/// `refs_update_symref()` do. A reftable store is handed the object database for the peeled
+/// value it records with an annotated tag; the files backend writes the loose ref alone.
+fn commit_ref_edit(repo: &gix::Repository, edit: gix::refs::transaction::RefEdit) -> Result<()> {
+    use gix::refs::file::transaction::PackedRefs;
+    let packed = if crate::refstore::is_reftable(repo) {
+        PackedRefs::DeletionsAndNonSymbolicUpdates(Box::new(repo.objects.clone()))
+    } else {
+        PackedRefs::DeletionsOnly
+    };
+    repo.refs
+        .transaction()
+        .packed_refs(packed)
+        .log_symref_updates()
+        .prepare([edit], gix::lock::acquire::Fail::Immediately, gix::lock::acquire::Fail::Immediately)?
+        .commit(repo.committer().transpose()?)?;
+    Ok(())
+}
+
+/// `refs_update_ref(msg, name, new, NULL, flags, UPDATE_REFS_DIE_ON_ERR)` (refs.c), `deref` being
+/// `!(flags & REF_NO_DEREF)`; `msg` is `None` for a NULL message, which logs no text at all.
+fn update_ref(repo: &gix::Repository, msg: Option<&str>, name: &str, new: gix::refs::Target, deref: bool) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    commit_ref_edit(
+        repo,
+        RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: msg.unwrap_or_default().into(),
+                },
+                expected: PreviousValue::Any,
+                new,
+            },
+            name: name.try_into()?,
+            deref,
+        },
+    )
+}
+
+/// `refs_update_symref(refs, name, target, msg)` (refs.c): `name` made a symbolic ref to `target`
+/// with `REF_NO_DEREF`, in a transaction of its own.
+fn update_symref(repo: &gix::Repository, name: &str, target: &str, msg: Option<&str>) -> Result<()> {
+    update_ref(repo, msg, name, gix::refs::Target::Symbolic(target.try_into()?), false)
+}
+
+/// `update_remote_refs()` (builtin/clone.c:534-570) without the connectivity check, which the fetch
+/// already made:
+///
+/// ```c
+/// if (refs) {
+///         write_remote_refs(mapped_refs);
+///         if (option_single_branch && option_tags)
+///                 write_followtags(refs, msg);
+/// }
+///
+/// if (remote_head_points_at && remote_head_points_at->peer_ref && !option_bare) {
+///         ...
+///         if (refs_update_symref(get_main_ref_store(the_repository), head_ref.buf,
+///                                remote_head_points_at->peer_ref->name,
+///                                msg) < 0)
+///                 die(_("unable to update %s"), head_ref.buf);
+/// ```
+///
+/// `write_remote_refs()` creates every mapped ref that has a `peer_ref` in one
+/// `REF_TRANSACTION_FLAG_INITIAL` transaction (builtin/clone.c:473-498), which the files backend
+/// writes straight into `packed-refs` without reflogs. `write_followtags()` then updates each
+/// advertised `refs/tags/*` whose object the clone has, one `refs_update_ref()` each
+/// (builtin/clone.c:500-514), and `<branch_top>HEAD` becomes a symbolic ref to the tracking ref of
+/// the branch the remote's `HEAD` names.
+fn update_remote_refs(
+    repo: &gix::Repository,
+    advertised: &[Ref],
+    mapped: &[MappedRef],
+    remote_head_points_at: Option<&MappedRef>,
+    plan: &RefWrites<'_>,
+) -> Result<()> {
+    if plan.refs_advertised {
+        let creations: Vec<(gix::refs::FullName, gix::ObjectId)> = mapped
+            .iter()
+            .filter_map(|r| Some((r.peer.clone()?, r.id)))
+            .collect();
+        repo.refs
+            .initial_transaction_commit(
+                &creations,
+                Box::new(repo.objects.clone()),
+                repo.committer().transpose()?,
+                gix::lock::acquire::Fail::Immediately,
+            )
+            .map_err(|e| crate::fatal::die(e.to_string()))?;
+        if plan.single_branch && plan.tags {
+            for r in advertised {
+                let (name, Some(id), _) = r.unpack() else { continue };
+                // `odb_has_object(the_repository->objects, &ref->old_oid, 0)`: a tag outside what
+                // the pack brought is not followed, and without `HAS_OBJECT_FETCH_PROMISOR` a partial
+                // clone's promisor remote is not asked for it (builtin/clone.c:508).
+                if !name.starts_with(b"refs/tags/") {
+                    continue;
+                }
+                let fetch_if_missing = gix::odb::store::fetch_if_missing();
+                gix::odb::store::set_fetch_if_missing(false);
+                let has_object = gix::objs::Exists::exists(&repo.objects, id);
+                gix::odb::store::set_fetch_if_missing(fetch_if_missing);
+                if !has_object {
+                    continue;
+                }
+                update_ref(repo, Some(plan.msg), &name.to_str_lossy(), gix::refs::Target::Object(id.to_owned()), true)?;
+            }
+        }
+    }
+    if let Some(peer) = remote_head_points_at.and_then(|r| r.peer.as_ref()).filter(|_| !plan.bare) {
+        // `branch_top` is `refs/remotes/<name>/` outside a bare clone (builtin/clone.c:1298-1300).
+        let head_ref = format!("refs/remotes/{}/HEAD", plan.remote_name);
+        update_symref(repo, &head_ref, &peer.as_bstr().to_str_lossy(), Some(plan.msg))
+            .map_err(|_| crate::fatal::die(format!("unable to update {head_ref}")))?;
+    }
+    Ok(())
+}
+
+/// `update_head()` (builtin/clone.c:572-613): `HEAD` linked to the branch the clone checks out and,
+/// outside a bare clone, that branch created at the remote's value with its upstream configured; a
+/// detached `HEAD` for `--branch <tag>`, `--revision` and a remote `HEAD` that names no branch; or
+/// `HEAD` left unborn on the branch the remote's `HEAD` will become.
+fn update_head(
+    repo: &gix::Repository,
+    our: Option<&MappedRef>,
+    remote: Option<gix::ObjectId>,
+    unborn: Option<&str>,
+    plan: &RefWrites<'_>,
+) -> Result<()> {
+    let install_branch_config = |head: &str, merge: &str| {
+        // `install_branch_config(0, head, remote_name, our->name)`: quiet.
+        super::branch::install_tracking(
+            repo,
+            head,
+            &(plan.remote_name.to_string(), merge.to_string(), head.to_string()),
+            true,
+        )
+    };
+    match (our, remote, unborn) {
+        (Some(our), ..) if !plan.revision && our.name.starts_with(b"refs/heads/") => {
+            let name = our.name.to_str_lossy();
+            update_symref(repo, "HEAD", &name, None).map_err(|_| crate::fatal::die("unable to update HEAD"))?;
+            if !plan.bare {
+                update_ref(repo, Some(plan.msg), "HEAD", gix::refs::Target::Object(our.id), true)?;
+                install_branch_config(&name["refs/heads/".len()..], &name)?;
+            }
+        }
+        (Some(our), ..) => {
+            // `lookup_commit_or_die(&our->old_oid, our->name)` (commit.c:81-91) peels to the commit
+            // and says so when it had to.
+            let commit = repo
+                .find_object(our.id)
+                .ok()
+                .and_then(|object| object.peel_to_commit().ok())
+                .map(|commit| commit.id)
+                .ok_or_else(|| crate::fatal::die(format!("could not parse {}", our.name)))?;
+            if commit != our.id {
+                eprintln!("warning: {} {} is not a commit!", our.name, our.id);
+            }
+            update_ref(repo, Some(plan.msg), "HEAD", gix::refs::Target::Object(commit), false)?;
+        }
+        (None, Some(remote), _) => {
+            update_ref(repo, Some(plan.msg), "HEAD", gix::refs::Target::Object(remote), false)?;
+        }
+        (None, None, Some(unborn)) if unborn.starts_with("refs/heads/") => {
+            update_symref(repo, "HEAD", unborn, None).map_err(|_| crate::fatal::die("unable to update HEAD"))?;
+            if !plan.bare {
+                install_branch_config(&unborn["refs/heads/".len()..], unborn)?;
+            }
+        }
+        (None, None, _) => {}
+    }
+    Ok(())
+}
+
+/// `update_remote_refs()` and `update_head()` for a clone whose fetch mapped `ref_map`, deciding
+/// what `cmd_clone()` decides between them (builtin/clone.c:1538-1586):
+///
+/// ```c
+/// remote_head = find_ref_by_name(refs, "HEAD");
+/// remote_head_points_at = guess_remote_head(remote_head, mapped_refs,
+///                                           REMOTE_GUESS_HEAD_QUIET);
+///
+/// if (option_branch) {
+///         our_head_points_at = find_remote_branch(mapped_refs, option_branch);
+///         [...]
+/// } else if (option_rev) {
+///         our_head_points_at = mapped_refs;
+///         [...]
+/// } else if (remote_head_points_at) {
+///         our_head_points_at = remote_head_points_at;
+/// } else if (remote_head) {
+///         our_head_points_at = NULL;
+/// } else {
+///         [...]
+///         if (transport_ls_refs_options.unborn_head_target &&
+///             skip_prefix(transport_ls_refs_options.unborn_head_target,
+///                         "refs/heads/", &branch)) {
+///                 unborn_head  = xstrdup(transport_ls_refs_options.unborn_head_target);
+///         } else {
+///                 branch = to_free = repo_default_branch_name(the_repository, 0);
+///                 unborn_head = xstrfmt("refs/heads/%s", branch);
+///         }
+///         [...]
+///         our_head_points_at = find_remote_branch(mapped_refs, branch);
+/// ```
+///
+/// `HEAD` is among the refs only where `cmd_clone()` asked the remote for it — `opts.wants_head`,
+/// cleared by `--revision` and by `--single-branch --branch` (builtin/clone.c:1380-1385,
+/// :1405-1409, :1435-1436) — or where protocol v0/v1 advertised everything anyway.
+/// `fallback_branch` answers `refs/heads/` and `repo_default_branch_name(the_repository, 0)`.
+fn write_clone_refs(
+    repo: &gix::Repository,
+    ref_map: &gix::remote::fetch::RefMap,
+    v2: bool,
+    plan: &RefWrites<'_>,
+    fallback_branch: impl FnOnce() -> Option<String>,
+) -> Result<()> {
+    let mapped = wanted_peer_refs(ref_map, plan);
+    let wants_head = !plan.revision && !(plan.single_branch && plan.branch.is_some());
+    let remote_head = ref_map
+        .remote_refs
+        .iter()
+        .find(|r| r.unpack().0 == "HEAD" && !matches!(r, Ref::Unborn { .. }))
+        .filter(|_| wants_head || !v2);
+    let remote_head_points_at = guess_mapped_head(remote_head, &mapped, plan.default_branch);
+
+    let mut unborn_head = None;
+    let our_head_points_at = if let Some(branch) = plan.branch {
+        Some(find_remote_branch(&mapped, branch).ok_or_else(|| {
+            crate::fatal::die(format!("Remote branch {branch} not found in upstream {}", plan.remote_name))
+        })?)
+    } else if plan.revision {
+        mapped.first()
+    } else if remote_head_points_at.is_some() {
+        remote_head_points_at
+    } else if remote_head.is_some() {
+        None
+    } else {
+        let unborn = unborn_head_target(ref_map)
+            .filter(|target| target.starts_with("refs/heads/"))
+            .or_else(fallback_branch);
+        let our = unborn
+            .as_deref()
+            .and_then(|head| find_remote_branch(&mapped, &head["refs/heads/".len().min(head.len())..]));
+        unborn_head = unborn;
+        our
+    };
+
+    update_remote_refs(repo, &ref_map.remote_refs, &mapped, remote_head_points_at, plan)?;
+    let remote = remote_head.and_then(|head| head.unpack().1).map(ToOwned::to_owned);
+    update_head(repo, our_head_points_at, remote, unborn_head.as_deref(), plan)
+}
+
+/// `ref_store_create_on_disk()` for a reftable clone (refs.c:2226-2244), run where git's `init_db()`
+/// ran it: before any ref is written. The fetch went through the files ref store the clone was laid
+/// down with and wrote no ref, so that store holds nothing but the `HEAD` `init_db()` points at the
+/// default branch; it goes, and the reftable stack and its stubs come. The config gets what
+/// `initialize_repository_version()` (setup.c:2444-2512) writes into a clone's still-empty config
+/// before anything else: an `[extensions]` section ahead of `[core]`, and version 1.
+fn create_reftable_ref_store(git_dir: &Path) -> Result<()> {
     let _ = std::fs::remove_file(git_dir.join("packed-refs"));
     let _ = std::fs::remove_dir_all(git_dir.join("refs"));
     let _ = std::fs::remove_dir_all(git_dir.join("logs"));
@@ -4931,71 +4619,20 @@ fn adopt_reftable(git_dir: &Path) -> Result<()> {
         set("extensions.refstorage", "reftable")?;
     }
     set("core.repositoryformatversion", "1")?;
-
-    let repo = gix::open(git_dir)?;
-    let log = |message: &[u8]| LogChange {
-        mode: RefLog::AndReference,
-        force_create_reflog: false,
-        message: message.into(),
-    };
-    let commit = |edits: Vec<RefEdit>| -> Result<()> {
-        let (file_lock_fail, packed_refs_lock_fail) = (
-            gix::lock::acquire::Fail::Immediately,
-            gix::lock::acquire::Fail::Immediately,
-        );
-        repo.refs
-            .transaction()
-            .packed_refs(gix::refs::file::transaction::PackedRefs::DeletionsAndNonSymbolicUpdates(Box::new(
-                repo.objects.clone(),
-            )))
-            .prepare(edits, file_lock_fail, packed_refs_lock_fail)?
-            .commit(repo.committer().transpose()?)?;
-        Ok(())
-    };
-    let update = |name, new, message: &[u8], deref| RefEdit {
-        change: Change::Update {
-            log: log(message),
-            expected: PreviousValue::Any,
-            new,
-        },
-        name,
-        deref,
-    };
-
-    // `if (refs)`: a remote that advertised nothing has no initial transaction.
-    if !initial.is_empty() {
-        commit(
-            initial
-                .into_iter()
-                .map(|(name, target)| RefEdit {
-                    change: Change::Update {
-                        log: log(b""),
-                        expected: PreviousValue::MustNotExist,
-                        new: target,
-                    },
-                    name,
-                    deref: false,
-                })
-                .collect(),
-        )?;
-    }
-    for (name, target) in followtags {
-        commit(vec![update(name, target, &msg, false)])?;
-    }
-    for (name, target) in remote_heads {
-        commit(vec![update(name, target, &msg, false)])?;
-    }
-    let head_name: gix::refs::FullName = "HEAD".try_into()?;
-    match head {
-        Target::Symbolic(branch) => {
-            commit(vec![update(head_name.clone(), Target::Symbolic(branch), b"", false)])?;
-            if let Some(id) = created_branch {
-                commit(vec![update(head_name, Target::Object(id), &msg, true)])?;
-            }
-        }
-        Target::Object(id) => commit(vec![update(head_name, Target::Object(id), &msg, false)])?,
-    }
     Ok(())
+}
+
+/// Point `repo` at the reftable store [`create_reftable_ref_store`] laid down, keeping its
+/// in-memory configuration (the clone's `-c` pairs among it).
+fn reopen_as_reftable(repo: &mut gix::Repository) {
+    let opts = gix::refs::store::init::Options {
+        write_reflog: repo.refs.write_reflog,
+        object_hash: repo.object_hash(),
+        precompose_unicode: repo.refs.precompose_unicode,
+        prohibit_windows_device_names: repo.refs.prohibit_windows_device_names,
+        ref_storage: gix::refs::store::RefStorage::Reftable,
+    };
+    repo.refs = gix::refs::file::Store::at(repo.git_dir().to_owned(), opts);
 }
 
 #[cfg(test)]
@@ -5057,30 +4694,6 @@ mod tests {
         let refs = advertisement(&[(7, "HEAD"), (7, "refs/heads/b"), (7, "refs/heads/a")]);
         let refs: Vec<&(gix::ObjectId, Vec<u8>)> = refs.iter().collect();
         assert_eq!(guess_remote_head(&refs, "main").as_deref(), Some("refs/heads/b"));
-    }
-
-    /// Only the `clone: from <url>` run is rewritten, and every reflog under
-    /// `logs/` is visited — `logs/HEAD`, the branch's, and the remote-tracking
-    /// `HEAD`'s all carry it, and a rewrite that missed one would leave a
-    /// repository naming two different sources for the same clone.
-    #[test]
-    fn the_clone_reflog_source_is_rewritten_everywhere_and_nowhere_else() {
-        let dir = std::env::temp_dir().join(format!("zvcs-clone-reflog-{}", std::process::id()));
-        let logs = dir.join("logs").join("refs").join("heads");
-        std::fs::create_dir_all(&logs).expect("scratch");
-        let line = |what: &str| format!("0{}0 name <n@e> 1 +0000\t{what}\n", "0".repeat(38));
-        std::fs::write(dir.join("logs").join("HEAD"), line("clone: from /tmp/scratch")).unwrap();
-        std::fs::write(logs.join("main"), line("clone: from /tmp/scratch")).unwrap();
-        // A message that merely contains the path is not the clone line.
-        std::fs::write(logs.join("other"), line("commit: /tmp/scratch")).unwrap();
-
-        rewrite_clone_reflog_source(&dir, "clone: from /tmp/scratch", "/repo/x.bundle").unwrap();
-
-        let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap();
-        assert!(read(dir.join("logs").join("HEAD")).ends_with("clone: from /repo/x.bundle\n"));
-        assert!(read(logs.join("main")).ends_with("clone: from /repo/x.bundle\n"));
-        assert!(read(logs.join("other")).ends_with("commit: /tmp/scratch\n"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

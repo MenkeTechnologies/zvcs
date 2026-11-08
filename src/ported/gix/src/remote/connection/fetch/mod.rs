@@ -180,6 +180,7 @@ where
             con: Some(self),
             ref_map,
             dry_run: DryRun::No,
+            write_refs: true,
             reflog_message: None,
             write_packed_refs: WritePackedRefs::Never,
             shallow: Default::default(),
@@ -289,6 +290,8 @@ where
     con: Option<ConnectionDetached<'remote, T>>,
     ref_map: RefMap,
     dry_run: DryRun,
+    /// Whether the ref updates are applied; see [`Prepare::with_write_refs()`].
+    write_refs: bool,
     reflog_message: Option<RefLogMessage>,
     write_packed_refs: WritePackedRefs,
     shallow: remote::fetch::Shallow,
@@ -324,6 +327,16 @@ where
     /// object-exists checks see the same objects a real fetch would.
     pub fn with_dry_run(mut self, enabled: bool) -> Self {
         self.inner.dry_run = if enabled { DryRun::Yes } else { DryRun::No };
+        self
+    }
+
+    /// If disabled, the pack is received and checked as for any fetch, but the refs are left for the caller
+    /// to write: the updates are worked out as a dry run would, and reported in the outcome.
+    ///
+    /// `git clone` fetches through the transport and then writes the refs itself, in transactions of its
+    /// own (`update_remote_refs()`, `update_head()`, builtin/clone.c:534-613).
+    pub fn with_write_refs(mut self, enabled: bool) -> Self {
+        self.inner.write_refs = enabled;
         self
     }
 
@@ -466,6 +479,11 @@ where
 
     pub(crate) fn with_keep_pack(mut self, enabled: bool) -> Self {
         self.keep_pack = enabled;
+        self
+    }
+
+    pub(crate) fn with_write_refs(mut self, enabled: bool) -> Self {
+        self.write_refs = enabled;
         self
     }
 }

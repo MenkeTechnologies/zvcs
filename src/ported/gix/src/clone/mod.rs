@@ -59,6 +59,9 @@ pub struct PrepareFetch {
     /// The branch `HEAD` is set to when the remote advertised no `HEAD` (git's `repo_default_branch_name()`), if any.
     #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
     default_branch: Option<BString>,
+    /// Whether [`fetch_only()`](Self::fetch_only()) writes the fetched refs and `HEAD`; see [`Self::with_write_refs()`].
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    write_refs: bool,
 }
 
 /// The error returned by [`PrepareFetch::new()`].
@@ -208,6 +211,7 @@ impl PrepareFetch {
             filter: None,
             revision: None,
             default_branch: None,
+            write_refs: true,
         })
     }
 }

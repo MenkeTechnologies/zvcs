@@ -64,6 +64,15 @@ impl PrepareFetch {
         self
     }
 
+    /// If disabled, [`fetch_only()`](Self::fetch_only()) receives the pack and leaves the refs, `HEAD` and the
+    /// branch configuration to the caller, which then writes them as `git clone` does: the mapped refs in one
+    /// initial transaction, the followed tags, the remote-tracking `HEAD` and `HEAD` itself in transactions of
+    /// their own (`update_remote_refs()`, `update_head()`, builtin/clone.c:534-613).
+    pub fn with_write_refs(mut self, enabled: bool) -> Self {
+        self.write_refs = enabled;
+        self
+    }
+
     /// Apply the given configuration `values` right before readying the actual fetch from the remote.
     /// The configuration is marked with [source API](gix_config::Source::Api), and will not be written back, it's
     /// retained only in memory.

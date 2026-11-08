@@ -63,7 +63,21 @@ impl Transaction<'_, '_> {
                         RefLog::AndReference => (true, true),
                     };
                     if update_reflog {
+                        // `parse_and_write_reflog()` for a symbolic update (refs/files-backend.c:3154-3170):
+                        // the entry records what the new target resolves to, and `lock->old_oid`, the
+                        // value the reference resolved to before (`lock_ref_for_update()`,
+                        // refs/files-backend.c:2764-2789). A dangling target logs nothing.
+                        let symref_log = match new {
+                            Target::Symbolic(target) if self.options.log_symref_updates => Some((
+                                resolved_id(self.store, change.update.name.as_ref()),
+                                resolved_id(self.store, target.as_ref()),
+                            )),
+                            _ => None,
+                        };
                         let log_update = match new {
+                            Target::Symbolic(_) if symref_log.is_some() => symref_log
+                                .as_ref()
+                                .and_then(|(previous, new_oid)| Some((*previous, new_oid.as_ref()?))),
                             Target::Symbolic(_) => {
                                 // Special HACK: no reflog for symref changes as there is no OID involved which the reflog needs.
                                 // Unless, the ref is new and we can obtain a peeled id
@@ -114,9 +128,11 @@ impl Transaction<'_, '_> {
                             // symbolic is never dropped for being "unchanged", because replacing
                             // `ref: refs/heads/main` with the id it resolves to detaches it. Hence
                             // the third disjunct — see [`Edit::previous_is_symbolic`].
+                            // A symbolic update always has `REF_NEEDS_COMMIT` (refs/files-backend.c:2839-2846).
                             let do_update = log.mode == RefLog::Only
                                 || previous.as_ref() != Some(new_oid)
-                                || change.previous_is_symbolic;
+                                || change.previous_is_symbolic
+                                || symref_log.is_some();
                             if do_update {
                                 self.store.reflog_create_or_append(
                                     change.update.name.as_ref(),
@@ -381,3 +397,16 @@ mod error {
 pub use error::Error;
 
 use crate::transaction::PreviousValue;
+
+/// `refs_resolve_ref_unsafe(refs, name, RESOLVE_REF_READING, &oid, NULL)` (refs.c): the object `name`
+/// resolves to through at most `SYMREF_MAXDEPTH` (5) symbolic references, if any.
+fn resolved_id(store: &crate::store_impl::file::Store, name: &crate::FullNameRef) -> Option<gix_hash::ObjectId> {
+    let mut name = name.to_owned();
+    for _ in 0..=5 {
+        match store.try_find(name.as_ref()).ok()??.target {
+            Target::Object(oid) => return Some(oid),
+            Target::Symbolic(next) => name = next,
+        }
+    }
+    None
+}

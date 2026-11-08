@@ -725,8 +725,9 @@ struct Opts {
     ws: Whitespace,            // -w / -b / --ignore-space-at-eol / --ignore-cr-at-eol
     ignore_lines: Vec<Needle>, // -I<re>
     reverse: bool,             // -R
-    /// [`RouteCtx::queue_time_reverse`]: whether `reverse` also moves the status
-    /// letter, which it does for every caller but `diff-pairs` itself.
+    /// [`RouteCtx::queue_time_reverse`]: whether `reverse` swaps the queue ahead of
+    /// `diffcore_std()` and moves the status letter, which it does for every caller
+    /// but `diff-pairs` itself.
     queue_time_reverse: bool,
     filter: Option<Filter>,    // --diff-filter
     pickaxe: Option<Pickaxe>,  // -S / -G / --find-object (finalized after parse)
@@ -2580,6 +2581,16 @@ fn flush(
         pairs.retain(|p| !(is_gitlink_mode(p.old_mode) && is_gitlink_mode(p.new_mode)));
     }
 
+    // A queue-time `-R` (`flags.reverse_diff`) swaps each pair as `diff_change()` and
+    // `diff_addremove()` queue it (diff.c:7605-7607, 7647-7652), ahead of
+    // `diffcore_std()`: the rename pass pairs the swapped sides, the filter reads the
+    // swapped letters, and the queue keeps the walk's order.
+    if opts.reverse && opts.queue_time_reverse {
+        for p in &mut pairs {
+            reverse_pair(p, true);
+        }
+    }
+
     // ---- diffcore_std order: break -> rename -> merge-broken -> pickaxe ----
     // `builtin/diff-pairs.c` calls `diffcore_std()` per batch, and only sets
     // `skip_resolving_statuses` when no detection was asked for — so the status
@@ -2656,10 +2667,11 @@ fn flush(
 
     apply_relative(repo, &mut pairs, &opts.relative)?;
 
-    // `-R`: swap each pair's two sides for display (the prefixes were swapped globally).
-    if opts.reverse {
+    // `-R`: swap each pair's two sides for display (the prefixes were swapped globally),
+    // unless the queue was built reversed above.
+    if opts.reverse && !opts.queue_time_reverse {
         for p in &mut pairs {
-            reverse_pair(p, opts.queue_time_reverse);
+            reverse_pair(p, false);
         }
     }
 

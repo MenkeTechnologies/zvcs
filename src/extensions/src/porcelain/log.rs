@@ -6539,6 +6539,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     renames: Some(super::diffcore_rename::DETECT_COPY),
                     ..patch_opts.clone()
                 });
+                // A combined merge runs its passes on `diff_tree_combined()`'s copy of the
+                // options (`diffopts = *opt`, combine-diff.c:1518), so the rename limit they
+                // hit never reaches `diff_warn_rename_limit()`.
+                let mut combined_warn = super::diffcore_rename::Warnings::default();
+                let warn_slot = match combined_record {
+                    true => &mut combined_warn,
+                    false => &mut rename_warn,
+                };
                 let mut files = collect_changes(
                     &repo,
                     &commit,
@@ -6547,7 +6555,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     patch_opts.ws,
                     Some(follow_opts.as_ref().unwrap_or(&patch_opts)),
                     pre,
-                    Some(&mut rename_warn),
+                    Some(warn_slot),
                 )?;
                 if count_formats {
                     let drivers = match diff_drivers.as_mut() {
@@ -6639,7 +6647,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                             patch_opts.ws,
                             Some(&patch_opts),
                             limit.as_mut(),
-                            Some(&mut rename_warn),
+                            Some(&mut combined_warn),
                         )?;
                         if let Some(prefix) = &patch_opts.relative {
                             other.retain(|f| f.path.starts_with(prefix.as_bytes()));
@@ -6798,28 +6806,31 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     // `find_paths_generic()`/`combined_objfind()` have already had
                     // their say about which paths survive; every block below reports
                     // the narrowed list, and nothing at all when it came out empty.
+                    let (combined_limit, merge_hdr) =
+                        combined_scope(&combined_hdr, combined_paths.as_deref(), &diff_pathspecs);
                     if combined_paths.as_ref().is_some_and(|v| v.is_empty()) {
                     } else if raw {
                         diff.extend_from_slice(&super::diff::merge_combined_raw(
                             &repo,
                             node.id,
                             &node.parents,
-                            combined_paths.as_deref().unwrap_or(&diff_pathspecs),
+                            combined_limit,
                             crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex())
                                 .max(MINIMUM_ABBREV),
                             z,
                             true,
                             false,
-                            combined_hdr.reversed_pairs,
+                            merge_hdr.scan.as_ref(),
                         )?);
                         separator = true;
                     } else if name_only || name_status {
-                        for (path, letters) in super::diff::merge_combined_names(
+                        for (path, letters, _) in super::diff::merge_combined_names(
                             &repo,
                             node.id,
                             &node.parents,
-                            combined_paths.as_deref().unwrap_or(&diff_pathspecs),
-                            combined_hdr.reversed_pairs,
+                            combined_limit,
+                            false,
+                            merge_hdr.scan.as_ref(),
                         )? {
                             if name_status {
                                 diff.extend_from_slice(letters.as_bytes());
@@ -6998,6 +7009,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 // `do_diff_combined()` renders it (log-tree.c:1064-1065) and the
                 // needle narrowed its *path set*, not its shape. The batched window
                 // renders the unnarrowed one, so this record is rendered on its own.
+                let (pickaxe_limit, pickaxe_hdr) =
+                    combined_scope(&combined_hdr, combined_paths.as_deref(), &diff_pathspecs);
                 let combined_pickaxe_patch: Vec<u8> = match combined_record && has_pickaxe {
                     false => Vec::new(),
                     true if combined_paths.as_ref().is_some_and(|v| v.is_empty()) => Vec::new(),
@@ -7005,14 +7018,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                         &repo,
                         node.id,
                         &node.parents,
-                        combined_paths.as_deref().unwrap_or(&diff_pathspecs),
+                        pickaxe_limit,
                         // `show_patch_diff()` (combine-diff.c:1030) opens with
                         // `context = opt->context`, so a combined merge honours
                         // `-U<n>` exactly as a two-way patch does.
                         patch_opts.ctx,
                         diff_merges == DiffMerges::DenseCombined,
                         &patch_opts.colors,
-                        &combined_hdr,
+                        &pickaxe_hdr,
                     )?,
                 };
                 // A remerge record diffs the re-merged tree against the recorded one,
@@ -12597,6 +12610,28 @@ fn any_count_changed(
         }
     }
     Ok(false)
+}
+
+/// The path limit and header a combined merge renders with once the pickaxe has
+/// narrowed its path set (`survivors`). Under `find_paths_generic()` the pickaxe
+/// narrows each parent's queue after the tree walk and the rename pass
+/// (combine-diff.c:1403-1405, diff.c:7489-7498), so the walk keeps the command's
+/// own pathspec and the survivors ride in the scan. The multitree scan
+/// (`--find-object` alone) is narrowed after the walk by `combined_objfind()`
+/// (combine-diff.c:1555-1556), which a path limit reproduces.
+fn combined_scope<'a>(
+    hdr: &super::diff::CombinedHeaderOpts,
+    survivors: Option<&'a [String]>,
+    pathspecs: &'a [String],
+) -> (&'a [String], super::diff::CombinedHeaderOpts) {
+    let mut hdr = hdr.clone();
+    match (&mut hdr.scan, survivors) {
+        (Some(scan), Some(keep)) => {
+            scan.keep = Some(keep.iter().map(|p| p.as_bytes().to_vec()).collect());
+            (pathspecs, hdr)
+        }
+        (_, limit) => (limit.unwrap_or(pathspecs), hdr),
+    }
 }
 
 /// `pickaxe()` (diffcore-pickaxe.c) over one commit's change list.

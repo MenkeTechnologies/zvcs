@@ -86,7 +86,10 @@
 //!   **first parent**, emitted before the path set is even consulted, so `-c --stat`
 //!   on a clean merge prints a diffstat where `-c` alone prints only the commit id.
 //!   `--exit-code` reports 0 throughout: the combined pass never queues a pair on the
-//!   caller's `diffopt`
+//!   caller's `diffopt`. With `-M`/`-C`/`-B`, `--diff-filter` or `-S`/`-G` the path set is
+//!   `find_paths_generic()`'s: each parent is diffed on its own through rename
+//!   detection, the pickaxe and the filter, `-R` swapping every pair as it is queued,
+//!   and a path survives only where every parent's queue still names it
 //! * `-m`, `-c` and `--cc` are three settings of one knob
 //!   (`--diff-merges=separate|combined|dense-combined`), so the last one on the command
 //!   line wins
@@ -2565,25 +2568,58 @@ fn combined_commit(
     walk_opts.filter = ALL_STATUSES;
     walk_opts.route = None;
 
-    // One change list per parent, in walk order.
-    let mut per_parent: Vec<Vec<Change>> = Vec::with_capacity(parents.len());
-    for p in parents {
-        let before = tree_of(repo, *p)?;
-        per_parent.push(collect(repo, Some(before), Some(new_tree), &walk_opts)?);
-    }
-
-    // Intersect on path: keep the first parent's order, drop anything a later parent
-    // agrees with. `p->parent[i]` for the surviving paths is that parent's old side.
-    let mut rows: Vec<(BString, Vec<Change>)> = Vec::new();
-    'outer: for c in &per_parent[0] {
-        let mut sides = vec![c.clone()];
-        for others in &per_parent[1..] {
-            match others.iter().find(|o| o.path == c.path) {
-                Some(o) => sides.push(o.clone()),
-                None => continue 'outer,
-            }
+    let scan = combined_scan(repo, opts)?;
+    // Each surviving path with, per parent, the pair `intersect_paths()` recorded
+    // for it, that pair's status letter and the parent's name for the path.
+    let mut rows: Vec<(BString, Vec<(Change, u8, BString)>)> = Vec::new();
+    if let Some(scan) = &scan {
+        // `find_paths_generic()` (combine-diff.c:1378-1420): the result side is the
+        // first parent's `two`, each parent's side its own pair's `one`.
+        let paths: Vec<String> = opts.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        let side = |(kind, id): (Option<gix::objs::tree::EntryKind>, ObjectId)| {
+            kind.map(|k| Side { mode: k.into(), id })
+        };
+        for sides in super::diff::merge_generic_rows(repo, commit_id, parents, &paths, scan)? {
+            let path = sides[0].path.clone();
+            let result = side(sides[0].two);
+            let sides = sides
+                .into_iter()
+                .map(|s| {
+                    let change = Change { old: side(s.one), new: result, path: path.clone() };
+                    let name = if s.renamed() { s.one_path } else { path.clone() };
+                    (change, s.status, name)
+                })
+                .collect();
+            rows.push((path, sides));
         }
-        rows.push((c.path.clone(), sides));
+    } else {
+        // One change list per parent, in walk order.
+        let mut per_parent: Vec<Vec<Change>> = Vec::with_capacity(parents.len());
+        for p in parents {
+            let before = tree_of(repo, *p)?;
+            per_parent.push(collect(repo, Some(before), Some(new_tree), &walk_opts)?);
+        }
+
+        // Intersect on path: keep the first parent's order, drop anything a later
+        // parent agrees with. `p->parent[i]` for the surviving paths is that parent's
+        // old side, and its status `diff_tree_paths()`'s: `D` when the result lacks
+        // the path, `M` when the parent holds it, `A` otherwise (tree-diff.c:268-272)
+        // — never `T`.
+        let multitree_status = |c: &Change| match (c.old, c.new) {
+            (_, None) => b'D',
+            (Some(_), _) => b'M',
+            (None, _) => b'A',
+        };
+        'outer: for c in &per_parent[0] {
+            let mut sides = vec![(c.clone(), multitree_status(c), c.path.clone())];
+            for others in &per_parent[1..] {
+                match others.iter().find(|o| o.path == c.path) {
+                    Some(o) => sides.push((o.clone(), multitree_status(o), o.path.clone())),
+                    None => continue 'outer,
+                }
+            }
+            rows.push((c.path.clone(), sides));
+        }
     }
 
     let term = if opts.nul { b'\0' } else { b'\n' };
@@ -2634,11 +2670,11 @@ fn combined_commit(
                 for _ in sides {
                     out.push(b':');
                 }
-                for s in sides {
+                for (s, _, _) in sides {
                     let m = s.old.map_or(0, |o| o.mode.value());
                     out.extend_from_slice(format!("{m:06o} ").as_bytes());
                 }
-                let rmode = sides[0].new.map_or(0, |n| n.mode.value());
+                let rmode = sides[0].0.new.map_or(0, |n| n.mode.value());
                 out.extend_from_slice(format!("{rmode:06o}").as_bytes());
                 // `diff_aligned_abbrev(&oid, opt->abbrev)` (combine-diff.c:1257-1259)
                 // — the same width the two-tree raw format uses, which `--abbrev=<n>`
@@ -2648,14 +2684,14 @@ fn combined_commit(
                     opts.abbrev,
                     &repo.object_hash().null().to_string(),
                 );
-                for s in sides {
+                for (s, _, _) in sides {
                     let id = s.old.map_or_else(
                         || zeros.clone(),
                         |o| crate::abbrev::aligned_abbrev(repo, &o.id, opts.abbrev),
                     );
                     out.extend_from_slice(format!(" {id}").as_bytes());
                 }
-                let rid = sides[0].new.map_or_else(
+                let rid = sides[0].0.new.map_or_else(
                     || zeros.clone(),
                     |n| crate::abbrev::aligned_abbrev(repo, &n.id, opts.abbrev),
                 );
@@ -2663,18 +2699,18 @@ fn combined_commit(
             }
             // The status column is one letter per parent, for `--raw` and
             // `--name-status` alike.
-            for s in sides {
-                out.push(status(s));
+            for (_, letter, _) in sides {
+                out.push(*letter);
             }
             out.push(sep);
         }
         // `--combined-all-paths` (`show_raw_diff`, combine-diff.c:1268-1274): the
         // path as each parent knew it, ahead of the result's own, each closed by the
-        // inter-name terminator. Without rename detection every parent's path is the
-        // result path, which is what this walk produces.
+        // inter-name terminator: a renaming or copying parent's own name, else the
+        // result path.
         if opts.combined_all_paths {
-            for _ in sides {
-                write_path(out, path, opts.nul);
+            for (_, _, name) in sides {
+                write_path(out, name, opts.nul);
                 out.push(sep);
             }
         }
@@ -2706,7 +2742,10 @@ fn combined_commit(
             unified_context(&opts.diff_args),
             opts.dense_combined,
             &colors,
-            &combined_header_opts(&opts.diff_args, opts.combined_all_paths),
+            &super::diff::CombinedHeaderOpts {
+                scan,
+                ..combined_header_opts(&opts.diff_args, opts.combined_all_paths)
+            },
         )?;
         if needsep {
             out.extend_from_slice(&opts.line_prefix);
@@ -2751,6 +2790,110 @@ fn combined_header_opts(diff_args: &[String], all_paths: bool) -> super::diff::C
         }
     }
     hdr
+}
+
+/// `find_paths_generic()`'s options (combine-diff.c:1378-1420) as `diff_opt_parse()`
+/// leaves them for this command, or `None` when `need_generic_pathscan`
+/// (combine-diff.c:1542-1548) is false and the multitree scan runs. `diff-tree` is
+/// plumbing: `git_diff_basic_config()` (diff.c:478-487) reads `diff.renameLimit`
+/// but not `diff.renames`, so rename detection waits for `-M`/`-C`.
+fn combined_scan(repo: &gix::Repository, opts: &Opts) -> Result<Option<super::diff::GenericScan>> {
+    use super::diff_pickaxe::Kind;
+    use super::diffcore_rename::{parse_break_opt, parse_rename_score, DETECT_COPY, DETECT_RENAME};
+    let mut rename = super::diffcore_rename::Options {
+        rename_limit: repo
+            .config_snapshot()
+            .integer("diff.renameLimit")
+            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+    let mut filter: Option<Vec<u8>> = None;
+    let mut pickaxe: Option<(u8, Vec<u8>)> = None;
+    let mut find_object: Vec<String> = Vec::new();
+    let (mut pickaxe_regex, mut pickaxe_all, mut text) = (false, false, false);
+    for a in opts.diff_args.iter() {
+        let (flag, value) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+            _ => (a.as_str(), None),
+        };
+        match flag {
+            // `diff_opt_find_renames()` / `diff_opt_find_copies()` (diff.c:5701-5735).
+            "-M" | "--find-renames" => {
+                rename.rename_score = parse_rename_score(value.unwrap_or("")).0;
+                rename.detect_rename = DETECT_RENAME;
+            }
+            "-C" | "--find-copies" => {
+                rename.rename_score = parse_rename_score(value.unwrap_or("")).0;
+                rename.detect_rename = DETECT_COPY;
+            }
+            "--no-renames" => rename.detect_rename = 0,
+            "-B" | "--break-rewrites" => rename.break_opt = parse_break_opt(value.unwrap_or("")).unwrap_or(-1),
+            "--rename-empty" => rename.rename_empty = true,
+            "--no-rename-empty" => rename.rename_empty = false,
+            "--diff-filter" => filter.get_or_insert_with(Vec::new).extend_from_slice(value.unwrap_or("").as_bytes()),
+            "--pickaxe-regex" => pickaxe_regex = true,
+            "--pickaxe-all" => pickaxe_all = true,
+            "--find-object" => find_object.push(value.unwrap_or("").to_string()),
+            "-a" | "--text" => text = true,
+            "--no-text" => text = false,
+            _ if a.starts_with("-M") => {
+                rename.rename_score = parse_rename_score(&a[2..]).0;
+                rename.detect_rename = DETECT_RENAME;
+            }
+            _ if a.starts_with("-C") => {
+                rename.rename_score = parse_rename_score(&a[2..]).0;
+                rename.detect_rename = DETECT_COPY;
+            }
+            _ if a.starts_with("-B") => rename.break_opt = parse_break_opt(&a[2..]).unwrap_or(-1),
+            _ if a.starts_with("-l") => {
+                if let Ok(n) = super::diff::parse_rename_limit(&a[2..]) {
+                    rename.rename_limit = n;
+                }
+            }
+            _ if a.starts_with("-S") || a.starts_with("-G") => {
+                pickaxe = Some((a.as_bytes()[1], a.as_bytes()[2..].to_vec()));
+            }
+            _ => {}
+        }
+    }
+    // `diff_setup_done()`: `--find-copies-harder` turns copy detection on.
+    rename.find_copies_harder = opts.find_copies_harder;
+    if rename.find_copies_harder {
+        rename.detect_rename = DETECT_COPY;
+    }
+    let kind = match (pickaxe, find_object.is_empty()) {
+        (_, false) => {
+            let mut ids = Vec::with_capacity(find_object.len());
+            for rev in &find_object {
+                ids.push(repo.rev_parse_single(rev.as_str())?.detach());
+            }
+            Some(Kind::ObjFind(ids))
+        }
+        (Some((which, pat)), true) => {
+            let needle = super::diff_pickaxe::compile_needle(pat, which == b'G' || pickaxe_regex, opts.pickaxe_icase)
+                .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+            Some(match which {
+                b'G' => Kind::Grep(needle),
+                _ => Kind::Occurrences(needle),
+            })
+        }
+        (None, true) => None,
+    };
+    let content_pickaxe = matches!(kind, Some(Kind::Grep(_) | Kind::Occurrences(_)));
+    let need_generic_pathscan =
+        rename.break_opt != -1 || rename.detect_rename != 0 || content_pickaxe || opts.filter_given;
+    if !need_generic_pathscan {
+        return Ok(None);
+    }
+    Ok(Some(super::diff::GenericScan {
+        // A routed run has moved `-R` to `route_reverse` (see `needs_pairs`).
+        reverse: opts.reverse || opts.route_reverse,
+        rename,
+        filter,
+        keep: None,
+        pickaxe: kind.map(|kind| std::rc::Rc::new(super::diff::GenericPickaxe { kind, all: pickaxe_all, text })),
+    }))
 }
 
 /// The `--color[=<when>]` / `--no-color` the command line left in force, the last

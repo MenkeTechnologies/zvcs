@@ -121,9 +121,10 @@ const DEFAULT_ABBREV: usize = 7;
 /// [`crate::tmp_objdir`] and [`remerge_side`]. An octopus merge is skipped with
 /// git's own warning (log-tree.c:1135-1141). `--combined-all-paths` is applied:
 /// `show_raw_diff()`'s per-parent path columns and `show_combined_header()`'s
-/// per-parent `--- a/<path>` lines are both emitted. No rename detection runs in the
-/// combined walk, so `filename_changed()` is false for every parent and each column
-/// is the result path — the same simplification `git diff-tree -c` makes here.
+/// per-parent `--- a/<path>` lines are both emitted. With rename detection on (the
+/// porcelain default), `find_paths_generic()` diffs each parent on its own, so a
+/// parent that renamed or copied the file (`filename_changed()`) is named by its own
+/// path and every other column is the result path.
 ///
 /// `--check` is `DIFF_FORMAT_CHECKDIFF`, which `diff_setup_done()` lets clear every
 /// other output format: the record becomes its header and the whitespace report,
@@ -4012,8 +4013,9 @@ fn show_commit_record(
     }
     // `cmd_log_init_finish()` (builtin/log.c:333) clears `always_show_header` when
     // `--diff-filter` is in play, so a commit whose queue the filter emptied prints
-    // nothing at all — not even its header.
-    if disp.patch.diff_filter.is_some() && diff_shown && files.is_empty() {
+    // nothing at all — not even its header. A combined merge is the exception the
+    // pickaxe test above makes: `diff_tree_combined()` prints the header first.
+    if disp.patch.diff_filter.is_some() && diff_shown && files.is_empty() && !combined {
         return Ok(());
     }
     // ```c
@@ -4198,23 +4200,24 @@ fn show_commit_record(
                 repo, commit, &parents, pathspecs, disp, pickaxe,
             )?),
         };
-        // The pathspec limit the combined writers take. Under a pickaxe it is the
-        // surviving path list; an empty one means "no path at all", which an empty
-        // pathspec vector would instead read as "no limit", so the writers below are
-        // skipped outright in that case.
-        let combined_paths: Vec<String> = match &survivors {
-            Some(paths) => paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
-            None => pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(),
-        };
+        // The pathspec limit the combined writers take: the tree walk's, which the
+        // rename pass sees through (combine-diff.c:1403). An empty survivor list
+        // means "no path at all", so the writers below are skipped outright then.
+        let combined_paths: Vec<String> =
+            pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
         let combined_empty = survivors.as_ref().is_some_and(Vec::is_empty);
-        // `-R` turns the combined pairs around only under `find_paths_generic()`;
-        // `-S`/`-G` are part of what selects it (combine-diff.c:1542-1548).
-        let combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
+        // `-S`/`-G` are part of what selects `find_paths_generic()`
+        // (combine-diff.c:1542-1548), whose per-parent `diffcore_std()` the
+        // survivors stand for.
+        let mut combined_hdr = super::diff::CombinedHeaderOpts::from_patch_opts(
             repo,
             &disp.patch,
             disp.combined_all_paths,
             pickaxe.active(),
         );
+        if let Some(scan) = &mut combined_hdr.scan {
+            scan.keep = survivors;
+        }
         // git shows a blank line after a merge's message regardless of format,
         // then the combined diff against all parents, plus `--stat` (against the
         // first parent) when requested. The empty user format prints neither the
@@ -4248,21 +4251,21 @@ fn show_commit_record(
                     commit.id().detach(),
                     &parent_ids,
                     &combined_paths,
-                    combined_hdr.reversed_pairs,
+                    disp.combined_all_paths,
+                    combined_hdr.scan.as_ref(),
                 )?,
             };
-            for (path, letters) in rows {
+            for (path, letters, names) in rows {
                 if status {
                     out.extend_from_slice(letters.as_bytes());
                     out.push(sep);
                 }
                 // `show_raw_diff()`'s `rev->combined_all_paths` loop sits outside
                 // the format test, so the name formats carry the per-parent columns
-                // too. No rename detection runs here, so `filename_changed()` is
-                // false for every parent and each column is the result path.
+                // too: each parent's name for the path (combine-diff.c:1268-1274).
                 if disp.combined_all_paths {
-                    for _ in &letters.chars().collect::<Vec<_>>() {
-                        out.extend_from_slice(&name_bytes(&path, disp.z));
+                    for name in &names {
+                        out.extend_from_slice(&name_bytes(name, disp.z));
                         out.push(sep);
                     }
                 }
@@ -4345,7 +4348,7 @@ fn show_commit_record(
                         disp.z,
                         true,
                         disp.combined_all_paths,
-                        combined_hdr.reversed_pairs,
+                        combined_hdr.scan.as_ref(),
                     )?);
                 }
                 needsep = true;

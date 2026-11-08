@@ -5731,7 +5731,7 @@ fn collect_index_worktree(
             // `grab_blob()` (combine-diff.c:313-321): a gitlink stage reads as its
             // `Subproject commit` line, never as an object.
             let side = |(id, kind): (ObjectId, EntryKind)| -> Result<CombinedSide> {
-                Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M' })
+                Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M', path: None })
             };
             // `dpath->mode` is `wt_mode`, which `show_raw_diff()` prints; the patch
             // reads the file again and takes the mode its own `lstat()` gives
@@ -6952,18 +6952,36 @@ impl PatchOpts {
     /// `diff.renames` (porcelain default on) unless `-M`/`-C`/`--no-renames` said
     /// otherwise, with `--find-copies-harder` forcing copies (diff.c:5267-5268).
     /// `generic_filter` is the `-S`/`-G`/`--follow` part, which these options do
-    /// not carry.
-    pub(crate) fn combined_pairs_reversed(&self, repo: &gix::Repository, generic_filter: bool) -> bool {
-        if !self.reverse {
-            return false;
+    /// not carry. `None` is the all-trees-at-once `find_paths_multitree()`.
+    pub(crate) fn generic_scan(&self, repo: &gix::Repository, generic_filter: bool) -> Option<GenericScan> {
+        let cfg = repo.config_snapshot();
+        let mut detect_rename = self.renames.unwrap_or_else(|| {
+            diffcore_rename::config_rename(cfg.string("diff.renames").as_deref().map(|v| v.as_bstr()))
+        });
+        if self.find_copies_harder {
+            detect_rename = diffcore_rename::DETECT_COPY;
         }
-        let detect_rename = self.find_copies_harder
-            || self.renames.unwrap_or_else(|| {
-                diffcore_rename::config_rename(
-                    repo.config_snapshot().string("diff.renames").as_deref().map(|v| v.as_bstr()),
-                )
-            }) != 0;
-        generic_filter || detect_rename || self.break_opt != -1 || self.diff_filter.is_some()
+        let need_generic_pathscan =
+            generic_filter || detect_rename != 0 || self.break_opt != -1 || self.diff_filter.is_some();
+        need_generic_pathscan.then(|| GenericScan {
+            reverse: self.reverse,
+            rename: diffcore_rename::Options {
+                detect_rename,
+                rename_score: self.rename_score,
+                // `-l<n>`, else `diff.renameLimit` (diff.c:5317-5318).
+                rename_limit: match self.rename_limit < 0 {
+                    true => cfg.integer("diff.renameLimit").unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT),
+                    false => self.rename_limit,
+                },
+                find_copies_harder: self.find_copies_harder,
+                rename_empty: self.rename_empty,
+                break_opt: self.break_opt,
+                hash_kind: repo.object_hash(),
+            },
+            filter: self.diff_filter.clone(),
+            keep: None,
+            pickaxe: None,
+        })
     }
 }
 
@@ -10435,6 +10453,349 @@ struct CombinedSide {
     /// `p->parent[i].status` (tree-diff.c:237): `D` when the result dropped the
     /// path, `M` when this parent held it too, `A` when only the result holds it.
     status: u8,
+    /// `p->parent[i].path` (combine-diff.c:61-64, :98-100): the name this parent
+    /// knew the content by, recorded only when `--combined-all-paths` is on and the
+    /// pair was a rename or copy (`filename_changed()`); `None` reads as the
+    /// result path.
+    path: Option<BString>,
+}
+
+/// `find_paths_generic()`'s view of the diff options (combine-diff.c:1378-1420):
+/// what each parent's `diff_tree_oid(parent_i, result)` and `diffcore_std()` run
+/// with. A combined diff takes this scan exactly when `need_generic_pathscan`
+/// holds (combine-diff.c:1542-1548); see [`PatchOpts::generic_scan`].
+#[derive(Clone)]
+pub(crate) struct GenericScan {
+    /// `flags.reverse_diff`: `diff_change()`/`diff_addremove()` swap every pair
+    /// as it is queued (diff.c:7605-7607, 7647-7652), so `intersect_paths()`
+    /// records parent `i`'s tree as the result and the result as each parent.
+    pub(crate) reverse: bool,
+    /// `diffcore_break()`, `diffcore_rename()` and `diffcore_merge_broken()`
+    /// (diff.c:7489-7495).
+    pub(crate) rename: diffcore_rename::Options,
+    /// `--diff-filter`: `diffcore_apply_filter()` (diff.c:7506).
+    pub(crate) filter: Option<Vec<u8>>,
+    /// The paths `diffcore_pickaxe()` (diff.c:7497-7498) left in every parent's
+    /// queue, which the caller's own pickaxe works out; `None` without a pickaxe.
+    pub(crate) keep: Option<Vec<Vec<u8>>>,
+    /// `diffcore_pickaxe()` run on each parent's queue here, for a caller that has
+    /// no pickaxe of its own over trees (`diff-tree`).
+    pub(super) pickaxe: Option<std::rc::Rc<GenericPickaxe>>,
+}
+
+/// `-S`/`-G`/`--find-object` as `diffcore_pickaxe()` (diffcore-pickaxe.c:184-214)
+/// applies them to one queue, without textconv (`diff-tree` does not allow it).
+pub(super) struct GenericPickaxe {
+    pub(super) kind: super::diff_pickaxe::Kind,
+    /// `DIFF_PICKAXE_ALL`: any hit keeps the whole queue, none clears it.
+    pub(super) all: bool,
+    /// `--text`: `-G` reads a binary side too (diffcore-pickaxe.c:163-167).
+    pub(super) text: bool,
+}
+
+/// `pickaxe_match()` (diffcore-pickaxe.c:129-182) on one pair of tree sides.
+fn generic_pickaxe_match(
+    repo: &gix::Repository,
+    px: &GenericPickaxe,
+    one: &diffcore_rename::FileSpec,
+    two: &diffcore_rename::FileSpec,
+) -> Result<bool> {
+    use super::diff_pickaxe::Kind;
+    if !one.valid() && !two.valid() {
+        return Ok(false);
+    }
+    if let Kind::ObjFind(ids) = &px.kind {
+        let id = |s: &diffcore_rename::FileSpec| s.valid().then_some(s.oid);
+        return Ok(super::diff_pickaxe::objfind_hit(ids, id(one), id(two)));
+    }
+    if generic_unmodified(one, two) {
+        return Ok(false);
+    }
+    let read = |s: &diffcore_rename::FileSpec| -> Result<Option<Vec<u8>>> {
+        match gix::objs::tree::EntryMode::try_from(s.mode) {
+            Ok(mode) if s.valid() => Ok(Some(grab_blob(repo, mode.kind(), s.oid)?)),
+            _ => Ok(None),
+        }
+    };
+    let (a, b) = (read(one)?, read(two)?);
+    let binary = |side: &Option<Vec<u8>>| side.as_deref().is_some_and(looks_binary);
+    if matches!(px.kind, Kind::Grep(_)) && !px.text && (binary(&a) || binary(&b)) {
+        return Ok(false);
+    }
+    Ok(px.kind.content_hit(a.as_deref(), b.as_deref()))
+}
+
+/// One pair of a parent's queue as `intersect_paths()` reads it
+/// (combine-diff.c:52-64): `two` is the combined path's own side, `one` the
+/// parent's.
+pub(crate) struct GenericPair {
+    pub(crate) path: BString,
+    pub(crate) one_path: BString,
+    pub(crate) one: (Option<EntryKind>, ObjectId),
+    pub(crate) two: (Option<EntryKind>, ObjectId),
+    pub(crate) status: u8,
+}
+
+impl GenericPair {
+    /// `filename_changed()` (combine-diff.c:33-36): a rename or a copy, whose
+    /// `one` side carries the parent's own name.
+    pub(crate) fn renamed(&self) -> bool {
+        matches!(self.status, b'R' | b'C')
+    }
+}
+
+/// `match_filter()` (diff.c:7272-7281): a modification that carries a score (a
+/// rewrite `diffcore_break()` measured) answers to `B`, any other pair to its status.
+fn generic_filter_selected(filter: &[u8], status: u8, score: u32) -> bool {
+    match status == b'M' && score != 0 {
+        true => diff_filter_selected(filter, b'B'),
+        false => diff_filter_selected(filter, status),
+    }
+}
+
+/// `diff_unmodified_pair()` (diff.c:6484-6514) for two tree sides.
+fn generic_unmodified(one: &diffcore_rename::FileSpec, two: &diffcore_rename::FileSpec) -> bool {
+    one.valid() == two.valid() && one.mode == two.mode && one.path == two.path && one.oid == two.oid
+}
+
+/// `diff_tree_oid(parent, result, "", opt)` then `diffcore_std(opt)`
+/// (combine-diff.c:1403-1404) for one parent: the recursive tree walk, limited by
+/// the pathspec, with `--find-copies-harder`'s unmodified entries
+/// (tree-diff.c:517-532), then break, rename and merge-broken detection
+/// (diff.c:7489-7495), `diff_resolve_rename_copy()` (:7503-7505) and
+/// `diffcore_apply_filter()` (:7506). The pickaxe is the caller's
+/// ([`GenericScan::keep`]).
+fn generic_parent_queue(
+    repo: &gix::Repository,
+    parent_tree: &gix::Tree<'_>,
+    result_tree: &gix::Tree<'_>,
+    specs: Option<&super::log::PathspecMatcher>,
+    scan: &GenericScan,
+) -> Result<Vec<GenericPair>> {
+    use gix::object::tree::diff::ChangeDetached;
+    let (old_tree, new_tree) = match scan.reverse {
+        false => (parent_tree, result_tree),
+        true => (result_tree, parent_tree),
+    };
+    let null = repo.object_hash().null();
+    let admit = |path: &BString| specs.is_none_or(|s| s.matches(path));
+    let mut q = diffcore_rename::Queue::default();
+    let queue = |q: &mut diffcore_rename::Queue, path: &BString, one: Option<(u32, ObjectId)>, two: Option<(u32, ObjectId)>| {
+        let spec = |side: Option<(u32, ObjectId)>| match side {
+            Some((mode, id)) => diffcore_rename::FileSpec::new(path.clone(), mode, id, true),
+            None => diffcore_rename::FileSpec::new(path.clone(), 0, null, false),
+        };
+        let one = q.add_spec(spec(one));
+        let two = q.add_spec(spec(two));
+        q.add_pair(one, two);
+    };
+    let blob = |mode: gix::objs::tree::EntryMode, id: &ObjectId| (!mode.is_tree()).then(|| (u32::from(mode.value()), *id));
+    let mut seen: BTreeSet<BString> = BTreeSet::new();
+    for change in repo.diff_tree_to_tree(Some(old_tree), Some(new_tree), Some(gix::diff::Options::default()))? {
+        // The recursive walk queues blobs and gitlinks; a tree that turned into a
+        // file is a deletion of the one and an addition of the other.
+        let (path, one, two) = match &change {
+            ChangeDetached::Addition { location, entry_mode, id, .. } => (location, None, blob(*entry_mode, id)),
+            ChangeDetached::Deletion { location, entry_mode, id, .. } => (location, blob(*entry_mode, id), None),
+            ChangeDetached::Modification { location, previous_entry_mode, previous_id, entry_mode, id, .. } => {
+                (location, blob(*previous_entry_mode, previous_id), blob(*entry_mode, id))
+            }
+            ChangeDetached::Rewrite { .. } => continue,
+        };
+        if (one.is_none() && two.is_none()) || !admit(path) {
+            continue;
+        }
+        seen.insert(path.clone());
+        queue(&mut q, path, one, two);
+    }
+    if scan.rename.find_copies_harder && scan.rename.detect_rename == diffcore_rename::DETECT_COPY {
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        old_tree.traverse().breadthfirst(&mut recorder)?;
+        for entry in recorder.records {
+            if entry.mode.is_tree() || seen.contains(&entry.filepath) || !admit(&entry.filepath) {
+                continue;
+            }
+            let side = Some((u32::from(entry.mode.value()), entry.oid));
+            queue(&mut q, &entry.filepath, side, side);
+        }
+    }
+    // `ll_diff_tree_paths()` queues in tree order, which the rename pass keeps.
+    let order: Vec<diffcore_rename::Pair> = {
+        let mut pairs = q.pairs.clone();
+        pairs.sort_by(|a, b| q.specs[a.two].path.cmp(&q.specs[b.two].path));
+        pairs
+    };
+    q.pairs = order;
+    let mut content = diffcore_rename::OdbContent { repo };
+    diffcore_rename::run(&mut q, &scan.rename, &mut content);
+    // `diffcore_pickaxe()` (diff.c:7497-7498), whose `pickaxe()` keeps the hits, or
+    // under `--pickaxe-all` the whole queue when anything hit (diffcore-pickaxe.c:184-214).
+    if let Some(px) = &scan.pickaxe {
+        let mut hits = Vec::with_capacity(q.pairs.len());
+        for pair in &q.pairs {
+            hits.push(generic_pickaxe_match(repo, px, &q.specs[pair.one], &q.specs[pair.two])?);
+        }
+        match px.all {
+            true if hits.iter().any(|&h| h) => {}
+            true => q.pairs.clear(),
+            false => {
+                let mut hit = hits.into_iter();
+                q.pairs.retain(|_| hit.next().unwrap_or(false));
+            }
+        }
+    }
+    diffcore_rename::resolve_rename_copy(&mut q);
+
+    let kind = |mode: u32| gix::objs::tree::EntryMode::try_from(mode).ok().map(|m| m.kind());
+    let mut out = Vec::with_capacity(q.pairs.len());
+    for pair in &q.pairs {
+        let (one, two) = (&q.specs[pair.one], &q.specs[pair.two]);
+        if let Some(filter) = &scan.filter {
+            if !generic_filter_selected(filter, pair.status, pair.score) {
+                continue;
+            }
+        }
+        // `intersect_paths()` passes over `diff_unmodified_pair()` (combine-diff.c:50).
+        if generic_unmodified(one, two) {
+            continue;
+        }
+        let side = |s: &diffcore_rename::FileSpec| match s.valid() {
+            true => (kind(s.mode), s.oid),
+            false => (None, null),
+        };
+        out.push(GenericPair {
+            path: two.path.clone(),
+            one_path: one.path.clone(),
+            one: side(one),
+            two: side(two),
+            status: pair.status,
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `find_paths_generic()` (combine-diff.c:1378-1420): every parent's queue in turn,
+/// folded by `intersect_paths()` (combine-diff.c:38-106) into the paths all of them
+/// name. Each row holds one pair per parent, in parent order; the first pair's
+/// `two` side is the combined path's own (`combine_diff_path_new()` from parent
+/// 0's pair, combine-diff.c:52-56), and pair `i`'s `one` side is parent `i`'s, so a
+/// rename shows the parent's content under its old name.
+fn generic_rows(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    scan: &GenericScan,
+) -> Result<Vec<Vec<GenericPair>>> {
+    let specs = match paths.is_empty() {
+        true => None,
+        false => Some(super::log::PathspecMatcher::new(repo, paths)?),
+    };
+    let mut rows: Vec<Vec<GenericPair>> = Vec::new();
+    for (n, pt) in parent_trees.iter().enumerate() {
+        let queue = generic_parent_queue(repo, pt, result_tree, specs.as_ref(), scan)?;
+        if n == 0 {
+            rows = queue.into_iter().map(|p| vec![p]).collect();
+            continue;
+        }
+        // Both lists are in path order: a row the queue lacks is dropped, a queue
+        // entry no row names is skipped (combine-diff.c:75-104).
+        let mut queue = queue.into_iter().peekable();
+        rows.retain_mut(|sides| {
+            let path = sides[0].path.clone();
+            while queue.next_if(|q| q.path < path).is_some() {}
+            match queue.next_if(|q| q.path == path) {
+                Some(p) => {
+                    sides.push(p);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+    if let Some(keep) = &scan.keep {
+        rows.retain(|sides| keep.iter().any(|k| k.as_slice() == sides[0].path.as_slice()));
+    }
+    Ok(rows)
+}
+
+/// [`generic_rows`] for a merge commit, for a caller that renders the raw records
+/// itself (`diff-tree`).
+pub(crate) fn merge_generic_rows(
+    repo: &gix::Repository,
+    commit: ObjectId,
+    parents: &[ObjectId],
+    paths: &[String],
+    scan: &GenericScan,
+) -> Result<Vec<Vec<GenericPair>>> {
+    let result_tree = repo.find_commit(commit)?.tree()?;
+    let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
+    for p in parents {
+        parent_trees.push(repo.find_commit(*p)?.tree()?);
+    }
+    generic_rows(repo, &result_tree, &parent_trees, paths, scan)
+}
+
+/// [`generic_rows`] read into the [`CombinedPath`]s the writers take, with
+/// `grab_blob()`'s content for every side (combine-diff.c:304-335).
+fn generic_path_set(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    scan: &GenericScan,
+    combined_all_paths: bool,
+) -> Result<Vec<CombinedPath>> {
+    let read = |side: Option<EntryKind>, id: ObjectId| match side {
+        Some(k) => grab_blob(repo, k, id),
+        None => Ok(Vec::new()),
+    };
+    let rows = generic_rows(repo, result_tree, parent_trees, paths, scan)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for sides in rows {
+        let (kind, id) = sides[0].two;
+        let path = sides[0].path.clone();
+        let mut parents = Vec::with_capacity(sides.len());
+        for s in sides {
+            let (p_kind, p_id) = s.one;
+            parents.push(CombinedSide {
+                kind: p_kind,
+                id: p_id,
+                bytes: read(p_kind, p_id)?,
+                status: s.status,
+                path: (combined_all_paths && s.renamed()).then_some(s.one_path),
+            });
+        }
+        out.push(CombinedPath {
+            path,
+            kind,
+            patch_kind: kind,
+            result_deleted: false,
+            convert_result: false,
+            textconv: false,
+            id,
+            bytes: read(kind, id)?,
+            parents,
+        });
+    }
+    Ok(out)
+}
+
+/// The path set `diff_tree_combined()` builds (combine-diff.c:1549-1567):
+/// `find_paths_generic()` when a scan is given, `find_paths_multitree()` otherwise.
+fn tree_combined_path_set(
+    repo: &gix::Repository,
+    result_tree: &gix::Tree<'_>,
+    parent_trees: &[gix::Tree<'_>],
+    paths: &[String],
+    scan: Option<&GenericScan>,
+    combined_all_paths: bool,
+) -> Result<Vec<CombinedPath>> {
+    match scan {
+        Some(scan) => generic_path_set(repo, result_tree, parent_trees, paths, scan, combined_all_paths),
+        None => combined_path_set(repo, result_tree, parent_trees, paths),
+    }
 }
 
 /// The paths a combined diff covers: every path whose result-side entry differs
@@ -10485,6 +10846,7 @@ fn combined_path_set(
                 kind: p_kind,
                 id: p_id,
                 bytes: p_bytes,
+                path: None,
             });
         }
         if shared_with_a_parent {
@@ -10524,8 +10886,8 @@ fn render_combined_raw_at(
     z: bool,
     line_prefix: &[u8],
     // `rev->combined_all_paths` (combine-diff.c:1268-1274): the path as each parent
-    // knew it, ahead of the result's own. `filename_changed()` is `R` or `C`, and
-    // this walk runs no rename detection, so every parent's path is the result path.
+    // knew it, ahead of the result's own: `p->parent[i].path`, set only for a rename
+    // or copy (`filename_changed()`), else the result path.
     combined_all_paths: bool,
 ) {
     if fmt & F_RAW != 0 {
@@ -10565,8 +10927,8 @@ fn render_combined_raw_at(
         out.push(if z { 0 } else { b'\t' });
     }
     if combined_all_paths {
-        for _ in &cp.parents {
-            out.extend_from_slice(&name_field(&cp.path, z));
+        for p in &cp.parents {
+            out.extend_from_slice(&name_field(p.path.as_ref().unwrap_or(&cp.path), z));
             out.push(if z { 0 } else { b'\t' });
         }
     }
@@ -10588,18 +10950,14 @@ pub(crate) fn merge_combined_raw(
     z: bool,
     raw: bool,
     combined_all_paths: bool,
-    reversed_pairs: bool,
+    scan: Option<&GenericScan>,
 ) -> Result<Vec<u8>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
-    let mut set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
-    // `-R` under the generic scan: see [`PatchOpts::combined_pairs_reversed`].
-    if reversed_pairs {
-        reverse_combined(&mut set);
-    }
+    let set = tree_combined_path_set(repo, &result_tree, &parent_trees, paths, scan, combined_all_paths)?;
     let fmt = if raw { F_RAW } else { F_NAME_STATUS };
     let mut out = Vec::new();
     for cp in &set {
@@ -10864,7 +11222,7 @@ pub(crate) fn worktree_combined_results(
     for (path, kind, stages) in items {
         let parents: Vec<CombinedSide> = stages
             .iter()
-            .map(|&(id, k)| Ok(CombinedSide { kind: Some(k), id, bytes: grab_blob(repo, k, id)?, status: b'M' }))
+            .map(|&(id, k)| Ok(CombinedSide { kind: Some(k), id, bytes: grab_blob(repo, k, id)?, status: b'M', path: None }))
             .collect::<Result<_>>()?;
         let (patch_kind, bytes, result_deleted, convert_result) =
             combined_worktree_result(repo, workdir, path, *kind, null, &parents)?;
@@ -10993,7 +11351,7 @@ fn oneway_combined_path(
         _ => {}
     }
     let side = |kind: EntryKind, id: ObjectId| -> Result<CombinedSide> {
-        Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M' })
+        Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M', path: None })
     };
     let parents = vec![side(index_kind, entry.id)?, side(tree_kind, tree_id)?];
     let id = repo.object_hash().null();
@@ -11198,29 +11556,31 @@ fn emit_combined(
 /// result differs from every parent, the same filter the combined patch uses; the
 /// stat formats do not go through here, because git leaves those on the
 /// first-parent diff.
+///
+/// The third element is each parent's name for the path under
+/// `--combined-all-paths` (`show_raw_diff()`, combine-diff.c:1268-1274): the
+/// parent's own name for a rename or copy, the result path otherwise.
 pub(crate) fn merge_combined_names(
     repo: &gix::Repository,
     commit: ObjectId,
     parents: &[ObjectId],
     paths: &[String],
-    reversed_pairs: bool,
-) -> Result<Vec<(BString, String)>> {
+    combined_all_paths: bool,
+    scan: Option<&GenericScan>,
+) -> Result<Vec<(BString, String, Vec<BString>)>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
 
-    let mut set = combined_path_set(repo, &result_tree, &parent_trees, paths)?;
-    // `-R` under the generic scan: see [`PatchOpts::combined_pairs_reversed`].
-    if reversed_pairs {
-        reverse_combined(&mut set);
-    }
+    let set = tree_combined_path_set(repo, &result_tree, &parent_trees, paths, scan, combined_all_paths)?;
     Ok(set
         .into_iter()
         .map(|cp| {
             let letters = cp.parents.iter().map(|p| char::from(p.status)).collect();
-            (cp.path, letters)
+            let names = cp.parents.iter().map(|p| p.path.clone().unwrap_or_else(|| cp.path.clone())).collect();
+            (cp.path, letters, names)
         })
         .collect())
 }
@@ -11245,9 +11605,9 @@ pub(crate) struct CombinedHeaderOpts {
     pub(crate) b_prefix: Vec<u8>,
     /// `rev->combined_all_paths`: one `--- <prefix><path>` per parent.
     pub(crate) all_paths: bool,
-    /// The path set was gathered from `-R`-swapped pairs: see
-    /// [`PatchOpts::combined_pairs_reversed`].
-    pub(crate) reversed_pairs: bool,
+    /// `find_paths_generic()`'s per-parent options when `need_generic_pathscan`
+    /// holds, `None` for `find_paths_multitree()`: see [`PatchOpts::generic_scan`].
+    pub(crate) scan: Option<GenericScan>,
 }
 
 impl Default for CombinedHeaderOpts {
@@ -11257,7 +11617,7 @@ impl Default for CombinedHeaderOpts {
             a_prefix: b"a/".to_vec(),
             b_prefix: b"b/".to_vec(),
             all_paths: false,
-            reversed_pairs: false,
+            scan: None,
         }
     }
 }
@@ -11288,7 +11648,7 @@ impl CombinedHeaderOpts {
             a_prefix,
             b_prefix,
             all_paths,
-            reversed_pairs: o.combined_pairs_reversed(repo, generic_filter),
+            scan: o.generic_scan(repo, generic_filter),
         }
     }
 }
@@ -11374,10 +11734,7 @@ pub(crate) fn combined_trees_patch_painted(
     colors: &diff_color::DiffColors,
     hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
-    let mut set = combined_path_set(repo, result_tree, parent_trees, paths)?;
-    if hdr.reversed_pairs {
-        reverse_combined(&mut set);
-    }
+    let set = tree_combined_path_set(repo, result_tree, parent_trees, paths, hdr.scan.as_ref(), hdr.all_paths)?;
     // `show_combined_header()` (combine-diff.c:933): `opt->flags.full_index` picks
     // the whole hex, everything else `DEFAULT_ABBREV` — which `core.abbrev` moves.
     let hexsz = repo.object_hash().len_in_hex();
@@ -11520,8 +11877,8 @@ fn combined_patch(
         }
 
         // `if (rev->combined_all_paths)` (combine-diff.c:988-1005): one `---` line
-        // per parent, each naming the path as that parent knew it — the result path
-        // here, since no rename detection runs in this walk — and `/dev/null` for a
+        // per parent, each naming the path as that parent knew it (`p->parent[i].path`,
+        // set for a rename or copy, else the result path) — and `/dev/null` for a
         // parent that reports the path as added. Without the option it is the single
         // line git prints, `/dev/null` only when *every* parent added it.
         if combined_all_paths {
@@ -11532,7 +11889,7 @@ fn combined_patch(
                         &mut out,
                         line_prefix,
                         b"--- ",
-                        &quote_one(a_prefix, &cp.path),
+                        &quote_one(a_prefix, p.path.as_ref().unwrap_or(&cp.path)),
                     ),
                 }
             }

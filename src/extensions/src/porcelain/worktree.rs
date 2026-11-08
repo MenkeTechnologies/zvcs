@@ -4276,6 +4276,20 @@ fn checkout_into(
             eprint!("{warnings}");
         }
     }
+    // `add_worktree()` checks out through `unpack_trees()`, which ends in
+    // `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`; the index it writes
+    // therefore carries a fully valid `TREE` extension. An index built straight from a tree is
+    // exactly what `prime_cache_tree()` (cache-tree.c:897) describes, so prime it from the same
+    // tree rather than leaving the extension out — a later `write-tree` or `status` would
+    // otherwise have to rebuild what git had already recorded.
+    index.prime_cache_tree(&repo.objects, &tree)?;
+    //
+    // Primed, like the write options, ahead of the checkout: `check_updates()` is followed
+    // at once by the index write (builtin/reset.c:522-530), and a file written in the second
+    // the index is dated by stays racily clean (`is_racy_timestamp()`, read-cache.c:355-373),
+    // so a later `ie_match_stat()` compares its content — through the attribute lookup that
+    // loads the sparse patterns (attr.c:821) — as it does after stock git's checkout.
+    let write_options = crate::config::index_write_options(repo);
     let opts = repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     let odb = repo.objects.clone().into_arc()?;
     crate::worktree::checkout_subset(
@@ -4287,17 +4301,7 @@ fn checkout_into(
         &std::sync::atomic::AtomicBool::default(),
         opts,
     )?;
-    // `add_worktree()` checks out through `unpack_trees()`, which ends in
-    // `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`; the index it writes
-    // therefore carries a fully valid `TREE` extension. An index built straight from a tree is
-    // exactly what `prime_cache_tree()` (cache-tree.c:897) describes, so prime it from the same
-    // tree rather than leaving the extension out — a later `write-tree` or `status` would
-    // otherwise have to rebuild what git had already recorded.
-    index.prime_cache_tree(&repo.objects, &tree)?;
-    index.write_to(
-        std::fs::File::create(admin.join("index"))?,
-        crate::config::index_write_options(repo),
-    )?;
+    index.write_to(std::fs::File::create(admin.join("index"))?, write_options)?;
     Ok(())
 }
 

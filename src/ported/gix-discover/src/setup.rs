@@ -74,7 +74,138 @@ fn get_common_dir(gitdir: &std::path::Path) -> std::path::PathBuf {
     let target = text.trim_end_matches(['\n', '\r']);
     let path = std::path::Path::new(target);
     let joined = if path.is_absolute() { path.to_path_buf() } else { gitdir.join(path) };
-    std::fs::canonicalize(&joined).unwrap_or(joined)
+    strbuf_realpath_or_die(&joined)
+}
+
+/// `strbuf_add_real_path()` (abspath.c:318-327), which is `strbuf_realpath(sb, path,
+/// die_on_error=1)`: `strbuf_realpath_1()` (abspath.c:78-200) walks `path` one component
+/// at a time from its root, or from the cwd when it is relative, resolving `..` against
+/// what was resolved so far and splicing each symlink's target in front of the
+/// components still to come. Only the last component may be missing; any other
+/// `lstat()` failure dies naming the path resolved up to the component that failed.
+fn strbuf_realpath_or_die(path: &std::path::Path) -> std::path::PathBuf {
+    use bstr::ByteSlice;
+    // `#define MAXSYMLINKS 32` (abspath.c:66-69).
+    const MAXSYMLINKS: usize = 32;
+    // `offset_1st_component()` knows drive letters and UNC roots on Windows; this walk
+    // only knows `/`, so other platforms keep the canonicalization they had.
+    if cfg!(not(unix)) {
+        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    }
+    let original = gix_path::into_bstr(path).into_owned();
+    if original.is_empty() {
+        die("The empty string is not a valid path");
+    }
+    // `get_root_part()` (abspath.c:53-63): the bytes `offset_1st_component()` counts.
+    let root_part = |buf: &mut Vec<u8>| -> Vec<u8> {
+        let offset = usize::from(buf.first().is_some_and(|b| is_dir_sep(*b)));
+        buf.drain(..offset).collect()
+    };
+    let mut remaining = original.to_vec();
+    let mut resolved = root_part(&mut remaining);
+    if resolved.is_empty() {
+        // "relative path; can use CWD as the initial resolved path"
+        match std::env::current_dir() {
+            Ok(cwd) => resolved = gix_path::into_bstr(cwd).into_owned().into(),
+            Err(e) => die(&format!("unable to get current working directory: {}", strerror(&e))),
+        }
+    }
+    let mut num_symlinks = 0usize;
+    while !remaining.is_empty() {
+        // `get_next_component()` (abspath.c:32-50).
+        let start = remaining.iter().position(|b| !is_dir_sep(*b)).unwrap_or(remaining.len());
+        let end = remaining[start..]
+            .iter()
+            .position(|b| is_dir_sep(*b))
+            .map_or(remaining.len(), |p| start + p);
+        let next: Vec<u8> = remaining[start..end].to_vec();
+        remaining.drain(..end);
+        match next.as_slice() {
+            b"" | b"." => continue,
+            b".." => {
+                strip_last_component(&mut resolved);
+                continue;
+            }
+            _ => {}
+        }
+        if !resolved.last().is_some_and(|b| is_dir_sep(*b)) {
+            resolved.push(b'/');
+        }
+        resolved.extend_from_slice(&next);
+        let at = gix_path::from_bstr(resolved.as_bstr()).into_owned();
+        match std::fs::symlink_metadata(&at) {
+            // "error out unless this was the last component"
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound || !remaining.is_empty() {
+                    die(&format!("Invalid path '{}': {}", resolved.as_bstr(), strerror(&e)));
+                }
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                num_symlinks += 1;
+                if num_symlinks > MAXSYMLINKS + 1 {
+                    die(&format!(
+                        "More than {MAXSYMLINKS} nested symlinks on path '{}'",
+                        original.as_bstr()
+                    ));
+                }
+                let mut symlink: Vec<u8> = match std::fs::read_link(&at) {
+                    Ok(target) => gix_path::into_bstr(target).into_owned().into(),
+                    Err(e) => die(&format!("Invalid symlink '{}': {}", resolved.as_bstr(), strerror(&e))),
+                };
+                if symlink.first().is_some_and(|b| is_dir_sep(*b)) {
+                    // "absolute symlink; set resolved to root"
+                    resolved = root_part(&mut symlink);
+                } else {
+                    // "relative symlink": its target replaces the last component.
+                    strip_last_component(&mut resolved);
+                }
+                if !remaining.is_empty() {
+                    symlink.push(b'/');
+                    symlink.extend_from_slice(&remaining);
+                }
+                remaining = symlink;
+            }
+            Ok(_) => {}
+        }
+    }
+    gix_path::from_bstr(resolved.as_bstr()).into_owned()
+}
+
+/// `strip_last_component()` (abspath.c:16-29): drop the last component and the
+/// separators before it, never the root.
+fn strip_last_component(path: &mut Vec<u8>) {
+    let offset = usize::from(path.first().is_some_and(|b| is_dir_sep(*b)));
+    let mut len = path.len();
+    while offset < len && !is_dir_sep(path[len - 1]) {
+        len -= 1;
+    }
+    while offset < len && is_dir_sep(path[len - 1]) {
+        len -= 1;
+    }
+    path.truncate(len);
+}
+
+fn is_dir_sep(b: u8) -> bool {
+    b == b'/'
+}
+
+/// `strerror(errno)` as `die_errno()` appends it: the OS text without the
+/// ` (os error N)` that `std::io::Error`'s `Display` adds.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
+}
+
+/// `die()` (usage.c): stdout flushed as `exit()` flushes stdio, then `fatal: <msg>`
+/// on stderr and exit 128.
+fn die(msg: &str) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    eprintln!("fatal: {msg}");
+    std::process::exit(128)
 }
 
 /// `validate_headref()` (`setup.c:352-402`): a `refs/…` symlink, a file whose text

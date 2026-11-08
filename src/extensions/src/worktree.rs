@@ -249,6 +249,19 @@ where
     if let Some(on_entry) = &options.on_entry {
         (0..up_to_date).for_each(|_| on_entry());
     }
+    // `checkout_entry_ca()` runs `convert_attrs()` on the first regular file it writes
+    // (entry.c:584-587), whose attribute lookup loads the sparse patterns of the index being
+    // checked out (attr.c:821, dir.c:1557-1574).
+    let writes_a_file = stale.iter().any(|&i| {
+        let e = &index.entries()[i];
+        use gix::index::entry::{Flags, Mode};
+        matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE) && !e.flags.contains(Flags::SKIP_WORKTREE)
+    });
+    if writes_a_file {
+        if let Some(warnings) = crate::unpack_sparse::take_result_index_pattern_warnings() {
+            eprint!("{warnings}");
+        }
+    }
     if stale.len() == index.entries().len() {
         let res = gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options);
         if res.is_ok() {

@@ -221,6 +221,13 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
         .filter(|(idx, full, meta)| {
             let entry = &index.entries()[*idx];
             if meta.file_type().is_file() {
+                // `index_fd()`'s attribute lookup reads `.gitattributes` from the index first
+                // when none is checked out (attr.c:856-865), and `read_attr_from_index()` loads
+                // the index's sparse patterns (attr.c:821, dir.c:1557-1574) — the result of a
+                // sparse `unpack_trees()` its checkout did not load already.
+                if let Some(warnings) = crate::unpack_sparse::take_result_index_pattern_warnings() {
+                    eprint!("{warnings}");
+                }
                 compare_data(repo, &mut filter, entry.path(index), full, &entry.id)
             } else {
                 modified_check_fs(object_hash, full, meta, &entry.id)

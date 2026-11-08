@@ -123,6 +123,23 @@ impl Warning {
     }
 }
 
+/// `istate->sparse_checkout_patterns` of the last `o->internal.result` a
+/// [`SparseCheckout`] stood for, while still unloaded: the warnings its own
+/// `init_sparse_checkout_patterns()` (dir.c:1557-1574) prints when the first attribute
+/// lookup of `check_updates()` reaches it. `check_updates()` sets `GIT_ATTR_CHECKOUT`
+/// (unpack-trees.c:456), so `read_attr()` asks `read_attr_from_index()` first (attr.c:852-855),
+/// and that asks `path_in_cone_mode_sparse_checkout()` of the index (attr.c:821).
+/// [`take_result_index_pattern_warnings`] consumes it, as the load is cached on the
+/// `index_state` and happens once.
+static RESULT_INDEX_PATTERNS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The warnings the result index's pattern load prints, the first time `checkout_entry_ca()`
+/// writes a regular file and so runs `convert_attrs()` on it (entry.c:584-587); `None` once
+/// loaded, or when no sparse `unpack_trees()` stands behind the checkout.
+pub(crate) fn take_result_index_pattern_warnings() -> Option<String> {
+    RESULT_INDEX_PATTERNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
+
 /// `unpack_trees()` with `o->skip_sparse_checkout` clear: the pattern list it read and the
 /// options its warnings depend on.
 pub(crate) struct SparseCheckout {
@@ -152,7 +169,15 @@ impl SparseCheckout {
     /// [`Self::begin`] for a caller that has already read the patterns, `None` standing for
     /// `o->skip_sparse_checkout`.
     pub(crate) fn with_patterns(patterns: Option<UnpackPatterns>, opts: Opts) -> Option<Self> {
-        patterns.map(|patterns| SparseCheckout { patterns, opts })
+        let patterns = patterns?;
+        // `populate_from_existing_patterns()` loads the file into this run's own `pl`
+        // (unpack-trees.c:1832-1840), so `add_pattern_to_hashsets()` warns here, once per
+        // `unpack_trees()`. `o->internal.result` is a fresh `index_state` whose
+        // `sparse_checkout_patterns` nothing has loaded yet (dir.c:1557-1574).
+        eprint!("{}", patterns.warnings);
+        *RESULT_INDEX_PATTERNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(patterns.warnings.clone());
+        Some(SparseCheckout { patterns, opts })
     }
 
     /// The two sparse loops and `apply_sparse_checkout()` over `result`, the index the merge

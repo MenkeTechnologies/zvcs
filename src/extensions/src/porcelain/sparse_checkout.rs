@@ -968,6 +968,9 @@ pub(crate) struct UnpackPatterns {
     /// `pl->full_cone`: a bare `/*` line sets it, a `!/*/` line clears it
     /// (dir.c:731-741).
     full_cone: bool,
+    /// What `add_pattern_to_hashsets()` warned while loading the file (dir.c:798-936), for
+    /// [`crate::unpack_sparse::SparseCheckout`] to print where `unpack_trees()` loads it.
+    pub(crate) warnings: String,
 }
 
 impl UnpackPatterns {
@@ -989,7 +992,7 @@ impl UnpackPatterns {
     pub(crate) fn load_with_warnings(repo: &gix::Repository, cone: bool) -> Option<(Self, String)> {
         let (sparsity, warnings) = load_pattern_file(repo, cone).ok().flatten()?;
         let full_cone = matches!(&sparsity, Sparsity::Cone(c) if c.full);
-        Some((UnpackPatterns { sparsity, full_cone }, warnings))
+        Some((UnpackPatterns { sparsity, full_cone, warnings: warnings.clone() }, warnings))
     }
 
     /// `path_matches_pattern_list()` (dir.c:1502-1566) for `path`, whose last

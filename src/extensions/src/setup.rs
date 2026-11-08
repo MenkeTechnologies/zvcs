@@ -758,6 +758,58 @@ pub(crate) fn note_setup_work_tree() {
     WORK_TREE_SET_UP.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this process entered its repository through `enter_repo()` rather than
+/// `setup_git_directory()` — set by `receive-pack`.
+static ENTERED_REPO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that the command found its repository through `enter_repo()`, which
+/// `chdir()`s into the git directory it settled on and calls
+/// `apply_and_export_relative_gitdir(repo, ".", 0)` (setup.c:1879-1897): every
+/// child starts there with `GIT_DIR=.`, and, as
+/// `setup_git_directory()` never ran, without the `GIT_PREFIX` it exports
+/// (setup.c:2117-2124).
+pub(crate) fn note_enter_repo() {
+    ENTERED_REPO.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a child git this process stands in for was left with by its own setup.
+#[derive(Debug, Clone)]
+pub(crate) struct ChildSetup {
+    /// The child's [`after_setup`], or `None` to keep this process's model.
+    pub setup: Option<AfterSetup>,
+    /// The `GIT_PREFIX` the child's `setup_git_directory()` exports to its own
+    /// children (setup.c:2117-2124): the child's prefix, empty when it is NULL.
+    pub prefix: Vec<u8>,
+}
+
+thread_local! {
+    /// Repositories this process works on in place of a child git it does not spawn,
+    /// by real git directory, each with the setup that child would have been left in.
+    static CHILD_SETUPS: std::cell::RefCell<Vec<(PathBuf, ChildSetup)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The [`ChildSetup`] [`as_child`] installed for `repo`, if any.
+fn child_setup(repo: &gix::Repository) -> Option<ChildSetup> {
+    CHILD_SETUPS.with(|s| {
+        let s = s.borrow();
+        let key = (!s.is_empty()).then(|| realpath(repo.git_dir()))?;
+        s.iter().rev().find(|(k, _)| *k == key).map(|(_, child)| child.clone())
+    })
+}
+
+/// Run `f` with [`after_setup`] and [`export_to_child`] answering `child` for the
+/// repository at `git_dir`: the state of a child git whose work this process does
+/// itself, so the hooks it runs see that child's cwd, `GIT_DIR`, `GIT_WORK_TREE`
+/// and `GIT_PREFIX`.
+pub(crate) fn as_child<T>(git_dir: &Path, child: ChildSetup, f: impl FnOnce() -> T) -> T {
+    let key = realpath(git_dir);
+    CHILD_SETUPS.with(|s| s.borrow_mut().push((key, child)));
+    let out = f();
+    CHILD_SETUPS.with(|s| s.borrow_mut().pop());
+    out
+}
+
 /// The process state git's setup leaves behind for its children — hooks, the
 /// editor — which zvcs does not reproduce in its own process because it never
 /// `chdir`s.
@@ -806,6 +858,17 @@ pub(crate) struct AfterSetup {
 ///   with the new cwd stripped as a leading path, or left whole when it is not
 ///   one — and a set `GIT_WORK_TREE` becomes `.`.
 pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
+    if let Some(setup) = child_setup(repo).and_then(|c| c.setup) {
+        return Some(setup);
+    }
+    if ENTERED_REPO.load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(AfterSetup {
+            cwd: realpath(repo.git_dir()),
+            git_dir: PathBuf::from("."),
+            export_git_dir: true,
+            work_tree_env: None,
+        });
+    }
     let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
     let explicit = std::env::var_os("GIT_DIR");
     let work_tree_env = std::env::var_os("GIT_WORK_TREE");
@@ -932,7 +995,15 @@ pub(crate) fn export_to_child(
     cmd: &mut std::process::Command,
 ) {
     use std::os::unix::ffi::OsStringExt;
-    cmd.env("GIT_PREFIX", std::ffi::OsString::from_vec(prefix_bytes(repo)));
+    match child_setup(repo) {
+        Some(child) => {
+            cmd.env("GIT_PREFIX", std::ffi::OsString::from_vec(child.prefix));
+        }
+        None if !ENTERED_REPO.load(std::sync::atomic::Ordering::Relaxed) => {
+            cmd.env("GIT_PREFIX", std::ffi::OsString::from_vec(prefix_bytes(repo)));
+        }
+        None => {}
+    }
     let Some(s) = setup else {
         return;
     };

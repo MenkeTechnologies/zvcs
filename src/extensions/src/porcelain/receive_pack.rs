@@ -511,6 +511,7 @@ fn open_repo(dir: &str) -> Option<gix::Repository> {
     // configuration instead of the receiving repository's.
     let home = std::fs::canonicalize(repo.workdir().unwrap_or_else(|| repo.git_dir())).ok()?;
     std::env::set_current_dir(&home).ok()?;
+    crate::setup::note_enter_repo();
     gix::open(&home).ok()
 }
 
@@ -3856,7 +3857,9 @@ fn spawn_hook(
     let path = crate::hooks::find(repo, name).ok().flatten()?;
 
     let (hook_dir, git_dir) = enter_repo_dir(repo);
-    let mut cmd = std::process::Command::new(&path);
+    // `find_hook()`'s `git_path("hooks/%s")` (hook.c:26-64) under `enter_repo()`'s
+    // `GIT_DIR=.`: `hooks/<name>`, or the `core.hooksPath` spelling, is the hook's `$0`.
+    let mut cmd = std::process::Command::new(crate::hooks::exec_name(repo, name, &path, &hook_dir));
     cmd.args(args)
         .current_dir(&hook_dir)
         .env("GIT_DIR", &git_dir)
@@ -4017,13 +4020,28 @@ fn update_worktree_to(
 
     // `push_to_checkout()`: the hook takes over the whole job when it exists, and a
     // non-zero exit is the refusal. `invoked_hook` is false when there is no hook.
-    let hook = repo.common_dir().join("hooks").join("push-to-checkout");
-    if is_executable(&hook) {
-        let ok = std::process::Command::new(&hook)
+    //
+    // `run_hooks_opt()` leaves `cp->dir` unset, so the hook starts in the git directory
+    // `enter_repo()` moved to, named as `find_hook()` spells it there (hook.c:86-104),
+    // with no stdin and its stdout on stderr (hook.h:183-186, hook.c:589-607). `GIT_DIR` is
+    // `absolute_path(get_worktree_git_dir(worktree))` (receive-pack.c:1465-1467), which
+    // for the main worktree is `absolute_path(".")`: the cwd with `/.` appended
+    // (abspath.c:293-316).
+    if let Ok(Some(hook)) = crate::hooks::find(repo, "push-to-checkout") {
+        let (hook_dir, _) = enter_repo_dir(repo);
+        let git_dir_env = match crate::setup::realpath(git_dir) == crate::setup::realpath(repo.git_dir()) {
+            true => hook_dir.join("."),
+            false => git_dir.to_owned(),
+        };
+        use std::os::fd::AsFd;
+        let stdout = std::io::stderr().as_fd().try_clone_to_owned().map(std::process::Stdio::from);
+        let ok = std::process::Command::new(crate::hooks::exec_name(repo, "push-to-checkout", &hook, &hook_dir))
             .arg(new.to_hex().to_string())
-            .current_dir(&workdir)
-            .env("GIT_DIR", git_dir)
-            .env("GIT_WORK_TREE", &workdir)
+            .current_dir(&hook_dir)
+            .env("GIT_DIR", &git_dir_env)
+            .env("GIT_WORK_TREE", crate::hooks::absolutize(&workdir))
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.unwrap_or_else(|_| std::process::Stdio::inherit()))
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -4107,15 +4125,6 @@ fn push_to_deploy(
     None
 }
 
-/// Whether `path` is a file this process could run, which is what
-/// `run_hooks_opt()` requires before it counts the hook as invoked.
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 /// `run_update_hook()`: `update <ref> <old> <new>`, one run per ref.
 fn run_update_hook(repo: &gix::Repository, cmd: &Command, band: &mut Band) -> bool {
     let args = [cmd.name.clone(), cmd.old.to_string(), cmd.new.to_string()];
@@ -4167,7 +4176,9 @@ fn run_proc_receive_hook(
         return true;
     };
 
-    let mut child = match std::process::Command::new(&path)
+    // `argv[0]` is `find_hook()`'s path as `enter_repo()` left it (receive-pack.c:1145-1152).
+    let program = crate::hooks::exec_name(repo, "proc-receive", &path, &enter_repo_dir(repo).0);
+    let mut child = match std::process::Command::new(program)
         .current_dir(enter_repo_dir(repo).0)
         .env("GIT_DIR", enter_repo_dir(repo).1)
         .stdin(std::process::Stdio::piped())

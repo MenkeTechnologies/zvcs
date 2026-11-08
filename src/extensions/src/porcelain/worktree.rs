@@ -575,10 +575,15 @@ fn head_info(repo: &gix::Repository) -> Result<HeadInfo> {
 /// `None` means "not broken": no such loose file (the ref is packed, or genuinely
 /// unborn — both of which git forgives), a symref, or contents that parse.
 fn broken_referent(repo: &gix::Repository, name: &gix::refs::FullNameRef) -> Option<ObjectId> {
+    broken_referent_in(repo, repo.common_dir(), name)
+}
+
+/// [`broken_referent`] in the ref store whose common directory is `common`.
+fn broken_referent_in(repo: &gix::Repository, common: &Path, name: &gix::refs::FullNameRef) -> Option<ObjectId> {
     // `refs/heads/<name>` is not a per-worktree ref, so the files backend reads it
     // from the common directory (`files_ref_path()`); a linked worktree and the main
     // one see the same file.
-    let path = repo.common_dir().join(gix::path::from_byte_slice(name.as_bstr()));
+    let path = common.join(gix::path::from_byte_slice(name.as_bstr()));
     let raw = std::fs::read(path).ok()?;
     let buf = rtrim(&raw);
     if buf.starts_with(b"ref:") {
@@ -649,6 +654,21 @@ fn hex_pair(pair: &[u8]) -> Option<u8> {
 /// failed for some *other* reason, or a symref named something `HEAD` may not
 /// point at.
 fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
+    let find = |name: &gix::refs::FullNameRef| {
+        repo.find_reference(name).ok().and_then(|r| r.target().try_id().map(ObjectId::from))
+    };
+    head_info_of_store(repo, git_dir, repo.common_dir(), &find)
+}
+
+/// [`head_info_of_git_dir`] in the ref store `get_worktree_ref_store()` builds for a linked
+/// worktree (worktree.c:46, refs.c): `HEAD` read from `git_dir`, a shared referent looked up
+/// by `find` in the store whose common directory is `common`.
+fn head_info_of_store(
+    repo: &gix::Repository,
+    git_dir: &Path,
+    common: &Path,
+    find: &dyn Fn(&gix::refs::FullNameRef) -> Option<ObjectId>,
+) -> HeadInfo {
     let null = ObjectId::null(repo.object_hash());
     let raw = match std::fs::read(git_dir.join("HEAD")) {
         Ok(raw) => raw,
@@ -667,16 +687,12 @@ fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
         // first pass set, so the worktree shows the branch name at the null id.
         Some(target) => match FullName::try_from(target.trim().to_owned()) {
             Ok(name) => {
-                let oid = repo
-                    .find_reference(name.as_ref())
-                    .ok()
-                    .and_then(|r| r.target().try_id().map(ObjectId::from))
-                    .unwrap_or(null);
+                let oid = find(name.as_ref()).unwrap_or(null);
                 // A referent gitoxide declined to read is either missing — which
                 // git forgives — or broken, which makes the whole resolve return
                 // NULL. [`broken_referent`] is the test that separates them.
                 match oid.is_null() {
-                    true => match broken_referent(repo, name.as_ref()) {
+                    true => match broken_referent_in(repo, common, name.as_ref()) {
                         Some(partial) => HeadInfo::Unknown(partial),
                         None => HeadInfo::Branch { oid, name },
                     },
@@ -692,6 +708,28 @@ fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
         None => ObjectId::from_hex(text.as_bytes())
             .map_or(HeadInfo::Unknown(null), HeadInfo::Detached),
     }
+}
+
+/// `get_common_dir_noenv()` (setup.c:312-350) for a linked worktree's administrative
+/// directory: the real path of what its `commondir` file names, relative to `admin`,
+/// or `None` when it has no such file. `Err` is `strbuf_add_real_path()`'s `die()`
+/// text. An empty file, whose `die_errno()` reports whatever `errno` was left from
+/// before, keeps this repository's common directory.
+fn linked_common_dir(admin: &Path) -> Result<Option<PathBuf>, String> {
+    let Ok(data) = std::fs::read(admin.join("commondir")) else {
+        return Ok(None);
+    };
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let end = data.iter().rposition(|b| !matches!(b, b'\n' | b'\r')).map_or(0, |i| i + 1);
+    let named = gix::path::from_byte_slice(&data[..end]);
+    let path = match named.is_absolute() {
+        true => named.to_path_buf(),
+        false => admin.join(named),
+    };
+    let real = crate::setup::realpath_or_die(&path)?;
+    Ok(Some(real))
 }
 
 /// Enumerate the main worktree followed by every linked worktree, sorted by
@@ -803,7 +841,29 @@ fn collect_in_readdir_order(repo: &gix::Repository, expire: u64) -> Result<Vec<W
             PruneCheck::Keep(_) => None,
         };
 
+        // `get_worktree_ref_store()`'s files backend takes the shared refs from the
+        // directory `get_common_dir_noenv()` reads out of `commondir` (setup.c:312-350),
+        // `strbuf_add_real_path()` dying on a path whose inner component is missing; a
+        // `commondir` naming anywhere but this repository's common directory leaves
+        // `HEAD`'s branch unresolved at the null id.
+        let wt_common = match linked_common_dir(&admin) {
+            Ok(dir) => dir,
+            Err(msg) => crate::git_fatal!("{msg}"),
+        };
+        let foreign_common = wt_common.as_ref().is_some_and(|dir| *dir != common);
         let head = match repo.worktree_proxy_by_id(BStr::new(id.as_str())) {
+            _ if foreign_common => {
+                let wt_common = wt_common.clone().unwrap_or_default();
+                let store = gix::refs::file::Store::for_linked_worktree(
+                    admin.clone(),
+                    wt_common.clone(),
+                    gix::refs::store::init::Options { object_hash: repo.object_hash(), ..Default::default() },
+                );
+                let find = |name: &gix::refs::FullNameRef| {
+                    store.try_find(name).ok().flatten().and_then(|r| r.target.try_id().map(ObjectId::from))
+                };
+                head_info_of_store(repo, &admin, &wt_common, &find)
+            }
             Some(proxy) => match proxy.into_repo_with_possibly_inaccessible_worktree() {
                 Ok(wt_repo) => head_info(&wt_repo)?,
                 Err(_) => head_info_of_git_dir(repo, &admin),
@@ -1324,6 +1384,23 @@ enum GitfileErr {
     InvalidFormat,
     NoPath,
     NotARepo,
+    TooLarge,
+}
+
+impl GitfileErr {
+    /// The `READ_GITFILE_ERR_*` number (setup.h:31-40).
+    fn code(&self) -> u8 {
+        match self {
+            GitfileErr::StatFailed => 1,
+            GitfileErr::NotAFile => 2,
+            GitfileErr::OpenFailed => 3,
+            GitfileErr::ReadFailed => 4,
+            GitfileErr::InvalidFormat => 5,
+            GitfileErr::NoPath => 6,
+            GitfileErr::NotARepo => 7,
+            GitfileErr::TooLarge => 8,
+        }
+    }
 }
 
 /// Port of `read_gitfile_gently()`: read a `gitdir: <path>` gitfile and return
@@ -1355,12 +1432,10 @@ fn read_gitfile_raw(path: &Path) -> Result<Vec<u8>, GitfileErr> {
     if !st.is_file() {
         return Err(GitfileErr::NotAFile);
     }
-    // git rejects a > 1MB gitfile as READ_GITFILE_ERR_TOO_LARGE. Neither
-    // worktree caller distinguishes it from the other broken-file codes (both
-    // map every non-`NotAFile`/`NotARepo` error to "broken"), so it is folded
-    // into `ReadFailed` here rather than given its own variant.
+    // git rejects a > 1MB gitfile as READ_GITFILE_ERR_TOO_LARGE, whose number
+    // `validate_worktree()` prints; the repair callers treat it as broken.
     if st.len() > (1 << 20) {
-        return Err(GitfileErr::ReadFailed);
+        return Err(GitfileErr::TooLarge);
     }
     let buf = std::fs::read(path).map_err(|_| GitfileErr::OpenFailed)?;
     if buf.len() as u64 != st.len() {
@@ -1790,7 +1865,7 @@ fn repair(args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
     }
-    repair_worktrees(&repo, &common, &mut rc, relative);
+    repair_worktrees(&repo, &common, &mut rc, relative)?;
 
     Ok(if rc != 0 {
         ExitCode::FAILURE
@@ -1908,15 +1983,20 @@ pub(super) fn relative_path(target: &Path, base: &Path) -> PathBuf {
 
 /// Port of `repair_worktrees()`: fix each linked worktree's `.git` gitfile
 /// (skipping the main worktree, git's `worktrees + 1`).
-fn repair_worktrees(repo: &gix::Repository, common: &Path, rc: &mut i32, relative: bool) {
-    let Ok(worktrees) = collect_in_readdir_order(repo, u64::MAX) else {
-        return;
+fn repair_worktrees(repo: &gix::Repository, common: &Path, rc: &mut i32, relative: bool) -> Result<()> {
+    // `get_worktrees_internal()` dies where `get_linked_worktree()` does (a `commondir`
+    // `strbuf_add_real_path()` cannot resolve); anything else leaves nothing to repair.
+    let worktrees = match collect_in_readdir_order(repo, u64::MAX) {
+        Ok(worktrees) => worktrees,
+        Err(e) if e.is::<crate::fatal::Fatal>() => return Err(e),
+        Err(_) => return Ok(()),
     };
     for wt in worktrees.iter().filter(|w| w.is_linked()) {
         if let Some(id) = &wt.id {
             repair_gitfile(common, id, &wt.path, rc, relative);
         }
     }
+    Ok(())
 }
 
 /// Port of `repair_gitfile()`: rewrite `<wt>/.git` when it is missing, broken,
@@ -2850,7 +2930,10 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // that dies on an occupied path still leaves `refs/heads/<name>` behind, and repeating the
     // command then fails on the branch instead.
     if let Start::NewBranch { name, oid, force, from } = &start {
-        create_branch(&repo, name, *oid, *force, from)?;
+        // The child starts where `add()` stands, at the top of the work tree, so its
+        // `setup_git_directory()` exports an empty `GIT_PREFIX` (setup.c:2117-2124).
+        let branch_child = crate::setup::ChildSetup { setup: None, prefix: Vec::new() };
+        crate::setup::as_child(repo.git_dir(), branch_child, || create_branch(&repo, name, *oid, *force, from))?;
         // The child `git branch <new> <start> [<opt_track>]` sets the upstream after
         // it writes the ref, and its `branch '<n>' set up to track '<u>'.` lands on
         // stdout between the `Preparing worktree` line and the checkout's
@@ -2988,9 +3071,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // The child's `unpack_trees()` only applies sparse patterns it can read: with no
     // `info/sparse-checkout` to copy, `get_sparse_checkout_patterns()` fails and
     // `skip_sparse_checkout` is set, so the whole tree is written out.
-    let sparsity = super::sparse_checkout::load_sparsity_if_enabled(&repo)?
-        .filter(|_| repo.git_dir().join("info").join("sparse-checkout").exists());
-    if sparsity.is_some() {
+    let sparse = super::sparse_checkout::load_sparsity_if_enabled(&repo)?.is_some()
+        && repo.git_dir().join("info").join("sparse-checkout").exists();
+    if sparse {
         copy_sparse_checkout(&repo, &admin);
     }
     if repo.config_snapshot().boolean("extensions.worktreeConfig").unwrap_or(false) {
@@ -3014,10 +3097,16 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
         // `make_worktree_orphan()` (builtin/worktree.c:411-423) runs `symbolic-ref HEAD
         // refs/heads/<branch>` in the new worktree, `refs_update_symref(…, NULL)` once more.
-        match &wt_repo {
-            Some(wt_repo) => crate::refstore::state_ref_write(wt_repo, "HEAD", &head, "")?,
-            None => crate::refstore::write_ref_file_with_hook(&repo, "HEAD", &head, &admin.join("HEAD"))?,
-        }
+        let orphan_child = add_child_setup(&repo, &admin, path_arg, false);
+        crate::setup::as_child(&admin, orphan_child, || -> Result<()> {
+            match &wt_repo {
+                Some(wt_repo) => crate::refstore::state_ref_write(wt_repo, "HEAD", &head, ""),
+                None => {
+                    let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
+                    crate::refstore::write_ref_file_with_hook(&wt_repo, "HEAD", &head, &admin.join("HEAD"))
+                }
+            }
+        })?;
         let mut empty = gix::index::State::new(repo.object_hash());
         // The `reset --hard` over an unborn `HEAD` unpacks the empty tree, so its cache-tree names
         // that tree over zero entries. git records the id whether or not the object was ever
@@ -3035,7 +3124,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
         // The `reset --hard` over the unborn `HEAD` moves no ref, and ends in
         // `remove_branch_state()` (builtin/reset.c:542-543) all the same.
         let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
-        super::reset::remove_branch_state(&wt_repo, false)?;
+        let reset_child = add_child_setup(&repo, &admin, path_arg, true);
+        crate::setup::as_child(&admin, reset_child, || super::reset::remove_branch_state(&wt_repo, false))?;
         if lock_it {
             let reason = lock_reason.unwrap_or_else(|| "added with --lock".to_string());
             write_file(&admin.join("locked"), &reason)?;
@@ -3055,7 +3145,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 // `config.worktree` `copy_filtered_worktree_config()` just wrote; the repository
                 // opened for the `HEAD` write predates that copy.
                 let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
-                reset_ref_updates(&wt_repo, start.oid())?;
+                let reset_child = add_child_setup(&repo, &admin, path_arg, true);
+                crate::setup::as_child(&admin, reset_child, || reset_ref_updates(&wt_repo, start.oid()))?;
             }
         }
         None => {
@@ -3064,7 +3155,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
             write_worktree_reflog(&repo, &admin, start.oid())?;
             if checkout {
                 let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
-                reset_ref_updates(&wt_repo, start.oid())?;
+                let reset_child = add_child_setup(&repo, &admin, path_arg, true);
+                crate::setup::as_child(&admin, reset_child, || reset_ref_updates(&wt_repo, start.oid()))?;
             }
         }
     }
@@ -3078,7 +3170,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     if checkout {
-        checkout_into(&repo, &admin, &path, start.oid(), sparsity.as_ref())?;
+        checkout_into(&repo, &admin, &path, start.oid(), sparse)?;
     }
 
     // The `HEAD is now at …` line comes from the checkout itself, so
@@ -3925,6 +4017,39 @@ fn create_branch(
     Ok(())
 }
 
+/// The setup of a child git `add_worktree()` runs with `GIT_DIR=<path>/.git` and
+/// `GIT_WORK_TREE=<path>` in `child_env` and no `cp.dir` (builtin/worktree.c:584-585), `<path>`
+/// being `prefix_filename()` of the argument. `setup_explicit_git_dir()` replaces the gitfile
+/// with the administrative directory it names (setup.c:1162-1166), which it exports, and the
+/// child starts where `add()` stands, outside the new work tree, so its prefix is NULL. The
+/// `reset --hard` of `checkout_worktree()` needs a work tree: `setup_work_tree()` moves it to
+/// `<path>` and sets `GIT_WORK_TREE` to `.` (setup.c:494-514). `make_worktree_orphan()`'s
+/// `symbolic-ref` does not, and keeps both where they were.
+fn add_child_setup(
+    repo: &gix::Repository,
+    admin: &std::path::Path,
+    path_arg: &str,
+    need_work_tree: bool,
+) -> crate::setup::ChildSetup {
+    let path = crate::setup::prefix_filename(crate::setup::startup_prefix(repo).as_deref(), path_arg);
+    let git_dir = crate::setup::realpath(admin);
+    let setup = match need_work_tree {
+        true => crate::setup::AfterSetup {
+            cwd: crate::setup::realpath(std::path::Path::new(path_arg)),
+            git_dir,
+            export_git_dir: true,
+            work_tree_env: Some(".".into()),
+        },
+        false => crate::setup::AfterSetup {
+            cwd: crate::setup::setup_cwd(repo).unwrap_or_else(|| crate::setup::realpath(std::path::Path::new("."))),
+            git_dir,
+            export_git_dir: true,
+            work_tree_env: Some(path.into()),
+        },
+    };
+    crate::setup::ChildSetup { setup: Some(setup), prefix: Vec::new() }
+}
+
 /// The ref updates of the `reset --hard` child `checkout_worktree()` runs (builtin/worktree.c:396-406)
 /// in a worktree whose `HEAD` names `oid`, through the worktree's ref store: `reset_refs()`
 /// (builtin/reset.c:283-311) sets `ORIG_HEAD` to the old `HEAD`, logged as `updating ORIG_HEAD`
@@ -4110,7 +4235,7 @@ fn checkout_into(
     admin: &Path,
     path: &Path,
     oid: ObjectId,
-    sparsity: Option<&super::sparse_checkout::Sparsity>,
+    sparse: bool,
 ) -> Result<()> {
     let tree = repo.find_commit(oid)?.tree_id()?.detach();
     let mut index = repo.index_from_tree(&tree)?;
@@ -4121,17 +4246,34 @@ fn checkout_into(
     // than writing it out. `EXTENDED` is what carries the bit through
     // serialization, and forces index version 3 — the same widening git's own
     // index gets.
-    if let Some(sparsity) = sparsity {
-        let paths: Vec<gix::bstr::BString> = {
-            let backing = index.path_backing();
-            index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
-        };
-        for (entry, entry_path) in index.entries_mut().iter_mut().zip(paths.iter()) {
-            if !sparsity.includes(&entry_path.to_str_lossy()) {
-                entry.flags.insert(
-                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
-                );
-            }
+    //
+    // `populate_from_existing_patterns()` loads the copied file in the child's dialect
+    // (unpack-trees.c:1832-1840, dir.c:3512-3523), and a file cone mode cannot read draws
+    // `add_pattern_to_hashsets()`'s warnings and is matched as a non-cone list
+    // (dir.c:798-936).
+    let patterns = match sparse {
+        true => {
+            let wt_repo = gix::open_opts(admin, repo.open_options().clone())?;
+            let cone = wt_repo.config_snapshot().boolean("core.sparseCheckoutCone").unwrap_or(false);
+            super::sparse_checkout::UnpackPatterns::load_with_warnings(&wt_repo, cone)
+        }
+        false => None,
+    };
+    if let Some((pl, warnings)) = &patterns {
+        eprint!("{warnings}");
+        pl.mark_new_skip_worktree(&mut index, &|_| true, false)?;
+    }
+    // `checkout_entry_ca()` reads the attributes of the first regular file it writes
+    // (`convert_attrs()`, entry.c:584-587), and `read_attr_from_index()` asks
+    // `path_in_cone_mode_sparse_checkout()` of the result index (attr.c:821), whose own
+    // `init_sparse_checkout_patterns()` loads the file a second time (dir.c:1557-1574).
+    if let Some((_, warnings)) = &patterns {
+        let writes_a_file = index.entries().iter().any(|e| {
+            use gix::index::entry::{Flags, Mode};
+            matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE) && !e.flags.contains(Flags::SKIP_WORKTREE)
+        });
+        if writes_a_file {
+            eprint!("{warnings}");
         }
     }
     let opts = repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
@@ -4214,6 +4356,12 @@ fn remove(args: &[String]) -> Result<ExitCode> {
             });
         }
     }
+    // `if (validate_worktree(wt, &errmsg, WT_VALIDATE_WORKTREE_MISSING_OK))
+    //         die(_("validation failed, cannot remove working tree: %s"), errmsg.buf);`
+    // (builtin/worktree.c:1458-1460), `-f` or not.
+    if let Some(errmsg) = validate_worktree(&repo, wt, true) {
+        return die(&format!("validation failed, cannot remove working tree: {errmsg}"));
+    }
 
     // `check_clean_worktree()`: git runs `status --porcelain` inside the worktree and
     // refuses on any output at all, tracked or not. A checkout that is already gone
@@ -4261,6 +4409,63 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     // any worktree existed. `rmdir` fails harmlessly while other worktrees remain.
     let _ = std::fs::remove_dir(&worktrees_dir);
     Ok(ExitCode::from(if failed { 255 } else { 0 }))
+}
+
+/// Port of `validate_worktree()` (worktree.c:362-431): `None` when the worktree's `.git` file
+/// names its administrative directory, else the message `move` and `remove` die with. With
+/// `missing_ok` (`WT_VALIDATE_WORKTREE_MISSING_OK`) a checkout that is gone passes.
+/// `read_gitfile_gently()` validates the directory the file names with `is_git_directory()`,
+/// which reads its `commondir` (setup.c:312-350), so a junk `commondir` is error code 7.
+fn validate_worktree(repo: &gix::Repository, wt: &Wt, missing_ok: bool) -> Option<String> {
+    let wt_path = wt.path.join(".git");
+    let Some(id) = &wt.id else {
+        return match wt_path.is_dir() {
+            true => None,
+            false => Some(format!(
+                "'{}' at main working tree is not the repository directory",
+                path_to_string(&wt_path)
+            )),
+        };
+    };
+    // `repo_common_path_replace(wt->repo, &buf, "worktrees/%s…", wt->id)`: the common
+    // directory as this process holds it, `.git` from the main worktree's top.
+    let common_path = |name: String| match repo.common_dir() == repo.git_dir() {
+        true => crate::setup::git_path_spelled(repo, &name),
+        false => crate::hooks::absolutize(repo.common_dir()).join(name),
+    };
+    if !wt.path.is_absolute() {
+        return Some(format!(
+            "'{}' file does not contain absolute path to the working tree location",
+            path_to_string(&common_path(format!("worktrees/{id}/gitdir")))
+        ));
+    }
+    if missing_ok && std::fs::symlink_metadata(&wt.path).is_err() {
+        return None;
+    }
+    if std::fs::symlink_metadata(&wt_path).is_err() {
+        return Some(format!("'{}' does not exist", path_to_string(&wt_path)));
+    }
+    let path = match read_gitfile(&wt_path) {
+        Ok(path) => path,
+        Err(err) => {
+            return Some(format!(
+                "'{}' is not a .git file, error code {}",
+                path_to_string(&wt_path),
+                err.code()
+            ));
+        }
+    };
+    let admin = common_path(format!("worktrees/{id}"));
+    let real = gix::path::realpath(crate::hooks::absolutize(&admin)).unwrap_or_else(|_| admin.clone());
+    let ignore_case = repo.config_snapshot().boolean("core.ignoreCase").unwrap_or(false);
+    match fspathcmp(&path_to_string(&path), &path_to_string(&real), ignore_case) {
+        true => None,
+        false => Some(format!(
+            "'{}' does not point back to '{}'",
+            path_to_string(&wt.path),
+            path_to_string(&admin)
+        )),
+    }
 }
 
 /// Port of `validate_no_submodules()` (builtin/worktree.c:1203-1242): `move`, and `remove`
@@ -4378,17 +4583,13 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     //         die(_("validation failed, cannot move working tree: %s"), errmsg.buf);
     // ```
     //
-    // (`move_worktree()`, builtin/worktree.c.) `validate_worktree()` checks that
+    // (`move_worktree()`, builtin/worktree.c:1346-1347.) `validate_worktree()` checks that
     // the checkout is still where the administrative directory says it is, and
     // its own message names the `.git` link that is missing. Without it a
     // worktree whose directory has been deleted reported the failed `rename(2)`
     // instead — a different message, and one that leaks the destination.
-    let dotgit = wt.path.join(".git");
-    if std::fs::symlink_metadata(&dotgit).is_err() {
-        return die(&format!(
-            "validation failed, cannot move working tree: '{}' does not exist",
-            path_to_string(&dotgit)
-        ));
+    if let Some(errmsg) = validate_worktree(&repo, wt, false) {
+        return die(&format!("validation failed, cannot move working tree: {errmsg}"));
     }
 
     if let Err(e) = std::fs::rename(&wt.path, &dest) {

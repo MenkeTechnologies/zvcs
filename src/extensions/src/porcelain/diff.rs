@@ -6747,7 +6747,7 @@ pub(crate) fn commit_patch(
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
     let r = patch_render(repo, &PatchOpts { ctx, ..Default::default() });
     let mut drivers = DriverCache::new(repo)?;
-    commit_patch_with(repo, &mut cache, &mut drivers, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None, false)
+    commit_patch_with(repo, &mut cache, &mut drivers, &r, commit.id, parent, &PatchOpts { ctx, ..Default::default() }, None, false, None)
 }
 
 /// The render settings `log -p`/`show` use for a patch body. Resolved once per
@@ -7062,7 +7062,7 @@ pub(crate) fn commit_patches(
         return jobs
             .iter()
             .map(|(id, parent)| {
-                commit_patch_with(repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow)
+                commit_patch_with(repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow, None)
             })
             .collect();
     }
@@ -7088,7 +7088,7 @@ pub(crate) fn commit_patches(
                     let Some((id, parent)) = jobs.get(i) else { break };
                     mine.push((
                         i,
-                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow)?,
+                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), follow, None)?,
                     ));
                 }
                 Ok(mine)
@@ -7124,13 +7124,24 @@ pub(crate) fn commit_patches(
 pub(crate) struct Ahead {
     pub(crate) errors: Vec<String>,
     pub(crate) patch: Result<Vec<u8>>,
+    /// What the commit's `diffcore_rename()` left for `diff_warn_rename_limit()`.
+    pub(crate) rename_warn: diffcore_rename::Warnings,
 }
 
 impl Ahead {
     /// Work `f` that runs ahead of git's order, its `die()` and `error()` lines held for the record.
     pub(crate) fn run(f: impl FnOnce() -> Result<Vec<u8>>) -> Ahead {
         let (patch, errors) = gix::odb::store::capture_errors(|| gix::odb::store::defer_die(f));
-        Ahead { errors, patch: patch.unwrap_or_else(|message| Err(crate::fatal::die(message))) }
+        Ahead {
+            errors,
+            patch: patch.unwrap_or_else(|message| Err(crate::fatal::die(message))),
+            rename_warn: Default::default(),
+        }
+    }
+
+    /// The slot of a commit with no patch to compute.
+    pub(crate) fn empty() -> Ahead {
+        Ahead { errors: Vec::new(), patch: Ok(Vec::new()), rename_warn: Default::default() }
     }
 }
 
@@ -7173,9 +7184,12 @@ pub(crate) fn commit_patches_ahead(
                     if i > failed_at.load(Relaxed) {
                         break;
                     }
-                    let ahead = Ahead::run(|| {
-                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), false)
+                    let mut warn = diffcore_rename::Warnings::default();
+                    let mut ahead = Ahead::run(|| {
+                        let warn = Some(&mut warn);
+                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), false, warn)
                     });
+                    ahead.rename_warn = warn;
                     if ahead.patch.is_err() {
                         failed_at.fetch_min(i, Relaxed);
                     }
@@ -7199,7 +7213,7 @@ pub(crate) fn commit_patches_ahead(
     if let Some(e) = failure {
         return Err(e);
     }
-    let mut out: Vec<Ahead> = (0..jobs.len()).map(|_| Ahead { errors: Vec::new(), patch: Ok(Vec::new()) }).collect();
+    let mut out: Vec<Ahead> = (0..jobs.len()).map(|_| Ahead::empty()).collect();
     for (i, ahead) in done {
         out[i] = ahead;
     }
@@ -7227,6 +7241,9 @@ fn commit_deltas(
     // Whether `--relative`'s prefix is stripped from the reported names as well as
     // used to narrow the queue. See the block at the end of this function.
     strip: bool,
+    // Where `diffcore_rename()`'s `needed_rename_limit` and `degraded_cc_to_c` go, for
+    // the caller's `diff_warn_rename_limit()` (diff.c:7524-7528).
+    warn: Option<&mut diffcore_rename::Warnings>,
 ) -> Result<Vec<Delta>> {
     // `diff_tree_oid()`'s two trees, read as `fill_tree_descriptor()` reads them (tree-walk.c:85-99).
     let new_tree = super::log::diff_tree_side(repo, commit_id)?;
@@ -7328,7 +7345,10 @@ fn commit_deltas(
     }
     // `-B` runs through the same pass even with no rename detection behind it.
     if ro.detect_rename != 0 || ro.break_opt != -1 {
-        run_diffcore_rename(repo, cache, &mut deltas, &ro, false, false)?;
+        let w = run_diffcore_rename(repo, cache, &mut deltas, &ro, false, false)?;
+        if let Some(slot) = warn {
+            *slot = w;
+        }
         deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
     }
     // The `--follow` limit, applied once the rename it is following exists as a
@@ -7402,7 +7422,7 @@ pub(crate) fn commit_dirstat(
     // for the pairs the loop below names, so the lookup itself does not raise a bad
     // `--attr-source`.
     let mut drivers = DriverCache::new(repo)?.without_attr_source_check();
-    let deltas = commit_deltas(repo, &mut cache, &mut drivers, commit_id, parent, opts, specs, false, false)?;
+    let deltas = commit_deltas(repo, &mut cache, &mut drivers, commit_id, parent, opts, specs, false, false, None)?;
     let hash_kind = repo.object_hash();
     let want_damage = !ds.by_file && !ds.by_line;
     let mut files: Vec<(BString, u64)> = Vec::with_capacity(deltas.len());
@@ -7484,8 +7504,9 @@ fn commit_patch_with(
     // matches kept. Limiting the tree diff first would hide the deletion side and
     // leave the rename rendered as an addition.
     follow: bool,
+    warn: Option<&mut diffcore_rename::Warnings>,
 ) -> Result<Vec<u8>> {
-    let mut deltas = commit_deltas(repo, cache, drivers, commit_id, parent, opts, specs, follow, true)?;
+    let mut deltas = commit_deltas(repo, cache, drivers, commit_id, parent, opts, specs, follow, true, warn)?;
     // `fill_textconv()` lives in `builtin_diff()`, so only the patch renderer starts
     // a converter — `commit_dirstat()` shares `commit_deltas` and must not. A
     // tree-to-tree diff has no worktree side, so no filespec is ever read by path.
@@ -12930,6 +12951,7 @@ pub(crate) fn commit_check(
         specs.as_mut(),
         false,
         true,
+        None,
     )?;
     let hash_kind = repo.object_hash();
     // `builtin_checkdiff()` asks `whitespace_rule()` per pair (diff.c:4297), so the

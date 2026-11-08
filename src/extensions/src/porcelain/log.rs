@@ -6568,6 +6568,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 let follow_opts = follow_search.then(|| super::diff::PatchOpts {
                     find_copies_harder: true,
                     renames: Some(super::diffcore_rename::DETECT_COPY),
+                    // `repo_diff_setup()` leaves `rename_limit` at -1 (diff.c:5128), so the pass
+                    // takes `diff.renameLimit` (:5317-5318), never the command's `-l<n>`.
+                    rename_limit: -1,
                     ..patch_opts.clone()
                 });
                 // A combined merge runs its passes on `diff_tree_combined()`'s copy of the
@@ -6992,6 +6995,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 let follow_patch_opts = super::diff::PatchOpts {
                     find_copies_harder: true,
                     renames: Some(super::diffcore_rename::DETECT_COPY),
+                    rename_limit: -1,
                     ..patch_opts.clone()
                 };
                 let follow_patch: Vec<u8> = match &node.follow_path {
@@ -7092,7 +7096,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     (None, Some(_)) => &separate_patch,
                     // `context = opt->context` (combine-diff.c:1030): the window
                     // renders a merge's combined patch, which reads `-U<n>`.
-                    (None, None) => patches.get(&repo, &diff_nodes, ni, patch_opts.ctx, &diff_pathspecs)?,
+                    (None, None) => patches.get(&repo, &diff_nodes, ni, patch_opts.ctx, &diff_pathspecs, &mut rename_warn)?,
                 };
                 // `additional_path_headers` (diff.c:3772-3777, 7050-7096): the
                 // conflict notices the re-merge recorded, spliced into the sections
@@ -8370,6 +8374,9 @@ impl PatchWindow {
         i: usize,
         ctx: u32,
         paths: &[String],
+        // `opt->diffopt`'s rename warnings, which each commit's rename pass updates as
+        // the record is reached (`diffcore_rename()`, diffcore-rename.c:1092, :1111).
+        rename_warn: &mut super::diffcore_rename::Warnings,
     ) -> Result<&'a [u8]> {
         if !self.active {
             return Ok(&[]);
@@ -8421,7 +8428,7 @@ impl PatchWindow {
             }
             let computed = super::diff::commit_patches_ahead(repo, &jobs, &self.patch_opts, paths)?;
             self.slots = (0..span.len())
-                .map(|_| super::diff::Ahead { errors: Vec::new(), patch: Ok(Vec::new()) })
+                .map(|_| super::diff::Ahead::empty())
                 .collect();
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;
@@ -8434,6 +8441,7 @@ impl PatchWindow {
         // The record is due: what its reads printed goes out now, and a read that died dies
         // here, with every earlier record written (log-tree.c:1176-1222).
         let slot = &mut self.slots[i - self.start];
+        record_rename_warnings(rename_warn, slot.rename_warn);
         for line in slot.errors.drain(..) {
             eprintln!("{line}");
         }
@@ -14649,6 +14657,9 @@ fn follow_source(
     let opts = super::diff::PatchOpts {
         find_copies_harder: true,
         renames: Some(super::diffcore_rename::DETECT_COPY),
+        // `diff.renameLimit`, not `-l<n>`: `repo_diff_setup()` leaves `rename_limit` at -1
+        // (diff.c:5128, :5317-5318).
+        rename_limit: -1,
         ..popts.clone()
     };
     let files = collect_changes(

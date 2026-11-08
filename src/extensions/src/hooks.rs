@@ -280,38 +280,7 @@ pub fn run_with_env(
         Some(s) => s.cwd.clone(),
         None => absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir())),
     };
-    // What the exec is handed is also what the hook sees as its own name — the
-    // kernel passes a `#!` script the pathname given to `execve()`, so `$0` is
-    // `.git/hooks/pre-commit` under git and a hook's `dirname "$0"` is relative
-    // to the work tree root it runs in. So git's spelling is exec'd when it is
-    // relative and names this same file from the child's directory (`Command`
-    // resolves a relative program containing `/` after the child's `chdir`).
-    //
-    // With [`crate::setup::after_setup`]'s model of the spelling — an explicit
-    // `GIT_DIR`/`GIT_WORK_TREE` included — an absolute spelling is exec'd
-    // verbatim too, since git's may be unnormalized (`<abs>/sub/../.git/...`).
-    // Without the model, only a discovered repository's relative spelling is
-    // trusted. A spelling without a `/` that `execvp()` would look up on `PATH`
-    // keeps the absolute path either way.
-    let modelled = setup.is_some();
-    let discovered = modelled
-        || (std::env::var_os("GIT_DIR").is_none() && std::env::var_os("GIT_WORK_TREE").is_none());
-    let program = match Path::new(&shown) {
-        abs if modelled
-            && abs.is_absolute()
-            && crate::setup::realpath(abs) == crate::setup::realpath(&path) =>
-        {
-            abs.to_path_buf()
-        }
-        rel if discovered
-            && rel.is_relative()
-            && shown.contains('/')
-            && crate::setup::realpath(&workdir.join(rel)) == crate::setup::realpath(&path) =>
-        {
-            rel.to_path_buf()
-        }
-        _ => absolutize(&path),
-    };
+    let program = spawn_spelling(&shown, &path, &workdir, setup.is_some());
     let mut cmd = Command::new(&program);
     cmd.args(args).current_dir(&workdir);
     // `GIT_PREFIX` — the work-tree-relative directory the command was typed in,
@@ -369,6 +338,50 @@ pub fn run_with_env(
         }
     }
     Ok(Outcome { invoked: true, ok: child.wait()?.success() })
+}
+
+/// The program the hook `event` found at `path` is exec'd as by a caller that
+/// spawns it itself, starting it in `workdir`: [`spawn_spelling`] of git's name for it.
+pub(crate) fn exec_name(repo: &gix::Repository, event: &str, path: &Path, workdir: &Path) -> PathBuf {
+    let shown = paths(repo, event).map(|(_, shown)| shown).unwrap_or_default();
+    spawn_spelling(&shown, path, workdir, crate::setup::after_setup(repo).is_some())
+}
+
+/// The program a hook is exec'd as, `shown` being git's spelling of the file at
+/// `path` and `workdir` the directory the hook starts in.
+///
+/// What the exec is handed is also what the hook sees as its own name — the
+/// kernel passes a `#!` script the pathname given to `execve()`, so `$0` is
+/// `.git/hooks/pre-commit` under git and a hook's `dirname "$0"` is relative
+/// to the work tree root it runs in. So git's spelling is exec'd when it is
+/// relative and names this same file from the child's directory (`Command`
+/// resolves a relative program containing `/` after the child's `chdir`).
+///
+/// With [`crate::setup::after_setup`]'s model of the spelling — an explicit
+/// `GIT_DIR`/`GIT_WORK_TREE` included — an absolute spelling is exec'd
+/// verbatim too, since git's may be unnormalized (`<abs>/sub/../.git/...`).
+/// Without the model, only a discovered repository's relative spelling is
+/// trusted. A spelling without a `/` that `execvp()` would look up on `PATH`
+/// keeps the absolute path either way.
+fn spawn_spelling(shown: &str, path: &Path, workdir: &Path, modelled: bool) -> PathBuf {
+    let discovered = modelled
+        || (std::env::var_os("GIT_DIR").is_none() && std::env::var_os("GIT_WORK_TREE").is_none());
+    match Path::new(shown) {
+        abs if modelled
+            && abs.is_absolute()
+            && crate::setup::realpath(abs) == crate::setup::realpath(path) =>
+        {
+            abs.to_path_buf()
+        }
+        rel if discovered
+            && rel.is_relative()
+            && shown.contains('/')
+            && crate::setup::realpath(&workdir.join(rel)) == crate::setup::realpath(path) =>
+        {
+            rel.to_path_buf()
+        }
+        _ => absolutize(path),
+    }
 }
 
 /// `GIT_DIR` as git leaves it for a hook, or `None` when git exports nothing.

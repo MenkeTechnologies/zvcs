@@ -979,20 +979,17 @@ impl UnpackPatterns {
     /// a failed `open()` returns -1 (dir.c:1164-1170) and `o->skip_sparse_checkout` is
     /// set — the skip-worktree bits are left alone rather than every path excluded.
     pub(crate) fn load(repo: &gix::Repository, cone: bool) -> Option<Self> {
-        let text = std::fs::read_to_string(pattern_path(repo)).ok()?;
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-        let mut full_cone = false;
-        for l in &lines {
-            match l.trim_end_matches('\r') {
-                "/*" => full_cone = true,
-                "!/*/" => full_cone = false,
-                _ => {}
-            }
-        }
-        Some(UnpackPatterns {
-            sparsity: sparsity_from_lines(repo, &lines, cone),
-            full_cone,
-        })
+        Self::load_with_warnings(repo, cone).map(|(patterns, _)| patterns)
+    }
+
+    /// [`Self::load`] through `add_patterns_from_buffer()`'s cone loading
+    /// (`add_pattern_to_hashsets()`, dir.c:798-936): a file cone mode cannot read is
+    /// matched as the non-cone list it is, and the warnings `get_sparse_checkout_patterns()`
+    /// printed while loading it are returned for the caller to print where git does.
+    pub(crate) fn load_with_warnings(repo: &gix::Repository, cone: bool) -> Option<(Self, String)> {
+        let (sparsity, warnings) = load_pattern_file(repo, cone).ok().flatten()?;
+        let full_cone = matches!(&sparsity, Sparsity::Cone(c) if c.full);
+        Some((UnpackPatterns { sparsity, full_cone }, warnings))
     }
 
     /// `path_matches_pattern_list()` (dir.c:1502-1566) for `path`, whose last
@@ -1853,6 +1850,12 @@ fn cone_hashsets(patterns: &[Vec<u8>], ignore_case: bool, warnings: &mut String)
         .map(|(pattern, _)| pattern[1..].to_str_lossy().into_owned())
         .collect();
     let mut cone = Cone::new(dirs);
+    // The parent hashmap is what the file's `!/<dir>/*/` lines moved across, and
+    // nothing else (dir.c:869-904): a `/<dir>/` whose own parents the file never
+    // names leaves their immediate files out, where [`Cone::new`] would infer them.
+    cone.parents = std::iter::once(String::new())
+        .chain(parent.entries.into_values().map(|(pattern, _)| pattern[1..].to_str_lossy().into_owned()))
+        .collect();
     cone.full = full;
     cone.ignore_case = ignore_case;
     Some(cone)

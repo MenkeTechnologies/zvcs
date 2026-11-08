@@ -1680,6 +1680,11 @@ pub(crate) fn add_remote_or_group(repo: &gix::Repository, name: &str, list: &mut
         }
     }
     if list.len() == prev {
+        // `remote_get(name)` (remote.c:2216) reads a `remotes/` or `branches/` definition, and
+        // with it prints the deprecation warning, in the process that builds the list: the
+        // `fetch --multiple` parent warns before each child it spawns warns again
+        // (builtin/fetch.c:2762-2767).
+        let _ = super::remote::legacy(repo, name);
         if !remote_is_configured(repo, name) {
             return false;
         }

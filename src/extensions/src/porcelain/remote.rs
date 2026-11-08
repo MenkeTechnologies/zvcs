@@ -421,7 +421,7 @@ fn remote_exists_or_legacy(repo: &gix::Repository, name: &str) -> bool {
 
 /// The legacy file definition of `name`, consulted only when the configuration
 /// names no URL for it (remote.c:808-815).
-fn legacy(repo: &gix::Repository, name: &str) -> Option<gix::remote::legacy::Remote> {
+pub(crate) fn legacy(repo: &gix::Repository, name: &str) -> Option<gix::remote::legacy::Remote> {
     if !effective_urls(repo, name, "url").is_empty() {
         return None;
     }

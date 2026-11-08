@@ -412,7 +412,7 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
             None => lines.extend(inputs.iter().cloned()),
         }
         write_pattern_file(&repo, &lines)?;
-        Sparsity::Patterns(parse_patterns(&lines))
+        Sparsity::Patterns(parse_patterns(&lines), path_case(&repo))
     };
 
     apply(&repo, &sparsity)?;
@@ -552,6 +552,9 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
         }
     }
     let rules_file = rules_file_arg.map(PathBuf::from);
+    // `check-rules` runs under RUN_SETUP, so `repo_ignore_case()` holds the repository's
+    // `core.ignoreCase` for a rules file as much as for the worktree's own definition.
+    let case = path_case(&crate::setup::discover()?);
 
     let sparsity = match &rules_file {
         // `--rules-file` holds a directory list in cone mode, patterns otherwise.
@@ -593,9 +596,11 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
                         Err(code) => return Ok(code),
                     }
                 }
-                Sparsity::Cone(Cone::new(dedup_nested(dirs)))
+                let mut cone = Cone::new(dedup_nested(dirs));
+                cone.ignore_case = case == Case::Fold;
+                Sparsity::Cone(cone)
             } else {
-                Sparsity::Patterns(parse_patterns(&lines))
+                Sparsity::Patterns(parse_patterns(&lines), case)
             }
         }
         None => {
@@ -824,7 +829,7 @@ pub(crate) enum Sparsity {
     Full,
     Cone(Cone),
     /// Non-cone gitignore-syntax patterns, in file order.
-    Patterns(Vec<Pattern>),
+    Patterns(Vec<Pattern>, Case),
 }
 
 impl Sparsity {
@@ -838,7 +843,7 @@ impl Sparsity {
         match self {
             Sparsity::Full => true,
             Sparsity::Cone(c) => c.matches(path),
-            Sparsity::Patterns(p) => patterns_include(p, path),
+            Sparsity::Patterns(p, case) => patterns_include(p, *case, path),
         }
     }
 }
@@ -874,11 +879,32 @@ pub(crate) fn load_sparsity(repo: &gix::Repository) -> Result<Sparsity> {
 /// [`update_cone_mode`] rather than reading `core.sparseCheckoutCone` itself.
 fn load_sparsity_with(repo: &gix::Repository, cone: bool) -> Result<Sparsity> {
     let lines = read_pattern_file(repo)?;
-    Ok(if cone {
-        Sparsity::Cone(Cone::new(cone_dirs(&lines)))
+    Ok(sparsity_from_lines(repo, &lines, cone))
+}
+
+/// `lines` as `add_patterns_from_buffer()` hands them to a `pattern_list` of the given
+/// dialect, matched under the repository's `core.ignoreCase` ([`path_case`]).
+fn sparsity_from_lines(repo: &gix::Repository, lines: &[String], cone: bool) -> Sparsity {
+    let case = path_case(repo);
+    if cone {
+        let mut cone = Cone::new(cone_dirs(lines));
+        cone.ignore_case = case == Case::Fold;
+        Sparsity::Cone(cone)
     } else {
-        Sparsity::Patterns(parse_patterns(&lines))
-    })
+        Sparsity::Patterns(parse_patterns(lines), case)
+    }
+}
+
+/// `repo_ignore_case()` (environment.c:134-138) as the non-cone matcher applies it:
+/// `match_basename()` and `match_pathname()` compare literal parts with `fspathcmp()` and
+/// `fspathncmp()`, which turn into `strcasecmp()`/`strncasecmp()` under `core.ignoreCase`
+/// (dir.c:127-140), and `fnmatch_icase_mem()` adds `WM_CASEFOLD` to the wildmatch
+/// (dir.c:205-206).
+fn path_case(repo: &gix::Repository) -> Case {
+    match repo.config_snapshot().boolean("core.ignoreCase").unwrap_or(false) {
+        true => Case::Fold,
+        false => Case::Sensitive,
+    }
 }
 
 fn parse_patterns(lines: &[String]) -> Vec<Pattern> {
@@ -896,7 +922,7 @@ fn parse_patterns(lines: &[String]) -> Vec<Pattern> {
 /// pattern decides every path beneath it. Evaluating each of `path`'s prefixes
 /// in turn — directories first, the file itself last, later matches overriding
 /// earlier ones — reproduces that without the walk.
-fn patterns_include(patterns: &[Pattern], path: &str) -> bool {
+fn patterns_include(patterns: &[Pattern], case: Case, path: &str) -> bool {
     let mut included = false;
     let mut offset = 0usize;
     loop {
@@ -910,7 +936,7 @@ fn patterns_include(patterns: &[Pattern], path: &str) -> bool {
                 prefix.as_bytes().as_bstr(),
                 basename_pos,
                 Some(is_dir),
-                Case::Sensitive,
+                case,
                 WildMode::NO_MATCH_SLASH_LITERAL,
             ) {
                 included = !p.is_negative();
@@ -964,11 +990,7 @@ impl UnpackPatterns {
             }
         }
         Some(UnpackPatterns {
-            sparsity: if cone {
-                Sparsity::Cone(Cone::new(cone_dirs(&lines)))
-            } else {
-                Sparsity::Patterns(parse_patterns(&lines))
-            },
+            sparsity: sparsity_from_lines(repo, &lines, cone),
             full_cone,
         })
     }
@@ -977,14 +999,14 @@ impl UnpackPatterns {
     /// component starts at `basename`.
     fn matches(&self, path: &[u8], basename: usize, is_dir: bool) -> PatternMatch {
         match &self.sparsity {
-            Sparsity::Patterns(patterns) => {
+            Sparsity::Patterns(patterns, case) => {
                 // `last_matching_pattern_from_list()`: the last pattern that matches decides.
                 let hit = patterns.iter().rev().find(|p| {
                     p.matches_repo_relative_path(
                         path.as_bstr(),
                         (basename != 0).then_some(basename),
                         Some(is_dir),
-                        Case::Sensitive,
+                        *case,
                         WildMode::NO_MATCH_SLASH_LITERAL,
                     )
                 });
@@ -1854,7 +1876,7 @@ fn load_pattern_file(repo: &gix::Repository, cone: bool) -> Result<Option<(Spars
         }
     }
     let lines: Vec<String> = patterns.iter().map(|p| p.to_str_lossy().into_owned()).collect();
-    Ok(Some((Sparsity::Patterns(parse_patterns(&lines)), warnings)))
+    Ok(Some((Sparsity::Patterns(parse_patterns(&lines), path_case(repo)), warnings)))
 }
 
 /// The definition `update_working_directory(repo, NULL)` works from: `update_sparsity()`
@@ -1866,7 +1888,7 @@ fn load_for_update(repo: &gix::Repository, cone: bool) -> Result<(Sparsity, Stri
     Ok(match load_pattern_file(repo, cone)? {
         Some(loaded) => loaded,
         None if cone => (Sparsity::Cone(Cone::new(BTreeSet::new())), String::new()),
-        None => (Sparsity::Patterns(Vec::new()), String::new()),
+        None => (Sparsity::Patterns(Vec::new(), path_case(repo)), String::new()),
     })
 }
 
@@ -2185,7 +2207,7 @@ fn apply_reloaded(repo: &gix::Repository, sparsity: &Sparsity, load_warnings: &s
     // that back into `INDEX_EXPANDED` so the write below runs `convert_to_sparse()`.
     let advise = match sparsity {
         Sparsity::Full => false,
-        Sparsity::Patterns(_) => true,
+        Sparsity::Patterns(..) => true,
         Sparsity::Cone(_) => !config_bool(repo, "index", "sparse")?.unwrap_or(false),
     };
     crate::sparse_index::ensure_full_index_with_advice(repo, &mut index, advise);
@@ -2730,10 +2752,10 @@ mod tests {
     #[test]
     fn non_cone_membership() {
         let pats = parse_patterns(&["keep".to_owned(), "!keep/skip".to_owned()]);
-        assert!(patterns_include(&pats, "keep/k"));
-        assert!(patterns_include(&pats, "keep/deep/k"));
-        assert!(!patterns_include(&pats, "keep/skip/k"));
-        assert!(!patterns_include(&pats, "top"));
+        assert!(patterns_include(&pats, Case::Sensitive, "keep/k"));
+        assert!(patterns_include(&pats, Case::Sensitive, "keep/deep/k"));
+        assert!(!patterns_include(&pats, Case::Sensitive, "keep/skip/k"));
+        assert!(!patterns_include(&pats, Case::Sensitive, "top"));
     }
 
     /// A directory already covered by a recursive ancestor is dropped, matching

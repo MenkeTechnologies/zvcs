@@ -62,6 +62,12 @@ pub struct PrepareFetch {
     /// Whether [`fetch_only()`](Self::fetch_only()) writes the fetched refs and `HEAD`; see [`Self::with_write_refs()`].
     #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
     write_refs: bool,
+    /// `opts.wants_head`: whether the remote's `HEAD` is fetched alongside the refspecs; see [`Self::with_wants_head()`].
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    wants_head: bool,
+    /// `TRANS_OPT_FOLLOWTAGS`: ask with `include-tag` whatever the tag mode; see [`Self::with_follow_tags()`].
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    follow_tags: bool,
 }
 
 /// The error returned by [`PrepareFetch::new()`].
@@ -212,6 +218,8 @@ impl PrepareFetch {
             revision: None,
             default_branch: None,
             write_refs: true,
+            wants_head: true,
+            follow_tags: false,
         })
     }
 }

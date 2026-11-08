@@ -73,6 +73,24 @@ impl PrepareFetch {
         self
     }
 
+    /// If disabled, the remote's `HEAD` is not fetched alongside the refspecs, which is `cmd_clone()`
+    /// clearing `opts.wants_head` for `--single-branch --branch` (builtin/clone.c:1380-1385): the ls-refs
+    /// request names no `HEAD` and the fetch wants only what the refspecs map
+    /// (`wanted_peer_refs()`, builtin/clone.c:443-471).
+    pub fn with_wants_head(mut self, enabled: bool) -> Self {
+        self.wants_head = enabled;
+        self
+    }
+
+    /// If enabled, the fetch asks with `include-tag` even where the remote's tag mode follows no tags,
+    /// as `transport_set_option(transport, TRANS_OPT_FOLLOWTAGS, "1")` does for every single-branch clone
+    /// (builtin/clone.c:1380-1381), `--no-tags`, `--mirror` and `--revision` included. The tags the pack
+    /// then carries are not written by this; that is `write_followtags()`'s, behind `option_tags`.
+    pub fn with_follow_tags(mut self, enabled: bool) -> Self {
+        self.follow_tags = enabled;
+        self
+    }
+
     /// Apply the given configuration `values` right before readying the actual fetch from the remote.
     /// The configuration is marked with [source API](gix_config::Source::Api), and will not be written back, it's
     /// retained only in memory.

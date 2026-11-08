@@ -114,13 +114,6 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `--depth` combined with `--no-single-branch` costs one extra ls-refs round
 ///     trip, because gitoxide has already resolved its implicit single-branch
 ///     refspec by the time the replacement wildcard remote is installed.
-///   * `--single-branch` fetches every tag, not only the ones reachable from the
-///     branch. git auto-follows tags during negotiation; the vendored
-///     `Tags::Included` maps `refs/tags/*:refs/tags/*` exactly like `Tags::All`
-///     (`gix-protocol/src/fetch/types.rs:241`) and no reachability filter exists
-///     anywhere in the vendored crates, so an unreachable tag — and the history
-///     it pins — is transferred too. Pruning the extra tag refs afterwards would
-///     hide the over-fetch rather than fix it, so they are left visible.
 /// ```
 /// `git clone`'s usage block, byte-for-byte from stock git 2.55.0. Printed on
 /// stdout for `-h` and on stderr for a usage error, both exiting 129.
@@ -1697,6 +1690,23 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let single_branch = single_branch.or_else(|| {
         (shallow_depth_given || shallow_since_given || shallow_exclude_given).then_some(true)
     });
+    // ```c
+    // if (option_single_branch) {
+    //         transport_set_option(transport, TRANS_OPT_FOLLOWTAGS, "1");
+    //
+    //         if (option_branch)
+    //                 opts.wants_head = 0;
+    // }
+    // ```
+    //
+    // (builtin/clone.c:1380-1385.) Settled before `--revision` clears `option_single_branch`
+    // (:1405-1407), and whatever `option_tags` says: a `--no-tags` or `--mirror` single-branch
+    // clone still asks with `include-tag`, and so receives the tags pointing into its pack
+    // without writing a ref for them. Without `HEAD` among the wants, a `--branch` clone fetches
+    // that branch alone, and the tags it follows are the ones on its history.
+    prepare = prepare
+        .with_follow_tags(single_branch == Some(true))
+        .with_wants_head(!(single_branch == Some(true) && branch.is_some()));
 
     // Decide which refspec set this clone needs and, with it, which tag mode.
     // Supplying `configure_remote` at all suppresses gitoxide's own clone default
@@ -1706,9 +1716,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let plan = if revision.is_some() {
         // `--revision` fetches its own refspec and writes none (builtin/clone.c:1319, 1590).
         None
-    } else if mirror {
+    } else if mirror && single_branch != Some(true) {
         Some(Refspecs::Mirror)
     } else if single_branch == Some(true) {
+        // `wanted_peer_refs()` hands `get_fetch_map()` the one ref a single-branch clone is
+        // restricted to (builtin/clone.c:451-463), so a `--mirror` one, whose `+refs/*:refs/*`
+        // maps that ref onto itself as `--bare` does, fetches it alone like any other; the
+        // wildcard is still what `write_refspec_config()` records (:801-835).
         Some(Refspecs::Single {
             branch: branch.clone(),
             bare,
@@ -2088,6 +2102,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let ref_writes = |advertised: bool| RefWrites {
         remote_name: &effective_remote_name,
         bare,
+        mirror,
         single_branch: single_branch == Some(true),
         tags: option_tags,
         branch: branch.as_deref(),
@@ -2919,12 +2934,10 @@ fn resolve_single_ref(
                     name.to_string(),
                 ]
             };
-            Some(
-                candidates
-                    .into_iter()
-                    .find(|c| advertised(c))
-                    .ok_or_else(|| format!("Remote branch {name} not found in upstream"))?,
-            )
+            // `copy_ref(find_remote_branch(refs, option_branch))` is NULL for a branch the remote
+            // does not have (builtin/clone.c:459-462), which maps nothing; `cmd_clone()` dies of it
+            // once the refs are in, naming the remote (:1538-1546).
+            candidates.into_iter().find(|c| advertised(c))
         }
         // `guess_remote_head(head, refs, REMOTE_GUESS_HEAD_QUIET)` (builtin/clone.c:455-458)
         // only answers with a branch the remote advertised. A `HEAD` that is unborn, or a
@@ -3032,6 +3045,10 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
                 while section.remove("tagOpt").is_some() {}
             }
             if fixups.set_mirror {
+                // `write_refspec_config()` records `+refs/*:refs/*` for every `--mirror` clone, a
+                // single-branch one included, as `option_single_branch && !option_mirror` keeps the
+                // single ref out of it (builtin/clone.c:801-835).
+                section.set("fetch", "+refs/*:refs/*")?;
                 section.push("mirror", Some("true".into()))?;
             }
             if let Some(spec) = &fixups.promisor_filter {
@@ -4215,6 +4232,7 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
 
 /// One entry of `wanted_peer_refs()`'s list (builtin/clone.c:443-471): a remote ref the clone's
 /// refspecs selected, and the local ref it is written to when it has a `peer_ref`.
+#[derive(Clone)]
 struct MappedRef {
     /// The remote's name for it, or the hex id a `--revision` refspec spelled out.
     name: gix::bstr::BString,
@@ -4231,6 +4249,8 @@ struct RefWrites<'a> {
     remote_name: &'a str,
     /// `option_bare`.
     bare: bool,
+    /// `option_mirror`.
+    mirror: bool,
     /// `option_single_branch`, as `cmd_clone()` resolved it.
     single_branch: bool,
     /// `option_tags`: cleared by `--no-tags`, `--mirror` and `--revision`
@@ -4291,6 +4311,13 @@ fn wanted_peer_refs(ref_map: &gix::remote::fetch::RefMap, plan: &RefWrites<'_>) 
                 peer: gix::refs::FullName::try_from(name.to_owned()).ok(),
             });
         }
+    } else if plan.mirror && plan.single_branch && plan.branch.is_some() {
+        // `TAG_REFSPEC` is applied to the one ref `find_remote_branch()` returned as well
+        // (builtin/clone.c:459-466): the explicit refspec mapped a tag onto itself as
+        // `+refs/*:refs/*`, and `TAG_REFSPEC` maps it a second time, which the initial transaction
+        // refuses. Outside `--mirror` the explicit refspec is the one mapping a tag gets.
+        let tags: Vec<MappedRef> = mapped.iter().filter(|r| r.name.starts_with(b"refs/tags/")).cloned().collect();
+        mapped.extend(tags);
     }
     mapped
 }

@@ -305,6 +305,13 @@ impl PrepareFetch {
         if self.revision.is_some() {
             remote = remote.with_fetch_tags(remote::fetch::Tags::None);
         }
+        // `transport_set_option(transport, TRANS_OPT_FOLLOWTAGS, "1")` (builtin/clone.c:1380-1381) is set
+        // before `--revision` clears `option_single_branch` (:1405-1407) and regardless of `option_tags`, so
+        // the request carries `include-tag` (transport.c:493, fetch-pack.c:413, :1395-1396) and the pack the tags
+        // pointing into it. Which of them become refs stays with the caller's tag mode.
+        if self.follow_tags && remote.fetch_tags == remote::fetch::Tags::None {
+            remote = remote.with_fetch_tags(remote::fetch::Tags::Included);
+        }
 
         // Add HEAD after the remote was written to config, we need it to know what to check out later, and assure
         // the ref that HEAD points to is present no matter what.
@@ -327,8 +334,9 @@ impl PrepareFetch {
             let connection = connection.into_detached();
             let mut fetch_opts = {
                 let mut opts = self.fetch_options.clone();
-                // `opts.wants_head = 0` for `--revision` (builtin/clone.c:1408).
-                if self.revision.is_none() && !opts.extra_refspecs.contains(&head_refspec) {
+                // `opts.wants_head = 0` for `--revision` (builtin/clone.c:1408) and for
+                // `--single-branch --branch` (:1383-1384).
+                if self.revision.is_none() && self.wants_head && !opts.extra_refspecs.contains(&head_refspec) {
                     opts.extra_refspecs.push(head_refspec.clone());
                 }
                 if let Some(ref_name) = &self.ref_name {

@@ -45,6 +45,17 @@ pub fn report_text(message: &str) -> String {
         .collect()
 }
 
+/// `vfreportf()` (usage.c:12-38): `<prefix><message>\n` built in one buffer and
+/// handed to stderr with a single `write_in_full()`. `eprintln!` writes each
+/// format piece separately, so a reader relaying a child's stderr (receive-pack's
+/// band 2) can split one line across two packets where git sends one.
+pub fn write_report(prefix: &str, message: &str) {
+    use std::io::Write;
+    let mut line = crate::gitsig::report(prefix, message);
+    line.push('\n');
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
 /// A diagnostic already written to stderr; only the exit code is left to carry.
 ///
 /// Not every git diagnostic is a `die()`. `report_path_error()` writes `error: …`

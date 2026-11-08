@@ -67,7 +67,7 @@ fn usage_error() -> ExitCode {
 
 /// Print a `fatal:` line and return git's fatal exit code.
 fn fatal(message: &str) -> ExitCode {
-    eprintln!("fatal: {message}");
+    crate::fatal::write_report("fatal: ", message);
     ExitCode::from(128)
 }
 

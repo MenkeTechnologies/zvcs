@@ -1456,8 +1456,16 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
         // `bisect_state()` in git covers `skip` alongside the two terms; this port
         // splits the skip half into `bisect_skip()`, which is the same code path
         // down to the shared `bisect_auto_next()`.
+        //
+        // Called directly, `bisect_state()` runs `bisect_autostart()` before
+        // `check_and_set_terms()` (builtin/bisect.c:1066-1072), so a session the
+        // command ended (`git bisect reset` inside the script) records no terms.
         let res = with_stdout_to(&ctx.file("BISECT_RUN"), || match rc {
             125 => bisect_skip(&[]),
+            _ if !ctx.in_progress() => {
+                eprint!("You need to start by \"git bisect start\"\n\n");
+                Ok(BISECT_FAILED)
+            }
             _ => bisect_state(&new_state, &[]),
         })?;
         print_file_to_stdout(&ctx.file("BISECT_RUN"))?;
@@ -1809,10 +1817,14 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
     // changes what the *next* session does — a stale `BISECT_FIRST_PARENT`
     // silently makes an ordinary `bisect start` walk first parents only.
     //
-    // In a reftable repository the refs go first, as git orders it: every
-    // `refs/bisect/*` plus `BISECT_HEAD` and `BISECT_EXPECTED_REV` in one
-    // `refs_delete_refs(…, "bisect: remove", …, REF_NO_DEREF)` transaction.
-    if ctx.reftable() {
+    // The refs go first, as git orders it, in either backend: every
+    // `refs/bisect/*` (packed ones included) plus `BISECT_HEAD` and
+    // `BISECT_EXPECTED_REV` in one `refs_delete_refs(…, "bisect: remove", …,
+    // REF_NO_DEREF)` transaction (bisect.c:1194-1210). The files backend
+    // removes empty parents only below `refs/<kind>/`
+    // (`try_remove_empty_parents()`, refs/files-backend.c:1330-1370), so an
+    // emptied `refs/bisect` directory stays.
+    {
         use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
         let mut names: Vec<String> = Vec::new();
         for reference in ctx.repo.references()?.prefixed("refs/bisect/")? {
@@ -1853,10 +1865,6 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
-    }
-    let refs = ctx.refs_dir();
-    if refs.exists() {
-        std::fs::remove_dir_all(refs)?;
     }
     Ok(())
 }
@@ -2096,9 +2104,8 @@ fn start(args: &[String]) -> Result<ExitCode> {
     };
     clean_state(&ctx)?;
 
-    if !ctx.reftable() {
-        std::fs::create_dir_all(ctx.refs_dir())?;
-    }
+    // No `refs/bisect` directory up front: the files backend makes it with the first
+    // ref it writes there, so a start that records no ref leaves none behind.
     std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
     std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
     if first_parent {
@@ -2677,17 +2684,23 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     };
 
     for raw in content.lines() {
-        let line = raw.trim_start();
-        let Some(rest) = line
-            .strip_prefix("git bisect ")
-            .or_else(|| line.strip_prefix("git-bisect "))
+        // `process_replay_line()` (builtin/bisect.c:1153-1165): blanks and tabs only, around
+        // the prefix and the word; the prefix must be followed by `isspace()`, so comments,
+        // blank lines and a bare `git bisect` are skipped. Whatever follows the word's run of
+        // blanks is `rev`, never split further.
+        const BLANKS: [char; 2] = [' ', '\t'];
+        let line = raw.trim_start_matches(BLANKS);
+        let Some(after) = line.strip_prefix("git bisect").or_else(|| line.strip_prefix("git-bisect"))
         else {
-            continue; // comments and blank lines
-        };
-        let mut toks = rest.split_whitespace();
-        let Some(cmd) = toks.next() else {
             continue;
         };
+        if !after.starts_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = after.trim_start_matches(BLANKS);
+        let word_end = rest.find(BLANKS).unwrap_or(rest.len());
+        let cmd = &rest[..word_end];
+        let rev_text = rest[word_end..].trim_start_matches(BLANKS);
         if cmd == "start" {
             // `process_replay_line()` hands the rest of the line to
             // `sq_dequote_to_strvec()`, because `bisect_start()` wrote those
@@ -2700,7 +2713,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
             // dequote, and `bisect_replay()` ignores the failure, so a
             // hand-written `git bisect start <bad> <good>` replays as a *bare*
             // `start` with the operands dropped.
-            let text = rest[cmd.len()..].trim_start();
+            let text = rev_text;
             // ```c
             // res = bisect_start(terms, argv.v, argv.nr);
             // strvec_clear(&argv);
@@ -2734,7 +2747,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         // dequote, so the unquoted spelling reaches `bisect_terms` as no
         // argument at all.
         if cmd == "terms" {
-            let argv = sq_dequote_argv(rest[cmd.len()..].trim_start());
+            let argv = sq_dequote_argv(rev_text);
             let code = terms_cmd(if argv.len() == 1 { &argv } else { &[] })?;
             if code != ExitCode::SUCCESS {
                 return Ok(code);
@@ -2754,7 +2767,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
         //
         // (builtin/bisect.c:1049-1051.) Everything after the state word is one `rev`
         // string — git never splits it — and it reaches `bisect_write()` unresolved.
-        let rev = rest[cmd.len()..].trim_start();
+        let rev = rev_text;
 
         // ```c
         // if (check_and_set_terms(terms, word.buf) ||
@@ -3251,7 +3264,20 @@ fn check_good_are_ancestors_of_bad(
     }
     // `if (!res) { /* Create file BISECT_ANCESTORS_OK. */ … }` — recorded only when the
     // range came out clear, so a checked-out merge base leaves the check to run again.
-    std::fs::write(ctx.file("BISECT_ANCESTORS_OK"), "")?;
+    // `open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0600)`, and a failure is only
+    // `warning_errno()`: the next step runs the check again (bisect.c:952-964).
+    let filename = ctx.file("BISECT_ANCESTORS_OK");
+    let created = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&filename)
+    };
+    if let Err(e) = created {
+        eprintln!(
+            "warning: could not create file '{}': {}",
+            filename.display(),
+            crate::external::strerror(&e)
+        );
+    }
     Ok(None)
 }
 

@@ -204,6 +204,12 @@ fn upwards_message(err: &gix::discover::upwards::Error) -> Option<String> {
             Some(no_repository_walked())
         }
         E::NoGitRepositoryWithinFs { limit, .. } => Some(no_repository_at_mount_point(limit)),
+        // `if (strbuf_getcwd(&cwd)) die_errno(_("Unable to read current working directory"));`
+        // (setup.c:1948-1949), before the walk starts: a deleted cwd.
+        E::CurrentDir(io) => Some(format!(
+            "Unable to read current working directory: {}",
+            crate::external::strerror(io)
+        )),
         _ => None,
     }
 }

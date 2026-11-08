@@ -44,6 +44,14 @@ pub struct Outcome {
     /// `true` if `--atomic` was requested, at least one mapping was rejected, and `edits` was
     /// therefore left unapplied in its entirety.
     pub rejected_atomically: bool,
+    /// The updates the store refused without `--atomic`, whose transaction is git's
+    /// `REF_TRANSACTION_ALLOW_FAILURE` one (builtin/fetch.c:2056-2063), in the order they
+    /// were refused; their entries in [`edits`](Self::edits) are the edits as queued, unwritten.
+    pub rejections: Vec<gix_ref::file::transaction::Rejection>,
+    /// The error the store refused an `--atomic` transaction with, worded as git words
+    /// it, which `do_fetch()` reports once the summary is out (builtin/fetch.c:2101-2110,
+    /// :2195-2200); nothing was written.
+    pub transaction_error: Option<(gix_ref::file::transaction::ErrorKind, gix_ref::bstr::BString)>,
 }
 
 /// Describe the way a ref was updated, with particular focus on how the (peeled) target commit was affected.

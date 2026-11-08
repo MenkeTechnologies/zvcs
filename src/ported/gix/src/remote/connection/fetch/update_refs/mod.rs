@@ -419,6 +419,8 @@ pub(crate) fn update_queued(
         .filter_map(|update| update.edit_index)
         .collect();
     queued.sort_by_key(|&index| queue.order.get(&edits[index].name).copied().unwrap_or(u32::MAX));
+    let mut rejections = Vec::new();
+    let mut transaction_error = None;
     let mut transaction = queue.prune;
     let pruned = transaction.len();
     transaction.extend(queued.iter().map(|&index| edits[index].clone()));
@@ -440,22 +442,46 @@ pub(crate) fn update_queued(
                 .config
                 .lock_timeout()
                 .map_err(crate::reference::edit::Error::from)?;
-            let applied = repo
-                .refs
-                .transaction()
-                .packed_refs(
-                    match write_packed_refs {
-                        fetch::WritePackedRefs::Only => {
-                            gix_ref::file::transaction::PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(Box::new(&repo.objects))},
-                        fetch::WritePackedRefs::Never => gix_ref::file::transaction::PackedRefs::DeletionsOnly
+            let mut builder = repo.refs.transaction().packed_refs(match write_packed_refs {
+                fetch::WritePackedRefs::Only => {
+                    gix_ref::file::transaction::PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(
+                        Box::new(&repo.objects),
+                    )
+                }
+                fetch::WritePackedRefs::Never => gix_ref::file::transaction::PackedRefs::DeletionsOnly,
+            });
+            // Without `--atomic` the transaction is `REF_TRANSACTION_ALLOW_FAILURE`
+            // (builtin/fetch.c:2056-2063): an update the store refuses is dropped and
+            // reported by `commit_ref_transaction()` (:1878-1904), the rest is written.
+            if !atomic {
+                builder = builder.allow_failure();
+            }
+            match builder.prepare(transaction, file_lock_fail, packed_refs_lock_fail) {
+                Ok(prepared) => {
+                    rejections = prepared.rejections().to_vec();
+                    let committer = repo.committer().transpose().map_err(|err| {
+                        update::Error::EditReferences(crate::reference::edit::Error::ParseCommitterTime(err))
+                    })?;
+                    let applied = prepared
+                        .commit(committer)
+                        .map_err(crate::reference::edit::Error::from)?;
+                    // The committed edits keep the transaction's order, the refused ones left out.
+                    let refused: std::collections::HashSet<&gix_ref::bstr::BStr> =
+                        rejections.iter().map(|r| r.refname.as_ref()).collect();
+                    let written: Vec<usize> = queued
+                        .into_iter()
+                        .filter(|&index| !refused.contains(edits[index].name.as_bstr()))
+                        .collect();
+                    for (index, edit) in written.into_iter().zip(applied.into_iter().skip(pruned)) {
+                        edits[index] = edit;
                     }
-                )
-                .prepare(transaction, file_lock_fail, packed_refs_lock_fail)
-                .map_err(crate::reference::edit::Error::from)?
-                .commit(repo.committer().transpose().map_err(|err| update::Error::EditReferences(crate::reference::edit::Error::ParseCommitterTime(err)))?)
-                .map_err(crate::reference::edit::Error::from)?;
-            for (index, edit) in queued.into_iter().zip(applied.into_iter().skip(pruned)) {
-                edits[index] = edit;
+                }
+                // `--atomic`: `commit_ref_transaction()` fails as a whole, and `do_fetch()`
+                // reports the store's text once the summary is out (:2101-2110, :2195-2200).
+                Err(gix_ref::file::transaction::prepare::Error::Reftable { kind, message }) if atomic => {
+                    transaction_error = Some((kind, message));
+                }
+                Err(err) => return Err(crate::reference::edit::Error::from(err).into()),
             }
         }
         fetch::DryRun::Yes => {}
@@ -465,6 +491,8 @@ pub(crate) fn update_queued(
         edits,
         updates,
         rejected_atomically,
+        rejections,
+        transaction_error,
     })
 }
 

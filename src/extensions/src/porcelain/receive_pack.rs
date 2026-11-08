@@ -1881,7 +1881,7 @@ fn execute_commands_non_atomic(
         let rejections = match repo.edit_references_allowing_failure(queued) {
             Ok((_, rejections)) => rejections,
             Err(e) => {
-                band.error(&transaction_error(&e));
+                band.error(&transaction_error(repo, &e));
                 for cmd in cmds.iter_mut() {
                     cmd.error = Some("failed to update refs".into());
                 }
@@ -1894,7 +1894,7 @@ fn execute_commands_non_atomic(
         let mut failed_refs = std::collections::HashMap::new();
         for rejection in &rejections {
             if !rejection.message.is_empty() {
-                band.error(&rejection.message.to_string());
+                band.error(&enter_repo_lock_path(repo, &rejection.message.to_string()));
             }
             failed_refs.insert(rejection.refname.to_string(), rejection.kind.message());
         }
@@ -1907,13 +1907,33 @@ fn execute_commands_non_atomic(
 }
 
 /// The `err` text of a transaction that failed as a whole: git's own for a
-/// refusal of the reftable backend, the gitoxide error chain otherwise.
-fn transaction_error(e: &gix::reference::edit::Error) -> String {
+/// refusal the store words as git does and for a loose ref someone else holds
+/// locked, the gitoxide error chain otherwise.
+fn transaction_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String {
     use gix::refs::file::transaction::prepare;
-    if let gix::reference::edit::Error::FileTransactionPrepare(prepare::Error::Reftable { message, .. }) = e {
-        return message.to_string();
+    match e {
+        gix::reference::edit::Error::FileTransactionPrepare(prepare::Error::Reftable { message, .. }) => {
+            message.to_string()
+        }
+        gix::reference::edit::Error::FileTransactionPrepare(prepare::Error::LockAcquire { .. }) => {
+            enter_repo_lock_path(repo, &super::update_ref::lock_error(repo, e))
+        }
+        _ => e.to_string(),
     }
-    e.to_string()
+}
+
+/// The lock path in `message` as receive-pack spells it. `enter_repo()` chdirs into the
+/// git directory and sets it to `.` (setup.c:1889-1897), so `files_ref_path()` names a
+/// loose ref `./refs/...` (refs/files-backend.c:277-285) and `unable_to_lock_message()`
+/// makes that `<git-dir>/./refs/....lock` with `absolute_path()` (lockfile.c:257, :298),
+/// where the store here names it from the absolute git directory.
+fn enter_repo_lock_path(repo: &gix::Repository, message: &str) -> String {
+    let dir = repo.common_dir().display().to_string();
+    message.replacen(
+        &format!("Unable to create '{dir}/"),
+        &format!("Unable to create '{dir}/./"),
+        1,
+    )
 }
 
 /// `execute_commands_atomic()`: one transaction over every command, so a refusal
@@ -1964,7 +1984,7 @@ fn execute_commands_atomic(
                 .into_iter()
                 .flatten()
                 .next()
-                .map_or_else(|| transaction_error(&e), |(text, _)| text);
+                .map_or_else(|| transaction_error(repo, &e), |(text, _)| text);
             band.error(&text);
             reported = Some("atomic transaction failed");
         }

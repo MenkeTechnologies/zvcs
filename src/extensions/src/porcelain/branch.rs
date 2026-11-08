@@ -2283,7 +2283,7 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         .as_str()
         .try_into()
         .map_err(|e| anyhow!("invalid branch name '{name}': {e}"))?;
-    repo.edit_reference(RefEdit {
+    let edited = repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
@@ -2299,7 +2299,17 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         },
         name: full_name,
         deref: false,
-    })?;
+    });
+    // `die("%s", err.buf)` when the transaction fails (branch.c:665-673): a refusal
+    // the store words as git does is that text, like a name conflict with another
+    // branch (refs/files-backend.c:795-829, :3064-3082).
+    if let Err(gix::reference::edit::Error::FileTransactionPrepare(
+        gix::refs::file::transaction::prepare::Error::Reftable { message, .. },
+    )) = &edited
+    {
+        return fatal(message);
+    }
+    edited?;
 
     // ```c
     // if (real_ref && track)

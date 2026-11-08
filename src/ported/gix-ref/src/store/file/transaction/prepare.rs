@@ -601,16 +601,24 @@ impl Transaction<'_, '_> {
             // (refs/files-backend.c:3021-3033): an error about the update's values refuses
             // the update alone, any other fails the transaction.
             let refusal = match &locked {
-                Ok(()) if allow_failure => {
-                    self.check_locked_name(&updates, cid, packed_for_lookups, &mut refnames_to_check)
-                }
-                Err(err) if allow_failure => self.refusal(&updates, cid, err, packed_for_lookups),
-                _ => None,
+                Ok(()) => self.check_locked_name(&updates, cid, packed_for_lookups, &mut refnames_to_check),
+                Err(err) => self.refusal(&updates, cid, err, packed_for_lookups),
             };
-            if let Some((kind, message)) = refusal {
-                reject(&mut updates, cid, kind, message, &mut rejections, self.store.object_hash);
-                continue;
-            }
+            let locked = match refusal {
+                Some((kind, message)) if allow_failure => {
+                    reject(&mut updates, cid, kind, message, &mut rejections, self.store.object_hash);
+                    continue;
+                }
+                // Any other transaction fails on `lock_raw_ref()`'s name conflict with
+                // the text `refs_verify_refname_available()` gave it
+                // (refs/files-backend.c:795-829, :903-934), which the other refusals
+                // already carry in their own error.
+                Some((kind @ ErrorKind::NameConflict, message)) => Err(Error::Reftable {
+                    kind,
+                    message: message.into(),
+                }),
+                _ => locked,
+            };
             if let Err(err) = locked {
                 let err = match err {
                     Error::LockAcquire {
@@ -650,25 +658,37 @@ impl Transaction<'_, '_> {
         // `refs_verify_refnames_available(refs->packed_ref_store, &refnames_to_check,
         // &transaction->refnames, NULL, transaction, 0, err)` (refs/files-backend.c:3064-3082):
         // a reference created loose must not clash with one in `packed-refs` either, and
-        // under `REF_TRANSACTION_ALLOW_FAILURE` the clash refuses that update alone.
-        if allow_failure {
-            for cid in refnames_to_check {
-                if updates[cid].rejected {
-                    continue;
-                }
-                let extras = transaction_refnames(&updates);
-                let name = updates[cid].update.name.as_bstr().to_owned();
-                if let Some(message) = refname_conflict(self.store, packed_for_lookups, false, name.as_ref(), &extras) {
-                    reject(
-                        &mut updates,
-                        cid,
-                        ErrorKind::NameConflict,
-                        message,
-                        &mut rejections,
-                        self.store.object_hash,
-                    );
-                }
+        // under `REF_TRANSACTION_ALLOW_FAILURE` the clash refuses that update alone;
+        // otherwise it fails the transaction with `REF_TRANSACTION_ERROR_NAME_CONFLICT`.
+        for cid in refnames_to_check {
+            if updates[cid].rejected {
+                continue;
             }
+            let extras = transaction_refnames(&updates);
+            let name = updates[cid].update.name.as_bstr().to_owned();
+            let Some(message) = refname_conflict(self.store, packed_for_lookups, false, name.as_ref(), &extras) else {
+                continue;
+            };
+            if !allow_failure {
+                // `files_transaction_cleanup()` aborts the nested `packed-refs`
+                // transaction holding the deletions (refs/files-backend.c:2930-2936).
+                let packed_lines = packed_deletion_lines(kind, &updates);
+                if !packed_lines.is_empty() {
+                    file::transaction_hook(self.store, "aborted", &packed_lines);
+                }
+                return Err(Error::Reftable {
+                    kind: ErrorKind::NameConflict,
+                    message: message.into(),
+                });
+            }
+            reject(
+                &mut updates,
+                cid,
+                ErrorKind::NameConflict,
+                message,
+                &mut rejections,
+                self.store.object_hash,
+            );
         }
         let prepared_lines = packing_lines.unwrap_or_else(|| {
             updates
@@ -1379,8 +1399,9 @@ mod error {
         },
         #[error("Could not read reference")]
         ReferenceDecode(#[from] file::loose::reference::decode::Error),
-        /// A store with the reftable backend refused the transaction; `message` is git's
-        /// error text verbatim, like `cannot lock ref 'refs/heads/main': is at <id> but expected <id>`.
+        /// A store with the reftable backend refused the transaction, or the files backend
+        /// refused it for a name conflict; `message` is git's error text verbatim, like
+        /// `cannot lock ref 'refs/heads/main': is at <id> but expected <id>`.
         #[error("{message}")]
         Reftable {
             kind: file::transaction::ErrorKind,

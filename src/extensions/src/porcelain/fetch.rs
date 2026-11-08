@@ -1236,6 +1236,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     let mut failure = false;
     let mut fatal = false;
     let mut refused = false;
+    let mut status: Option<u8> = None;
     let mut fetch_head = FetchHead {
         path: repo.git_dir().join("FETCH_HEAD"),
         enabled: opts.write_fetch_head && !opts.dry_run,
@@ -1265,6 +1266,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 Verdict::Rejected => failure = true,
                 Verdict::Fatal => fatal = true,
                 Verdict::Refused => refused = true,
+                Verdict::Failed(code) => status = Some(code),
             }
         } else {
             // ```c
@@ -1314,6 +1316,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     }
     if refused {
         return Ok(ExitCode::from(255));
+    }
+    if let Some(code) = status {
+        return Ok(ExitCode::from(code));
     }
 
     // `--write-commit-graph` / `fetch.writeCommitGraph`: rebuild the commit-graph
@@ -1580,6 +1585,10 @@ pub(super) enum Verdict {
     /// `--negotiate-only` against a server that cannot do it: `transport_fetch_refs()`
     /// answered -1, which is the exit status.
     Refused,
+    /// `do_fetch()` returned the `enum ref_transaction_error` of the `--atomic` transaction
+    /// the store refused (builtin/fetch.c:2101-2110), which `cmd_fetch()` returns as the exit
+    /// status: 254 for a name conflict.
+    Failed(u8),
 }
 
 /// git's `transfer.credentialsInUrl`, applied before a connection is opened.
@@ -2249,14 +2258,6 @@ struct Line {
     /// Full local ref name for `--porcelain`'s fourth column (`FETCH_HEAD` for
     /// the rows that have no tracking ref).
     full: String,
-    /// Whether this row's `<from>` name counts towards the `<from>` column's
-    /// width. `refcol_width()` (builtin/fetch.c:667-706) walks the *ref map* and
-    /// skips every entry with `!ref->peer_ref` — a mapping with no local
-    /// destination, which is exactly a `-> FETCH_HEAD` row — and pruned refs are
-    /// not in the ref map at all, `display_state_init()` having run before
-    /// `prune_refs()` (:1979, :2000). So neither kind widens the column, and both
-    /// are still padded to whatever width the rest of the report chose.
-    widens: bool,
 }
 
 /// The `.git/FETCH_HEAD` sink for one `git fetch` invocation.
@@ -3568,6 +3569,29 @@ fn fetch_one(
     // asked for: in one `refs_delete_refs()` transaction of their own, or under `--atomic` as
     // the first entries of the transaction the updates join (`prune_refs()`, :1478-1491).
     let (prune_lines, atomic_prune, dangling_symrefs) = prune_refs(repo, &prune_prefixes, prepared.ref_map(), opts)?;
+    // `display_state_init()` sizes the `<from>` column from the ref map before anything is
+    // pruned or fetched (builtin/fetch.c:2017-2018), and `prune_refs()` prints its rows there and
+    // then, padded to `transport_summary_width(stale_refs)`, with the dangling symrefs after them
+    // (:1493-1504) — so they are out whatever becomes of the fetch that follows.
+    let refcol = refcol_width(repo, prepared.ref_map(), opts);
+    let mut shown_url = false;
+    if !opts.quiet {
+        for l in &prune_lines {
+            if opts.porcelain {
+                println!("{} {} {} {}", l.flag, l.old.to_hex(), l.new.to_hex(), l.full);
+                continue;
+            }
+            if !shown_url {
+                eprintln!("From {url}");
+                shown_url = true;
+            }
+            let sw = 2 * abbrev + 3;
+            eprintln!(" {} {:<sw$} {:<refcol$} -> {}{}", l.flag, l.summary, l.from, l.to, l.reason);
+        }
+        for line in &dangling_symrefs {
+            eprintln!("{line}");
+        }
+    }
 
     // Which auto-followed tags git would have left for its *second* pass. This
     // has to be decided here, against the object database as it stands before a
@@ -3949,6 +3973,9 @@ fn fetch_one(
     let mut update_lines: Vec<Line> = Vec::new();
     let mut fetch_head_rows: Vec<(String, bool)> = Vec::new();
     let mut rejected = false;
+    // The refs the `REF_TRANSACTION_ALLOW_FAILURE` transaction refused (builtin/fetch.c:1832-1872).
+    let store_refused: std::collections::HashSet<&gix::bstr::BStr> =
+        update_refs.rejections.iter().map(|r| r.refname.as_ref()).collect();
     let mut head_status =
         FetchHeadStatus::new(explicit_refspecs, upstream, remote_name.as_deref(), &merge_spec_values);
     // Set when a refspec would overwrite a ref some worktree has checked out and
@@ -4081,7 +4108,6 @@ fn fetch_one(
                         new: id,
                         full: "FETCH_HEAD".to_string(),
                         status,
-                        widens: false,
                     });
                 }
                 continue;
@@ -4372,6 +4398,15 @@ fn fetch_one(
                 ('!', "  (unable to update local ref)")
             }
         };
+        // `ref_update_display_info_set_failed()` (builtin/fetch.c:933-945) of a row whose
+        // ref `commit_ref_transaction()` found among the transaction's rejections
+        // (:2185-2190). The summary width was taken before the commit (:2099-2100), so
+        // unlike an update refused earlier it keeps its column.
+        let (flag, reason) = if store_refused.contains(local_full.as_bstr()) {
+            ('!', "  (unable to update local ref)")
+        } else {
+            (flag, reason)
+        };
 
         // `--porcelain`'s two id columns: a ref that did not exist before shows
         // the null id on the left, and one that stayed put repeats its own id on
@@ -4404,7 +4439,6 @@ fn fetch_one(
             full: local_full.as_bstr().to_string(),
             status,
             backfill,
-            widens: true,
         });
     }
 
@@ -4435,7 +4469,10 @@ fn fetch_one(
     // `--atomic` aborted the transaction: no ref moved, the pruned ones included, so no FETCH_HEAD
     // row may be recorded either. git leaves the file truncated and empty, and still prints the
     // summary of what it would have done.
-    let atomic_abort = update_refs.rejected_atomically;
+    // An `--atomic` transaction the store refused wrote nothing either; its error comes after
+    // the summary (builtin/fetch.c:2101-2110, :2195-2200).
+    let transaction_error = update_refs.transaction_error.as_ref();
+    let atomic_abort = update_refs.rejected_atomically || transaction_error.is_some();
 
     // ```c
     // if (dry_run)
@@ -4486,6 +4523,24 @@ fn fetch_one(
         }
     }
 
+    // `ref_transaction_rejection_handler()` (builtin/fetch.c:1832-1872) over the updates the
+    // transaction refused, from `commit_ref_transaction()` ahead of `FETCH_HEAD` and the summary.
+    let mut conflict_msg_shown = false;
+    for rejection in &update_refs.rejections {
+        use gix::refs::file::transaction::ErrorKind;
+        if rejection.kind == ErrorKind::NameConflict && !conflict_msg_shown {
+            eprintln!(
+                "error: some local refs could not be updated; try running\n 'git remote prune {}' to remove any old, conflicting branches",
+                remote_name.clone().or_else(|| name_or_url.map(|n| n.to_string())).unwrap_or_default()
+            );
+            conflict_msg_shown = true;
+        } else if !rejection.message.is_empty() {
+            eprintln!("error: {}", rejection.message);
+        } else {
+            eprintln!("error: fetching ref {} failed: {}", rejection.refname, rejection.kind.message());
+        }
+    }
+
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;
 
     // ```c
@@ -4510,7 +4565,8 @@ fn fetch_one(
     // `FETCH_HEAD` — the ref-map entry with no local destination, of which there must be
     // exactly one. `install_branch_config(0, …)` writes the three keys without the notice
     // `git branch -u` prints, because the `BRANCH_CONFIG_VERBOSE` bit is not set here.
-    if opts.set_upstream {
+    // Skipped with `set_head()` once an `--atomic` transaction failed (builtin/fetch.c:2105-2110).
+    if opts.set_upstream && transaction_error.is_none() {
         let mut source: Option<String> = None;
         let mut ambiguous = false;
         for mapping in &ref_map.mappings {
@@ -4569,6 +4625,17 @@ fn fetch_one(
         }
     }
 
+    // git's `do_set_head`: only a refspec-less fetch of a configured remote follows the remote's
+    // `HEAD`, and only when `remote.<name>.followRemoteHEAD` is not `never`. `--dry-run` does not
+    // stop it: `set_head()` is not one of the writes `dry_run` guards (builtin/fetch.c:2121-2127).
+    // It runs ahead of the summary, which `cleanup:` prints (:2186-2192), and not at all once an
+    // `--atomic` transaction failed (:2105-2110).
+    if !explicit_refspecs && has_configured_refspecs && transaction_error.is_none() {
+        if let Some(name) = remote_name.as_deref() {
+            set_head_from_remote(repo, name, follow_head.unwrap_or(FollowRemoteHead::Create), ref_map, opts)?;
+        }
+    }
+
     // --- print the summary ------------------------------------------------
     // ```c
     // /*
@@ -4589,15 +4656,8 @@ fn fetch_one(
     // mappings in ref-map order.
     update_lines.sort_by_key(|l| (l.backfill, l.status));
 
-    // Pruned refs are reported first, mirroring git's prune-before-fetch order.
-    let pruned_rows = prune_lines.len();
-    let print_dangling = || {
-        for line in &dangling_symrefs {
-            eprintln!("{line}");
-        }
-    };
-    let mut lines = prune_lines;
-    lines.extend(update_lines);
+    // The pruned refs were reported as they went, ahead of the fetch.
+    let lines = update_lines;
 
     if !opts.quiet && !lines.is_empty() {
         if opts.porcelain {
@@ -4614,7 +4674,6 @@ fn fetch_one(
                 ));
             }
             print!("{out}");
-            print_dangling();
         } else {
             let rendered: Vec<(String, String)> = lines
                 .iter()
@@ -4661,45 +4720,43 @@ fn fetch_one(
             // git 2.50.1 padded both, which is why this is the one row shape the
             // two releases disagree about.
             let sw = if rejected { 0 } else { 2 * abbrev + 3 };
-            // `prune_refs()` prints its rows on the spot, padded to its own
-            // `transport_summary_width(stale_refs)` (builtin/fetch.c:1493-1501), so they keep the
-            // column whatever becomes of the updates.
-            let prune_sw = 2 * abbrev + 3;
-            let fw = lines
-                .iter()
-                .zip(&rendered)
-                .filter(|(l, _)| l.widens)
-                .map(|(_, (f, _))| f.chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(REFCOL_WIDTH);
-            eprintln!("From {url}");
-            for (i, (l, (from, to))) in lines.iter().zip(&rendered).enumerate() {
-                if i == pruned_rows {
-                    print_dangling();
-                }
-                let sw = if i < pruned_rows { prune_sw } else { sw };
+            // The `<from>` column is the width `display_state_init()` took from the ref map
+            // (builtin/fetch.c:2017-2018), the one the pruned rows were printed with, and the
+            // header is printed once, by the first row (`shown_url`, :848-851).
+            let fw = refcol;
+            if !shown_url {
+                eprintln!("From {url}");
+            }
+            for (l, (from, to)) in lines.iter().zip(&rendered) {
                 eprintln!(
                     " {} {:<sw$} {:<fw$} -> {}{}",
                     l.flag, l.summary, from, to, l.reason,
                 );
             }
-            if pruned_rows == lines.len() {
-                print_dangling();
-            }
         }
     }
 
-    // git's `do_set_head`: only a refspec-less fetch of a configured remote follows the remote's
-    // `HEAD`, and only when `remote.<name>.followRemoteHEAD` is not `never`. `--dry-run` does not
-    // stop it: `set_head()` is not one of the writes `dry_run` guards (builtin/fetch.c:2121-2127).
-    if !explicit_refspecs && has_configured_refspecs {
-        if let Some(name) = remote_name.as_deref() {
-            set_head_from_remote(repo, name, follow_head.unwrap_or(FollowRemoteHead::Create), ref_map, opts)?;
-        }
+    // `if (retcode && atomic_fetch) goto cleanup;` (builtin/fetch.c:2105-2110): an `--atomic`
+    // transaction the store refused skips `set_head()`, and `cleanup:` reports the store's text
+    // after the summary (:2195-2200). `do_fetch()` returns the `enum ref_transaction_error`
+    // (refs.h:20-37), which `cmd_fetch()` exits with.
+    if let Some((kind, message)) = transaction_error {
+        use gix::refs::file::transaction::ErrorKind;
+        eprintln!("error: {message}");
+        let code: i32 = match kind {
+            ErrorKind::Generic => -1,
+            ErrorKind::NameConflict => -2,
+            ErrorKind::CreateExists => -3,
+            ErrorKind::NonexistentRef => -4,
+            ErrorKind::IncorrectOldValue => -5,
+            ErrorKind::InvalidNewValue => -6,
+            ErrorKind::ExpectedSymref => -7,
+            ErrorKind::CaseConflict => -8,
+        };
+        return Ok(Verdict::Failed(code as u8));
     }
 
-    Ok(if rejected { Verdict::Rejected } else { Verdict::Ok })
+    Ok(if rejected || !update_refs.rejections.is_empty() { Verdict::Rejected } else { Verdict::Ok })
 }
 
 /// `remote.<name>.followRemoteHEAD`, git's `enum follow_remote_head_settings`.
@@ -4861,7 +4918,6 @@ fn prune_refs(
             old: id,
             new: null,
             full: name.as_bstr().to_string(),
-            widens: false,
             // Prune rows are not ref-map entries at all: `prune_refs()` reports them
             // before the walk, and they are prepended to the summary.
             status: 0,
@@ -4869,6 +4925,73 @@ fn prune_refs(
         })
         .collect();
     Ok((lines, atomic, dangling))
+}
+
+/// `refcol_width()` (builtin/fetch.c:687-728): the width of the summary's `<from>` column,
+/// which `display_state_init()` takes from the ref map before anything is pruned or fetched.
+///
+/// ```c
+/// if (ref->status == REF_STATUS_REJECT_SHALLOW ||
+///     !ref->peer_ref ||
+///     !strcmp(ref->name, "HEAD"))
+///         continue;
+/// /* uptodate lines are only shown on high verbosity level */
+/// if (verbosity <= 0 && oideq(&ref->peer_ref->old_oid, &ref->old_oid))
+///         continue;
+/// rlen = utf8_strwidth(prettify_refname(ref->name));
+/// if (!compact_format)
+///         llen = utf8_strwidth(prettify_refname(ref->peer_ref->name));
+/// len = 21 /* flag and summary */ + rlen + 4 /* -> */ + llen;
+/// if (len >= max)
+///         continue;
+/// ```
+fn refcol_width(repo: &gix::Repository, ref_map: &gix::remote::fetch::RefMap, opts: &FetchOpts) -> usize {
+    // `prettify_refname()` (refs.c): only these three prefixes are dropped.
+    let prettify = |name: &str| -> usize {
+        let short = ["refs/heads/", "refs/tags/", "refs/remotes/"]
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix))
+            .unwrap_or(name);
+        unicode_width::UnicodeWidthStr::width(short)
+    };
+    let mut max = crate::pager::term_columns();
+    if opts.compact {
+        max = max * 2 / 3;
+    }
+    let mut width = REFCOL_WIDTH;
+    for mapping in &ref_map.mappings {
+        let Some(local) = mapping.local.as_ref() else { continue };
+        let name = match mapping.remote.as_name() {
+            Some(name) => name.to_string(),
+            None => mapping.remote.as_id().map(|id| id.to_string()).unwrap_or_default(),
+        };
+        if name == "HEAD" {
+            continue;
+        }
+        if !opts.verbose {
+            // `peer_ref->old_oid`: the value the local ref resolves to, tags unpeeled.
+            let mut current = repo.try_find_reference(local.as_bstr()).ok().flatten();
+            let mut old_oid = None;
+            for _ in 0..5 {
+                let Some(r) = current.take() else { break };
+                if let Some(id) = r.target().try_id() {
+                    old_oid = Some(id.to_owned());
+                    break;
+                }
+                current = r.follow().and_then(Result::ok);
+            }
+            if mapping.remote.as_id().is_some_and(|id| old_oid == Some(id.to_owned())) {
+                continue;
+            }
+        }
+        let rlen = prettify(&name);
+        let llen = if opts.compact { 0 } else { prettify(&local.to_string()) };
+        if (21 + rlen + 4 + llen) as i64 >= max {
+            continue;
+        }
+        width = width.max(rlen);
+    }
+    width
 }
 
 /// The order `do_fetch()` queues the updates of `ref_map` in, as each local ref's rank.

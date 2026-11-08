@@ -100,6 +100,11 @@ where
     {
         let ref_map = &self.ref_map;
         if ref_map.is_missing_required_mapping() {
+            // `die(_("couldn't find remote ref %s"))` (remote.c:2157) ends the process before
+            // `disconnect_git()`, so no end-of-interaction flush follows (transport.c:1020-1030).
+            if let Some(con) = self.con.as_mut() {
+                con.transport.skip_end_of_interaction();
+            }
             let mut specs = ref_map.refspecs.clone();
             specs.extend(ref_map.extra_refspecs.clone());
             return Err(Error::NoMapping {
@@ -109,6 +114,10 @@ where
         }
 
         let mut con = self.con.take().expect("receive() can only be called once");
+        // Every failure from here to the end of `fetch_pack()` is a `die()` in git, which never reaches
+        // `disconnect_git()`'s flush (transport.c:1020-1030): the connection closes without one until
+        // the fetch has come through and `restore_end_of_interaction()` below re-arms it.
+        con.transport.skip_end_of_interaction();
         let mut handshake = con.handshake.take().expect("receive() can only be called once");
 
         let expected_object_hash = repo.object_hash();
@@ -288,6 +297,10 @@ where
             rounds: v.negotiate.rounds,
         });
 
+        // Nothing fetched over v0/v1 leaves `finished_handshake` set, so `disconnect_git()` writes the
+        // closing flush when the connection goes (transport.c:1024-1025), once the fetch did not die.
+        let flush_on_close = negotiate.is_none()
+            && !matches!(handshake.server_protocol_version, gix_protocol::transport::Protocol::V2);
         if negotiate.is_some() {
             // `fetch_refs_via_pack()` clears `finished_handshake` once `fetch_pack()` has run
             // (transport.c:564), so `disconnect_git()` writes no closing flush after a fetch
@@ -492,6 +505,9 @@ where
                 },
             },
         };
+        if flush_on_close {
+            con.transport.restore_end_of_interaction();
+        }
         Ok(out)
     }
 }
@@ -574,6 +590,7 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
         negotiate::add_wants(
             self.objects,
             arguments,
+            self.refs,
             self.ref_map,
             remote_ref_target_known,
             self.shallow,
@@ -608,6 +625,17 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             previous_response,
             &self.restrictions.always_have,
         )
+    }
+
+    fn update_shallow(&mut self, updates: &[gix_protocol::fetch::response::ShallowUpdate]) {
+        for update in updates {
+            match update {
+                gix_protocol::fetch::response::ShallowUpdate::Shallow(id) => self.graph.register_shallow(*id),
+                // `find_common()` parses the commit under its shallow graft before `unregister_shallow()`
+                // drops the graft (fetch-pack.c:467-475), so it stays parentless for this walk.
+                gix_protocol::fetch::response::ShallowUpdate::Unshallow(_) => {}
+            }
+        }
     }
 
     fn next_have(&mut self) -> Option<Result<gix_hash::ObjectId, negotiate::Error>> {

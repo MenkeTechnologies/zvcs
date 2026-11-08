@@ -3391,7 +3391,7 @@ fn fetch_one(
     }
 
     let should_interrupt = AtomicBool::new(false);
-    let prepared = match connection
+    let mut prepared = match connection
         .with_server_options(server_options)
         .prepare_fetch(&mut *progress, map_options)
     {
@@ -3478,6 +3478,10 @@ fn fetch_one(
             return Err(err);
         }
     };
+    // Every refusal from here to `fetch_pack()` is a `die()` that never reaches `disconnect_git()`'s
+    // closing flush (transport.c:1020-1030), so a v0/v1 `upload-pack` reads the end of its input
+    // where it waits for wants and dies 'the remote end hung up unexpectedly' itself.
+    prepared.skip_end_of_interaction();
 
     // `get_ref_map()` (builtin/fetch.c:544-545) runs on the advertisement, so an unreachable remote
     // dies first, and `FETCH_HEAD` was already truncated by `do_fetch()` (:1912-1917).

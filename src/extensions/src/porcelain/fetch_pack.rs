@@ -75,9 +75,6 @@
 //!     low-level fetch function this port does not drive), so a partial-clone
 //!     filter cannot be requested faithfully.
 //!   * `--refetch`.
-//!   * `--upload-pack=<exec>` / `--exec=<exec>` naming anything but the default
-//!     `git-upload-pack` — the vendored transport `connect`
-//!     takes no per-invocation override for the remote program.
 //!   * `--stateless-rpc`.
 //!   * a `<ref>` given as a raw object hash (`uploadpack.allowTipSHA1InWant`
 //!     and friends): the vendored refspec layer maps names, not bare ids.
@@ -155,6 +152,9 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     // Flags git's loop accepts that this port cannot act on; refused once the
     // whole command line has been read, so a later usage error still wins.
     let mut unported: Vec<String> = Vec::new();
+    // `args.uploadpack`, "git-upload-pack" unless `--upload-pack=`/`--exec=` named another
+    // program (builtin/fetch-pack.c:74-90); `None` is that default.
+    let mut upload_pack: Option<String> = None;
     let mut quiet = false;
     let mut no_progress = false;
 
@@ -280,13 +280,11 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--shallow-exclude=") => {
                 shallow_exclude.push(a["--shallow-exclude=".len()..].to_string());
             }
-            // `--upload-pack=<exec>` / `--exec=<exec>` only matter when they name
-            // something other than the program the transport would have run anyway.
+            // `--upload-pack=<exec>` / `--exec=<exec>`: the last one wins, and `git_connect()` runs it
+            // in place of `git-upload-pack` (builtin/fetch-pack.c:83-90, :226-227).
             _ if a.starts_with("--upload-pack=") || a.starts_with("--exec=") => {
                 let value = &a[a.find('=').map(|at| at + 1).unwrap_or(a.len())..];
-                if value != "git-upload-pack" {
-                    unported.push(a[..a.find('=').unwrap_or(a.len())].to_string());
-                }
+                upload_pack = (value != "git-upload-pack").then(|| value.to_string());
             }
             _ if a.starts_with("--filter=") => unported.push("--filter".to_string()),
             // Anything else is a usage error for git: usage on stderr, 129.
@@ -323,11 +321,6 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Nothing asked for at all: git exits 1 without a word.
-    if !all && sought.is_empty() {
-        return Ok(ExitCode::FAILURE);
-    }
-
     let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
@@ -350,13 +343,41 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     // remote from the URL alone: that also guarantees it carries no configured
     // refspecs which could write tracking refs behind our back. `Tags::None`
     // suppresses gitoxide's implicit tag refspec for the same reason.
-    let advertised = match list_refs(&repo, dest) {
-        Ok(rows) => rows,
+    //
+    // One connection carries both the listing and the fetch, as `git_connect()` is called once and
+    // `fetch_pack()` runs over the refs `get_remote_refs()`/`get_remote_heads()` read on it
+    // (builtin/fetch-pack.c:226-259), so `--upload-pack` runs its program once.
+    // `prepare_fetch()` needs a refspec to hold; the ones naming the wants replace it after the
+    // selection below.
+    let remote = repo
+        .remote_at(dest)?
+        .with_fetch_tags(Tags::None)
+        .with_refspecs(["HEAD"], gix::remote::Direction::Fetch)?;
+    let plan = super::fetch_progress::Plan {
+        progress: !no_progress,
+        quiet,
+        keep_pack: keep,
+        unpack_limit: super::fetch_progress::unpack_limit(&repo),
+        index_pack_required: super::fetch::fetch_pack_fsck_objects(&repo),
+    };
+    let remote_output = super::fetch_progress::RemoteOutput::new(&repo);
+    let prepared = match connect(&remote, upload_pack.as_deref(), &remote_output, plan) {
+        Ok(prepared) => prepared,
         Err(e) => {
             eprintln!("fatal: {e}");
             return Ok(ExitCode::from(128));
         }
     };
+    let advertised = advertisement(prepared.ref_map());
+    // A v0/v1 server that advertised no ref at all is `fetch_pack()`'s flush and
+    // `die(_("no matching remote head"))` (fetch-pack.c:2165-2168).
+    if prepared.ref_map().remote_refs.is_empty()
+        && prepared.protocol_version() != gix::protocol::transport::Protocol::V2
+    {
+        drop(prepared);
+        eprintln!("fatal: no matching remote head");
+        return Ok(ExitCode::from(128));
+    }
 
     // --- select the refs to report and to want ----------------------------
     let advertised_tags: Vec<String> = advertised
@@ -365,7 +386,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         .map(|(name, _)| name.clone())
         .collect();
     let mut selected: Vec<(String, ObjectId)> = Vec::new();
-    let mut missing = false;
+    let mut missing: Vec<&str> = Vec::new();
     if all {
         selected = advertised;
     } else {
@@ -385,8 +406,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
                              refspec layer, which maps names only ({PORTED})"
                         );
                     }
-                    eprintln!("error: no such remote ref {name}");
-                    missing = true;
+                    missing.push(name);
                 }
             }
         }
@@ -427,21 +447,33 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Nothing matched: git never opens a fetch and exits 1.
+    // `report_unmatched_refs()` names every sought ref the advertisement lacked once `fetch_pack()`
+    // returned and the connection was closed, ahead of the fetched refs on stdout
+    // (builtin/fetch-pack.c:258-281, fetch-pack.c:2333-2354).
+    let report_unmatched = || {
+        for name in &missing {
+            eprintln!("error: no such remote ref {name}");
+        }
+    };
+
+    // Nothing to want, asked for or matched: `fetch_pack()` finds everything local and closes the
+    // conversation as `do_fetch_pack()` does with a flush over v0/v1, and `do_fetch_pack_v2()`
+    // without one (fetch-pack.c:1242-1245, :1753-1754); the command then exits 1.
     if selected.is_empty() {
+        let mut prepared = prepared;
+        if prepared.protocol_version() == gix::protocol::transport::Protocol::V2 {
+            prepared.skip_end_of_interaction();
+        }
+        drop(prepared);
+        report_unmatched();
         return Ok(ExitCode::FAILURE);
     }
 
     // --- phase 2: negotiate and receive the pack --------------------------
     let shallow = build_shallow(depth, deepen_relative, shallow_since.as_deref(), &shallow_exclude)?;
-    let plan = super::fetch_progress::Plan {
-        progress: !no_progress,
-        quiet,
-        keep_pack: keep,
-        unpack_limit: super::fetch_progress::unpack_limit(&repo),
-        index_pack_required: super::fetch::fetch_pack_fsck_objects(&repo),
-    };
-    if let Err(e) = receive(&repo, dest, &selected, shallow, Locks { keep_lock, lock_pack }, plan) {
+    let received = receive(&repo, prepared, &selected, shallow, Locks { keep_lock, lock_pack }, plan);
+    remote_output.finish();
+    if let Err(e) = received {
         // A failed fetch surfaces as git's `fatal:` with 128 unless it is one of
         // our own refusals, which must stay loud and unmistakable.
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -467,13 +499,14 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    report_unmatched();
     let mut out = String::new();
     for (name, oid) in &selected {
         out.push_str(&format!("{} {name}\n", oid.to_hex()));
     }
     print!("{out}");
 
-    Ok(if missing {
+    Ok(if !missing.is_empty() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -818,8 +851,8 @@ fn hex2chr(hi: u8, lo: u8) -> Option<u8> {
     Some(digit(hi)? << 4 | digit(lo)?)
 }
 
-/// The connect options for `dest`: over the local transport, the `upload-pack`
-/// of this installation.
+/// The connect options for `dest`: `program` when `--upload-pack`/`--exec` named one, and
+/// otherwise, over the local transport, the `upload-pack` of this installation.
 ///
 /// `git_connect()` spawns `git-upload-pack` through `git_exec_path()`
 /// (connect.c, `conn->git_cmd = 1` for a local path), so stock `fetch-pack`
@@ -828,37 +861,48 @@ fn hex2chr(hi: u8, lo: u8) -> Option<u8> {
 /// zvcs installed, an older server whose `deepen-relative` answer wrote a
 /// shallow boundary the request never asked for. `fetch` already pins its
 /// program the same way ([`super::fetch::local_service_program`]).
-fn own_upload_pack(remote: &gix::Remote<'_>) -> gix::remote::connect::Options {
+fn own_upload_pack(remote: &gix::Remote<'_>, program: Option<&str>) -> gix::remote::connect::Options {
     gix::remote::connect::Options {
         upload_pack: super::fetch::local_service_program(
             remote.url(gix::remote::Direction::Fetch),
-            None,
+            program.map(Into::into),
             "upload-pack",
         ),
         ..Default::default()
     }
 }
 
-/// Every ref the remote advertises, as `(full name, id)` pairs.
+/// The connection to `remote` with its advertisement read: `git_connect()` running `upload_pack`
+/// or this installation's `upload-pack`, and the ref listing `fetch-pack` makes over it.
 ///
-/// The id is the ref's own target, so an annotated tag reports the tag object
-/// rather than the commit it peels to — that is the pair `upload-pack` puts on
-/// the wire and what stock `fetch-pack` prints. Unborn refs are skipped: they
-/// name no object, and git prints nothing for them.
-fn list_refs(repo: &gix::Repository, dest: &str) -> Result<Vec<(String, ObjectId)>> {
-    let remote = repo.remote_at(dest)?.with_fetch_tags(Tags::None);
-    // With no refspecs configured, the server must not pre-filter by prefix or
-    // the listing would come back empty.
-    let (ref_map, _handshake) = remote
-        .connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?
-        .ref_map(
+/// The listing is unfiltered, as `get_remote_refs()` sends `ls-refs` without a ref prefix
+/// (builtin/fetch-pack.c:240-242).
+fn connect<'remote, 'repo>(
+    remote: &'remote gix::Remote<'repo>,
+    upload_pack: Option<&str>,
+    remote_output: &super::fetch_progress::RemoteOutput,
+    plan: super::fetch_progress::Plan,
+) -> Result<gix::remote::fetch::Prepare<'remote, 'repo, Box<dyn gix::protocol::transport::client::blocking_io::Transport + Send>>>
+{
+    let mut connection =
+        remote.connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(remote, upload_pack))?;
+    connection.set_transfer_progress(!plan.progress, Some(remote_output.handler()));
+    Ok(connection.prepare_fetch(
         gix::progress::Discard,
         gix::remote::ref_map::Options {
             prefix_from_spec_as_filter_on_remote: false,
             ..Default::default()
         },
-    )?;
+    )?)
+}
 
+/// Every ref the remote advertised, as `(full name, id)` pairs.
+///
+/// The id is the ref's own target, so an annotated tag reports the tag object
+/// rather than the commit it peels to — that is the pair `upload-pack` puts on
+/// the wire and what stock `fetch-pack` prints. Unborn refs are skipped: they
+/// name no object, and git prints nothing for them.
+fn advertisement(ref_map: &gix::remote::fetch::RefMap) -> Vec<(String, ObjectId)> {
     let mut rows = Vec::with_capacity(ref_map.remote_refs.len());
     for r in &ref_map.remote_refs {
         let (name, oid) = match r {
@@ -879,7 +923,7 @@ fn list_refs(repo: &gix::Repository, dest: &str) -> Result<Vec<(String, ObjectId
         };
         rows.push((name.to_string(), oid));
     }
-    Ok(rows)
+    rows
 }
 
 /// A refusal raised from inside the fetch, to be reported as an error rather
@@ -957,46 +1001,36 @@ fn build_shallow(
     Ok(Shallow::NoChange)
 }
 
-/// Want exactly `selected`, receive the pack, and keep it or explode it into
-/// loose objects as [`dispose`] decides.
+/// Want exactly `selected` over the connection `prepared` holds, receive the pack, and keep
+/// it or explode it into loose objects as [`dispose`] decides.
 ///
 /// Each ref is turned into a one-sided fetch refspec (`refs/heads/main` with no
 /// destination), which makes it a `want` without producing any ref edit — the
 /// property `fetch-pack` depends on.
 fn receive(
     repo: &gix::Repository,
-    dest: &str,
+    prepared: gix::remote::fetch::Prepare<'_, '_, Box<dyn gix::protocol::transport::client::blocking_io::Transport + Send>>,
     selected: &[(String, ObjectId)],
     shallow: Shallow,
     locks: Locks,
     plan: super::fetch_progress::Plan,
 ) -> Result<()> {
     let keep = plan.keep_pack;
-    let remote = repo
-        .remote_at(dest)?
-        .with_fetch_tags(Tags::None)
-        .with_refspecs(
-            selected.iter().map(|(name, _)| name.as_str()),
-            gix::remote::Direction::Fetch,
-        )?;
+    let refspecs = selected
+        .iter()
+        .map(|(name, _)| {
+            gix::refspec::parse(name.as_str().into(), gix::refspec::parse::Operation::Fetch).map(|spec| spec.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let should_interrupt = AtomicBool::new(false);
-    let mut connection =
-        remote.connect_with_options(gix::remote::Direction::Fetch, own_upload_pack(&remote))?;
-    let remote_output = super::fetch_progress::RemoteOutput::new(repo);
-    connection.set_transfer_progress(!plan.progress, Some(remote_output.handler()));
-    let outcome = connection
-        .prepare_fetch(
-            gix::progress::Discard,
-            gix::remote::ref_map::Options::default(),
-        )?
+    let outcome = prepared
+        .with_fetch_refspecs(refspecs)?
         // Deepen exactly as `--depth`/`--shallow-*` asked; `Shallow::NoChange`
         // (the common case) leaves negotiation untouched.
         .with_shallow(shallow)
         .with_keep_pack(keep)
-        .receive(super::fetch_progress::Meters::new(plan), &should_interrupt);
-    remote_output.finish();
-    let outcome = outcome?;
+        .receive(super::fetch_progress::Meters::new(plan), &should_interrupt)?;
 
     match outcome.status {
         // Nothing new on the wire — every wanted object is already local.

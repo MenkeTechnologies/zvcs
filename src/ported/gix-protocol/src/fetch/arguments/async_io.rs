@@ -7,6 +7,32 @@ use gix_transport::client::{
 use crate::{Command, fetch::Arguments};
 
 impl Arguments {
+    /// Send the wants and the deepen request of a deepening V0/V1 fetch on their own, as `find_common()`
+    /// does under `args->deepen` before the first `have` so it can read the shallow list they are answered
+    /// with (fetch-pack.c:452-481). Over a stateless connection they lead every later request again.
+    pub async fn send_v1_deepen_request<'a, T: Transport + 'a>(
+        &mut self,
+        transport: &'a mut T,
+    ) -> Result<Box<dyn ExtendedBufRead<'a> + Unpin + 'a>, client::Error> {
+        let (extra_flush, retained_state) =
+            self.prepare_v1_deepen_request(transport.connection_persists_across_multiple_requests());
+        let mut line_writer = transport.request(
+            client::WriteMode::OneLfTerminatedLinePerWriteCall,
+            client::MessageKind::Flush,
+            self.trace,
+        )?;
+        for arg in self.args.drain(..) {
+            line_writer.write_all(&arg).await?;
+        }
+        if extra_flush {
+            line_writer.write_message(client::MessageKind::Flush).await?;
+        }
+        if let Some(next_args) = retained_state {
+            self.args = next_args;
+        }
+        Ok(line_writer.into_read().await?)
+    }
+
     /// Send fetch arguments to the server, and indicate this is the end of negotiations only if `add_done_argument` is present.
     pub async fn send<'a, T: Transport + 'a>(
         &mut self,

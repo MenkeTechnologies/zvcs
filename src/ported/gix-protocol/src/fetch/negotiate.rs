@@ -225,10 +225,17 @@ where
         }
     }
 
-    // color our commits as complete as identified by references, unconditionally
-    // (`git` is conditional here based on `deepen`, but it doesn't make sense and it's hard to extract from history when that happened).
+    // Color our commits as complete as identified by references, but only when not deepening:
+    // `mark_complete_and_common_ref()` runs `mark_complete_oid()` over every ref, the alternates'
+    // `mark_alternate_complete()` and `mark_recent_complete_commits()` under `if (!args->deepen)`
+    // (fetch-pack.c:838-848), `args->deepen` being any of `--depth`, `--shallow-since` or
+    // `--shallow-exclude` (fetch-pack.c:1169-1170, :1741-1742). A deepening fetch therefore has
+    // nothing COMPLETE: no advertised ref becomes a COMMON_REF and every local ref's history goes
+    // out as `have`s, while `mark_tips()` still seeds the negotiator with the same tips.
+    let deepen = !matches!(shallow, Shallow::NoChange);
+    let mark = if deepen { Flags::empty() } else { Flags::COMPLETE };
     let mut queue = Queue::new();
-    mark_all_refs_in_repo(refs, objects, graph, &mut queue, Flags::COMPLETE)?;
+    mark_all_refs_in_repo(refs, objects, graph, &mut queue, mark)?;
     // git seeds the negotiator with the tips of every alternate in `find_common()`, one line after
     // `mark_tips()` and outside its `negotiation_tips` early return, so they stay tips even when
     // `--negotiation-restrict` replaced our own. They still take part in the cut-off walk below.
@@ -239,11 +246,11 @@ where
             &alt_objs,
             graph,
             &mut queue,
-            Flags::COMPLETE,
+            mark,
         )?);
     }
     // Keep track of the tips, which happen to be on our queue right, before we traverse the graph with cutoff.
-    let tips = if let Some(cutoff) = cutoff_date {
+    let tips = if let Some(cutoff) = cutoff_date.filter(|_| !deepen) {
         let tips = Cow::Owned(queue.clone());
         // color all their parents up to the cutoff date, the oldest commit we know the server has.
         mark_recent_complete_commits(&mut queue, graph, cutoff)?;
@@ -392,6 +399,7 @@ fn advertised_position(ref_map: &RefMap, mapping: &refmap::Mapping) -> usize {
 /// `objects` are used to see if remote ids are known here and are tags, in which case they are also added as 'haves' as
 /// [negotiators](gix_negotiate::Negotiator) don't see tags at all.
 ///
+/// * `refs` is the local reference store, whose values decide which mappings are already up to date.
 /// * `ref_map` is the state of refs as known on the remote.
 /// * `shallow` defines if the history should be shallow.
 /// * `mapping_is_ignored` is typically initialized with [`make_refmapping_ignore_predicate`].
@@ -401,6 +409,7 @@ fn advertised_position(ref_map: &RefMap, mapping: &refmap::Mapping) -> usize {
 pub fn add_wants(
     objects: &impl gix_object::FindHeader,
     arguments: &mut crate::fetch::Arguments,
+    refs: &gix_ref::file::Store,
     ref_map: &RefMap,
     remote_ref_target_known: &[bool],
     shallow: &Shallow,
@@ -417,6 +426,38 @@ pub fn add_wants(
         .filter_map(|(m, known)| (is_shallow || !*known).then_some(m))
         .filter(|m| !mapping_is_ignored(m))
         .collect();
+    // The name a mapping's remote ref goes by: `remove_duplicates_in_refs()` and `add_wants()` below
+    // take an exact object id as its own hex.
+    let name_of = |m: &refmap::Mapping| match m.remote.as_name() {
+        Some(name) => Some(name.to_owned()),
+        None => m.remote.as_id().map(|id| bstr::BString::from(id.to_hex().to_string())),
+    };
+    // `transport_fetch_refs()` (transport.c:1646-1668) hands fetch-pack only the refs whose local
+    // counterpart does not already hold the advertised object, and every ref only when that leaves
+    // none, as when a shallow repository is deepened. A deepening fetch marks nothing COMPLETE
+    // (fetch-pack.c:838), so this is what keeps an unchanged ref out of its wants. git's ref map
+    // holds a remote ref once where several mappings name it (`add_merge_config()` skips a ref
+    // already there, builtin/fetch.c:237-247, and `ref_remove_duplicates()`), so the first mapping
+    // of each name, in refspec order, stands for it.
+    let up_to_date = |m: &refmap::Mapping| {
+        let (Some(local), Some(remote)) = (m.local.as_ref(), m.remote.as_id()) else {
+            return false;
+        };
+        !remote.is_null()
+            && refs
+                .find(local)
+                .ok()
+                .and_then(|r| r.target.try_id().map(ToOwned::to_owned))
+                .is_some_and(|local_id| local_id == remote)
+    };
+    let mut first_of_name = std::collections::HashMap::new();
+    for m in &wants {
+        first_of_name.entry(name_of(m)).or_insert(*m);
+    }
+    let changed = |m: &refmap::Mapping| !up_to_date(first_of_name[&name_of(m)]);
+    if wants.iter().any(|m| changed(m)) {
+        wants.retain(|m| changed(m));
+    }
     // git's want list is not refspec-major but advertisement-major: `filter_refs()` (`fetch-pack.c`) walks the
     // ref list exactly as the server advertised it, keeps the entries a sought refspec matched, and only then
     // appends the sought entries that were never advertised. Our mappings come out of `gix_refspec::MatchGroup`
@@ -432,13 +473,7 @@ pub fn add_wants(
     let mut sent = std::collections::HashSet::new();
     for want in wants {
         let id_on_remote = want.remote.as_id();
-        let name = match want.remote.as_name() {
-            Some(name) => name.to_owned(),
-            None => match id_on_remote {
-                Some(id) => bstr::BString::from(id.to_hex().to_string()),
-                None => continue,
-            },
-        };
+        let Some(name) = name_of(want) else { continue };
         if !sent.insert(name) {
             continue;
         }

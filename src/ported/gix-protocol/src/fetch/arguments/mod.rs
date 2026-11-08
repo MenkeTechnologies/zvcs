@@ -284,6 +284,23 @@ mod shared {
     use crate::fetch::Arguments;
 
     impl Arguments {
+        /// `find_common()` writes the wants first, the first one carrying the capabilities, then the
+        /// shallow lines, the deepen requests and the filter (fetch-pack.c:380-451), whatever order
+        /// they were added in.
+        fn order_v1_args(&mut self) {
+            self.args.sort_by_key(|line| {
+                if line.starts_with_str("want ") {
+                    0
+                } else if line.starts_with_str("shallow ") {
+                    1
+                } else if line.starts_with_str("filter ") {
+                    3
+                } else {
+                    2
+                }
+            });
+        }
+
         pub(in crate::fetch::arguments) fn prepare_v1(
             &mut self,
             transport_is_stateful: bool,
@@ -303,10 +320,21 @@ mod shared {
                 Some(self.args.clone())
             };
 
-            if let Some(first_arg_position) = self.args.iter().position(|l| l.starts_with_str("want ")) {
-                self.args.swap(first_arg_position, 0);
-            }
+            self.order_v1_args();
             Ok((on_into_read, retained_state))
+        }
+
+        /// The wants and the deepen request of a deepening V0/V1 fetch, sent on their own and ended by
+        /// their flush (`find_common()`, fetch-pack.c:452-458), returning whether `send_request()` closes
+        /// the request with a flush of its own, which it does over a stateless connection only
+        /// (fetch-pack.c:254-264), and the arguments every later stateless request starts with again.
+        pub(in crate::fetch::arguments) fn prepare_v1_deepen_request(
+            &mut self,
+            transport_is_stateful: bool,
+        ) -> (bool, Option<Vec<BString>>) {
+            let retained_state = (!transport_is_stateful).then(|| self.args.clone());
+            self.order_v1_args();
+            (!transport_is_stateful, retained_state)
         }
     }
 }

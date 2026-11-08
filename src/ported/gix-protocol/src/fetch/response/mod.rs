@@ -23,6 +23,10 @@ pub enum Error {
     /// stopped at a flush, delimiter or response-end where the section `do_fetch_pack_v2()` reads next belongs.
     #[error("expected '{section}'")]
     ExpectedSection { section: &'static str },
+    /// `find_common()`'s `die(_("expected shallow/unshallow, got %s"))` (fetch-pack.c:479) over a line in the
+    /// shallow list that answers a deepening V0/V1 request's wants.
+    #[error("expected shallow/unshallow, got {line}")]
+    ExpectedShallowList { line: String },
 }
 
 impl From<std::io::Error> for Error {

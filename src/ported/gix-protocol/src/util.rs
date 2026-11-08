@@ -68,6 +68,13 @@ mod with_transport {
             self.flush_packet_sent = true;
         }
 
+        /// Undo [`skip_end_of_interaction()`](Self::skip_end_of_interaction()) once the exchange it
+        /// covered reached the point where git would disconnect normally, so dropping the
+        /// connection writes the end-of-interaction flush-packet again.
+        pub fn restore_end_of_interaction(&mut self) {
+            self.flush_packet_sent = false;
+        }
+
         /// Useful to explicitly invalidate the connection by sending a flush-packet.
         /// This will happen exactly once, and it is not considered an error to call it multiple times.
         ///

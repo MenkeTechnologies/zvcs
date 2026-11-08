@@ -270,6 +270,17 @@ impl<'find, 'cache, T> Graph<'find, 'cache, T> {
 
 /// Commit based methods
 impl<T> Graph<'_, '_, Commit<T>> {
+    /// `register_shallow()` (shallow.c:32-45): from now on `id` is walked as a commit without parents,
+    /// and so is the commit already in the graph, whose parsed parent list is freed.
+    pub fn register_shallow(&mut self, id: gix_hash::ObjectId) {
+        let mut table = self.grafts.as_deref().cloned().unwrap_or_default();
+        table.register(id, crate::graft::Graft::Shallow, false);
+        self.grafts = Some(std::sync::Arc::new(table));
+        if let Some(commit) = self.map.get_mut(&id) {
+            commit.parents.clear();
+        }
+    }
+
     /// Lookup `id` in the graph, but insert it if it's not yet present by looking it up without failing if the commit doesn't exist.
     /// Call `new_data()` to obtain data for a newly inserted commit.
     /// `update_data(data)` gets run either on existing or on new data.

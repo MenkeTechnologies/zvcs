@@ -202,6 +202,56 @@ where
     pub fn ref_map(&self) -> &RefMap {
         &self.inner.ref_map
     }
+
+    /// The protocol version the server answered the handshake with.
+    pub fn protocol_version(&self) -> gix_protocol::transport::Protocol {
+        self.inner
+            .con
+            .as_ref()
+            .and_then(|con| con.handshake.as_ref())
+            .expect("prepare_fetch() always performs the handshake")
+            .server_protocol_version
+    }
+
+    /// Map the refs this connection already listed onto `refspecs` instead of the remote's own, and
+    /// fetch through those from now on.
+    ///
+    /// `fetch-pack` reads the advertisement once and picks its wants from it on the same connection
+    /// (`get_remote_heads()`/`get_remote_refs()` then `fetch_pack()`, builtin/fetch-pack.c:226-259),
+    /// so the refs to want are only known after the listing this instance carries.
+    pub fn with_fetch_refspecs(
+        mut self,
+        refspecs: Vec<gix_refspec::RefSpec>,
+    ) -> Result<Self, gix_protocol::fetch::refmap::init::Error> {
+        let con = self.inner.con.as_mut().expect("refspecs can only be replaced before receive()");
+        let capabilities = &con
+            .handshake
+            .as_ref()
+            .expect("prepare_fetch() always performs the handshake")
+            .capabilities;
+        let remote_refs = std::mem::take(&mut self.inner.ref_map.remote_refs);
+        self.inner.ref_map = RefMap::from_refs(
+            remote_refs,
+            capabilities,
+            gix_protocol::fetch::refmap::init::Context {
+                fetch_refspecs: refspecs.clone(),
+                extra_refspecs: Vec::new(),
+                opportunistic_refspecs: Vec::new(),
+            },
+        )?;
+        con.remote.fetch_specs = refspecs;
+        Ok(self)
+    }
+
+    /// Close the connection without the end-of-interaction flush-packet should this instance be
+    /// dropped before [`receive()`](Self::receive()) ran, as git's `die()` between `get_ref_map()`
+    /// and `fetch_pack()` never reaches `disconnect_git()` (transport.c:1020-1030).
+    /// `receive()` itself decides whether the flush is written after all.
+    pub fn skip_end_of_interaction(&mut self) {
+        if let Some(con) = self.inner.con.as_mut() {
+            con.transport.skip_end_of_interaction();
+        }
+    }
 }
 
 impl<T> PrepareDetached<'_, T>

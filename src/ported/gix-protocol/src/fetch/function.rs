@@ -227,6 +227,14 @@ where
                     let mut got_ready = false;
                     let mut replay = Vec::<gix_hash::ObjectId>::new();
                     let mut first_shallows = None::<Vec<ShallowUpdate>>;
+                    // A deepening fetch sends its wants and deepen lines on their own and reads the shallow
+                    // list they are answered with before the first `have` goes out (fetch-pack.c:452-481).
+                    if !matches!(shallow, Shallow::NoChange) {
+                        let mut rd = arguments.send_v1_deepen_request(transport).await?;
+                        let updates = crate::fetch::Response::shallow_list_from_line_reader(&mut rd).await?;
+                        negotiate.update_shallow(&updates);
+                        first_shallows = Some(updates);
+                    }
                     for id in &always_have {
                         arguments.have(id);
                         count += 1;

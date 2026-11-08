@@ -31,6 +31,34 @@ fn parse_v2_section<'a, T>(
 }
 
 impl Response {
+    /// Read the shallow list a deepening V0/V1 request's wants are answered with before any `have` is
+    /// sent: `shallow`/`unshallow` lines up to a flush, anything else being
+    /// `die(_("expected shallow/unshallow, got %s"))` and the end of the stream the reader's own hang-up
+    /// (`find_common()`, fetch-pack.c:455-481, pkt-line.c:364-372).
+    pub fn shallow_list_from_line_reader<'a>(
+        reader: &mut impl ExtendedBufRead<'a>,
+    ) -> Result<Vec<ShallowUpdate>, response::Error> {
+        let mut line = String::new();
+        let mut updates = Vec::new();
+        while reader.readline_str(&mut line)? != 0 {
+            if let Some(err) = response::upload_pack_error(&line) {
+                return Err(err);
+            }
+            let update = shallow_update_from_line(&line).map_err(|_| response::Error::ExpectedShallowList {
+                line: line.trim_end_matches('\n').into(),
+            })?;
+            updates.push(update);
+            line.clear();
+        }
+        if reader.stopped_at() != Some(MessageKind::Flush) {
+            return Err(response::Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the remote end hung up unexpectedly",
+            )));
+        }
+        Ok(updates)
+    }
+
     /// Parse a response of the given `version` of the protocol from `reader`.
     ///
     /// `client_expects_pack` is only relevant for V1 stateful connections, and if `false`, causes us to stop parsing when seeing `NAK`,

@@ -116,6 +116,10 @@ mod with_fetch {
             arguments: &mut fetch::Arguments,
             previous_response: Option<&fetch::Response>,
         ) -> Result<(negotiate::Round, bool), negotiate::Error>;
+        /// `register_shallow()` / `unregister_shallow()` for each line of the shallow list a deepening V0/V1
+        /// request was answered with, before the first `have` (fetch-pack.c:455-481): the walk that picks
+        /// the `have`s then stops at the new boundary.
+        fn update_shallow(&mut self, _updates: &[crate::fetch::response::ShallowUpdate]) {}
         /// `negotiator->next()` (fetch-negotiator.h): the next commit to offer as `have`, or `None` once
         /// there is nothing left to offer.
         fn next_have(&mut self) -> Option<Result<gix_hash::ObjectId, negotiate::Error>> {

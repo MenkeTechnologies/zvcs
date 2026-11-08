@@ -366,6 +366,9 @@ pub struct Transaction<'s, 'p> {
     /// The `reference-transaction` hook's view of a prepared transaction, kept for
     /// the `committed` or `aborted` run that ends it.
     hook: Option<transaction::HookFeed>,
+    /// In a store with the files backend, the updates a transaction that may fail partially
+    /// refused, `transaction->rejections` (refs.c:1276-1312).
+    rejections: Vec<transaction::Rejection>,
 }
 
 ///

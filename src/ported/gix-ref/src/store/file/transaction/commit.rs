@@ -46,6 +46,10 @@ impl Transaction<'_, '_> {
         // `core.logAllRefUpdates` or `core.preferSymlinkRefs`.
         crate::store_impl::file::write_options();
         let mut updates = self.updates.expect("BUG: must call prepare before commit");
+        // `files_transaction_finish()` passes over every update with a `rejection_err`
+        // (refs/files-backend.c:3352, :3400, :3434), and a half never split off is not
+        // in the transaction at all.
+        updates.retain(|edit| !edit.rejected && !edit.dropped);
         let delete_loose_refs = matches!(
             self.packed_refs,
             PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_)

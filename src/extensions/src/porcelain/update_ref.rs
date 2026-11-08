@@ -1617,17 +1617,17 @@ fn absent_violated(repo: &gix::Repository, entry: &Absent) -> Result<bool> {
 /// preconditions, then roll everything back. gitoxide's prepared transaction is
 /// perfectly rolled back when dropped, so this catches a doomed batch at
 /// `prepare` time exactly like stock git, without writing anything.
-fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) -> Result<()> {
+fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) -> Result<Vec<String>> {
     for entry in &batch.absent {
         refname(&entry.name)?;
     }
     if batch.edits.is_empty() && batch.absent.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if crate::refstore::is_reftable(repo) {
         let (edits, verify) = reftable_batch(repo, batch)?;
         reftable_transaction(repo, edits, &verify, batch_updates, true).map_err(|e| anyhow!(e))?;
-        return Ok(());
+        return Ok(Vec::new());
     }
     if let Some(message) = duplicate_update(&batch.edits) {
         crate::git_fatal!("{message}");
@@ -1654,7 +1654,7 @@ fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) 
         check_absent(repo, &batch.absent)?;
     }
     if batch.edits.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut edits = Vec::new();
     for (at, edit) in batch.edits.iter().enumerate() {
@@ -1679,17 +1679,31 @@ fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) 
         crate::git_fatal!("{reason}");
     }
     edits.retain(|(at, _)| conflicts.get(*at).is_none_or(Option::is_none));
-    let prepared = repo
-        .refs
-        .transaction()
+    // Under `--batch-updates` the transaction is `REF_TRANSACTION_ALLOW_FAILURE`
+    // (builtin/update-ref.c:706-707, :829-830), so a refusal the checks above leave to the
+    // backend is recorded for `commit` to report rather than failing `prepare`.
+    let mut transaction = repo.refs.transaction();
+    if batch_updates {
+        transaction = transaction.allow_failure();
+    }
+    let prepared = transaction
         .prepare(
             edits.into_iter().map(|(_, edit)| edit),
             gix::lock::acquire::Fail::Immediately,
             gix::lock::acquire::Fail::Immediately,
         )
         .map_err(|e| anyhow!("{e}"))?;
+    // The names of the updates refused, each the end of its symref chain as its
+    // `rejected` line names it: they take no part in the nested `packed-refs`
+    // transaction (refs/files-backend.c:3021-3058).
+    let mut refused: Vec<String> = rejected
+        .iter()
+        .filter_map(|at| batch.edits.get(*at))
+        .map(|edit| written_refname(repo, edit))
+        .collect();
+    refused.extend(prepared.rejections().iter().map(|r| r.refname.to_string()));
     drop(prepared); // rolls the acquired locks back, writing nothing.
-    Ok(())
+    Ok(refused)
 }
 
 /// Read `--stdin` instructions, then apply them as one atomic transaction.
@@ -1792,12 +1806,15 @@ fn run_stdin(
                 if hook.is_some() {
                     StdinHook::preparing(repo, &batch);
                 }
-                if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
-                    eprintln!("fatal: prepare: {e:#}");
-                    return Ok(ExitCode::from(128));
-                }
+                let refused = match validate_prepare(repo, &batch, batch_updates) {
+                    Ok(refused) => refused,
+                    Err(e) => {
+                        eprintln!("fatal: prepare: {e:#}");
+                        return Ok(ExitCode::from(128));
+                    }
+                };
                 if let Some(hook) = &mut hook {
-                    hook.prepared(repo, &batch);
+                    hook.prepared(repo, &batch, &refused);
                 }
                 report_ok("prepare");
                 state = TxnState::Prepared;
@@ -1806,11 +1823,14 @@ fn run_stdin(
                 // `ref_transaction_commit()` prepares a transaction `prepare` did not.
                 if let Some(hook) = hook.as_mut().filter(|h| h.prepared.is_none()) {
                     StdinHook::preparing(repo, &batch);
-                    if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
-                        eprintln!("fatal: commit: {e:#}");
-                        return Ok(ExitCode::from(128));
-                    }
-                    hook.prepared(repo, &batch);
+                    let refused = match validate_prepare(repo, &batch, batch_updates) {
+                        Ok(refused) => refused,
+                        Err(e) => {
+                            eprintln!("fatal: commit: {e:#}");
+                            return Ok(ExitCode::from(128));
+                        }
+                    };
+                    hook.prepared(repo, &batch, &refused);
                 }
                 if let Err(e) = apply(repo, std::mem::take(&mut batch), batch_updates) {
                     eprintln!("fatal: commit: {e:#}");
@@ -1897,10 +1917,11 @@ fn run_stdin(
         (TxnState::Open, hook) => {
             if let Some(hook) = hook {
                 StdinHook::preparing(repo, &batch);
-                if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
-                    return fatal(e);
-                }
-                hook.prepared(repo, &batch);
+                let refused = match validate_prepare(repo, &batch, batch_updates) {
+                    Ok(refused) => refused,
+                    Err(e) => return fatal(e),
+                };
+                hook.prepared(repo, &batch, &refused);
             }
             if let Err(e) = apply(repo, batch, batch_updates) {
                 return fatal(e);
@@ -3494,7 +3515,10 @@ impl StdinHook {
     /// nested `packed-refs` transaction of the files backend's deletions
     /// (refs/files-backend.c:3036-3118) — prepared when `packed-refs` holds one of the
     /// references, aborted otherwise — and `prepared`.
-    fn prepared(&mut self, repo: &gix::Repository, batch: &Batch) {
+    ///
+    /// `refused` names the updates a `--batch-updates` prepare refused, which the
+    /// nested transaction leaves out (refs/files-backend.c:3021-3033).
+    fn prepared(&mut self, repo: &gix::Repository, batch: &Batch, refused: &[String]) {
         let store = &repo.refs;
         let updates = Self::split(repo, Self::queued(repo, batch));
         let lines = Self::lines(repo, &updates);
@@ -3504,6 +3528,7 @@ impl StdinHook {
                 .iter()
                 .map(|(edit, _)| edit)
                 .filter(|edit| matches!(edit.change, Change::Delete { log, .. } if log != RefLog::Only))
+                .filter(|edit| !refused.iter().any(|name| name.as_str() == edit.name.as_bstr()))
                 .collect();
             let mut packed_lines = Vec::new();
             for edit in &deletions {

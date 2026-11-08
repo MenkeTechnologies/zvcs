@@ -175,6 +175,25 @@ impl crate::Repository {
             .map_err(Into::into)
     }
 
+    /// Apply `edits` like [edit_references(…)](Self::edit_references()), but in a transaction that may
+    /// fail partially, git's `REF_TRANSACTION_ALLOW_FAILURE`: an edit refused for its values or name is
+    /// left out and listed in the returned rejections, while the others are committed.
+    pub fn edit_references_allowing_failure(
+        &self,
+        edits: impl IntoIterator<Item = RefEdit>,
+    ) -> Result<(Vec<RefEdit>, Vec<gix_ref::file::transaction::Rejection>), reference::edit::Error> {
+        let committer = self.committer().transpose()?;
+        let (file_lock_fail, packed_refs_lock_fail) = self.config.lock_timeout()?;
+        let prepared = self
+            .refs
+            .transaction()
+            .allow_failure()
+            .prepare(edits, file_lock_fail, packed_refs_lock_fail)?;
+        let rejections = prepared.rejections().to_vec();
+        let edits = prepared.commit(committer)?;
+        Ok((edits, rejections))
+    }
+
     /// Return the repository head, an abstraction to help dealing with the `HEAD` reference.
     ///
     /// The `HEAD` reference can be in various states, for more information, the documentation of [`Head`](crate::Head).

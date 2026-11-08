@@ -168,16 +168,14 @@
 //! `.keep` is deleted after the commands ran; a push that is declined, refused in
 //! full or rejected by `--strict` leaves nothing behind.
 //!
-//! ### Not ported
+//! ### Ref updates
 //!
-//!   1. **A stale old value through a symref, outside `--atomic`.** git's batched
-//!      transaction keys its rejections by the name of the ref that failed, which
-//!      for an update through a symref is the ref it points at, so the command
-//!      is still reported `ok` and the symref and `HEAD` still get their log-only
-//!      entries (builtin/receive-pack.c:1873-1883, :1952-1962). This port refuses
-//!      the command with `incorrect old value provided` and logs nothing; gix-ref
-//!      has no `REF_TRANSACTION_ALLOW_FAILURE` that would let the symref's half
-//!      commit without its referent.
+//! Outside `--atomic` each phase (deletions, then the rest) is one ref
+//! transaction that may fail partially, `REF_TRANSACTION_ALLOW_FAILURE`: a
+//! refused update is keyed by the name of the ref that failed, which for an
+//! update through a symref is the ref it points at, so the command naming the
+//! symref is still reported `ok` and the symref and `HEAD` still get their
+//! log-only entries (builtin/receive-pack.c:1868-1966).
 //!
 //! Object alternates (git appends one `<oid> .have` line per alternate ref) bail
 //! rather than producing a short advertisement.
@@ -1848,11 +1846,15 @@ fn execute_commands_non_atomic(
     // Deletions go first, in a transaction of their own, so a delete and a
     // create that would meet in a D/F conflict both go through
     // (`PHASE_DELETIONS`, `PHASE_OTHERS`, receive-pack.c:1895-1917). Within a
-    // phase `update()` runs over every command before the transaction is
-    // committed, so every check's message precedes the backend's, and those
-    // come in the order of the updates (`ref_transaction_for_each_rejected_update()`,
-    // receive-pack.c:1939-1950).
+    // phase `update()` queues every command in one transaction that may fail
+    // partially, `REF_TRANSACTION_ALLOW_FAILURE` (:1918-1932), so the
+    // `reference-transaction` hook sees the phase's updates together, every
+    // check's message precedes the backend's, and those come in the order the
+    // updates were refused (`ref_transaction_for_each_rejected_update()`, :1940-1945).
     for deletions in [true, false] {
+        // The transaction is begun lazily, for the first command of the phase,
+        // whether or not `update()` then queues anything in it (:1919-1932).
+        let mut begun = false;
         let mut queued = Vec::new();
         for i in 0..cmds.len() {
             if si.cut_at.is_some_and(|n| i >= n) {
@@ -1861,26 +1863,56 @@ fn execute_commands_non_atomic(
             if !cmds[i].should_process() || cmds[i].proc_receive || (cmds[i].new == zero) != deletions {
                 continue;
             }
+            begun = true;
             match check_command(repo, config, &cmds[i], cmds.get(i + 1), zero, head, si, band) {
-                Ok(edit) => queued.push((i, edit)),
+                Ok(edit) => queued.push(edit),
                 Err(reason) => cmds[i].error = Some(reason),
             }
             si.note_cut(i);
         }
-        for (i, edit) in queued {
-            // The transaction is what refuses a bad old value, so its diagnostic
-            // is git's — `rp_error("%s", err.buf)` from the commit, then the
-            // per-ref reason out of the rejection list (receive-pack.c:1955-1972).
-            if let Some((text, reason)) = lock_failure(repo, &edit) {
-                band.error(&text);
-                cmds[i].error = Some(reason.to_string());
+        if !begun {
+            continue;
+        }
+        // `if (ref_transaction_commit(transaction, &err)) { rp_error("%s", err.buf);
+        // reported_error = "failed to update refs"; goto failure; }` (:1937-1941): a
+        // failure of the whole transaction is every command's error, the earlier
+        // phase's included.
+        let rejections = match repo.edit_references_allowing_failure(queued) {
+            Ok((_, rejections)) => rejections,
+            Err(e) => {
+                band.error(&transaction_error(&e));
+                for cmd in cmds.iter_mut() {
+                    cmd.error = Some("failed to update refs".into());
+                }
                 continue;
             }
-            if let Err(e) = repo.edit_references([edit]) {
-                cmds[i].error = Some(e.to_string());
+        };
+        // `ref_transaction_rejection_handler()` (:1868-1883) keys each refusal by the
+        // name of the update refused, which for an update through a symbolic ref is
+        // the ref it points at: the command naming the symref is not among them.
+        let mut failed_refs = std::collections::HashMap::new();
+        for rejection in &rejections {
+            if !rejection.message.is_empty() {
+                band.error(&rejection.message.to_string());
+            }
+            failed_refs.insert(rejection.refname.to_string(), rejection.kind.message());
+        }
+        for cmd in cmds.iter_mut() {
+            if let Some(reason) = failed_refs.get(&cmd.name) {
+                cmd.error = Some(reason.to_string());
             }
         }
     }
+}
+
+/// The `err` text of a transaction that failed as a whole: git's own for a
+/// refusal of the reftable backend, the gitoxide error chain otherwise.
+fn transaction_error(e: &gix::reference::edit::Error) -> String {
+    use gix::refs::file::transaction::prepare;
+    if let gix::reference::edit::Error::FileTransactionPrepare(prepare::Error::Reftable { message, .. }) = e {
+        return message.to_string();
+    }
+    e.to_string()
 }
 
 /// `execute_commands_atomic()`: one transaction over every command, so a refusal
@@ -1922,11 +1954,17 @@ fn execute_commands_atomic(
         // `if (ref_transaction_commit(transaction, &err)) { rp_error("%s", err.buf); … }`
         // (receive-pack.c:2010-2014): one message, from the first update the
         // backend could not lock, and every command then carries the same reason.
-        if let Some((text, _)) = edits.iter().find_map(|edit| lock_failure(repo, edit)) {
+        // The transaction runs, so the `reference-transaction` hook sees it at
+        // `preparing` before the backend refuses it (refs.c:2711-2721); git's text for
+        // the refusal is read off the refs it left untouched.
+        let checked: Vec<_> = edits.iter().map(|edit| lock_failure(repo, edit)).collect();
+        if let Err(e) = repo.edit_references(edits) {
+            let text = checked
+                .into_iter()
+                .flatten()
+                .next()
+                .map_or_else(|| transaction_error(&e), |(text, _)| text);
             band.error(&text);
-            reported = Some("atomic transaction failed");
-        } else if let Err(e) = repo.edit_references(edits) {
-            band.error(&e.to_string());
             reported = Some("atomic transaction failed");
         }
     }

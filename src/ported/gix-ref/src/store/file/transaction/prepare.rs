@@ -1,3 +1,5 @@
+use gix_object::bstr::BString;
+
 use crate::{
     FullName, FullNameRef, Reference, Target, packed,
     packed::transaction::buffer_into_transaction,
@@ -5,7 +7,7 @@ use crate::{
         file,
         file::{
             Transaction, loose,
-            transaction::{Edit, PackedRefs},
+            transaction::{Edit, PackedRefs, ErrorKind, Rejection},
         },
     },
     transaction::{Change, LogChange, PreviousValue, RefEdit, RefEditsExt, RefLog},
@@ -365,6 +367,8 @@ impl Transaction<'_, '_> {
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
                 previous_is_symbolic: false,
+                rejected: false,
+                dropped: false,
             })
             .collect();
         updates
@@ -383,6 +387,8 @@ impl Transaction<'_, '_> {
                     leaf_referent_previous_oid: None,
                     log_only_split: false,
                     previous_is_symbolic: false,
+                    rejected: false,
+                    dropped: false,
                 },
             )
             .map_err(Error::PreprocessingFailed)?;
@@ -496,6 +502,8 @@ impl Transaction<'_, '_> {
                                     parent_index: None,
                                     leaf_referent_previous_oid: None,
                                     previous_is_symbolic: false,
+                                    rejected: false,
+                                    dropped: false,
                                     // `REF_LOG_ONLY` on a deletion: append to the log and keep it,
                                     // rather than gix's "delete the log, keep the reference".
                                     log_only_split,
@@ -531,6 +539,228 @@ impl Transaction<'_, '_> {
         if takes_packed_refs_lock {
             file::packed_refs_lock();
         }
+        // A transaction that may fail partially locks the loose references first and
+        // builds the nested `packed-refs` transaction from the updates that were not
+        // refused, as `files_transaction_prepare()` does (refs/files-backend.c:3019-3058);
+        // until then `packed-refs` is read unlocked (:3060-3073). Otherwise it is
+        // prepared up front.
+        let allow_failure = self.options.allow_failure;
+        if allow_failure {
+            self.packed_buffer = self.store.assure_packed_refs_uptodate()?;
+        } else {
+            self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;
+        }
+
+        // The packed transaction's buffer when there is one, the unlocked snapshot otherwise —
+        // see [`Transaction::packed_buffer`][file::Transaction].
+        let packed_for_lookups = self
+            .packed_transaction
+            .as_ref()
+            .and_then(packed::Transaction::buffer)
+            .or_else(|| self.packed_buffer.as_ref().map(|b| &***b));
+        // The updates as `files_transaction_prepare()` leaves them for the hook at
+        // `prepared`: split, with the caller's old values (`lock_ref_for_update()`
+        // records what it finds on disk in the lock, not the update). A half split off
+        // an update refused before it was split is not among them, so the lines are
+        // put together once the locking is done.
+        let kind = self.store.object_hash;
+        let update_lines: Vec<Vec<u8>> = match &packing_lines {
+            Some(_) => Vec::new(),
+            None => updates
+                .iter()
+                .enumerate()
+                .map(|(idx, edit)| {
+                    let mut line = Vec::new();
+                    let verify_only = self.options.verify_only.contains(&idx);
+                    file::transaction::edit_hook_line(&mut line, kind, &edit.update, verify_only);
+                    line
+                })
+                .collect(),
+        };
+        // `transaction->rejections` and `refnames_to_check` (refs/files-backend.c:2961),
+        // the updates of references that did not exist, to be checked against
+        // `packed-refs` once every loose reference is locked.
+        let mut rejections = Vec::new();
+        let mut refnames_to_check = Vec::new();
+        for cid in 0..updates.len() {
+            if allow_failure && split_off_refused(&updates, cid, &head_split_indices) {
+                updates[cid].dropped = true;
+                continue;
+            }
+            let locked = Self::lock_ref_and_apply_change(
+                self.store,
+                ref_files_lock_fail_mode,
+                packed_for_lookups,
+                &mut updates[cid],
+                matches!(
+                    self.packed_refs,
+                    PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_)
+                ),
+            );
+            // `ref_transaction_maybe_set_rejected()` once `lock_ref_for_update()` failed
+            // (refs/files-backend.c:3021-3033): an error about the update's values refuses
+            // the update alone, any other fails the transaction.
+            let refusal = match &locked {
+                Ok(()) if allow_failure => {
+                    self.check_locked_name(&updates, cid, packed_for_lookups, &mut refnames_to_check)
+                }
+                Err(err) if allow_failure => self.refusal(&updates, cid, err, packed_for_lookups),
+                _ => None,
+            };
+            if let Some((kind, message)) = refusal {
+                reject(&mut updates, cid, kind, message, &mut rejections, self.store.object_hash);
+                continue;
+            }
+            if let Err(err) = locked {
+                let err = match err {
+                    Error::LockAcquire {
+                        source,
+                        full_name: _bogus,
+                    } => Error::LockAcquire {
+                        source,
+                        full_name: original_name(&updates, cid),
+                    },
+                    other => other,
+                };
+                // `files_transaction_cleanup()` aborts the nested `packed-refs`
+                // transaction holding the deletions locked so far
+                // (refs/files-backend.c:2930-2936).
+                let packed_lines = packed_deletion_lines(kind, &updates[..cid]);
+                if !packed_lines.is_empty() {
+                    file::transaction_hook(self.store, "aborted", &packed_lines);
+                }
+                return Err(err);
+            }
+
+            // traverse parent chain from leaf/peeled ref and set the leaf previous oid accordingly
+            // to help with their reflog entries
+            let change = &updates[cid];
+            if let (Some(crate::TargetRef::Object(oid)), Some(parent_idx)) =
+                (change.update.change.previous_value(), change.parent_index)
+            {
+                let oid = oid.to_owned();
+                let mut parent_idx_cursor = Some(parent_idx);
+                while let Some(parent) = parent_idx_cursor.take().map(|idx| &mut updates[idx]) {
+                    parent_idx_cursor = parent.parent_index;
+                    parent.leaf_referent_previous_oid = Some(oid);
+                }
+            }
+        }
+
+        // `refs_verify_refnames_available(refs->packed_ref_store, &refnames_to_check,
+        // &transaction->refnames, NULL, transaction, 0, err)` (refs/files-backend.c:3064-3082):
+        // a reference created loose must not clash with one in `packed-refs` either, and
+        // under `REF_TRANSACTION_ALLOW_FAILURE` the clash refuses that update alone.
+        if allow_failure {
+            for cid in refnames_to_check {
+                if updates[cid].rejected {
+                    continue;
+                }
+                let extras = transaction_refnames(&updates);
+                let name = updates[cid].update.name.as_bstr().to_owned();
+                if let Some(message) = refname_conflict(self.store, packed_for_lookups, false, name.as_ref(), &extras) {
+                    reject(
+                        &mut updates,
+                        cid,
+                        ErrorKind::NameConflict,
+                        message,
+                        &mut rejections,
+                        self.store.object_hash,
+                    );
+                }
+            }
+        }
+        let prepared_lines = packing_lines.unwrap_or_else(|| {
+            updates
+                .iter()
+                .zip(&update_lines)
+                .filter(|(edit, _)| !edit.dropped)
+                .flat_map(|(_, line)| line.iter().copied())
+                .collect()
+        });
+
+        // `lock_ref_for_update()`: a `REF_LOG_VIA_SPLIT` update copies `old_oid` from its
+        // parent lock, so the HEAD entry reads exactly like the branch entry it mirrors.
+        for (branch_idx, head_idx) in head_split_indices {
+            if let Some(crate::TargetRef::Object(oid)) = updates[branch_idx].update.change.previous_value() {
+                let oid = oid.to_owned();
+                updates[head_idx].leaf_referent_previous_oid = Some(oid);
+            }
+        }
+        self.rejections = rejections;
+        if allow_failure {
+            self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;
+        }
+        let packed_for_lookups = self
+            .packed_transaction
+            .as_ref()
+            .and_then(packed::Transaction::buffer)
+            .or_else(|| self.packed_buffer.as_ref().map(|b| &***b));
+
+        // The nested `packed-refs` transaction `files_transaction_prepare()` opens for
+        // the deletions (refs/files-backend.c:3036-3058, :3084-3118): prepared, and so
+        // seen by the hook at `preparing` and `prepared`, when `packed-refs` holds one of
+        // the references, and aborted straight away otherwise.
+        let packed_lines = packed_deletion_lines(kind, &updates);
+        let mut packed_feed = None;
+        if !packed_lines.is_empty() {
+            let needed = {
+                let snapshot;
+                let buffer = match packed_for_lookups {
+                    Some(buffer) => Some(buffer),
+                    None => {
+                        snapshot = self.store.assure_packed_refs_uptodate().ok().flatten();
+                        snapshot.as_ref().map(|b| &***b)
+                    }
+                };
+                buffer.is_some_and(|buffer| {
+                    updates.iter().any(|edit| {
+                        is_packed_deletion(edit)
+                            && possibly_adjust_name_for_prefixes(edit.update.name.as_ref())
+                                .is_some_and(|name| matches!(buffer.try_find(name.as_ref()), Ok(Some(_))))
+                    })
+                })
+            };
+            if needed {
+                for state in ["preparing", "prepared"] {
+                    if !file::transaction_hook(self.store, state, &packed_lines) {
+                        self.updates = Some(updates);
+                        let store = self.store;
+                        drop(self);
+                        file::transaction_hook_refused(store, state, &[&packed_lines]);
+                    }
+                }
+                packed_feed = Some(packed_lines);
+            } else {
+                file::transaction_hook(self.store, "aborted", &packed_lines);
+            }
+        }
+
+        self.updates = Some(updates);
+        // `ref_transaction_prepare()` runs the hook at `prepared` once the backend has
+        // prepared, and a refusal aborts the transaction — the nested one first — and
+        // dies (refs.c:2723-2727).
+        if !file::transaction_hook(self.store, "prepared", &prepared_lines) {
+            let store = self.store;
+            drop(self);
+            let mut aborted: Vec<&[u8]> = packed_feed.iter().map(Vec::as_slice).collect();
+            aborted.push(&prepared_lines);
+            file::transaction_hook_refused(store, "prepared", &aborted);
+        }
+        self.hook = Some(file::transaction::HookFeed {
+            lines: prepared_lines,
+            packed: packed_feed,
+        });
+        Ok(self)
+    }
+
+    /// The nested `packed-refs` transaction of `updates`: the deletions it has to make there,
+    /// or the values migrated into it, and an unlocked snapshot for the edits that only read it.
+    fn prepare_packed_transaction(
+        &mut self,
+        updates: &[Edit],
+        packed_refs_lock_fail_mode: gix_lock::acquire::Fail,
+    ) -> Result<(), Error> {
         let mut maybe_updates_for_packed_refs = match self.packed_refs {
             PackedRefs::DeletionsAndNonSymbolicUpdates(_)
             | PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_) => Some(0_usize),
@@ -542,7 +772,13 @@ impl Transaction<'_, '_> {
         {
             let mut edits_for_packed_transaction = Vec::<RefEdit>::new();
             let mut needs_packed_refs_lookups = false;
-            for edit in &updates {
+            for edit in updates {
+                // A refused update takes no part in the `packed-refs` transaction
+                // (`continue` after `ref_transaction_maybe_set_rejected()`,
+                // refs/files-backend.c:3027-3031).
+                if edit.rejected || edit.dropped {
+                    continue;
+                }
                 let log_mode = match edit.update.change {
                     Change::Update {
                         log: LogChange { mode, .. },
@@ -682,150 +918,7 @@ impl Transaction<'_, '_> {
                 self.packed_buffer = self.store.assure_packed_refs_uptodate()?;
             }
         }
-
-        // The packed transaction's buffer when there is one, the unlocked snapshot otherwise —
-        // see [`Transaction::packed_buffer`][file::Transaction].
-        let packed_for_lookups = self
-            .packed_transaction
-            .as_ref()
-            .and_then(packed::Transaction::buffer)
-            .or_else(|| self.packed_buffer.as_ref().map(|b| &***b));
-        // The updates as `files_transaction_prepare()` leaves them for the hook at
-        // `prepared`: split, with the caller's old values (`lock_ref_for_update()`
-        // records what it finds on disk in the lock, not the update).
-        let kind = self.store.object_hash;
-        let prepared_lines = packing_lines.unwrap_or_else(|| {
-            let mut lines = Vec::new();
-            for (idx, edit) in updates.iter().enumerate() {
-                let verify_only = self.options.verify_only.contains(&idx);
-                file::transaction::edit_hook_line(&mut lines, kind, &edit.update, verify_only);
-            }
-            lines
-        });
-        for cid in 0..updates.len() {
-            let change = &mut updates[cid];
-            if let Err(err) = Self::lock_ref_and_apply_change(
-                self.store,
-                ref_files_lock_fail_mode,
-                packed_for_lookups,
-                change,
-                matches!(
-                    self.packed_refs,
-                    PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(_)
-                ),
-            ) {
-                let err = match err {
-                    Error::LockAcquire {
-                        source,
-                        full_name: _bogus,
-                    } => Error::LockAcquire {
-                        source,
-                        full_name: {
-                            let mut cursor = change.parent_index;
-                            let mut ref_name = change.name();
-                            while let Some(parent_idx) = cursor {
-                                let parent = &updates[parent_idx];
-                                // The chain ends at the root of the split, which names the
-                                // requested ref; the cursor has to move on from it, or a lock
-                                // that cannot be taken spins here forever.
-                                if parent.parent_index.is_none() {
-                                    ref_name = parent.name();
-                                }
-                                cursor = parent.parent_index;
-                            }
-                            ref_name
-                        },
-                    },
-                    other => other,
-                };
-                // `files_transaction_cleanup()` aborts the nested `packed-refs`
-                // transaction holding the deletions locked so far
-                // (refs/files-backend.c:2930-2936).
-                let packed_lines = packed_deletion_lines(kind, &updates[..cid]);
-                if !packed_lines.is_empty() {
-                    file::transaction_hook(self.store, "aborted", &packed_lines);
-                }
-                return Err(err);
-            }
-
-            // traverse parent chain from leaf/peeled ref and set the leaf previous oid accordingly
-            // to help with their reflog entries
-            if let (Some(crate::TargetRef::Object(oid)), Some(parent_idx)) =
-                (change.update.change.previous_value(), change.parent_index)
-            {
-                let oid = oid.to_owned();
-                let mut parent_idx_cursor = Some(parent_idx);
-                while let Some(parent) = parent_idx_cursor.take().map(|idx| &mut updates[idx]) {
-                    parent_idx_cursor = parent.parent_index;
-                    parent.leaf_referent_previous_oid = Some(oid);
-                }
-            }
-        }
-
-        // `lock_ref_for_update()`: a `REF_LOG_VIA_SPLIT` update copies `old_oid` from its
-        // parent lock, so the HEAD entry reads exactly like the branch entry it mirrors.
-        for (branch_idx, head_idx) in head_split_indices {
-            if let Some(crate::TargetRef::Object(oid)) = updates[branch_idx].update.change.previous_value() {
-                let oid = oid.to_owned();
-                updates[head_idx].leaf_referent_previous_oid = Some(oid);
-            }
-        }
-
-        // The nested `packed-refs` transaction `files_transaction_prepare()` opens for
-        // the deletions (refs/files-backend.c:3036-3058, :3084-3118): prepared, and so
-        // seen by the hook at `preparing` and `prepared`, when `packed-refs` holds one of
-        // the references, and aborted straight away otherwise.
-        let packed_lines = packed_deletion_lines(kind, &updates);
-        let mut packed_feed = None;
-        if !packed_lines.is_empty() {
-            let needed = {
-                let snapshot;
-                let buffer = match packed_for_lookups {
-                    Some(buffer) => Some(buffer),
-                    None => {
-                        snapshot = self.store.assure_packed_refs_uptodate().ok().flatten();
-                        snapshot.as_ref().map(|b| &***b)
-                    }
-                };
-                buffer.is_some_and(|buffer| {
-                    updates.iter().any(|edit| {
-                        is_packed_deletion(edit)
-                            && possibly_adjust_name_for_prefixes(edit.update.name.as_ref())
-                                .is_some_and(|name| matches!(buffer.try_find(name.as_ref()), Ok(Some(_))))
-                    })
-                })
-            };
-            if needed {
-                for state in ["preparing", "prepared"] {
-                    if !file::transaction_hook(self.store, state, &packed_lines) {
-                        self.updates = Some(updates);
-                        let store = self.store;
-                        drop(self);
-                        file::transaction_hook_refused(store, state, &[&packed_lines]);
-                    }
-                }
-                packed_feed = Some(packed_lines);
-            } else {
-                file::transaction_hook(self.store, "aborted", &packed_lines);
-            }
-        }
-
-        self.updates = Some(updates);
-        // `ref_transaction_prepare()` runs the hook at `prepared` once the backend has
-        // prepared, and a refusal aborts the transaction — the nested one first — and
-        // dies (refs.c:2723-2727).
-        if !file::transaction_hook(self.store, "prepared", &prepared_lines) {
-            let store = self.store;
-            drop(self);
-            let mut aborted: Vec<&[u8]> = packed_feed.iter().map(Vec::as_slice).collect();
-            aborted.push(&prepared_lines);
-            file::transaction_hook_refused(store, "prepared", &aborted);
-        }
-        self.hook = Some(file::transaction::HookFeed {
-            lines: prepared_lines,
-            packed: packed_feed,
-        });
-        Ok(self)
+        Ok(())
     }
 
     /// The hook at `preparing` over the caller's `edits` (refs.c:2711-2717); a
@@ -910,6 +1003,8 @@ impl Transaction<'_, '_> {
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
                 previous_is_symbolic: false,
+                rejected: false,
+                dropped: false,
             })
             .collect();
         self.updates = Some(updates);
@@ -926,6 +1021,252 @@ impl Transaction<'_, '_> {
     }
 }
 
+/// A transaction that may fail partially, git's `REF_TRANSACTION_ALLOW_FAILURE`:
+/// which failures of `lock_ref_for_update()` refuse just the update.
+impl Transaction<'_, '_> {
+    /// The error code and text `lock_ref_for_update()` fails update `cid` with for
+    /// `err`, when it is one `ref_transaction_maybe_set_rejected()` takes: anything but
+    /// `REF_TRANSACTION_ERROR_GENERIC` (refs.c:1290-1295). Each message names the update
+    /// the caller queued, `ref_update_original_update_refname()` (refs.c:3150-3156).
+    fn refusal(
+        &self,
+        updates: &[Edit],
+        cid: usize,
+        err: &Error,
+        packed: Option<&packed::Buffer>,
+    ) -> Option<(ErrorKind, String)> {
+        let name = updates[cid].update.name.as_bstr();
+        let original = original_name(updates, cid);
+        let (kind, reason) = match err {
+            // `lock_raw_ref()` with `mustexist` (refs/files-backend.c:885-897, :922-930).
+            Error::DeleteReferenceMustExist { .. } | Error::MustExist { .. } => (
+                ErrorKind::NonexistentRef,
+                format!("unable to resolve reference '{name}'"),
+            ),
+            // `check_old_oid()` (refs/files-backend.c:2617-2667).
+            Error::MustNotExist { .. } => (ErrorKind::CreateExists, "reference already exists".into()),
+            Error::ReferenceOutOfDate {
+                expected: Target::Object(expected),
+                actual,
+                ..
+            } => {
+                let current = match actual {
+                    Target::Object(id) => Some(*id),
+                    Target::Symbolic(referent) => Self::resolve_symref_chain(self.store, referent, packed),
+                };
+                match current {
+                    Some(current) => (
+                        ErrorKind::IncorrectOldValue,
+                        format!("is at {current} but expected {expected}"),
+                    ),
+                    None => (
+                        ErrorKind::NonexistentRef,
+                        format!("reference is missing but expected {expected}"),
+                    ),
+                }
+            }
+            // `unable_to_lock_message()` of a lock someone else holds, which
+            // `lock_raw_ref()` reports as `REF_TRANSACTION_ERROR_CREATE_EXISTS`
+            // (refs/files-backend.c:845-866, lockfile.c:254-299).
+            Error::LockAcquire {
+                source: gix_lock::acquire::Error::PermanentlyLocked {
+                    resource_path, holder, ..
+                },
+                ..
+            } => {
+                let absolute = std::path::absolute(resource_path).unwrap_or_else(|_| resource_path.clone());
+                (
+                    ErrorKind::CreateExists,
+                    format!(
+                        "Unable to create '{}.lock': File exists.\n\n{holder}",
+                        absolute.display()
+                    ),
+                )
+            }
+            // `safe_create_leading_directories()` meeting a file where a directory has
+            // to be, `SCLD_EXISTS`, which `refs_verify_refname_available()` explains
+            // (refs/files-backend.c:795-829).
+            Error::Io(_) => {
+                let extras = transaction_refnames(updates);
+                let message = refname_conflict(self.store, packed, true, name, &extras)?;
+                (ErrorKind::NameConflict, message)
+            }
+            _ => return None,
+        };
+        Some((kind, format!("cannot lock ref '{original}': {reason}")))
+    }
+
+    /// What `lock_raw_ref()` checks once the lock on update `cid` is taken: a
+    /// directory where the reference should be that holds other references is a name
+    /// conflict (`EISDIR`, refs/files-backend.c:903-934), and a reference that does not
+    /// exist is queued in `refnames_to_check` for the `packed-refs` check (:974-996).
+    fn check_locked_name(
+        &self,
+        updates: &[Edit],
+        cid: usize,
+        packed: Option<&packed::Buffer>,
+        refnames_to_check: &mut Vec<usize>,
+    ) -> Option<(ErrorKind, String)> {
+        let edit = &updates[cid];
+        let name = edit.update.name.as_ref();
+        if self.store.reference_path(name).is_dir() {
+            let extras = transaction_refnames(updates);
+            let message = refname_conflict(self.store, packed, true, name.as_bstr(), &extras)?;
+            let original = original_name(updates, cid);
+            return Some((ErrorKind::NameConflict, format!("cannot lock ref '{original}': {message}")));
+        }
+        if matches!(Self::read_existing_ref(self.store, name, packed), Ok(None)) {
+            refnames_to_check.push(cid);
+        }
+        None
+    }
+}
+
+/// `ref_transaction_maybe_set_rejected()` (refs.c:1276-1312) for update `cid` of a
+/// transaction that may fail partially: record why, and release its lock, which
+/// `files_transaction_cleanup()` would (refs/files-backend.c:2915-2929). Its parents
+/// never had the old value copied to their locks (:2792-2803), so their log entries
+/// carry the null id.
+fn reject(
+    updates: &mut [Edit],
+    cid: usize,
+    kind: ErrorKind,
+    message: String,
+    rejections: &mut Vec<Rejection>,
+    hash: gix_hash::Kind,
+) {
+    let edit = &mut updates[cid];
+    edit.rejected = true;
+    edit.lock = None;
+    let expected = match &edit.update.change {
+        Change::Update { expected, .. } | Change::Delete { expected, .. } => expected,
+    };
+    // `REF_HAVE_OLD`, with the null id for a reference that must not exist yet.
+    let (old_oid, old_target) = match expected {
+        PreviousValue::MustExistAndMatch(Target::Object(oid)) => (Some(*oid), None),
+        PreviousValue::MustExistAndMatch(Target::Symbolic(name)) => (None, Some(name.as_bstr().to_owned())),
+        PreviousValue::MustNotExist => (Some(hash.null()), None),
+        _ => (None, None),
+    };
+    let (new_oid, new_target) = match &edit.update.change {
+        Change::Update {
+            new: Target::Object(oid), ..
+        } => (Some(*oid), None),
+        Change::Update {
+            new: Target::Symbolic(name),
+            ..
+        } => (None, Some(name.as_bstr().to_owned())),
+        Change::Delete { .. } => (Some(gix_hash::ObjectId::null(hash)), None),
+    };
+    rejections.push(Rejection {
+        refname: edit.update.name.as_bstr().to_owned(),
+        new_oid,
+        old_oid,
+        new_target,
+        old_target,
+        kind,
+        message: message.into(),
+    });
+    let mut cursor = updates[cid].parent_index;
+    while let Some(parent) = cursor {
+        updates[parent].leaf_referent_previous_oid = None;
+        cursor = updates[parent].parent_index;
+    }
+}
+
+/// Whether update `cid` was split off one that was refused before it could be split
+/// (see [`Edit::dropped`]): the referent of a symbolic reference, or the `HEAD`
+/// mirror of a branch update that was itself dropped.
+fn split_off_refused(updates: &[Edit], cid: usize, head_split_indices: &[(usize, usize)]) -> bool {
+    match updates[cid].parent_index {
+        Some(parent) => updates[parent].rejected || updates[parent].dropped,
+        None => head_split_indices
+            .iter()
+            .any(|&(branch, head)| head == cid && updates[branch].dropped),
+    }
+}
+
+/// `ref_update_original_update_refname()` (refs.c:3150-3156): the name of the update the
+/// caller queued that update `cid` was split off.
+fn original_name(updates: &[Edit], cid: usize) -> BString {
+    let mut idx = cid;
+    while let Some(parent) = updates[idx].parent_index {
+        idx = parent;
+    }
+    updates[idx].name()
+}
+
+/// `transaction->refnames`: the names the transaction updates, without those refused
+/// (refs.c:1296-1300) or never split off.
+fn transaction_refnames(updates: &[Edit]) -> std::collections::BTreeSet<BString> {
+    updates
+        .iter()
+        .filter(|edit| !edit.rejected && !edit.dropped)
+        .map(Edit::name)
+        .collect()
+}
+
+/// `refs_verify_refname_available()` (refs.c:2789-2968) of `refname` in a files store
+/// for a transaction that is not the initial one: the message of the first conflict,
+/// a leading directory that is a reference or one of `extras`, or an existing reference
+/// or one of `extras` below `refname/`. With `loose` unset only `packed-refs` is
+/// consulted, as `files_transaction_prepare()` asks of `refs->packed_ref_store`.
+fn refname_conflict(
+    store: &file::Store,
+    packed: Option<&packed::Buffer>,
+    loose: bool,
+    refname: &gix_object::bstr::BStr,
+    extras: &std::collections::BTreeSet<BString>,
+) -> Option<String> {
+    use gix_object::bstr::ByteSlice;
+    // `refs_read_raw_ref()` succeeding; any error reading it counts as absent.
+    let exists = |name: &gix_object::bstr::BStr| {
+        let name = FullNameRef::new_unchecked(name);
+        if loose {
+            matches!(Transaction::read_existing_ref(store, name, packed), Ok(Some(_)))
+        } else {
+            packed.is_some_and(|packed| matches!(packed.try_find(name), Ok(Some(_))))
+        }
+    };
+    for (slash, _) in refname.iter().enumerate().filter(|(_, b)| **b == b'/') {
+        let dirname = refname[..slash].as_bstr();
+        if exists(dirname) {
+            return Some(format!("'{dirname}' exists; cannot create '{refname}'"));
+        }
+        if extras.contains(dirname) {
+            return Some(format!("cannot process '{refname}' and '{dirname}' at the same time"));
+        }
+    }
+    let mut prefix = BString::from(refname);
+    prefix.push(b'/');
+    // `REFS_FOR_EACH_INCLUDE_BROKEN`: a reference that does not parse still counts.
+    let existing: Option<BString> = if loose {
+        let relative: Result<&gix_path::RelativePath, _> = prefix.as_bstr().try_into();
+        relative.ok().and_then(|relative| {
+            store
+                .iter_prefixed_packed(relative, packed)
+                .ok()?
+                .find_map(|r| r.ok().map(|r| r.name.as_bstr().to_owned()))
+        })
+    } else {
+        packed.and_then(|packed| {
+            packed
+                .iter_prefixed(prefix.clone())
+                .ok()?
+                .find_map(|r| r.ok().map(|r| r.name.as_bstr().to_owned()))
+        })
+    };
+    if let Some(existing) = existing {
+        return Some(format!("'{existing}' exists; cannot create '{refname}'"));
+    }
+    // `find_descendant_ref()` (refs.c:1787-1811).
+    extras
+        .range(prefix.clone()..)
+        .take_while(|extra| extra.starts_with(&prefix))
+        .next()
+        .map(|extra| format!("cannot process '{refname}' and '{extra}' at the same time"))
+}
+
 /// The reflog mode an edit carries, whichever kind of change it is.
 fn log_mode_of(change: &Change) -> RefLog {
     match change {
@@ -939,9 +1280,9 @@ fn log_mode_of(change: &Change) -> RefLog {
 
 /// An update `files_transaction_prepare()` queues in its nested `packed-refs`
 /// transaction: `REF_DELETING && !REF_LOG_ONLY && !REF_IS_PRUNING`
-/// (refs/files-backend.c:3036-3039).
+/// (refs/files-backend.c:3036-3039). A refused update is not queued (:3027-3031).
 fn is_packed_deletion(edit: &Edit) -> bool {
-    matches!(edit.update.change, Change::Delete { log, .. } if log != RefLog::Only)
+    !edit.rejected && !edit.dropped && matches!(edit.update.change, Change::Delete { log, .. } if log != RefLog::Only)
 }
 
 /// The hook's lines for the nested `packed-refs` transaction of `updates`: each

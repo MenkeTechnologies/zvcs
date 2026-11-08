@@ -180,6 +180,16 @@ pub(in crate::store_impl::file) struct Edit {
     /// `git update-ref --no-deref HEAD $(git rev-parse HEAD)` appends `<id> <id> <ident> <ts>`
     /// to `.git/logs/HEAD` and leaves `HEAD` detached.
     previous_is_symbolic: bool,
+    /// The update is refused by a transaction that may fail partially: git's `rejection_err`, set by
+    /// `ref_transaction_maybe_set_rejected()` (refs.c:1276-1312). `files_transaction_finish()` passes
+    /// over it (refs/files-backend.c:3352, :3400, :3434), but the `reference-transaction` hook
+    /// still lists it (`transaction_hook_feed_stdin()`, refs.c:2602-2640).
+    rejected: bool,
+    /// The update was split off one that was refused before `lock_ref_for_update()` split it, so it
+    /// is not part of git's transaction at all: `split_symref_update()` and `split_head_update()`
+    /// run for an update only once it is locked (refs/files-backend.c:2707-2792). gix splits every
+    /// edit up front, so such a half is dropped instead.
+    dropped: bool,
 }
 
 impl Edit {
@@ -225,6 +235,7 @@ impl file::Store {
             reftable: None,
             options: Options::default(),
             hook: None,
+            rejections: Vec::new(),
         }
     }
 }
@@ -241,7 +252,9 @@ impl<'p> Transaction<'_, 'p> {
     /// refused for any reason but [`ErrorKind::Generic`] is dropped and listed by
     /// [`rejections()`](Self::rejections()), while the others are committed.
     ///
-    /// Only a store with the reftable backend honours it.
+    /// Both backends honour it: the files backend records a refusal of
+    /// `lock_ref_for_update()` (refs/files-backend.c:3021-3033) and of the
+    /// `packed-refs` name check that follows the locking (:3064-3082).
     pub fn allow_failure(mut self) -> Self {
         self.options.allow_failure = true;
         self
@@ -290,7 +303,10 @@ impl<'p> Transaction<'_, 'p> {
     /// The updates a prepared transaction that [may fail partially](Self::allow_failure())
     /// refused, in the order they were refused.
     pub fn rejections(&self) -> &[Rejection] {
-        self.reftable.as_ref().map_or(&[], |data| data.rejections())
+        match self.reftable.as_ref() {
+            Some(data) => data.rejections(),
+            None => &self.rejections,
+        }
     }
 }
 

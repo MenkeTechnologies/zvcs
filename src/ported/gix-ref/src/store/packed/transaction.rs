@@ -180,7 +180,6 @@ impl packed::Transaction {
 
         file.with_mut(|f| f.write_all(HEADER_LINE))?;
 
-        let mut num_written_lines = 0;
         loop {
             match (refs_sorted.peek(), peekable_sorted_edits.peek()) {
                 (Some(Err(_)), _) => {
@@ -192,7 +191,6 @@ impl packed::Transaction {
                 }
                 (Some(Ok(_)), None) => {
                     let pref = refs_sorted.next().expect("next").expect("no err");
-                    num_written_lines += 1;
                     file.with_mut(|out| write_packed_ref(out, pref))?;
                 }
                 (Some(Ok(pref)), Some(edit)) => {
@@ -200,32 +198,31 @@ impl packed::Transaction {
                     match pref.name.as_bstr().cmp(edit.inner.name.as_bstr()) {
                         Less => {
                             let pref = refs_sorted.next().expect("next").expect("valid");
-                            num_written_lines += 1;
                             file.with_mut(|out| write_packed_ref(out, pref))?;
                         }
                         Greater => {
                             let edit = peekable_sorted_edits.next().expect("next");
-                            file.with_mut(|out| write_edit(out, edit, &mut num_written_lines))?;
+                            file.with_mut(|out| write_edit(out, edit))?;
                         }
                         Equal => {
                             let _pref = refs_sorted.next().expect("next").expect("valid");
                             let edit = peekable_sorted_edits.next().expect("next");
-                            file.with_mut(|out| write_edit(out, edit, &mut num_written_lines))?;
+                            file.with_mut(|out| write_edit(out, edit))?;
                         }
                     }
                 }
                 (None, Some(_)) => {
                     let edit = peekable_sorted_edits.next().expect("next");
-                    file.with_mut(|out| write_edit(out, edit, &mut num_written_lines))?;
+                    file.with_mut(|out| write_edit(out, edit))?;
                 }
             }
         }
 
-        if num_written_lines == 0 {
-            std::fs::remove_file(file.resource_path())?;
-        } else {
-            file.commit()?;
-        }
+        // `write_with_updates()` writes the header and whatever is left, so a transaction
+        // deleting the last packed reference leaves a `packed-refs` holding only its
+        // `# pack-refs with: ...` line (refs/packed-backend.c:1407-1418, :1769-1795);
+        // nothing but `packed_ref_store_remove_on_disk()` removes the file.
+        file.commit()?;
         drop(refs_sorted);
         Ok(())
     }
@@ -241,7 +238,7 @@ fn write_packed_ref(out: &mut dyn std::io::Write, pref: packed::Reference<'_>) -
     Ok(())
 }
 
-fn write_edit(out: &mut dyn std::io::Write, edit: &Edit, lines_written: &mut i32) -> std::io::Result<()> {
+fn write_edit(out: &mut dyn std::io::Write, edit: &Edit) -> std::io::Result<()> {
     match edit.inner.change {
         Change::Delete { .. } => {}
         Change::Update {
@@ -254,7 +251,6 @@ fn write_edit(out: &mut dyn std::io::Write, edit: &Edit, lines_written: &mut i32
             if let Some(object) = edit.peeled {
                 writeln!(out, "^{object}")?;
             }
-            *lines_written += 1;
         }
         Change::Update {
             new: Target::Symbolic(_),

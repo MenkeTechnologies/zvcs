@@ -292,19 +292,6 @@ pub(crate) fn sequencer_signer(
     gpg_sign.map(|key| resolve_signer(repo, Some(key.to_string())))
 }
 
-/// The signer a plain `git commit` with no `-S` would use: `commit.gpgSign` and
-/// nothing else.
-///
-/// `continue_single_pick()` (sequencer.c:5232-5257) spawns
-/// `git commit [--no-edit --cleanup=strip]` and deliberately pushes **no** `-S`,
-/// unlike `run_git_commit()` two functions up. So a stopped pick that resumes is
-/// signed exactly when the *config* asks for it — the `-S` that started the
-/// sequence does not reach it.
-pub(crate) fn commit_config_signer(repo: &gix::Repository) -> Option<crate::gitsig::Signer> {
-    (repo.config_snapshot().boolean("commit.gpgSign") == Some(true))
-        .then(|| resolve_signer(repo, None))
-}
-
 /// Everything `dry_run_commit()` needs: the report shape plus which index the
 /// report is taken against (`-a`, `-i`/`--include`, or a pathspec-limited commit).
 struct DryRun {

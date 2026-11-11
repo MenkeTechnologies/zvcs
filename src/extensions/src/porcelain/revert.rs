@@ -109,8 +109,8 @@
 //!     `git commit` with no `-S` (sequencer.c:5232-5257), so only `commit.gpgSign`
 //!     applies there. The same spawn is why a resumed revert's reflog line reads
 //!     `commit: Revert "…"` and not `revert: …` — the child names itself, and
-//!     `sequencer_determine_whence()` does not look at `REVERT_HEAD`; see
-//!     [`super::replay_commit::continue_reflog_action`].
+//!     `sequencer_determine_whence()` does not look at `REVERT_HEAD`; the
+//!     `git commit` is run in process by `cherry_pick::continue_single_pick()`.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -304,6 +304,9 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // `sequencer_init_config()` comes before `parse_args()` (builtin/revert.c:293):
+    // its `commit.cleanup` warnings print whatever the command line says.
+    let config_cleanup = crate::sequencer::init_config_cleanup(crate::setup::discover().ok().as_ref());
     let mut o = Options::default();
     // git keeps unrecognized options in the operand list (`PARSE_OPT_KEEP_UNKNOWN_OPT`)
     // and only diagnoses them once the revision parser gets to them.
@@ -462,7 +465,9 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
 
     // Post-parse, in git's order: cleanup mode, then command-mode compatibility.
     let cleanup = match o.cleanup.as_deref() {
-        None => None,
+        // No `--cleanup`: `commit.cleanup` from `git_sequencer_config()` stands, as
+        // an explicit mode (sequencer.c:281-295).
+        None => config_cleanup.as_deref().and_then(Cleanup::parse),
         Some(arg) => match Cleanup::parse(arg) {
             Some(c) => Some(c),
             None => {
@@ -532,7 +537,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         if !specs.is_empty() {
             return Ok(usage_error());
         }
-        return run_mode(&repo, mode);
+        return run_mode(&repo, mode, o.edit_given);
     }
 
     if specs.is_empty() {
@@ -718,7 +723,7 @@ fn set_mode(o: &mut Options, new: Cmd) -> Option<ExitCode> {
 /// rest. Each one falls back to its single-pick form (`continue_single_pick()`,
 /// `rollback_single_pick()`, `skip_single_pick()`) when no `.git/sequencer` is
 /// live, which is also where the "nothing in progress" refusals come from.
-fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
+fn run_mode(repo: &gix::Repository, mode: Cmd, edit: Option<bool>) -> Result<ExitCode> {
     let git_dir = repo.git_dir().to_owned();
     match mode {
         // `cmd == 'q'`: `sequencer_remove_state()` then `remove_branch_state()`.
@@ -731,8 +736,8 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Abort => sequencer_rollback(repo, &git_dir),
-        Cmd::Skip => sequencer_skip(repo, &git_dir),
-        Cmd::Continue => sequencer_continue(repo, &git_dir),
+        Cmd::Skip => sequencer_skip(repo, &git_dir, edit),
+        Cmd::Continue => sequencer_continue(repo, &git_dir, edit),
     }
 }
 
@@ -787,7 +792,7 @@ fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
 
 /// `sequencer_skip()`: drop the stopped revert, then resume the sequence if one
 /// is live.
-fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path, edit: Option<bool>) -> Result<ExitCode> {
     if !crate::refstore::state_ref_exists(repo, "REVERT_HEAD") {
         if crate::sequencer::get_last_command(git_dir) != Some(crate::sequencer::Action::Revert) {
             eprintln!("error: no revert in progress");
@@ -807,14 +812,18 @@ fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<E
     if !crate::sequencer::dir(git_dir).is_dir() {
         return Ok(ExitCode::SUCCESS);
     }
-    sequencer_continue(repo, git_dir)
+    // `sequencer_continue(r, opts)` with the `--skip` command line's options.
+    sequencer_continue(repo, git_dir, edit)
 }
 
 /// `sequencer_continue()`: commit the revert that stopped, then replay whatever
 /// the todo list still holds.
-fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
+fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path, edit: Option<bool>) -> Result<ExitCode> {
+    // `read_populate_opts()` runs first (sequencer.c:5593): an `edit` the
+    // sequence recorded overrides the command line's.
+    let edit = crate::sequencer::read_opts(git_dir).edit.or(edit);
     if !crate::sequencer::todo_path(git_dir).exists() {
-        return Ok(match continue_single_pick(repo, git_dir)? {
+        return Ok(match super::cherry_pick::continue_single_pick(repo, edit, "revert")? {
             Ok(()) => ExitCode::SUCCESS,
             Err(code) => code,
         });
@@ -827,7 +836,7 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
         return Ok(ExitCode::from(128));
     }
     if crate::refstore::state_ref_exists(repo, "REVERT_HEAD") || crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
-        if let Err(code) = continue_single_pick(repo, git_dir)? {
+        if let Err(code) = super::cherry_pick::continue_single_pick(repo, edit, "revert")? {
             return Ok(code);
         }
     }
@@ -859,7 +868,8 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
     let o = Options {
         no_commit: loaded.no_commit,
         signoff: loaded.signoff,
-        edit_given: loaded.edit,
+        // `edit` merged above: the file's value, else the `--continue` command line's.
+        edit_given: edit,
         reference: false,
         mainline: loaded.mainline as usize,
         cleanup: loaded.default_msg_cleanup.clone(),
@@ -872,148 +882,6 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
     let cleanup = o.cleanup.as_deref().and_then(Cleanup::parse);
     // git's `todo_list.current++`: the instruction that stopped is finished.
     run_todo(repo, &o, cleanup, &todo, 1, true)
-}
-
-/// `continue_single_pick()`: finish the revert that stopped.
-///
-/// git spawns `git commit --no-edit --cleanup=strip`, which recovers the message
-/// from `MERGE_MSG` and the "which commit" from `REVERT_HEAD`. The revert commit
-/// takes the *current* user as author (unlike a cherry-pick, which preserves the
-/// original), so nothing but the message has to be recovered.
-///
-/// `Err(code)` is a refusal git already reported.
-fn continue_single_pick(
-    repo: &gix::Repository,
-    git_dir: &std::path::Path,
-) -> Result<std::result::Result<(), ExitCode>> {
-    if !crate::refstore::state_ref_exists(repo, "REVERT_HEAD") && !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
-        eprintln!("error: no cherry-pick or revert in progress");
-        eprintln!("fatal: revert failed");
-        return Ok(Err(ExitCode::from(128)));
-    }
-    // The child is `git commit`, whose `git_config(git_commit_config, &s)`
-    // (builtin/commit.c) runs before anything it checks — so a value that
-    // callback refuses (`diff.context=no`) dies there, ahead of the
-    // unmerged-paths report below.
-    crate::status_config::validate_commit(repo).map_err(|r| r.into_error())?;
-
-    let mut index = repo.open_index()?;
-    if index.entries().iter().any(|e| e.stage_raw() != 0) {
-        // A `git commit` child: its `U` lines flush at its own exit.
-        let _child = crate::cstdio::run_command();
-        return Ok(Err(super::commit::die_resolve_conflict(&index)));
-    }
-    // The tree comes out of the cache-tree, and the index is written back with the
-    // refreshed extension — because the child git spawns here is `git commit`, whose
-    // `prepare_index()` runs `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)`
-    // and then `write_locked_index()` (builtin/commit.c:486-491). Building the tree beside
-    // the index instead left the on-disk extension at whatever the conflict resolution had
-    // invalidated, so the next reader paid for a rebuild git had already done. Identical to
-    // what `cherry-pick --continue` does, for the same reason.
-    let tree_id = match super::write_tree::refresh_cache_tree(repo, &mut index, false)? {
-        Ok(id) => id,
-        // A directory/file collision is the only other way `cache_tree_update()` fails, and
-        // no index git wrote has one; the tree is still needed either way.
-        Err(_) => index_tree(repo, &index)?,
-    };
-    let head_id = repo.head_id()?.detach();
-    // The child's author and committer lookups, which a stopped revert (no
-    // `CHERRY_PICK_HEAD` to name the author) meets in that order.
-    if let Some(code) = super::cherry_pick::continue_commit_identity(repo, git_dir, true) {
-        return Ok(Err(code));
-    }
-
-    // The child is `git commit`, which refuses a commit with nothing in it: the status
-    // report on stdout, the cherry-pick advice on stderr when the stop was a cherry-pick
-    // (`CHERRY_PICK_HEAD` is what `revert --continue` resumes either way), and exit 1
-    // (builtin/commit.c:1078-1095). Same refusal as `cherry-pick --continue`.
-    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    if tree_id == head_tree {
-        let whence = super::commit::determine_whence(repo);
-        let _child = crate::cstdio::run_command();
-        super::replay_commit::enter_toplevel(repo);
-        return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
-    }
-
-    // `--cleanup=strip` is what git passes, so the `# Conflicts:` block the stop
-    // appended is dropped along with every other comment line.
-    let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();
-    let message = stripspace(
-        &raw,
-        Some(&super::commit::comment_prefix(&repo.config_snapshot())),
-    );
-
-    let author = repo
-        .author()
-        .ok_or_else(|| anyhow::anyhow!("no author identity configured"))??;
-    let author_time = author.time()?;
-    let committer = repo
-        .committer()
-        .ok_or_else(|| anyhow::anyhow!("no committer identity configured"))??;
-    let author_ident = format!("{} <{}>", author.name, author.email);
-    let committer_ident = format!("{} <{}>", committer.name, committer.email);
-    let new_id = super::commit::write_commit_object(
-        repo,
-        &committer.into(),
-        &author.into(),
-        message.as_bytes().as_bstr(),
-        tree_id,
-        vec![head_id],
-        super::commit::commit_config_signer(repo).as_ref(),
-    )?;
-    let subject = message.lines().next().unwrap_or("").to_string();
-    let moved = repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                // `continue_single_pick()` hands the work to a plain `git commit`
-                // without exporting `GIT_REFLOG_ACTION` (sequencer.c:5232-5257), and
-                // `sequencer_determine_whence()` recognises `CHERRY_PICK_HEAD` alone —
-                // so a resumed *revert* logs as `commit: Revert "…"`, not `revert:`.
-                // See [`super::replay_commit::continue_reflog_action`].
-                message: format!(
-                    "{}: {subject}",
-                    super::replay_commit::continue_reflog_action(repo)
-                )
-                .into(),
-            },
-            expected: PreviousValue::MustExistAndMatch(Target::Object(head_id)),
-            new: Target::Object(new_id),
-        },
-        name: "HEAD"
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
-        deref: true,
-    });
-    // The child `git commit` dies on a failed `HEAD` transaction —
-    // `die("%s", err.buf)` after `rollback_index_files()` (builtin/commit.c:1945-1948) — and
-    // `continue_single_pick()` returns its 128 as the command's status
-    // (sequencer.c:5354-5379). Raised as that `fatal:` rather than returned as the
-    // lock error, which the dispatcher would take for contention and re-run.
-    if let Err(e) = moved.map_err(anyhow::Error::from) {
-        return Err(match crate::fatal::lock_held_fatal(&e) {
-            Some(message) => crate::fatal::die(message),
-            None => e,
-        });
-    }
-
-    let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-    crate::sequencer::post_commit_cleanup(repo, false)?;
-
-    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    print_summary(
-        repo,
-        new_id,
-        &subject,
-        &author_ident,
-        &committer_ident,
-        &author_time,
-        head_tree,
-        tree_id,
-        false,
-    )?;
-    Ok(Ok(()))
 }
 
 /// A tree object built from the stage-0 entries of `index` — git's
@@ -1146,6 +1014,11 @@ fn revert_one(
                 return Ok(Step::Failed(ExitCode::from(128)));
             }
         }
+    } else if parents.is_empty() {
+        // `if (!commit->parents) parent = NULL;` comes first in `do_pick_commit()`
+        // (sequencer.c:2333), so a root commit never reaches the mainline checks and
+        // `-m <n>` of any value is accepted for it.
+        None
     } else {
         if o.mainline > 1 {
             eprintln!("error: commit {target_id} does not have parent {}", o.mainline);
@@ -1519,8 +1392,11 @@ fn revert_one(
         return Ok(Step::Failed(refusal.die()));
     }
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685):
-    // the in-process commit signs with exactly the key the sequencer carries.
-    let new_id = super::commit::write_commit_object(
+    // the in-process commit signs with exactly the key the sequencer carries. A
+    // signature gpg refused is `res = error(_("failed to write commit object"))`
+    // (sequencer.c:1687-1690), folded to status 1 by `res = !!res`
+    // (sequencer.c:2570) with the applied index and `MERGE_MSG` left behind.
+    let written = super::commit::write_commit_object(
         repo,
         &committer.into(),
         &author.into(),
@@ -1528,7 +1404,14 @@ fn revert_one(
         merged_tree,
         vec![head_id],
         signer.as_ref(),
-    )?;
+    );
+    let new_id = match written {
+        Err(e) if e.downcast_ref::<crate::fatal::Fatal>().is_some_and(|f| f.0 == "failed to write commit object") => {
+            eprintln!("error: failed to write commit object");
+            return Ok(Step::Failed(ExitCode::FAILURE));
+        }
+        other => other?,
+    };
     let moved = repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {

@@ -204,7 +204,7 @@
 //! `sequencer_reflog_action()`. A pick that *stopped* and is finished by
 //! `--continue` is logged differently, `commit (cherry-pick): <subject>`,
 //! because `continue_single_pick()` hands the commit to a plain `git commit`
-//! that names itself; see [`super::replay_commit::continue_reflog_action`].
+//! that names itself (`continue_single_pick()` runs that `git commit` in process).
 //! Mailmap is not applied to the printed
 //! identities, so a repository that rewrites the picked author via `.mailmap`
 //! would see a different ` Author:`. The detached-HEAD status header names the
@@ -450,8 +450,17 @@ struct Opts<'a> {
 }
 
 impl Opts<'_> {
+    /// `allow_empty()`'s order for a commit that became empty (sequencer.c:1813-1818):
+    /// `keep_redundant_commits` is tested before `drop_redundant_commits`, so
+    /// `--keep-redundant-commits --empty=drop` keeps the commit.
     fn empty_action(&self) -> Empty {
-        self.empty.unwrap_or(Empty::Stop)
+        if self.keep_redundant_commits() {
+            Empty::Keep
+        } else if self.empty == Some(Empty::Drop) {
+            Empty::Drop
+        } else {
+            Empty::Stop
+        }
     }
 
     /// `opts->keep_redundant_commits` as `run_sequencer` leaves it: the flag,
@@ -709,14 +718,12 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             "--no-allow-empty" => o.allow_empty = false,
             "--allow-empty-message" => o.allow_empty_message = true,
             "--no-allow-empty-message" => o.allow_empty_message = false,
-            "--keep-redundant-commits" => {
-                o.empty = Some(Empty::Keep);
-                o.keep_redundant_flag = true;
-            }
-            "--no-keep-redundant-commits" => {
-                o.empty = Some(Empty::Stop);
-                o.keep_redundant_flag = false;
-            }
+            // `OPT_BOOL(0, "keep-redundant-commits", &opts->keep_redundant_commits, ...)`
+            // (builtin/revert.c:156) leaves `empty_opt` alone: `run_sequencer` only
+            // ORs `--empty=keep` into it afterwards (builtin/revert.c:180-181), so
+            // `--empty=drop --no-keep-redundant-commits` still drops.
+            "--keep-redundant-commits" => o.keep_redundant_flag = true,
+            "--no-keep-redundant-commits" => o.keep_redundant_flag = false,
             // rerere only ever participates in conflict resolution, and every
             // conflicted pick is refused below, so both spellings are no-ops for
             // the pick — but `verify_opt_compatible` still reads which was given.
@@ -801,6 +808,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
 }
 
 pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
+    // `sequencer_init_config()` comes before `parse_args()` (builtin/revert.c:313):
+    // its `commit.cleanup` warnings print whatever the command line says.
+    let config_cleanup = crate::sequencer::init_config_cleanup(crate::setup::discover().ok().as_ref());
     let mut opts = match parse(args) {
         Ok(o) => o,
         Err(code) => return Ok(code),
@@ -816,7 +826,9 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
             Ok(mode) => Some(mode),
             Err(code) => return Ok(code),
         },
-        None => None,
+        // No `--cleanup`: `commit.cleanup` from `git_sequencer_config()` stands, as
+        // an explicit mode (sequencer.c:281-295).
+        None => config_cleanup.as_deref().and_then(|v| parse_cleanup(v).ok()),
     };
 
     // --- stage 2: sequencer verbs ----------------------------------------
@@ -1042,10 +1054,10 @@ fn build_todo(
 /// (`builtin/revert.c`) — so `--empty=keep` alone writes both keys, exactly as
 /// stock does.
 fn saved_opts<'a>(opts: &'a Opts<'a>, cleanup: Option<Cleanup>) -> crate::sequencer::SavedOpts<'a> {
-    // `--keep-redundant-commits` and `--empty=keep` both land on `Empty::Keep`
-    // here, and git makes them equivalent too: `keep_redundant_commits |=
-    // (empty_opt == KEEP_EMPTY_COMMIT)`.
-    let keep_redundant = opts.empty == Some(Empty::Keep);
+    // `keep_redundant_commits ||= (empty_opt == KEEP_EMPTY_COMMIT)` and
+    // `drop_redundant_commits = (empty_opt == DROP_EMPTY_COMMIT)`
+    // (builtin/revert.c:180-181) are set independently, so both keys can be saved.
+    let keep_redundant = opts.keep_redundant_commits();
     crate::sequencer::SavedOpts {
         no_commit: opts.no_commit,
         edit: opts.edit_given,
@@ -1279,13 +1291,10 @@ fn pick_one(
     //
     // Built before the merge, as `do_pick_commit` does: the strategy branch
     // below writes it to `MERGE_MSG` *before* it runs the merge program.
+    // `ctx->message` is never cleaned here: `MERGE_MSG` gets it raw
+    // (sequencer.c:2450), trailers and all, and only `try_to_commit()` strips the
+    // copy it commits (sequencer.c:1622-1630).
     let mut message: BString = pick.message_raw()?.to_owned();
-    // Only an explicit `--cleanup` rewrites the picked message; without one
-    // git carries it across untouched.
-    if let Some(mode) = cleanup {
-        let comment = super::commit::comment_prefix(&repo.config_snapshot());
-        message = cleanup_message(&message, mode, &comment);
-    }
     // git has no refusal here. Its only empty-message check is
     //
     // ```c
@@ -1327,29 +1336,6 @@ fn pick_one(
     if opts.signoff {
         // `append_signoff(&ctx->message, 0, 0)` (sequencer.c:2455).
         super::commit::append_signoff_bytes(&mut message, committer_ident.as_bytes(), 0, false);
-    }
-    // ```c
-    // if (flags & CLEANUP_MSG)
-    //         cleanup = COMMIT_MSG_CLEANUP_ALL;
-    // else if ((opts->signoff || opts->record_origin) &&
-    //          !opts->explicit_cleanup)
-    //         cleanup = COMMIT_MSG_CLEANUP_SPACE;
-    // else
-    //         cleanup = opts->default_msg_cleanup;
-    //
-    // if (cleanup != COMMIT_MSG_CLEANUP_NONE)
-    //         strbuf_stripspace(msg, …);
-    // ```
-    //
-    // (sequencer.c:1620-1630.) `try_to_commit()` applies this *after* the
-    // trailers are on, so `-s` or `-x` with no explicit `--cleanup` always
-    // whitespace-clean the finished message. That is what collapses the blank
-    // line those trailers insert ahead of themselves when the picked message
-    // was empty, leaving `(cherry picked from commit …)` on the first line
-    // instead of the third.
-    if cleanup.is_none() && (opts.signoff || opts.record_origin) {
-        let comment = super::commit::comment_prefix(&repo.config_snapshot());
-        message = cleanup_message(&message, Cleanup::Whitespace, &comment);
     }
     let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
         .summary()
@@ -1774,6 +1760,33 @@ fn pick_one(
             return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
         }
     };
+    // ```c
+    // if (flags & CLEANUP_MSG)
+    //         cleanup = COMMIT_MSG_CLEANUP_ALL;
+    // else if ((opts->signoff || opts->record_origin) &&
+    //          !opts->explicit_cleanup)
+    //         cleanup = COMMIT_MSG_CLEANUP_SPACE;
+    // else
+    //         cleanup = opts->default_msg_cleanup;
+    //
+    // if (cleanup != COMMIT_MSG_CLEANUP_NONE)
+    //         strbuf_stripspace(msg,
+    //           cleanup == COMMIT_MSG_CLEANUP_ALL ? comment_line_str : NULL);
+    // ```
+    //
+    // (sequencer.c:1622-1630.) It runs after the `prepare-commit-msg` hook, on the
+    // copy being committed, so `-s` or `-x` without `--cleanup` collapse the blank
+    // lines their trailers put ahead of an empty message while `MERGE_MSG` keeps
+    // them. Only `ALL` strips comments, and nothing here cuts at a scissors line:
+    // `scissors` is a plain whitespace cleanup for an in-process commit.
+    let message: BString = match cleanup {
+        None if !(opts.signoff || opts.record_origin) => message,
+        Some(Cleanup::Verbatim) => message,
+        None | Some(Cleanup::Whitespace) | Some(Cleanup::Scissors) => {
+            cleanup_message(&message, Cleanup::Whitespace, &super::commit::comment_prefix(&repo.config_snapshot()))
+        }
+        Some(mode @ (Cleanup::Strip | Cleanup::Default)) => cleanup_message(&message, mode, &super::commit::comment_prefix(&repo.config_snapshot())),
+    };
     let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
         .summary()
         .to_str_lossy()
@@ -1788,8 +1801,16 @@ fn pick_one(
         state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
         return Ok(PickOutcome::Stopped(refusal.die()));
     }
+    // `do_recursive_merge()` has written the merged index and work tree before
+    // `do_commit()` runs, so they are in place ahead of the commit object, the
+    // `HEAD` update and the `post-commit` hook, which reads that index.
+    state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
-    let new_id = super::commit::write_commit_object(
+    // A signature gpg refused is `res = error(_("failed to write commit object"))`
+    // (sequencer.c:1687-1690), which `do_pick_commit()` folds to `res = !!res`
+    // (sequencer.c:2570): status 1 with the merge, `MERGE_MSG` and
+    // `CHERRY_PICK_HEAD` left behind, not `commit`'s `die()`.
+    let written = super::commit::write_commit_object(
         &repo,
         &committer.to_owned()?,
         &author.to_owned()?,
@@ -1797,12 +1818,14 @@ fn pick_one(
         tree_id,
         vec![head_id],
         super::commit::sequencer_signer(&repo, opts.gpg_sign).as_ref(),
-    )?;
-
-    // `do_recursive_merge()` has written the merged index and work tree before
-    // `do_commit()` runs, so they are in place ahead of the `HEAD` update — and
-    // ahead of the `post-commit` hook, which reads that index.
-    state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+    );
+    let new_id = match written {
+        Err(e) if e.downcast_ref::<crate::fatal::Fatal>().is_some_and(|f| f.0 == "failed to write commit object") => {
+            eprintln!("error: failed to write commit object");
+            return Ok(PickOutcome::Stopped(ExitCode::FAILURE));
+        }
+        other => other?,
+    };
     let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
     // `try_to_commit()`: a failed `update_head_with_reflog()` is
     // `res = error("%s", err.buf)` (sequencer.c:1693-1696), which `do_pick_commit()`
@@ -1965,9 +1988,9 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
             super::reset::remove_branch_state(&repo, false)?;
             Ok(ExitCode::SUCCESS)
         }
-        Verb::Continue => sequencer_continue(&repo),
+        Verb::Continue => sequencer_continue(&repo, opts.edit_given),
         Verb::Abort => sequencer_rollback(&repo),
-        Verb::Skip => sequencer_skip(&repo),
+        Verb::Skip => sequencer_skip(&repo, opts.edit_given),
     }
 }
 
@@ -1994,10 +2017,13 @@ fn reset_merge(to: Option<ObjectId>) -> Result<ExitCode> {
 /// stopped instruction is committed first, the index is required to match the
 /// new `HEAD`, and `pick_commits()` resumes at the *next* instruction (git's
 /// `todo_list.current++`).
-fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
+fn sequencer_continue(repo: &gix::Repository, edit: Option<bool>) -> Result<ExitCode> {
     let git_dir = repo.git_dir().to_owned();
+    // `read_populate_opts()` runs first (sequencer.c:5593): an `edit` the
+    // sequence recorded overrides the command line's.
+    let edit = crate::sequencer::read_opts(&git_dir).edit.or(edit);
     if !crate::sequencer::todo_path(&git_dir).exists() {
-        return Ok(match continue_single_pick(repo, &git_dir)? {
+        return Ok(match continue_single_pick(repo, edit, "cherry-pick")? {
             Ok(()) => ExitCode::SUCCESS,
             Err(code) => code,
         });
@@ -2009,7 +2035,7 @@ fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
         return Ok(sequencer_failed_tail());
     }
     if crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") || crate::refstore::state_ref_exists(repo, "REVERT_HEAD") {
-        if let Err(code) = continue_single_pick(repo, &git_dir)? {
+        if let Err(code) = continue_single_pick(repo, edit, "cherry-pick")? {
             return Ok(code);
         }
     }
@@ -2035,7 +2061,7 @@ fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
         return Ok(sequencer_failed_tail());
     }
 
-    resume_todo(repo, &git_dir, &todo, 1)
+    resume_todo(repo, &git_dir, &todo, 1, edit)
 }
 
 /// `pick_commits()` over a todo list read back from disk, with the options the
@@ -2045,15 +2071,18 @@ fn resume_todo(
     git_dir: &std::path::Path,
     todo: &[crate::sequencer::TodoItem],
     start: usize,
+    edit: Option<bool>,
 ) -> Result<ExitCode> {
     // `read_populate_opts()`: the command line that started the sequence, minus
-    // everything `save_opts()` does not persist.
+    // everything `save_opts()` does not persist. `edit` is the caller's: the
+    // `--continue` command line's `-e`/`--no-edit` survives where `sequencer/opts`
+    // recorded none, since `populate_opts_cb()` only overwrites what the file holds.
     let loaded = crate::sequencer::read_opts(git_dir);
     let xopts: Vec<&str> = loaded.xopts.iter().map(String::as_str).collect();
     let opts = Opts {
         no_commit: loaded.no_commit,
-        edit: loaded.edit == Some(true),
-        edit_given: loaded.edit,
+        edit: edit == Some(true),
+        edit_given: edit,
         signoff: loaded.signoff,
         record_origin: loaded.record_origin,
         allow_ff: loaded.allow_ff,
@@ -2162,7 +2191,7 @@ fn rollback_single_pick(repo: &gix::Repository) -> Result<ExitCode> {
 /// The `rollback_is_safe()` check only runs when `CHERRY_PICK_HEAD` is already
 /// gone, because that is the state a hand-made `git commit` leaves — and in that
 /// state there is nothing left to skip, so git points at `--continue` instead.
-fn sequencer_skip(repo: &gix::Repository) -> Result<ExitCode> {
+fn sequencer_skip(repo: &gix::Repository, edit: Option<bool>) -> Result<ExitCode> {
     let git_dir = repo.git_dir().to_owned();
     if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
         if crate::sequencer::get_last_command(&git_dir) != Some(crate::sequencer::Action::Pick) {
@@ -2182,7 +2211,8 @@ fn sequencer_skip(repo: &gix::Repository) -> Result<ExitCode> {
     if !crate::sequencer::dir(&git_dir).is_dir() {
         return Ok(ExitCode::SUCCESS);
     }
-    sequencer_continue(repo)
+    // `sequencer_continue(r, opts)` with the `--skip` command line's options.
+    sequencer_continue(repo, edit)
 }
 
 /// Write a tree object from the stage-0 entries of the current index.
@@ -2241,179 +2271,67 @@ pub(super) fn continue_commit_identity(
     committer.map(|refusal| refusal.die())
 }
 
-/// `continue_single_pick()`: finish the pick that stopped.
+/// `continue_single_pick()` (sequencer.c:5232-5256): finish the pick or revert
+/// that stopped, for `cherry-pick --continue` and `revert --continue` alike.
 ///
-/// git spawns `git commit --no-edit --cleanup=strip`, which recovers the message
-/// and the author from `MERGE_MSG` and `CHERRY_PICK_HEAD`/`REVERT_HEAD`; this
-/// does the same work in process. The index must be fully resolved, the worktree
-/// already holds the resolution, and the state files go once the commit lands.
+/// ```c
+/// if (!refs_ref_exists(get_main_ref_store(r), "CHERRY_PICK_HEAD") &&
+///     !refs_ref_exists(get_main_ref_store(r), "REVERT_HEAD"))
+///         return error(_("no cherry-pick or revert in progress"));
 ///
-/// `Err(code)` is a refusal git already reported — including its "no cherry-pick
-/// or revert in progress", which is what a `--continue` with nothing stopped
-/// reduces to.
-fn continue_single_pick(
+/// cmd.git_cmd = 1;
+/// strvec_push(&cmd.args, "commit");
+/// if (!opts->edit || (opts->edit < 0 && !isatty(0)))
+///         strvec_pushl(&cmd.args, "--no-edit", "--cleanup=strip", NULL);
+///
+/// return run_command(&cmd);
+/// ```
+///
+/// The child is a plain `git commit`, run here in process: it takes the author
+/// from `CHERRY_PICK_HEAD` only (a stopped revert commits as the current user),
+/// the message from `MERGE_MSG`, and with `-e` opens the editor on its full
+/// template. `edit` is `opts->edit` after `read_populate_opts()`: `None` when
+/// neither the command line nor `sequencer/opts` said.
+///
+/// `Err(code)` is a status already reported: the `<me> failed` death for nothing
+/// in progress (the `-1` `cmd_cherry_pick()`/`cmd_revert()` die on), otherwise the
+/// child's own exit status, returned as it stands.
+pub(super) fn continue_single_pick(
     repo: &gix::Repository,
-    git_dir: &std::path::Path,
+    edit: Option<bool>,
+    me: &str,
 ) -> Result<std::result::Result<(), ExitCode>> {
-    let stopped = ["CHERRY_PICK_HEAD", "REVERT_HEAD"]
-        .into_iter()
-        .find(|name| crate::refstore::state_ref_exists(repo, name));
-    let Some(stopped) = stopped else {
-        return Ok(Err(sequencer_failed("no cherry-pick or revert in progress")));
-    };
-    // The child is `git commit`, whose `git_config(git_commit_config, &s)`
-    // (builtin/commit.c) runs before anything it checks — so a value that
-    // callback refuses (`diff.context=no`) dies there, ahead of the
-    // unmerged-paths report below.
-    crate::status_config::validate_commit(repo).map_err(|r| r.into_error())?;
-    let pick_id = crate::sequencer::read_state_oid(repo, stopped)
-        .ok_or_else(|| anyhow::anyhow!("invalid {stopped}"))?;
-    let pick = repo.find_commit(pick_id)?;
-
-    // The resolution must be complete: any conflict stage left blocks the
-    // commit. git gets here through the child `git commit`, so the diagnosis is
-    // literally that command's — the `U<TAB><path>` report on stdout included.
-    let mut index = repo.open_index()?;
-    if index.entries().iter().any(|e| e.stage_raw() != 0) {
-        // A `git commit` child: its `U` lines flush at its own exit.
-        let _child = crate::cstdio::run_command();
-        return Ok(Err(super::commit::die_resolve_conflict(&index)));
-    }
-    // The tree comes out of the cache-tree, and the index is written back with the
-    // refreshed extension — because the child git spawns here is `git commit`, whose
-    // `prepare_index()` runs `cache_tree_update(the_repository->index, WRITE_TREE_SILENT)`
-    // and then `write_locked_index()` (builtin/commit.c:486-491). Building the tree beside
-    // the index instead left the on-disk extension at whatever the conflict resolution had
-    // invalidated: stock's index after `cherry-pick --continue` names the new commit's tree
-    // at the root, and this port's was 19 bytes shorter with the root still marked `-1`, so
-    // the next reader paid for a rebuild git had already done.
-    //
-    // `refresh_cache_tree()` keeps git's `was_valid` gate: an already-valid extension is
-    // returned as-is and the index file is not rewritten (cache-tree.c:818).
-    let tree_id = match super::write_tree::refresh_cache_tree(repo, &mut index, false)? {
-        Ok(id) => id,
-        // Unreachable given the unmerged check just above — a directory/file collision is
-        // the only other way `cache_tree_update()` fails, and no index git wrote has one.
-        // The tree is still needed, so fall back to building it beside the index.
-        Err(_) => tree_from_index(repo, &index)?,
-    };
-    let head_id = repo
-        .head_id()
-        .map_err(|_| anyhow::anyhow!("HEAD does not point to a commit"))?
-        .detach();
-
-    if let Some(code) = continue_commit_identity(repo, git_dir, true) {
-        return Ok(Err(code));
-    }
-
-    // The child is `git commit`, and that command refuses a commit with nothing
-    // in it: `!committable && !allow_empty` prints the status and the
-    // empty-cherry-pick advice and returns 1 (builtin/commit.c:1078-1095). So a
-    // `--continue` over a pick that went empty stops again rather than recording
-    // it — only `git commit --allow-empty` or `--skip` moves past that.
-    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    if tree_id == head_tree {
-        // The child decides where it came from itself (`determine_whence()`,
-        // builtin/commit.c:198-206): a rebase pick needs `rebase-merge` *and* a
-        // `REBASE_HEAD` naming the commit being picked (sequencer.c:6986-6992), so
-        // the `REBASE_HEAD` an aborted rebase leaves behind does not make a later
-        // cherry-pick one.
-        let whence = super::commit::determine_whence(repo);
-        // A `git commit` child (sequencer.c:5240-5256): its buffered report
-        // flushes at its exit, after its advice on stderr.
-        let _child = crate::cstdio::run_command();
-        super::replay_commit::enter_toplevel(repo);
-        return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
-    }
-
-    // The message git commits is `MERGE_MSG` with the default cleanup applied
-    // (comment lines dropped) — which is the picked message the stop recorded,
-    // carrying any `-x`/`-s` trailer, plus whatever the user edited in.
-    let merge_msg = std::fs::read_to_string(git_dir.join("MERGE_MSG"))
-        .unwrap_or_else(|_| pick.message_raw().map(|m| m.to_string()).unwrap_or_default());
-    let message: BString = clean_message(&merge_msg).into();
-
-    let committer = repo
-        .committer()
-        .ok_or_else(|| anyhow::anyhow!("committer identity is not configured"))??;
-    let author = pick.author()?;
-    let new_id = super::commit::write_commit_object(
-        repo,
-        &committer.to_owned()?,
-        &author.to_owned()?,
-        message.as_bstr(),
-        tree_id,
-        vec![head_id],
-        super::commit::commit_config_signer(repo).as_ref(),
-    )?;
-    // The child here is `git commit`, not the sequencer's own `try_to_commit()`,
-    // and `continue_single_pick()` gives it no `GIT_REFLOG_ACTION` — so the
-    // wording is `builtin/commit.c`'s whence-derived default rather than the
-    // `cherry-pick:` the *unstopped* picks above write. See
-    // [`super::replay_commit::continue_reflog_action`].
-    let action = super::replay_commit::continue_reflog_action(repo);
-    let reflog = gix::reference::log::message(&action, message.as_bstr(), 1);
-    // That child's `HEAD` transaction failing is `die("%s", err.buf)` after
-    // `rollback_index_files()` (builtin/commit.c:1945-1948), and `continue_single_pick()`
-    // returns its 128 as the command's status (sequencer.c:5354-5379). Raised as a
-    // `fatal:` rather than returned as the lock error, which the dispatcher would
-    // take for contention and re-run.
-    if let Some(message) = held_ref_lock(advance_head(repo, head_id, new_id, reflog))? {
-        return Err(crate::fatal::die(message));
-    }
-    // `sequencer_post_commit_cleanup()`, which is what the child `git commit`
-    // runs on its way out: the pseudo-refs always go, the sequencer directory
-    // only once the todo is down to the instruction just finished.
-    let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-    crate::sequencer::post_commit_cleanup(repo, false)?;
-
-    // `print_commit_summary()`. `git commit` reaches it with
-    // `author_date_is_interesting()` true here, because `prepare_to_commit()`
-    // set `author_message = "CHERRY_PICK_HEAD"` to reuse the picked author — so
-    // the ` Date:` line appears just as it does for a pick that did not stop.
-    let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
-        .summary()
-        .to_str_lossy()
-        .into_owned();
-    let branch_label = match repo.head_name()? {
-        Some(name) => name.shorten().to_string(),
-        None => "detached HEAD".to_string(),
-    };
-    println!("[{branch_label} {}] {subject}", new_id.attach(repo).shorten_or_id());
-    let author_ident = format!("{} <{}>", author.name, author.email);
-    let committer_ident = format!("{} <{}>", committer.name, committer.email);
-    if author_ident != committer_ident {
-        println!(" Author: {author_ident}");
-    }
+    if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD")
+        && !crate::refstore::state_ref_exists(repo, "REVERT_HEAD")
     {
-        use gix::date::time::format;
-        println!(" Date: {}", author.time()?.format_or_unix(format::DEFAULT));
+        eprintln!("error: no cherry-pick or revert in progress");
+        eprintln!("fatal: {me} failed");
+        return Ok(Err(ExitCode::from(crate::fatal::EXIT_FATAL)));
     }
-    // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
-    print!("{}", crate::summary_committer_block(repo, &committer_ident));
-    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
-    print_diffstat(head_tree, tree_id)?;
-    Ok(Ok(()))
-}
-
-/// git's default message cleanup: drop whole-line comments (`#…`) and collapse
-/// trailing blank lines, ensuring a single trailing newline.
-fn clean_message(raw: &str) -> String {
-    let mut out = String::new();
-    for line in raw.lines() {
-        if line.starts_with('#') {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
-    if out.is_empty() {
-        out.push('\n');
-    }
-    out
+    let edit = edit.unwrap_or_else(|| {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+    });
+    let args: Vec<String> = if edit {
+        Vec::new()
+    } else {
+        vec!["--no-edit".to_string(), "--cleanup=strip".to_string()]
+    };
+    super::replay_commit::enter_toplevel(repo);
+    // A child that cannot lock `HEAD` dies with `die("%s", err.buf)`
+    // (builtin/commit.c:1945-1948), and `run_command()` hands back its 128.
+    let code = match super::commit::commit(&args) {
+        Err(e) => match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => {
+                eprintln!("fatal: {message}");
+                ExitCode::from(crate::fatal::EXIT_FATAL)
+            }
+            // Any other `die()` in the child is its own `fatal:` and 128.
+            None => return Err(e),
+        },
+        Ok(code) => code,
+    };
+    Ok(if code == ExitCode::SUCCESS { Ok(()) } else { Err(code) })
 }
 
 /// git's stopped-on-empty state: record `CHERRY_PICK_HEAD` and `MERGE_MSG`,

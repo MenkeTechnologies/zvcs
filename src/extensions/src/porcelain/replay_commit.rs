@@ -134,7 +134,20 @@ pub(crate) fn run_git_commit(
                 eprintln!("fatal: {message}");
                 Ok(ExitCode::from(crate::fatal::EXIT_FATAL))
             }
-            None => Err(e),
+            // Any other `die()` in the child (`commit_tree_extended()`'s `failed to
+            // write commit object` on a signature gpg refused, builtin/commit.c:1942)
+            // is likewise its own `fatal:` and 128 for `run_command()` to return, which
+            // `do_pick_commit()` folds to 1 (sequencer.c:2570) rather than dying.
+            None => match e.downcast_ref::<crate::fatal::Fatal>() {
+                Some(f) => {
+                    crate::fatal::write_report("fatal: ", &f.0);
+                    Ok(ExitCode::from(crate::fatal::EXIT_FATAL))
+                }
+                None => match e.downcast_ref::<crate::fatal::Silent>() {
+                    Some(s) => Ok(ExitCode::from(s.0)),
+                    None => Err(e),
+                },
+            },
         },
         done => done,
     }
@@ -152,79 +165,4 @@ pub(crate) fn enter_toplevel(repo: &gix::Repository) {
     if let Some(top) = repo.workdir().and_then(|w| w.canonicalize().ok()) {
         let _ = std::env::set_current_dir(top);
     }
-}
-
-/// `sequencer_determine_whence()` (sequencer.c:6847-6866), reduced to the answer
-/// `builtin/commit.c`'s `reflog_msg` needs.
-///
-/// ```c
-/// if (refs_ref_exists(get_main_ref_store(r), "CHERRY_PICK_HEAD")) {
-///         if (file_exists(git_path_seq_dir()))
-///                 *whence = FROM_CHERRY_PICK_MULTI;
-///         if (file_exists(rebase_path()) &&
-///             !repo_get_oid(r, "REBASE_HEAD", &rebase_head) &&
-///             !repo_get_oid(r, "CHERRY_PICK_HEAD", &cherry_pick_head) &&
-///             oideq(&rebase_head, &cherry_pick_head))
-///                 *whence = FROM_REBASE_PICK;
-///         else
-///                 *whence = FROM_CHERRY_PICK_SINGLE;
-///         return 1;
-/// }
-/// return 0;
-/// ```
-///
-/// `REVERT_HEAD` is deliberately not consulted: git looks for `CHERRY_PICK_HEAD`
-/// alone, so a stopped **revert** leaves `whence` at `FROM_COMMIT` and its
-/// concluding commit is logged as a plain `commit:` — which is exactly what
-/// stock writes (`commit: Revert "…"`, measured against 2.55.0).
-fn whence_reflog_default(repo: &gix::Repository) -> &'static str {
-    if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
-        return "commit";
-    }
-    let read = |name: &str| crate::sequencer::read_state_oid(repo, name);
-    let rebase_pick = repo.git_dir().join("rebase-merge").exists()
-        && match (read("REBASE_HEAD"), read("CHERRY_PICK_HEAD")) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
-    if rebase_pick { "commit (rebase)" } else { "commit (cherry-pick)" }
-}
-
-/// The reflog action the `git commit` that `continue_single_pick()` spawns
-/// composes for itself.
-///
-/// ```c
-/// cmd.git_cmd = 1;
-/// strvec_push(&cmd.args, "commit");
-/// ...
-/// return run_command(&cmd);
-/// ```
-///
-/// (sequencer.c:5232-5257.) Unlike `run_git_commit()` two functions up, which
-/// pushes `GIT_REFLOG_ACTION=%s` onto the child's environment
-/// (sequencer.c:1141), `continue_single_pick()` pushes **nothing**: the child
-/// inherits whatever the user's environment held and otherwise falls all the way
-/// through to `reflog_msg`'s whence-derived default (builtin/commit.c:1850-1892):
-///
-/// ```c
-/// reflog_msg = getenv("GIT_REFLOG_ACTION");
-/// ...
-/// } else {
-///         if (!reflog_msg)
-///                 reflog_msg = is_from_cherry_pick(whence)
-///                                 ? "commit (cherry-pick)"
-///                                 : is_from_rebase(whence)
-///                                 ? "commit (rebase)"
-///                                 : "commit";
-/// ```
-///
-/// So a resumed cherry-pick is logged `commit (cherry-pick): <subject>` and a
-/// resumed revert `commit: <subject>` — *not* `cherry-pick:`/`revert:`, which is
-/// what the sequencer's own in-process picks write and what this port used to
-/// write here as well.
-pub(crate) fn continue_reflog_action(repo: &gix::Repository) -> String {
-    std::env::var("GIT_REFLOG_ACTION")
-        .ok()
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| whence_reflog_default(repo).to_string())
 }

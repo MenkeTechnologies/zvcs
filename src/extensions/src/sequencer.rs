@@ -1725,6 +1725,41 @@ pub struct LoadedOpts {
     pub default_msg_cleanup: Option<String>,
 }
 
+/// The `commit.cleanup` arm of `git_sequencer_config()` (sequencer.c:274-298), which
+/// `sequencer_init_config()` runs for `cherry-pick` and `revert` before their
+/// options are parsed (builtin/revert.c:293, :313).
+///
+/// Every entry is visited in config order: `verbatim`, `whitespace`, `strip` and
+/// `scissors` set the mode (and `explicit_cleanup`), anything else is a
+/// `warning: invalid commit message cleanup mode '<v>'` that leaves the mode as it
+/// was. `default` is not one of the four, so it warns too. Returns the mode name
+/// the last valid entry chose, for the caller's own `--cleanup` parser.
+pub fn init_config_cleanup(repo: Option<&gix::Repository>) -> Option<String> {
+    let snapshot = repo?.config_snapshot();
+    // One callback per configured value: a `-c` this port delivered twice is
+    // counted once (see `crate::config::CliEcho`).
+    let mut echoes = crate::config::CliEcho::new();
+    let mut mode = None;
+    for section in snapshot.sections() {
+        let header = section.header();
+        if !header.name().eq_ignore_ascii_case(b"commit") || header.subsection_name().is_some() {
+            continue;
+        }
+        let source = section.meta().source;
+        for value in section.values("cleanup") {
+            let value = value.to_string();
+            if echoes.is_echo(source, "commit.cleanup", Some(&value)) {
+                continue;
+            }
+            match value.as_str() {
+                "verbatim" | "whitespace" | "strip" | "scissors" => mode = Some(value),
+                other => eprintln!("warning: invalid commit message cleanup mode '{other}'"),
+            }
+        }
+    }
+    mode
+}
+
 /// `read_populate_opts()`: load `sequencer/opts`, or the defaults when the file
 /// was never written.
 pub fn read_opts(git_dir: &Path) -> LoadedOpts {

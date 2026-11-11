@@ -2568,6 +2568,7 @@ fn restore_conflict_stage(
         let should_interrupt = AtomicBool::new(false);
         // `checkout_paths()` writes through `state.istate = the_repository->index`
         // (builtin/checkout.c:412), so the attributes come from the full index.
+        checkout_worktree_convert_attrs(repo, &index, &subset);
         checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
     }
 
@@ -3046,6 +3047,7 @@ fn restore_from_index(
     let should_interrupt = AtomicBool::new(false);
     // `state.istate = the_repository->index` (builtin/checkout.c:412).
     sparse_dirs.truncate_at_abort(repo, &mut subset, &mut Vec::new());
+    checkout_worktree_convert_attrs(repo, &index, &subset);
     checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
     let sparse_errs = sparse_dirs.checkout_worktree(repo)?;
 
@@ -3315,6 +3317,7 @@ fn restore_from_tree(
     // what `restore -SW .` after `mv a A` leaves behind: `A` sorts first, goes, and `a`
     // is then written.
     die_on_bad_attr_source_for_writes(repo, &index, &subset)?;
+    checkout_worktree_convert_attrs(repo, &index, &subset);
     sparse_dirs.truncate_at_abort(repo, &mut subset, &mut to_remove);
     let fresh = checkout_interleaved(repo, &mut subset, &to_remove, &index, &should_interrupt)?;
     let sparse_errs = sparse_dirs.checkout_worktree(repo)?;
@@ -5218,6 +5221,27 @@ pub(super) fn die_on_bad_attr_source_for_writes(
             }
             Err(crate::fatal::die(message.to_owned()))
         }
+    }
+}
+
+/// `checkout_worktree()` (builtin/checkout.c:465-491) hands each entry of `subset` to
+/// `checkout_entry()` with `state.istate` the whole index (:451), under the `GIT_ATTR_CHECKIN`
+/// nothing in `checkout_paths()` changes: every regular file it writes or compares runs
+/// `convert_attrs()` ([`crate::index_racy::attribute_lookups`]), whose `.gitattributes` reads
+/// fall back to the index and load its sparse patterns there (attr.c:821, :857-865,
+/// dir.c:1557-1574).
+pub(super) fn checkout_worktree_convert_attrs(
+    repo: &gix::Repository,
+    cur: &gix::index::File,
+    subset: &gix::index::File,
+) {
+    for (path, _) in crate::index_racy::attribute_lookups(repo, cur, subset) {
+        crate::unpack_sparse::convert_attrs(
+            repo,
+            path,
+            crate::unpack_sparse::Istate::Current,
+            crate::unpack_sparse::Direction::Checkin,
+        );
     }
 }
 

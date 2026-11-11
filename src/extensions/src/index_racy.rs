@@ -199,6 +199,40 @@ pub(crate) fn ie_match_stat_unchanged_ignoring_valid(
     !(racy && modified_check_fs(index.object_hash(), full, &meta, &entry.id))
 }
 
+/// Does `ie_match_stat(istate, ce, st, CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE)`
+/// (read-cache.c:383-442) of `entry` of `index` reach `ce_compare_data()` for the file at `full`,
+/// and so `index_fd()`'s attribute lookup? Only an entry that is not intent-to-add, whose stat
+/// `ce_match_stat_basic()` cannot tell apart and whose timestamp is racy, over a regular file
+/// (`ce_modified_check_fs()`'s `S_IFREG` arm, read-cache.c:255-279).
+pub(crate) fn ie_match_stat_compares_data(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    entry: &gix::index::Entry,
+    full: &std::path::Path,
+) -> bool {
+    if entry.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) || entry.mode == gix::index::entry::Mode::COMMIT {
+        return false;
+    }
+    let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(full) else {
+        return false;
+    };
+    let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
+        return false;
+    };
+    let snapshot = repo.config_snapshot();
+    fs_meta.is_file()
+        && !match_stat_basic_differs(
+            entry,
+            &fs_meta,
+            &current,
+            repo.stat_options().unwrap_or_default(),
+            snapshot.boolean("core.fileMode").unwrap_or(true),
+            snapshot.boolean("core.symlinks").unwrap_or(true),
+            &index.object_hash().empty_blob(),
+        )
+        && is_racy_stat(index, &entry.stat)
+}
+
 /// Smudge every racily-clean entry of `index`, as `do_write_index()` does before serialising.
 ///
 /// ```c
@@ -221,13 +255,15 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
         .filter(|(idx, full, meta)| {
             let entry = &index.entries()[*idx];
             if meta.file_type().is_file() {
-                // `index_fd()`'s attribute lookup reads `.gitattributes` from the index first
-                // when none is checked out (attr.c:856-865), and `read_attr_from_index()` loads
-                // the index's sparse patterns (attr.c:821, dir.c:1557-1574) — the result of a
-                // sparse `unpack_trees()` its checkout did not load already.
-                if let Some(warnings) = crate::unpack_sparse::take_result_index_pattern_warnings() {
-                    eprint!("{warnings}");
-                }
+                // `index_fd()`'s attribute lookup reads `.gitattributes` from the index when
+                // none is checked out (attr.c:856-865), and `read_attr_from_index()` loads
+                // the index's sparse patterns (attr.c:821, dir.c:1557-1574).
+                crate::unpack_sparse::convert_attrs(
+                    repo,
+                    entry.path(index),
+                    crate::unpack_sparse::Istate::Current,
+                    crate::unpack_sparse::Direction::Checkin,
+                );
                 compare_data(repo, &mut filter, entry.path(index), full, &entry.id)
             } else {
                 modified_check_fs(object_hash, full, meta, &entry.id)
@@ -662,6 +698,30 @@ pub(crate) fn first_attribute_lookup(
     cur: &gix::index::File,
     subset: &gix::index::File,
 ) -> Option<AttributeLookup> {
+    attribute_lookups(repo, cur, subset).next().map(|(_, lookup)| lookup)
+}
+
+/// Every entry of `subset`, in index order, for which `checkout_entry()` reaches an attribute
+/// lookup, as [`first_attribute_lookup`] decides it for the first one.
+pub(crate) fn attribute_lookups<'a>(
+    repo: &'a gix::Repository,
+    cur: &'a gix::index::File,
+    subset: &'a gix::index::File,
+) -> impl Iterator<Item = (&'a gix::bstr::BStr, AttributeLookup)> + 'a {
+    let backing = subset.path_backing();
+    subset.entries().iter().filter_map(move |wanted| {
+        let path = wanted.path_in(backing);
+        entry_attribute_lookup(repo, cur, wanted, path).map(|lookup| (path, lookup))
+    })
+}
+
+/// [`attribute_lookups`] for the entry `wanted` of the subset, at `path`.
+fn entry_attribute_lookup(
+    repo: &gix::Repository,
+    cur: &gix::index::File,
+    wanted: &gix::index::Entry,
+    path: &gix::bstr::BStr,
+) -> Option<AttributeLookup> {
     use gix::index::entry::Mode;
     let stat_opts = repo.stat_options().unwrap_or_default();
     let snapshot = repo.config_snapshot();
@@ -669,36 +729,32 @@ pub(crate) fn first_attribute_lookup(
     let has_symlinks = snapshot.boolean("core.symlinks").unwrap_or(true);
     let empty_blob = cur.object_hash().empty_blob();
     let timestamp = cur.timestamp().unix_seconds();
-    let backing = subset.path_backing();
-    subset.entries().iter().find_map(|wanted| {
-        let regular = wanted.mode == Mode::FILE || wanted.mode == Mode::FILE_EXECUTABLE;
-        if !regular && wanted.mode != Mode::SYMLINK {
-            return None;
-        }
-        let path = wanted.path_in(backing);
-        let full = repo.workdir_path(path)?;
-        // A write: the file in the way, if there is one, goes first.
-        let write = |exists: bool| {
-            regular.then(|| if exists { AttributeLookup::AfterUnlink(full.clone()) } else { AttributeLookup::Plain })
-        };
-        let exists = std::fs::symlink_metadata(&full).is_ok();
-        // A source entry that is the index's own keeps the index's stat data; any other is a
-        // fresh entry with none, which can only differ from the file.
-        let Some(own) = cur
-            .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
-            .filter(|own| own.id == wanted.id && own.mode == wanted.mode)
-        else {
-            return write(exists);
-        };
-        let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
-            return write(exists);
-        };
-        let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
-            return write(exists);
-        };
-        if match_stat_basic_differs(own, &fs_meta, &current, stat_opts, trust_executable_bit, has_symlinks, &empty_blob) {
-            return write(exists);
-        }
-        (timestamp != 0 && timestamp <= i64::from(own.stat.mtime.secs)).then_some(AttributeLookup::Plain)
-    })
+    let regular = wanted.mode == Mode::FILE || wanted.mode == Mode::FILE_EXECUTABLE;
+    if !regular && wanted.mode != Mode::SYMLINK {
+        return None;
+    }
+    let full = repo.workdir_path(path)?;
+    // A write: the file in the way, if there is one, goes first.
+    let write = |exists: bool| {
+        regular.then(|| if exists { AttributeLookup::AfterUnlink(full.clone()) } else { AttributeLookup::Plain })
+    };
+    let exists = std::fs::symlink_metadata(&full).is_ok();
+    // A source entry that is the index's own keeps the index's stat data; any other is a
+    // fresh entry with none, which can only differ from the file.
+    let Some(own) = cur
+        .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+        .filter(|own| own.id == wanted.id && own.mode == wanted.mode)
+    else {
+        return write(exists);
+    };
+    let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+        return write(exists);
+    };
+    let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
+        return write(exists);
+    };
+    if match_stat_basic_differs(own, &fs_meta, &current, stat_opts, trust_executable_bit, has_symlinks, &empty_blob) {
+        return write(exists);
+    }
+    (timestamp != 0 && timestamp <= i64::from(own.stat.mtime.secs)).then_some(AttributeLookup::Plain)
 }

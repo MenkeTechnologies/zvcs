@@ -258,9 +258,7 @@ where
         matches!(e.mode, Mode::FILE | Mode::FILE_EXECUTABLE) && !e.flags.contains(Flags::SKIP_WORKTREE)
     });
     if writes_a_file {
-        if let Some(warnings) = crate::unpack_sparse::take_result_index_pattern_warnings() {
-            eprint!("{warnings}");
-        }
+        crate::unpack_sparse::check_updates_writes();
     }
     if stale.len() == index.entries().len() {
         let res = gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options);

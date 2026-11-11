@@ -1394,6 +1394,9 @@ fn refresh_index_quietly(repo: &gix::Repository) -> Result<()> {
     let Some(lock) = crate::index_racy::hold_locked_index(repo) else {
         return Ok(());
     };
+    // `discard_index()` and the re-read leave an `index_state` whose sparse patterns nothing
+    // has loaded (read-cache.c:2455-2474, dir.c:1557-1574).
+    crate::unpack_sparse::fresh_index();
     super::status::update_index_if_able(repo, lock, &[], None)
 }
 
@@ -1457,6 +1460,14 @@ fn skip_stat_unmatch(repo: &gix::Repository, deltas: &mut Vec<Delta>, quick_quit
                                     none => none.insert(super::convert_to_git::WorktreeFilter::for_diff(repo)?),
                                 };
                                 d.populated = true;
+                                // `convert_to_git(r->index, ...)` (diff.c:4483-4495): its attribute
+                                // lookup reads `.gitattributes`, and the sparse patterns, from the index.
+                                crate::unpack_sparse::convert_attrs(
+                                    repo,
+                                    d.path.as_bstr(),
+                                    crate::unpack_sparse::Istate::Current,
+                                    crate::unpack_sparse::Direction::Checkin,
+                                );
                                 f.convert(repo, &gix::path::from_bstr(d.path.as_bstr()), &raw)
                                     .map_err(|e| anyhow::anyhow!(e.to_string()))
                                     .map(Some)?
@@ -5287,6 +5298,45 @@ fn collect_tree_index(
     Ok(())
 }
 
+/// `ie_match_stat()` of each entry `run_diff_files()` and `get_stat_data()` reach
+/// (diff-lib.c:246-285, :315-347): a racily clean one whose stat cannot tell it apart is
+/// hashed by `ce_modified_check_fs()` (read-cache.c:436-441), and that `ce_compare_data()`
+/// reads its attributes, and with them the sparse patterns, from the index (attr.c:821,
+/// dir.c:1557-1574).
+fn racy_content_check_attrs(repo: &gix::Repository, index: &gix::index::File, paths: &[String]) -> Result<()> {
+    use gix::index::entry::Flags;
+    let Some(workdir) = repo.workdir() else { return Ok(()) };
+    let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
+    let Ok(mut ps) = repo.pathspec(
+        false,
+        &patterns,
+        false,
+        index,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+    ) else {
+        return Ok(());
+    };
+    let backing = index.path_backing();
+    for e in index.entries() {
+        let path = e.path_in(backing);
+        if e.stage_raw() != 0
+            || e.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID | Flags::UPTODATE)
+            || !ps.is_included(path, Some(false))
+        {
+            continue;
+        }
+        if crate::index_racy::ie_match_stat_compares_data(repo, index, e, &workdir.join(gix::path::from_bstr(path))) {
+            crate::unpack_sparse::convert_attrs(
+                repo,
+                path,
+                crate::unpack_sparse::Istate::Current,
+                crate::unpack_sparse::Direction::Checkin,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `<tree>` vs. the worktree. Reproduces `diff-index`: start from the tree-to-index
 /// difference, then let the index-to-worktree difference override the "new" side.
 ///
@@ -5307,6 +5357,7 @@ fn collect_tree_worktree(
 ) -> Result<()> {
     let stat_opts = repo.stat_options()?;
     let tree_id = rev_object(repo, spec)?.peel_to_tree()?.id;
+    racy_content_check_attrs(repo, &*repo.index_or_empty()?, paths)?;
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
 
     // Path -> new side and its `dirty_submodule` bits, in index order (the order
@@ -5628,6 +5679,7 @@ fn collect_index_worktree(
     combined: &mut Vec<CombinedPath>,
 ) -> Result<()> {
     let index = repo.index_or_empty()?;
+    racy_content_check_attrs(repo, &index, paths)?;
     let stage_table = conflict_stage_table(&index);
     let conflicts = conflict_stages(&index);
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();

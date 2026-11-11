@@ -447,6 +447,15 @@ impl Ctx {
             filters_quiet,
             ..
         } = self;
+        // `convert_to_git()`'s `convert_attrs()` (convert.c:1325-1337, :1426) reads
+        // `.gitattributes` from the index where the worktree has none, and with it the
+        // index's sparse patterns (attr.c:821, dir.c:1557-1574).
+        crate::unpack_sparse::convert_attrs(
+            repo,
+            rela,
+            crate::unpack_sparse::Istate::Current,
+            crate::unpack_sparse::Direction::Checkin,
+        );
         let slot = if warn { filters } else { filters_quiet };
         let filter = match slot {
             Some(f) => f,

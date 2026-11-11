@@ -123,21 +123,198 @@ impl Warning {
     }
 }
 
-/// `istate->sparse_checkout_patterns` of the last `o->internal.result` a
-/// [`SparseCheckout`] stood for, while still unloaded: the warnings its own
-/// `init_sparse_checkout_patterns()` (dir.c:1557-1574) prints when the first attribute
-/// lookup of `check_updates()` reaches it. `check_updates()` sets `GIT_ATTR_CHECKOUT`
-/// (unpack-trees.c:456), so `read_attr()` asks `read_attr_from_index()` first (attr.c:852-855),
-/// and that asks `path_in_cone_mode_sparse_checkout()` of the index (attr.c:821).
-/// [`take_result_index_pattern_warnings`] consumes it, as the load is cached on the
-/// `index_state` and happens once.
-static RESULT_INDEX_PATTERNS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The `struct index_state` an attribute lookup reads `.gitattributes` from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Istate {
+    /// `the_repository->index` as the command holds it: after a sparse `unpack_trees()`, the
+    /// `o->internal.result` its end copied over it (unpack-trees.c:2097-2098).
+    Current,
+    /// `o->src_index` while an `unpack_trees()` runs: the index as it was read, which
+    /// `verify_uptodate()` and `oneway_merge()` compare the worktree against.
+    Source,
+}
 
-/// The warnings the result index's pattern load prints, the first time `checkout_entry_ca()`
-/// writes a regular file and so runs `convert_attrs()` on it (entry.c:584-587); `None` once
-/// loaded, or when no sparse `unpack_trees()` stands behind the checkout.
-pub(crate) fn take_result_index_pattern_warnings() -> Option<String> {
-    RESULT_INDEX_PATTERNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+/// `enum git_attr_direction` (attr.h), the two values a worktree command reads under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// `GIT_ATTR_CHECKIN`, the default: a `.gitattributes` file in the worktree first, the
+    /// index only when there is none (attr.c:857-865).
+    Checkin,
+    /// `GIT_ATTR_CHECKOUT`, which `check_updates()` sets while it writes (unpack-trees.c:456,
+    /// :509): the index first (attr.c:852-856).
+    Checkout,
+}
+
+/// What the attribute machinery of one process remembers between lookups, as far as the
+/// sparse patterns of an index are concerned.
+///
+/// `init_sparse_checkout_patterns()` (dir.c:1557-1574) loads `info/sparse-checkout` into an
+/// `index_state` once, and every `read_attr_from_index()` asks
+/// `path_in_cone_mode_sparse_checkout()` of the index it reads (attr.c:821), so the first
+/// `.gitattributes` read from an index is where a cone file `add_pattern_to_hashsets()`
+/// cannot read warns for that index (dir.c:798-936). Which reads happen is decided by the
+/// attribute stack of `convert_attrs()`' check (convert.c:1325-1337): `prepare_attr_stack()`
+/// (attr.c:950-1043) keeps the frames of the directories its last path was in, reads the
+/// root frame once in `bootstrap_attr_stack()` (attr.c:936-938) and one frame per directory
+/// it enters, whichever index it is handed, and `git_attr_set_direction()` drops them all
+/// when the direction changes (attr.c:682-691).
+struct AttrPatterns {
+    /// The patterns of the index the command read are loaded.
+    read_loaded: bool,
+    /// `o->internal.result` of the last sparse `unpack_trees()`, with the warnings its pattern
+    /// load prints while it is still unloaded; once there is one, it is the command's index.
+    result: Option<Option<String>>,
+    /// `check_updates()` of that unpack switched to `GIT_ATTR_CHECKOUT` and back
+    /// (unpack-trees.c:456, :509), dropping the stack, and no lookup has run since.
+    flipped: bool,
+    direction: Direction,
+    /// The directory frames above the root one, outermost first; `None` before
+    /// `bootstrap_attr_stack()` has run.
+    stack: Option<Vec<BString>>,
+}
+
+static ATTR_PATTERNS: std::sync::Mutex<AttrPatterns> = std::sync::Mutex::new(AttrPatterns {
+    read_loaded: false,
+    result: None,
+    flipped: false,
+    direction: Direction::Checkin,
+    stack: None,
+});
+
+fn attr_patterns() -> std::sync::MutexGuard<'static, AttrPatterns> {
+    ATTR_PATTERNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `discard_index()` then a fresh read (read-cache.c:2470-2474), or an `unpack_trees()` with
+/// `o->skip_sparse_checkout` set whose result replaced the index: the command's index is an
+/// `index_state` whose `sparse_checkout_patterns` nothing has loaded.
+pub(crate) fn fresh_index() {
+    let mut s = attr_patterns();
+    s.read_loaded = false;
+    s.result = None;
+    s.flipped = false;
+}
+
+/// `update_working_directory()`'s `r->index->sparse_checkout_patterns = pl`, and its `= old_pl`
+/// on the way out (builtin/sparse-checkout.c:221-222, :253-257): while the guard lives, the
+/// command's index carries the definition being applied and loads nothing.
+pub(crate) struct GivenIndexPatterns {
+    read_loaded: bool,
+    result: Option<Option<String>>,
+}
+
+impl GivenIndexPatterns {
+    pub(crate) fn new() -> Self {
+        let mut s = attr_patterns();
+        let given = GivenIndexPatterns { read_loaded: s.read_loaded, result: s.result.take() };
+        s.read_loaded = true;
+        given
+    }
+}
+
+impl Drop for GivenIndexPatterns {
+    fn drop(&mut self) {
+        let mut s = attr_patterns();
+        s.read_loaded = self.read_loaded;
+        s.result = self.result.take();
+    }
+}
+
+/// `convert_attrs()` (convert.c:1325-1337) of `path` on `istate`, under `direction`: the
+/// `.gitattributes` reads `prepare_attr_stack()` makes for it and the sparse-pattern load the
+/// first read from an index runs, with the warnings that load prints.
+pub(crate) fn convert_attrs(repo: &gix::Repository, path: &BStr, istate: Istate, direction: Direction) {
+    let mut s = attr_patterns();
+    if istate == Istate::Current && std::mem::take(&mut s.flipped) {
+        s.stack = None;
+    }
+    // `git_attr_set_direction()`: `if (new_direction != direction) drop_all_attr_stacks();`
+    if direction != s.direction {
+        s.direction = direction;
+        s.stack = None;
+    }
+    let mut reads: Vec<BString> = Vec::new();
+    let stack = s.stack.get_or_insert_with(|| {
+        // `bootstrap_attr_stack()`'s root frame.
+        reads.push(".gitattributes".into());
+        Vec::new()
+    });
+    let dirlen = path.rfind_byte(b'/').unwrap_or(0);
+    // Pop the frames of directories `path` is not in.
+    while let Some(top) = stack.last() {
+        if top.len() <= dirlen && path.starts_with(top.as_slice()) && path[top.len()] == b'/' {
+            break;
+        }
+        stack.pop();
+    }
+    // "Build up to the directory 'path' is in", one frame per component.
+    let mut len = stack.last().map_or(0, |top| top.len());
+    while len < dirlen {
+        let start = if len == 0 { 0 } else { len + 1 };
+        let end = path[start..dirlen].find_byte(b'/').map_or(dirlen, |i| start + i);
+        let dir: BString = path[..end].into();
+        let mut file = dir.clone();
+        file.extend_from_slice(b"/.gitattributes");
+        reads.push(file);
+        stack.push(dir);
+        len = end;
+    }
+    for file in reads {
+        // `read_attr()` (attr.c:841-874): under `GIT_ATTR_CHECKIN` a file in the worktree
+        // answers and the index is not asked; `read_attr_from_file()` opens it with
+        // `O_NOFOLLOW` (attr.c:693-726), so a symlink there does not.
+        if direction == Direction::Checkin {
+            let on_disk = repo
+                .workdir()
+                .and_then(|wd| std::fs::symlink_metadata(wd.join(gix::path::from_bstr(file.as_bstr()))).ok());
+            if on_disk.is_some_and(|md| !md.file_type().is_symlink()) {
+                continue;
+            }
+        }
+        if istate == Istate::Current {
+            if let Some(result) = s.result.as_mut() {
+                // The file `populate_from_existing_patterns()` read for this unpack.
+                if let Some(warnings) = result.take() {
+                    eprint!("{warnings}");
+                }
+                break;
+            }
+        }
+        if s.read_loaded {
+            break;
+        }
+        // `init_sparse_checkout_patterns()`: nothing to load without `core.sparseCheckout`, and
+        // a pattern file that cannot be read is freed again, to be tried at the next read.
+        let config = repo.config_snapshot();
+        if !config.boolean("core.sparseCheckout").unwrap_or(false) {
+            break;
+        }
+        let cone = config.boolean("core.sparseCheckoutCone").unwrap_or(false);
+        let Some((_, warnings)) = UnpackPatterns::load_with_warnings(repo, cone) else {
+            continue;
+        };
+        s.read_loaded = true;
+        eprint!("{warnings}");
+        break;
+    }
+}
+
+/// `checkout_entry_ca()`'s `convert_attrs()` of the first regular file `check_updates()`
+/// writes (entry.c:584-587), under the `GIT_ATTR_CHECKOUT` it set (unpack-trees.c:456): the
+/// result index of a sparse `unpack_trees()` loads its patterns there. Nothing for a
+/// worktree write no sparse `unpack_trees()` stands behind.
+pub(crate) fn check_updates_writes() {
+    let mut s = attr_patterns();
+    let Some(result) = s.result.as_mut() else { return };
+    // `bootstrap_attr_stack()` reads the root frame from the index (attr.c:852-856, :936-938).
+    if let Some(warnings) = result.take() {
+        eprint!("{warnings}");
+    }
+    // The stack `GIT_ATTR_CHECKOUT` built goes again when `check_updates()` sets
+    // `GIT_ATTR_CHECKIN` back (unpack-trees.c:509).
+    s.flipped = false;
+    s.direction = Direction::Checkout;
+    s.stack = None;
 }
 
 /// `unpack_trees()` with `o->skip_sparse_checkout` clear: the pattern list it read and the
@@ -175,8 +352,10 @@ impl SparseCheckout {
         // `unpack_trees()`. `o->internal.result` is a fresh `index_state` whose
         // `sparse_checkout_patterns` nothing has loaded yet (dir.c:1557-1574).
         eprint!("{}", patterns.warnings);
-        *RESULT_INDEX_PATTERNS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(patterns.warnings.clone());
+        let mut s = attr_patterns();
+        s.result = Some(Some(patterns.warnings.clone()));
+        s.flipped = true;
+        drop(s);
         Some(SparseCheckout { patterns, opts })
     }
 
@@ -360,7 +539,7 @@ impl SparseCheckout {
         }
         if !was && new {
             // "If CE_UPDATE is set, verify_uptodate() must be called already".
-            if !update.contains(path) && self.uptodate_rejects(wt.repo, wt.stat, e, path) {
+            if !update.contains(path) && self.uptodate_rejects(wt, e, path) {
                 warnings.reject(Warning::NotUptodate, path);
                 return false;
             }
@@ -382,14 +561,14 @@ impl SparseCheckout {
     /// entry's `CE_SKIP_WORKTREE` set, so its file is `lstat()`ed whatever `o->reset` says
     /// (:2233-2239). A missing file is `ENOENT`, never a rejection; a gitlink never is
     /// (:2253-2262).
-    fn uptodate_rejects(
-        &self,
-        repo: &gix::Repository,
-        stat: &crate::porcelain::read_tree::StatCtx,
-        e: &gix::index::Entry,
-        path: &BString,
-    ) -> bool {
-        stat.probe(repo, e, path.as_bstr()) == crate::porcelain::read_tree::Probe::Changed
+    fn uptodate_rejects(&self, wt: &Worktree<'_, '_>, e: &gix::index::Entry, path: &BString) -> bool {
+        // Its `ie_match_stat()` hashes a racily clean regular file with the attributes, and
+        // with them the sparse patterns, of `o->src_index` (attr.c:821, dir.c:1557-1574).
+        let full = wt.repo.workdir_path(path.as_bstr());
+        if full.is_some_and(|full| crate::index_racy::ie_match_stat_compares_data(wt.repo, wt.src, e, &full)) {
+            convert_attrs(wt.repo, path.as_bstr(), Istate::Source, Direction::Checkin);
+        }
+        wt.stat.probe(wt.repo, e, path.as_bstr()) == crate::porcelain::read_tree::Probe::Changed
     }
 
     /// `verify_absent_1(ce, WARNING_SPARSE_ORPHANED_NOT_OVERWRITTEN, COMPLETELY_ABSENT, o)`
@@ -547,7 +726,7 @@ impl SparseCheckout {
         if !cheats && (self.opts.reset || self.opts.overwrite_untracked || e.flags.contains(Flags::UPTODATE)) {
             return false;
         }
-        e.mode != Mode::COMMIT && self.uptodate_rejects(wt.repo, wt.stat, e, path)
+        e.mode != Mode::COMMIT && self.uptodate_rejects(wt, e, path)
     }
 
     /// `read_directory(&d, o->src_index, "<name>/", ...)` with no `dir->flags` (unpack-trees.c:

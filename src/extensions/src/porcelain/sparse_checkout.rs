@@ -2171,6 +2171,7 @@ fn apply_reloaded(repo: &gix::Repository, sparsity: &Sparsity, load_warnings: &s
     });
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let _given = crate::unpack_sparse::GivenIndexPatterns::new();
     // `update_working_directory()` (builtin/sparse-checkout.c:203-210):
     //
     // ```c

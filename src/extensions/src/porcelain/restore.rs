@@ -1386,6 +1386,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // the_repository->index`, builtin/checkout.c:412) — `cur` supplies the
         // `.gitattributes` files the subset dropped.
         super::checkout::die_on_bad_attr_source_for_writes(&repo, &cur, &subset)?;
+        super::checkout::checkout_worktree_convert_attrs(&repo, &cur, &subset);
         sparse_dirs.truncate_at_abort(&repo, &mut subset, &mut remove);
         let written =
             super::checkout::checkout_interleaved(&repo, &mut subset, &remove, &cur, &should_interrupt)?;

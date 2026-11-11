@@ -895,6 +895,35 @@ fn finish(o: Opts) -> Result<ExitCode> {
     let (dirty, absent) = if o.checked() || o.reset {
         let stat_ctx = StatCtx::new(&repo, &old)?;
         let dirty = worktree_dirty(&repo, &old, &stat_ctx);
+        // The entries whose file `unpack_trees()` compares against `o->src_index`:
+        // `verify_uptodate()` of one `merged_entry()` replaces or `deleted_entry()` drops,
+        // which `o->reset` waves through unless it is `CE_VALID` (unpack-trees.c:2233-2245),
+        // and `oneway_merge()`'s `ie_match_stat()` of one `--reset -u` keeps (:3036-3042).
+        // A racily clean regular file is hashed there with its attributes, and with them
+        // the sparse patterns, read from that index (attr.c:821, dir.c:1557-1574).
+        if !o.index_only {
+            let backing = old.path_backing();
+            for e in old.entries().iter().filter(|e| e.stage_raw() == 0) {
+                let path = e.path_in(backing);
+                if e.flags.intersects(Flags::SKIP_WORKTREE | Flags::UPTODATE) {
+                    continue;
+                }
+                let replaced = removed.contains(path) || changed.contains(path);
+                let compared = match o.reset {
+                    true => (replaced && e.flags.contains(Flags::ASSUME_VALID)) || (!replaced && o.update),
+                    false => replaced,
+                };
+                let full = repo.workdir_path(path);
+                if compared && full.is_some_and(|full| crate::index_racy::ie_match_stat_compares_data(&repo, &old, e, &full)) {
+                    crate::unpack_sparse::convert_attrs(
+                        &repo,
+                        path,
+                        crate::unpack_sparse::Istate::Source,
+                        crate::unpack_sparse::Direction::Checkin,
+                    );
+                }
+            }
+        }
         let absent = if o.reset && o.update {
             worktree_absent(&repo, &old, &stat_ctx)
         } else {

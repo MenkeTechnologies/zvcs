@@ -1006,6 +1006,10 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // (`ce_mark_uptodate()`) is still true for the second, and reading the index back
         // from disk in between forgot it.
         if mode == ResetMode::Keep {
+            // That second `unpack_trees()` has no `o->update`, so `o->skip_sparse_checkout` is
+            // set, and the result it copies over the index is an `index_state` whose sparse
+            // patterns nothing has loaded (unpack-trees.c:1931-1940, :2097-2098).
+            crate::unpack_sparse::fresh_index();
             let current = index;
             index = reset_index_to_tree(&repo, &current, target_tree, false)?;
             // And it is `unpack_trees()`, so the untracked cache moves onto the result with
@@ -1763,6 +1767,31 @@ fn reset_worktree_hard(
         let backing = old.path_backing();
         old.entries().iter().map(|e| (e.path_in(backing).to_owned(), e.id, e.mode.bits())).collect()
     };
+    // That `ie_match_stat()` is asked of `o->src_index` (unpack-trees.c:3036-3042), so a
+    // racily clean kept entry is hashed with its attributes read from the index as read.
+    {
+        let target: HashSet<(&BStr, ObjectId, u32)> = {
+            let backing = new_index.path_backing();
+            new_index.entries().iter().map(|e| (e.path_in(backing), e.id, e.mode.bits())).collect()
+        };
+        let backing = old.path_backing();
+        for e in old.entries() {
+            let path = e.path_in(backing);
+            if e.flags.intersects(Flags::UPTODATE | Flags::SKIP_WORKTREE)
+                || !target.contains(&(path, e.id, e.mode.bits()))
+            {
+                continue;
+            }
+            if crate::index_racy::ie_match_stat_compares_data(repo, old, e, &workdir.join(gix::path::from_bstr(path))) {
+                crate::unpack_sparse::convert_attrs(
+                    repo,
+                    path,
+                    crate::unpack_sparse::Istate::Source,
+                    crate::unpack_sparse::Direction::Checkin,
+                );
+            }
+        }
+    }
     let settled: HashSet<BString> = {
         let backing = new_index.path_backing();
         let fresh = crate::worktree::up_to_date_paths(&new_index, &workdir, opts.stat_options);
@@ -2119,6 +2148,10 @@ fn reset_two_tree(
     all.extend(head.keys().cloned());
 
     let sparse = crate::merge_guard::sparse_patterns(repo).is_some();
+    // `populate_from_existing_patterns()` runs before `traverse_trees()` (unpack-trees.c:1931-1936),
+    // so its warnings come ahead of any refusal the merge functions report. `reset_index()`
+    // installs no porcelain messages (builtin/reset.c:62-125).
+    let sparse_unpack = crate::unpack_sparse::SparseCheckout::begin(repo, true, Default::default());
     let mut updates: Vec<(BString, Mode, ObjectId)> = Vec::new();
     // Paths to remove, with the index mode `remove_or_warn()` (entry.c:200-203) picks
     // the removal syscall from: `S_ISGITLINK(mode) ? rmdir_or_warn() : unlink_or_warn()`.
@@ -2309,7 +2342,7 @@ fn reset_two_tree(
     // deleted ones, and `reset_index()` installs no porcelain messages (builtin/reset.c:62-125).
     let mut upd: HashSet<BString> = updates.iter().map(|(p, _, _)| p.clone()).collect();
     let mut deletes = deletes;
-    if let Some(sparse) = crate::unpack_sparse::SparseCheckout::begin(repo, true, Default::default()) {
+    if let Some(sparse) = &sparse_unpack {
         let mut update: BTreeSet<BString> = upd.iter().cloned().collect();
         let mut remove: BTreeSet<BString> = deletes.iter().map(|(p, _)| p.clone()).collect();
         sparse.apply(repo, old, &mut new_index, &mut update, &mut remove)?;
@@ -2497,6 +2530,16 @@ fn worktree_uptodate(
     let Some(entry) = old.entries().iter().find(|e| e.stage_raw() == 0 && e.path_in(backing) == path) else {
         return blob_oid(repo, &full, &meta) == Some(oid);
     };
+    // A racily clean entry is hashed, its attributes, and with them the sparse patterns,
+    // read from `o->src_index` (attr.c:821, dir.c:1557-1574).
+    if !entry.flags.contains(Flags::UPTODATE) && crate::index_racy::ie_match_stat_compares_data(repo, old, entry, &full) {
+        crate::unpack_sparse::convert_attrs(
+            repo,
+            path,
+            crate::unpack_sparse::Istate::Source,
+            crate::unpack_sparse::Direction::Checkin,
+        );
+    }
     match super::read_tree::StatCtx::new(repo, old) {
         Ok(stat) => !matches!(stat.probe(repo, entry, path), super::read_tree::Probe::Changed),
         Err(_) => blob_oid(repo, &full, &meta) == Some(oid),

@@ -3508,6 +3508,18 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
 
     o.branch_name = find_branch_name(repo, &o);
     o.output_encoding = crate::revfilter::log_output_encoding(repo, o.encoding_opt.as_deref());
+    // `repo_logmsg_reencode()` returns a bare `char *`, so `pretty_print_commit()`
+    // reads a UTF-16 or UTF-32 commit as the C string that ends at its first NUL:
+    // no `From:`, an empty subject. The renderer below reads the header block out
+    // of the whole buffer instead, so the family is refused as `git log` and
+    // `git show` refuse it rather than answered with a different message.
+    if super::mailinfo::is_utf16_or_32_name(&o.output_encoding) {
+        bail!(
+            "unsupported flag \"--encoding={}\" (the UTF-16 and UTF-32 families are not ported; \
+             every other charset is)",
+            o.output_encoding
+        );
+    }
 
     // builtin/log.c: the stat+summary block is format-patch's default, but only
     // when the caller asked for no output format of its own — that is what makes

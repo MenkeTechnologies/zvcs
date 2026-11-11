@@ -1520,6 +1520,12 @@ pub(crate) fn decode_from(data: &[u8], from: &str) -> Option<String> {
     if is_utf8_name(from) {
         return std::str::from_utf8(data).ok().map(str::to_string);
     }
+    if let Some(form) = WideForm::reading(from) {
+        return form.decode(data);
+    }
+    if is_utf16_or_32_name(from) {
+        return None;
+    }
     let enc = encoding_rs::Encoding::for_label_no_replacement(from.as_bytes())?;
     // `..._without_replacement` is the arm that fails on a malformed sequence
     // instead of planting U+FFFD, which is what iconv's EILSEQ does.
@@ -1543,9 +1549,12 @@ pub(crate) fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
     }
     // `encoding_rs` has no UTF-16/UTF-32 *encoder*: `Encoding::output_encoding()`
     // maps `UTF_16LE`/`UTF_16BE` (and `replacement`) to UTF-8, so `encode()` would
-    // hand back UTF-8 bytes under a UTF-16 label — a wrong answer rather than a
-    // refusal. Report the conversion as impossible instead; the callers treat that
-    // the way they treat `iconv_open()` failing.
+    // hand back UTF-8 bytes under a UTF-16 label. The forms iconv knows are
+    // written by [`WideForm`]; any other spelling in the family is a name
+    // `iconv_open()` refuses.
+    if let Some(form) = WideForm::writing(to) {
+        return Some(form.encode(text));
+    }
     if is_utf16_or_32_name(to) {
         return None;
     }
@@ -1553,6 +1562,153 @@ pub(crate) fn encode_to(text: &str, to: &str) -> Option<Vec<u8>> {
     let (out, _, had_errors) = enc.encode(text);
     // An unmappable character is iconv's EILSEQ, not a `?` substitution.
     (!had_errors).then(|| out.into_owned())
+}
+
+/// One of the UTF-16 / UTF-32 forms iconv converts and `encoding_rs` cannot
+/// produce, as `reencode_string_len()` (utf8.c:566-623) resolves its name.
+#[derive(Clone, Copy)]
+struct WideForm {
+    /// Bytes per code unit: 2 for UTF-16, 4 for UTF-32.
+    unit: usize,
+    order: ByteOrder,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteOrder {
+    /// `UTF-16BE`, `UTF-32BE`: no byte-order mark either way.
+    Big,
+    /// `UTF-16LE`, `UTF-32LE`.
+    Little,
+    /// Plain `UTF-16`/`UTF-32`: the writer puts a byte-order mark first, the reader
+    /// takes the order from one and assumes big-endian without it.
+    Marked,
+    /// git's own `UTF-16LE-BOM` (utf8.c:588-591): little-endian behind `FF FE`.
+    LittleMarked,
+    /// git's own `UTF-16BE-BOM` (utf8.c:592-595): big-endian behind `FE FF`.
+    BigMarked,
+}
+
+impl WideForm {
+    /// `utf` `[-]` `16`|`32` `[le|be]`, case-blind: the spellings iconv answers to.
+    fn parse(name: &str) -> Option<WideForm> {
+        let lower = name.to_ascii_lowercase();
+        let rest = lower.strip_prefix("utf")?;
+        let rest = rest.strip_prefix('-').unwrap_or(rest);
+        let (unit, rest) = match rest.split_at_checked(2)? {
+            ("16", rest) => (2, rest),
+            ("32", rest) => (4, rest),
+            _ => return None,
+        };
+        let order = match rest {
+            "" => ByteOrder::Marked,
+            "le" => ByteOrder::Little,
+            "be" => ByteOrder::Big,
+            _ => return None,
+        };
+        Some(WideForm { unit, order })
+    }
+
+    /// The form `name` writes. `same_utf_encoding()` matches git's two `-BOM`
+    /// names before `iconv_open()` sees them (utf8.c:588-595).
+    fn writing(name: &str) -> Option<WideForm> {
+        if same_encoding("UTF-16LE-BOM", name) {
+            return Some(WideForm { unit: 2, order: ByteOrder::LittleMarked });
+        }
+        if same_encoding("UTF-16BE-BOM", name) {
+            return Some(WideForm { unit: 2, order: ByteOrder::BigMarked });
+        }
+        Self::parse(name)
+    }
+
+    /// The form `name` reads: "UTF-16LE-BOM is the same as UTF-16 for reading"
+    /// (utf8.c:576-578), and `UTF-16BE-BOM` is no name iconv knows.
+    fn reading(name: &str) -> Option<WideForm> {
+        if same_encoding("UTF-16LE-BOM", name) {
+            return Self::parse("UTF-16");
+        }
+        Self::parse(name)
+    }
+
+    /// The order plain `UTF-16`/`UTF-32` is written in. macOS's libiconv writes
+    /// `FE FF` and big-endian units, as `/usr/bin/iconv -t UTF-16` shows; glibc's
+    /// writes its mark and units in the host's order. git takes either: its build
+    /// probe only asks that the first two bytes be the two halves of a mark
+    /// (meson.build:1076-1094), and adds a big-endian one itself only where iconv
+    /// omits it (`ICONV_OMITS_BOM`, utf8.c:596-605).
+    fn marked_big_endian() -> bool {
+        cfg!(target_os = "macos") || cfg!(target_endian = "big")
+    }
+
+    fn encode(self, text: &str) -> Vec<u8> {
+        let (big, mark) = match self.order {
+            ByteOrder::Big => (true, false),
+            ByteOrder::Little => (false, false),
+            ByteOrder::Marked => (Self::marked_big_endian(), true),
+            ByteOrder::LittleMarked => (false, true),
+            ByteOrder::BigMarked => (true, true),
+        };
+        let mut out = Vec::with_capacity((text.len() + 1) * self.unit);
+        let mut push = |unit: u32| match (self.unit, big) {
+            (2, true) => out.extend_from_slice(&(unit as u16).to_be_bytes()),
+            (2, false) => out.extend_from_slice(&(unit as u16).to_le_bytes()),
+            (_, true) => out.extend_from_slice(&unit.to_be_bytes()),
+            (_, false) => out.extend_from_slice(&unit.to_le_bytes()),
+        };
+        if mark {
+            push(0xFEFF);
+        }
+        for c in text.chars() {
+            if self.unit == 4 {
+                push(c as u32);
+            } else {
+                let mut pair = [0u16; 2];
+                for unit in c.encode_utf16(&mut pair) {
+                    push(u32::from(*unit));
+                }
+            }
+        }
+        out
+    }
+
+    /// iconv's reading: a length that is not a whole number of units is `EINVAL`, an
+    /// unpaired surrogate or a value past U+10FFFF `EILSEQ`, and either is the NULL
+    /// `reencode_string_iconv()` returns (utf8.c:500-530).
+    fn decode(self, data: &[u8]) -> Option<String> {
+        if data.len() % self.unit != 0 {
+            return None;
+        }
+        let read = |chunk: &[u8], big: bool| -> u32 {
+            match (chunk.len(), big) {
+                (2, true) => u32::from(u16::from_be_bytes([chunk[0], chunk[1]])),
+                (2, false) => u32::from(u16::from_le_bytes([chunk[0], chunk[1]])),
+                (_, true) => u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                (_, false) => u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            }
+        };
+        let mut units = data.chunks_exact(self.unit);
+        let big = match self.order {
+            ByteOrder::Big | ByteOrder::BigMarked => true,
+            ByteOrder::Little | ByteOrder::LittleMarked => false,
+            ByteOrder::Marked => match data.get(..self.unit).map(|first| read(first, true)) {
+                Some(0xFEFF) => {
+                    units.next();
+                    true
+                }
+                Some(swapped) if swapped == 0xFFFE || swapped == 0xFFFE_0000 => {
+                    units.next();
+                    false
+                }
+                _ => true,
+            },
+        };
+        let values: Vec<u32> = units.map(|chunk| read(chunk, big)).collect();
+        if self.unit == 4 {
+            return values.into_iter().map(char::from_u32).collect();
+        }
+        char::decode_utf16(values.into_iter().map(|v| v as u16))
+            .collect::<Result<String, _>>()
+            .ok()
+    }
 }
 
 /// `get_sane_name()`: fall back to the address when the name looks wrong.

@@ -641,10 +641,15 @@ pub(crate) fn format_display_encoded(
         if blob.kind != gix::object::Kind::Blob {
             continue;
         }
+        // `reencode_string(msg, output_encoding, utf8)` and then
+        // `msglen = strlen(msg)` (notes.c:1305-1312): both ends are C strings, so a
+        // UTF-16 or UTF-32 note ends at its first NUL.
+        let c_string = |s: &[u8]| s.split(|&b| b == 0).next().unwrap_or_default().to_vec();
         let reencoded = (!output_encoding.is_empty()
             && !super::mailinfo::is_utf8_name(output_encoding))
-        .then(|| super::mailinfo::reencode(&blob.data, "utf-8", output_encoding))
-        .flatten();
+        .then(|| super::mailinfo::reencode(&c_string(&blob.data), "utf-8", output_encoding))
+        .flatten()
+        .map(|out| c_string(&out));
         let mut msg = reencoded.as_deref().unwrap_or(blob.data.as_slice());
         // "we will end the annotation by a newline anyway"
         if msg.last() == Some(&b'\n') {

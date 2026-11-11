@@ -3437,7 +3437,16 @@ fn build_patch(
     // The patches are `git log --pretty=medium` output (range-diff.c:54-70), and
     // the header line is `pp_commit_easy()` (range-diff.c:463): both render the
     // commit re-coded to the log output encoding (pretty.c:2315-2316).
-    super::log::logmsg_reencode(&mut commit.data, &crate::revfilter::log_output_encoding(repo, None));
+    let output_encoding = crate::revfilter::log_output_encoding(repo, None);
+    // `read_patches()` reads them out of a `git log` child (range-diff.c:54-75),
+    // and this port's `git log` refuses the UTF-16 and UTF-32 families.
+    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
+        anyhow::bail!(
+            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
+             families are not ported; every other charset is)"
+        );
+    }
+    super::log::logmsg_reencode(&mut commit.data, &output_encoding);
 
     // ` ## Metadata ##` — only the `Author:` line of `--pretty=medium` survives
     // upstream's header filter; `Date:` and `commit` are dropped.

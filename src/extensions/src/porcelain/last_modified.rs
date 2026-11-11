@@ -1219,7 +1219,7 @@ fn corrected_commit_dates_enabled(graph: Option<&gix::commitgraph::Graph>) -> bo
 /// `generation_numbers_enabled()` (commit-graph.c:778-791): the first commit's topological
 /// level is non-zero. git reads it from the newest layer of a split chain; every layer is
 /// written by the same `CDAT` code, so the base layer's first commit answers the same.
-fn generation_numbers_enabled(graph: Option<&gix::commitgraph::Graph>) -> bool {
+pub(crate) fn generation_numbers_enabled(graph: Option<&gix::commitgraph::Graph>) -> bool {
     graph.is_some_and(|g| g.num_commits() > 0 && g.commit_at(gix::commitgraph::Position(0)).generation() != 0)
 }
 

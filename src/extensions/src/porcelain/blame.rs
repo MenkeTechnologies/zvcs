@@ -837,6 +837,12 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // invent a commit for the final image: `sb->final` is set and `sb->contents_from` is refused
     // above.
     let overlay = opts.contents.is_some() || (opts.rev.is_none() && !opts.reverse);
+    // `if (!sb->contents_from) setup_work_tree(the_repository);` (blame.c:2818-2819):
+    // a bare repository reaches the fake commit only when `-g` took the `HEAD` that
+    // `cmd_blame()` queued for it into the reflog walk.
+    if overlay && opts.contents.is_none() && repo.workdir().is_none() {
+        return Err(crate::fatal::need_work_tree());
+    }
     let path_in_suspect = blob_at(&repo, &suspect, &rel_path).is_some();
     let mut index_only = false;
     if !path_in_suspect && overlay {
@@ -1891,6 +1897,7 @@ struct CommitInfo {
     boundary: bool,
     hex: String,
     author_name: Vec<u8>,
+    /// `ret->author_mail` as `get_ac_line()` fills it: `<mail>`, or `(unknown)`.
     author_mail: Vec<u8>,
     author_time: i64,
     author_tz: String,
@@ -1932,18 +1939,14 @@ fn collect_commit_info(
             let is_root = stored.parent_ids().next().is_none();
             let mut data = stored.data.clone();
             super::log::logmsg_reencode(&mut data, &output_encoding);
-            let commit = gix::objs::CommitRef::from_bytes(&data, repo.object_hash())?;
-            let author = commit.author()?;
-            let committer = commit.committer()?;
-            // `map_user()` rewrites only the name and the e-mail; the timestamp it
-            // is handed is left alone, so the date columns keep the commit's own.
-            let (author_name, author_mail) = mailmap.mapped(author.name, author.email);
-            let (committer_name, committer_mail) = mailmap.mapped(committer.name, committer.email);
-            let author_time = author.time().ok();
-            let committer_time = committer.time().ok();
-            // Reduced to owned values before the struct literal: the iterator
-            // and the summary both borrow `commit`, which drops at the end of
-            // this block while the literal's temporaries are still live.
+            // `get_ac_line()` and `find_commit_subject()` read the re-coded buffer
+            // as a C string, so a UTF-16 or UTF-32 one ends at its first NUL.
+            let visible = data.split(|&b| b == 0).next().unwrap_or_default();
+            let author = get_ac_line(visible, b"\nauthor ", &mailmap);
+            let committer = get_ac_line(visible, b"\ncommitter ", &mailmap);
+            // `commit->date`, which `assign_blame()` compares, is parsed out of the
+            // stored object, not out of the re-coded copy.
+            let committer_seconds = stored.committer().ok().and_then(|c| c.time().ok()).map_or(0, |t| t.seconds);
             // `--root` (git's `show_root`) stops root commits counting as
             // boundaries, dropping both the `^` marker and the porcelain
             // `boundary` field for them.
@@ -1963,31 +1966,42 @@ fn collect_commit_info(
             // branch (`blame.c:2601`). The date compared is `commit->date`, the
             // *committer* date, and the bound is ignored under `--reverse`.
             let date_cut = opts.reverse_from.is_none()
-                && opts.ages().below_max_age(committer_time.map(|t| t.seconds).unwrap_or(0));
+                && opts.ages().below_max_age(committer_seconds);
             let boundary = (!opts.show_root && is_root)
                 || opts.reverse_from.is_some_and(|from| from == line.commit_id)
                 || opts.bottom.contains(&line.commit_id)
                 || date_cut;
-            let summary = Vec::from(commit.message().summary().into_owned());
+            // ```c
+            // len = find_commit_subject(message, &subject);
+            // if (len) strbuf_add(&ret->summary, subject, len);
+            // else strbuf_addf(&ret->summary, "(%s)", oid_to_hex(&commit->object.oid));
+            // ```
+            // (builtin/blame.c:213-217.)
+            let summary = gix::objs::CommitRef::from_bytes(visible, repo.object_hash())
+                .ok()
+                .map(|commit| Vec::from(commit.message().summary().into_owned()))
+                .filter(|summary| !summary.is_empty())
+                .unwrap_or_else(|| format!("({})", line.commit_id.to_hex()).into_bytes());
+            // `format_time()` (builtin/blame.c:392-418): `-t` prints the time and the
+            // tz string as they are, any other mode takes `atoi(tz_str)`.
+            let display_date = match &author.unparsed {
+                _ if !author.known && opts.raw_timestamp => format!("0 {}", author.tz),
+                Some(raw) => raw.clone(),
+                None => opts.date_mode.format_time(author.time, author.offset),
+            };
             CommitInfo {
-                display_author: display_author(
-                    author_name.as_slice().into(),
-                    author_mail.as_slice().into(),
-                    opts.show_email,
-                ),
-                display_date: author_time
-                    .map(|t| opts.date_mode.format_time(t.seconds, t.offset))
-                    .unwrap_or_else(|| author.time.to_string()),
+                display_author: display_author(&author.name, &author.mail, opts.show_email),
+                display_date,
                 boundary,
                 hex: line.commit_id.to_hex().to_string(),
-                author_name,
-                author_mail,
-                author_time: author_time.map(|t| t.seconds).unwrap_or(0),
-                author_tz: format_tz(author_time.map(|t| t.offset).unwrap_or(0)),
-                committer_name,
-                committer_mail,
-                committer_time: committer_time.map(|t| t.seconds).unwrap_or(0),
-                committer_tz: format_tz(committer_time.map(|t| t.offset).unwrap_or(0)),
+                author_name: author.name,
+                author_mail: author.mail,
+                author_time: author.time,
+                author_tz: author.tz,
+                committer_name: committer.name,
+                committer_mail: committer.mail,
+                committer_time: committer.time,
+                committer_tz: committer.tz,
                 summary,
             }
         };
@@ -2016,6 +2030,7 @@ fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInf
     } else {
         (NOT_COMMITTED_NAME, NOT_COMMITTED_MAIL)
     };
+    let mail = [&b"<"[..], mail, b">"].concat();
     // git's message: `"Version of %s from %s"` where the second `%s` is the path,
     // or the `--contents` argument (`"standard input"` for `-`).
     let from = match opts.contents.as_deref() {
@@ -2024,33 +2039,87 @@ fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInf
         None => rel_path.to_string(),
     };
     CommitInfo {
-        display_author: display_author(name.as_bstr(), mail.as_bstr(), opts.show_email),
+        display_author: display_author(name, &mail, opts.show_email),
         display_date: opts.date_mode.format_time(now.seconds, now.offset),
         // `commit->date = now` (blame.c:209), so `assign_blame()`'s `max_age` test
         // can stop the dig at the working tree itself and mark it the boundary.
         boundary: fake_commit_cut(opts, now.seconds),
         hex: id.to_hex().to_string(),
         author_name: name.to_vec(),
-        author_mail: mail.to_vec(),
+        author_mail: mail.clone(),
         author_time: now.seconds,
         author_tz: format_tz(now.offset),
         committer_name: name.to_vec(),
-        committer_mail: mail.to_vec(),
+        committer_mail: mail,
         committer_time: now.seconds,
         committer_tz: format_tz(now.offset),
         summary: format!("Version of {rel_path} from {from}").into_bytes(),
     }
 }
 
-fn display_author(name: &gix::bstr::BStr, email: &gix::bstr::BStr, show_email: bool) -> Vec<u8> {
-    if show_email {
-        let mut v = Vec::with_capacity(email.len() + 2);
-        v.push(b'<');
-        v.extend_from_slice(email);
-        v.push(b'>');
-        v
-    } else {
-        name.to_vec()
+/// `blame_date_width`, which `format_time()` pads to only when it is not
+/// printing the raw `-t` form (builtin/blame.c:398-416): `0 (unknown)` stays
+/// unpadded.
+fn date_column_width(opts: &Options) -> usize {
+    match opts.raw_timestamp {
+        true => 0,
+        false => opts.date_mode.width(),
+    }
+}
+
+fn display_author(name: &[u8], mail: &[u8], show_email: bool) -> Vec<u8> {
+    match show_email {
+        true => mail.to_vec(),
+        false => name.to_vec(),
+    }
+}
+
+/// One identity as `get_ac_line()` (builtin/blame.c:131-182) leaves it in
+/// `struct commit_info`: the mail already in its `<…>`, or all three strings
+/// `(unknown)` with a zero time when the header is missing or not an identity.
+struct AcLine {
+    name: Vec<u8>,
+    mail: Vec<u8>,
+    time: i64,
+    /// Seconds east of UTC, what `atoi(tz)` hands `show_date()`.
+    offset: i32,
+    tz: String,
+    /// Whether the header was found and split; `error_out` otherwise.
+    known: bool,
+    /// The date field when it does not parse, printed as it stands.
+    unparsed: Option<String>,
+}
+
+/// `get_ac_line(inbuf, what, ...)`: `strstr()` for `what`, the rest of that line
+/// through `split_ident_line()`, and `map_user()` over the name and the mail.
+fn get_ac_line(inbuf: &[u8], what: &[u8], mailmap: &crate::mailmap::Mailmap) -> AcLine {
+    let line = inbuf
+        .windows(what.len())
+        .position(|w| w == what)
+        .map(|at| &inbuf[at + what.len()..])
+        .map(|rest| rest.split(|&b| b == b'\n').next().unwrap_or_default());
+    let Some(sig) = line.and_then(|line| gix::actor::SignatureRef::from_bytes(line).ok()) else {
+        // "Ugh"
+        return AcLine {
+            name: b"(unknown)".to_vec(),
+            mail: b"(unknown)".to_vec(),
+            time: 0,
+            offset: 0,
+            tz: "(unknown)".to_string(),
+            known: false,
+            unparsed: None,
+        };
+    };
+    let (name, mail) = mailmap.mapped(sig.name, sig.email);
+    let time = sig.time().ok();
+    AcLine {
+        name,
+        mail: [&b"<"[..], mail.as_slice(), b">"].concat(),
+        time: time.map_or(0, |t| t.seconds),
+        offset: time.map_or(0, |t| t.offset),
+        tz: format_tz(time.map_or(0, |t| t.offset)),
+        known: true,
+        unparsed: time.is_none().then(|| sig.time.to_string()),
     }
 }
 
@@ -2180,7 +2249,7 @@ fn emit_annotate_compat(
         // in `printf("\t(%10s\t%10s\t%d)", …)` then right-justifies that, which
         // only shows for a `format:<strftime>` narrower than ten columns.
         let mut date = ci.display_date.clone().into_bytes();
-        pad(&mut date, opts.date_mode.width().saturating_sub(ci.display_date.chars().count()));
+        pad(&mut date, date_column_width(opts).saturating_sub(ci.display_date.chars().count()));
 
         buf.extend_from_slice(b"\t(");
         pad_left(&mut buf, &ci.display_author, 10);
@@ -2324,9 +2393,7 @@ fn emit_human(
             let mut date = ci.display_date.clone().into_bytes();
             pad(
                 &mut date,
-                opts.date_mode
-                    .width()
-                    .saturating_sub(ci.display_date.chars().count()),
+                date_column_width(opts).saturating_sub(ci.display_date.chars().count()),
             );
             pad_left(&mut buf, &date, 10);
         }
@@ -2664,15 +2731,15 @@ fn emit_incremental(
 /// the path.
 fn write_suspect_detail(out: &mut impl Write, ci: &CommitInfo) -> Result<()> {
     write_field(out, b"author", &ci.author_name)?;
-    out.write_all(b"author-mail <")?;
+    out.write_all(b"author-mail ")?;
     out.write_all(&ci.author_mail)?;
-    out.write_all(b">\n")?;
+    out.write_all(b"\n")?;
     writeln!(out, "author-time {}", ci.author_time)?;
     writeln!(out, "author-tz {}", ci.author_tz)?;
     write_field(out, b"committer", &ci.committer_name)?;
-    out.write_all(b"committer-mail <")?;
+    out.write_all(b"committer-mail ")?;
     out.write_all(&ci.committer_mail)?;
-    out.write_all(b">\n")?;
+    out.write_all(b"\n")?;
     writeln!(out, "committer-time {}", ci.committer_time)?;
     writeln!(out, "committer-tz {}", ci.committer_tz)?;
     write_field(out, b"summary", &ci.summary)?;
@@ -3087,6 +3154,16 @@ struct Revs {
     /// (`builtin/blame.c:1035 revs.diffopt.flags.follow_renames = 0;`), so it never
     /// reaches `diff_setup_done()`'s check.
     follow: bool,
+    /// `revs->reflog_info`, which `-g`/`--walk-reflogs` allocates (revision.c:2459-2460):
+    /// from then on a commit operand goes into the reflog walk instead of
+    /// `revs->pending` (revision.c:306-319), so `find_single_final()` never sees it.
+    walk_reflogs: bool,
+    /// `revs->limited` as far as `setup_revisions()` has set it by its end, where it
+    /// refuses to combine with a reflog walk (revision.c:3218-3219).
+    limited: bool,
+    /// The `die()` an operand raised inside `add_pending_object_with_path()`, which
+    /// [`setup_revisions`] reports before it reads the next token.
+    fatal: Option<String>,
 }
 
 /// `handle_revision_arg()`'s view of one revision operand, as
@@ -3827,8 +3904,34 @@ fn glob_ref_pattern(prefix: Option<&str>, pattern: &str) -> String {
 /// `add_pending_object()` for an id whose name is already decided: record the
 /// entry and, when the flags carry it, the object's `UNINTERESTING` bit.
 fn queue_pending(repo: &gix::Repository, revs: &mut Revs, not: bool, name: String, id: ObjectId) {
+    if revs.fatal.is_some() {
+        return;
+    }
     if not {
         revs.uninteresting.insert(id);
+    }
+    // ```c
+    // if (revs->reflog_info && obj->type == OBJ_COMMIT) {
+    //         ...
+    //         add_reflog_for_walk(revs->reflog_info, (struct commit *)obj,
+    //                             buf.buf[0] ? buf.buf: name);
+    //         return; /* do not add the commit itself */
+    // }
+    // ```
+    // (revision.c:306-319.) The type is the named object's own, so a tag stays
+    // pending. `add_reflog_for_walk()` dies first thing on an `UNINTERESTING`
+    // commit (reflog-walk.c:172-173), naming the operand as
+    // `repo_interpret_branch_name()` spelled it; otherwise it only records which
+    // reflog to walk, which a blame never reads.
+    if revs.walk_reflogs && repo.find_header(id).is_ok_and(|h| h.kind() == gix::object::Kind::Commit) {
+        if revs.uninteresting.contains(&id) {
+            let shown = match crate::objname::interpret_branch_name(repo, &name) {
+                Some(Ok(branch)) if !branch.is_empty() => branch,
+                _ => name,
+            };
+            revs.fatal = Some(format!("cannot walk reflogs for {shown}"));
+        }
+        return;
     }
     revs.pending.push(Pending {
         name,
@@ -4296,11 +4399,15 @@ fn setup_revisions(
             if let Some(code) = revision_option(repo, revs, operands, &mut i, &mut not, &mut excludes)? {
                 return Ok(Some(code));
             }
-            i += 1;
-            continue;
-        }
-        if let Some(code) = queue_revision_arg(repo, revs, arg, not)? {
+        } else if let Some(code) = queue_revision_arg(repo, revs, arg, not)? {
             return Ok(Some(code));
+        }
+        // `add_reflog_for_walk()`'s `die()` ends the loop on the token that raised it.
+        if let Some(message) = revs.fatal.take() {
+            let mut err = std::io::stderr().lock();
+            writeln!(err, "fatal: {message}")?;
+            err.flush()?;
+            return Ok(Some(ExitCode::from(128)));
         }
         i += 1;
     }
@@ -4323,6 +4430,19 @@ fn setup_revisions(
         err.flush()?;
         return Ok(Some(ExitCode::from(128)));
     }
+    // ```c
+    // if (revs->reflog_info && revs->limited)
+    //         die("cannot combine --walk-reflogs with history-limiting options");
+    // ```
+    // (revision.c:3218-3219.) `prepare_show_merge()` sets `revs->limited` once it
+    // has found its pseudoref (revision.c:2049), and `--ancestry-path` sets it as
+    // it is parsed (:2438-2451).
+    if revs.walk_reflogs && (revs.limited || revs.show_merge || revs.ancestry_path) {
+        let mut err = std::io::stderr().lock();
+        writeln!(err, "fatal: cannot combine --walk-reflogs with history-limiting options")?;
+        err.flush()?;
+        return Ok(Some(ExitCode::from(128)));
+    }
     Ok(None)
 }
 
@@ -4332,6 +4452,27 @@ fn lookup_other_head(repo: &gix::Repository) -> Option<&'static str> {
     ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"]
         .into_iter()
         .find(|name| crate::refstore::state_ref_read(repo, name).ok().flatten().is_some())
+}
+
+/// Whether `handle_revision_opt()` sets `revs->limited` for `arg`, which a blame
+/// only observes through the `--walk-reflogs` refusal at the end of
+/// `setup_revisions()`: `--ancestry-path=<commit>` (revision.c:2443-2451),
+/// `--simplify-merges` and `--simplify-by-decoration` (:2471-2483),
+/// `--left-only`, `--right-only`, `--cherry`, `--cherry-mark` and
+/// `--cherry-pick` (:2518-2547), `--children` (:2748-2750), and the three
+/// orderings that set `revs->topo_order`, which leave it to
+/// `if (revs->topo_order && !generation_numbers_enabled(the_repository))`
+/// (:3195-3196).
+fn sets_limited(repo: &gix::Repository, arg: &str) -> bool {
+    match arg {
+        "--simplify-merges" | "--simplify-by-decoration" | "--left-only" | "--right-only" | "--cherry"
+        | "--cherry-mark" | "--cherry-pick" | "--children" => true,
+        "--topo-order" | "--date-order" | "--author-date-order" => {
+            let graph = repo.commit_graph_if_enabled().ok().flatten();
+            !super::last_modified::generation_numbers_enabled(graph.as_ref())
+        }
+        _ => arg.starts_with("--ancestry-path="),
+    }
 }
 
 /// One `-`-leading operand, routed the way `setup_revisions()` routes it: first
@@ -4349,6 +4490,14 @@ fn revision_option(
 ) -> Result<Option<ExitCode>> {
     let arg = operands[*i].as_str();
     if pseudo_revision_opt(repo, revs, arg, not, excludes)?.is_some() {
+        return Ok(None);
+    }
+    if matches!(arg, "-g" | "--walk-reflogs") {
+        revs.walk_reflogs = true;
+        return Ok(None);
+    }
+    if sets_limited(repo, arg) {
+        revs.limited = true;
         return Ok(None);
     }
     if let Some(code) = rev_option_value_check(repo, arg, operands.get(*i + 1).map(String::as_str))? {
@@ -4514,6 +4663,9 @@ fn resolve_targets(repo: &gix::Repository, opts: &mut Options) -> Result<Targets
         // parse loop has already recorded an occurrence in front of the `--`.
         show_merge: opts.show_merge,
         ancestry_path: opts.ancestry_path,
+        walk_reflogs: opts.walk_reflogs,
+        // `cmd_blame()` hands `--reverse` on as `--children` (builtin/blame.c:1054-1057).
+        limited: opts.limited || opts.reverse,
         ..Revs::default()
     };
     if let Some(code) = setup_revisions(repo, &revs, &mut queued)? {
@@ -4909,6 +5061,11 @@ struct Options {
     show_merge: bool,
     /// `--ancestry-path` seen in front of the `--`, same reasoning.
     ancestry_path: bool,
+    /// `-g`/`--walk-reflogs` seen in front of the `--`: `cmd_blame()`'s parse loop
+    /// hands it to `parse_revision_opt()` before `setup_revisions()` reads any operand.
+    walk_reflogs: bool,
+    /// A history-limiting option seen in front of the `--`, `--reverse` aside.
+    limited: bool,
     /// `--ancestry-path` with nothing for `collect_bottom_commits()` to find, whose
     /// `die()` `prepare_revision_walk()` raises — later than every diagnostic
     /// `resolve_targets` can, which is why it is carried rather than reported there.
@@ -5079,7 +5236,7 @@ enum ShortWord {
     /// Recognised and stored somewhere `cmd_blame()` never reads back.
     Dropped,
     /// `-g`, `--walk-reflogs`' short spelling, which diverts every commit
-    /// operand into the reflog walk (revision.c:306-319); not ported.
+    /// operand into the reflog walk (revision.c:306-319).
     WalkReflogs,
     /// Neither parser knows it; the payload is `ctx->argv[0]` as
     /// `parse_revision_opt()` prints it.
@@ -5357,6 +5514,8 @@ impl Options {
         let mut reverse = false;
         let mut show_merge = false;
         let mut ancestry_path = false;
+        let mut walk_reflogs = false;
+        let mut limited = false;
         let mut show_stats = false;
         let mut score_debug = false;
         let mut long = false;
@@ -5715,6 +5874,12 @@ impl Options {
                 // indistinguishable from one in the revision slot.
                 "--merge" => show_merge = true,
                 "--ancestry-path" => ancestry_path = true,
+                // `init_reflog_walk(&revs->reflog_info)` (revision.c:2459-2460), in
+                // place before `setup_revisions()` reads a single operand.
+                "--walk-reflogs" => walk_reflogs = true,
+                // A history-limiting option sets `revs->limited` here as it would in
+                // the revision slot; nothing else of it reaches a blame.
+                _ if sets_limited(repo, a) => limited = true,
                 // `--follow` is consumed the same way, but the line right after
                 // `cmd_blame()`'s parse loop clears `follow_renames` again
                 // (`builtin/blame.c:1035`), so unlike the two above it has no effect
@@ -5836,7 +6001,7 @@ impl Options {
                 // (revision.c:2768-2780) — see [`revision_short_word`].
                 _ if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 => match revision_short_word(a) {
                     ShortWord::Dropped => {}
-                    ShortWord::WalkReflogs => bail!("unsupported option: {a}"),
+                    ShortWord::WalkReflogs => walk_reflogs = true,
                     ShortWord::Unknown(name) => {
                         let word = original_word_index(original_args, i);
                         let name = if word > pre.len() { "(null)".to_string() } else { name };
@@ -5941,6 +6106,8 @@ impl Options {
             show_merge,
             ancestry_path,
             ancestry_path_pending: false,
+            walk_reflogs,
+            limited,
             show_stats,
             score_debug,
             long,

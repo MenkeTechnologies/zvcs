@@ -2015,6 +2015,93 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Some(refusal) = author_refusal {
         return Ok(refusal.die());
     }
+    // `--author="Name <email>"` overrides the author identity. The author *date*
+    // is unchanged: HEAD's on an amend (git preserves it), the configured author
+    // time (now / GIT_AUTHOR_DATE) on a new commit.
+    //
+    // Resolved here rather than at the write, because `prepare_to_commit()`'s
+    // editor block names the author (builtin/commit.c:998-1004) — git has had it
+    // since `determine_author_info()` ran inside `parse_and_validate_options()`,
+    // long before the template.
+    let author_override: Option<(String, String)> = match &author_arg {
+        Some(a) => Some(parse_author_ident(a)?),
+        None => None,
+    };
+
+    // The effective author identity, computed once as an owned signature so its
+    // parts outlive the write. Precedence for the base: `--reset-author` → config
+    // identity; `-C`/`-c` → the reused commit; `--amend` → HEAD; else config.
+    // `--author` then swaps name/email, `--date` the time. `None` means no
+    // override — the plain `repo.commit()` fast path (config author + canonical
+    // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
+    // Concluding a cherry-pick, revert or rebase pick keeps the *picked* commit's
+    // authorship — git's `author_message = "CHERRY_PICK_HEAD"`, which outranks
+    // `-C`/`-c` and is disarmed only by `--reset-author`.
+    let cherry_author: Option<gix::actor::Signature> =
+        match (whence.is_cherry_pick() || whence.is_rebase()) && !reset_author {
+            true => match read_state_oid(&repo, "CHERRY_PICK_HEAD") {
+                Some(id) => Some(repo.find_commit(id)?.author()?.to_owned()?),
+                None => None,
+            },
+            false => None,
+        };
+    let needs_author = amend
+        || reset_author
+        || author_override.is_some()
+        || date_override.is_some()
+        || reuse_commit.is_some()
+        || cherry_author.is_some();
+    let cfg_author = || -> Result<gix::actor::Signature> {
+        Ok(repo
+            .author()
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
+            .to_owned()?)
+    };
+    let author_owned: Option<gix::actor::Signature> = if needs_author {
+        let mut base = if reset_author {
+            cfg_author()?
+        } else if let Some(a) = &cherry_author {
+            a.clone()
+        } else if let Some(rc) = &reuse_commit {
+            rc.author()?.to_owned()?
+        // `--amend` names `HEAD` as `author_message` only through the
+        // `use_message = "HEAD"` it implies without `--fixup`
+        // (builtin/commit.c:1353-1363); `--amend --fixup=<c>` composes a new author.
+        // `current_head` is read before any hook runs (builtin/commit.c:1812-1816).
+        } else if let (true, Some(hc), None) = (amend, repo.head_commit().ok(), &fixup_arg) {
+            hc.author()?.to_owned()?
+        } else {
+            cfg_author()?
+        };
+        if let Some((name, email)) = &author_override {
+            base.name = name.as_str().into();
+            base.email = email.as_str().into();
+        }
+        if let Some(t) = date_override {
+            base.time = t;
+        }
+        Some(base)
+    } else {
+        None
+    };
+    // ```c
+    // export_one("GIT_AUTHOR_NAME", author.name_begin, author.name_end, 0);
+    // export_one("GIT_AUTHOR_EMAIL", author.mail_begin, author.mail_end, 0);
+    // export_one("GIT_AUTHOR_DATE", author.date_begin, author.tz_end, '@');
+    // ```
+    // (builtin/commit.c:686-688.) `determine_author_info()` `setenv()`s the
+    // ident it settled on, so `pre-commit`, `prepare-commit-msg`, `commit-msg`,
+    // `post-commit` and the editor all see the author the commit records, the
+    // date as `@<seconds> <tz>`. The guard puts the old values back when this
+    // function returns, which is when the `git commit` child stock spawns for
+    // `rebase` and the sequencer would exit.
+    let _author_env = match &author_owned {
+        Some(a) => Some(a.clone()),
+        None => cfg_author().ok(),
+    }
+    .map(|a| ExportedAuthor::export(&a));
+
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
@@ -2342,76 +2429,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         std::fs::write(repo.git_dir().join("COMMIT_EDITMSG"), crate::rawarg::to_bytes(&buf))?;
         return Ok(refusal.die());
     }
-
-    // `--author="Name <email>"` overrides the author identity. The author *date*
-    // is unchanged: HEAD's on an amend (git preserves it), the configured author
-    // time (now / GIT_AUTHOR_DATE) on a new commit.
-    //
-    // Resolved here rather than at the write, because `prepare_to_commit()`'s
-    // editor block names the author (builtin/commit.c:998-1004) — git has had it
-    // since `determine_author_info()` ran inside `parse_and_validate_options()`,
-    // long before the template.
-    let author_override: Option<(String, String)> = match &author_arg {
-        Some(a) => Some(parse_author_ident(a)?),
-        None => None,
-    };
-
-    // The effective author identity, computed once as an owned signature so its
-    // parts outlive the write. Precedence for the base: `--reset-author` → config
-    // identity; `-C`/`-c` → the reused commit; `--amend` → HEAD; else config.
-    // `--author` then swaps name/email, `--date` the time. `None` means no
-    // override — the plain `repo.commit()` fast path (config author + canonical
-    // reflog) runs unchanged, so a bare `git commit` is byte-for-byte as before.
-    // Concluding a cherry-pick, revert or rebase pick keeps the *picked* commit's
-    // authorship — git's `author_message = "CHERRY_PICK_HEAD"`, which outranks
-    // `-C`/`-c` and is disarmed only by `--reset-author`.
-    let cherry_author: Option<gix::actor::Signature> =
-        match (whence.is_cherry_pick() || whence.is_rebase()) && !reset_author {
-            true => match read_state_oid(&repo, "CHERRY_PICK_HEAD") {
-                Some(id) => Some(repo.find_commit(id)?.author()?.to_owned()?),
-                None => None,
-            },
-            false => None,
-        };
-    let needs_author = amend
-        || reset_author
-        || author_override.is_some()
-        || date_override.is_some()
-        || reuse_commit.is_some()
-        || cherry_author.is_some();
-    let cfg_author = || -> Result<gix::actor::Signature> {
-        Ok(repo
-            .author()
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("unable to determine author identity"))?
-            .to_owned()?)
-    };
-    let author_owned: Option<gix::actor::Signature> = if needs_author {
-        let mut base = if reset_author {
-            cfg_author()?
-        } else if let Some(a) = &cherry_author {
-            a.clone()
-        } else if let Some(rc) = &reuse_commit {
-            rc.author()?.to_owned()?
-        // `--amend` names `HEAD` as `author_message` only through the
-        // `use_message = "HEAD"` it implies without `--fixup`
-        // (builtin/commit.c:1353-1363); `--amend --fixup=<c>` composes a new author.
-        } else if let (Some(hc), None) = (&amend_head, &fixup_arg) {
-            hc.author()?.to_owned()?
-        } else {
-            cfg_author()?
-        };
-        if let Some((name, email)) = &author_override {
-            base.name = name.as_str().into();
-            base.email = email.as_str().into();
-        }
-        if let Some(t) = date_override {
-            base.time = t;
-        }
-        Some(base)
-    } else {
-        None
-    };
 
     // The commented help + status block, and the `-v` diff below the cut line, go
     // into the editor buffer only — git gates both on `use_editor && include_status`.
@@ -3078,26 +3095,37 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // first line. A subject written across two lines prints as one. It formats
     // the commit it just wrote, read back (`lookup_commit(r, oid)`, sequencer.c:1427),
     // through a `rev_info` whose `log_output_encoding` defaults to
-    // `get_log_output_encoding()` — so the subject is the
-    // stored bytes (after `ensure_utf8()` transcribed any stray Latin-1),
-    // re-coded from the `encoding` header to `i18n.logOutputEncoding`.
+    // `get_log_output_encoding()`. The format is a user format,
+    // `format:%h] %s` plus the identity lines below, so `format_commit_message()`
+    // expands it against the commit re-coded to UTF-8 and converts the finished
+    // record into the output encoding (pretty.c:2026-2046); `[<branch> ` before it
+    // and the newline after it are printed as they are (sequencer.c:1486-1492).
     let mut stored = repo.find_object(commit_id)?.data.clone();
-    super::log::logmsg_reencode(&mut stored, &crate::revfilter::log_output_encoding(&repo, None));
+    super::log::logmsg_reencode(&mut stored, "UTF-8");
     let body = stored.find(b"\n\n").map_or(&stored[..0], |p| &stored[p + 2..]);
     let subject = folded_subject(&crate::rawarg::from_bytes(body));
-    let mut line = format!("[{branch_label}{root_marker} {short}] ").into_bytes();
-    line.extend_from_slice(&crate::rawarg::to_bytes(&subject));
-    line.push(b'\n');
-    std::io::Write::write_all(&mut std::io::stdout(), &line)?;
+    print!("[{branch_label}{root_marker} ");
+    let mut record = format!("{short}] ").into_bytes();
+    record.extend_from_slice(&crate::rawarg::to_bytes(&subject));
+    record.push(b'\n');
 
     // git prints ` Author:` when the author identity differs from the
     // committer's (as `--author` and `--amend`-preserved authors do), and
     // ` Date:` when the author date differs from the committer date.
+    // `%an <%ae>` and `%cn <%ce>` are expanded first, by their own
+    // `repo_format_commit_message()` calls whose zeroed `pctx` converts them back
+    // into the commit's own encoding (pretty.c:2031-2038), and only then spliced
+    // into the format as literal text: the stored bytes, which the record's own
+    // conversion then reads as UTF-8.
     let written = repo.find_commit(commit_id.detach())?;
     let author = written.author()?;
     let committer = written.committer()?;
     if author.name != committer.name || author.email != committer.email {
-        println!(" Author: {} <{}>", author.name, author.email);
+        record.extend_from_slice(b" Author: ");
+        record.extend_from_slice(author.name);
+        record.extend_from_slice(b" <");
+        record.extend_from_slice(author.email);
+        record.extend_from_slice(b">\n");
     }
     // git's `author_date_is_interesting()` — `author_message || force_date`. The
     // author date is shown whenever it came from somewhere other than the clock:
@@ -3119,13 +3147,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         let dt = a_time
             .format(gix::date::time::format::DEFAULT)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        println!(" Date: {dt}");
+        record.extend_from_slice(format!(" Date: {dt}\n").as_bytes());
     }
     // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
-    print!(
-        "{}",
-        crate::summary_committer_block(&repo, &format!("{} <{}>", committer.name, committer.email))
+    record.extend_from_slice(
+        crate::summary_committer_block(&repo, &format!("{} <{}>", committer.name, committer.email)).as_bytes(),
     );
+    // The record ends where the format does; `log_tree_commit()` adds the newline.
+    record.pop();
+    super::log::user_format_to_output_encoding(&mut record, &crate::revfilter::log_output_encoding(&repo, None));
+    record.push(b'\n');
+    std::io::Write::write_all(&mut std::io::stdout(), &record)?;
 
     // --- short-stat + summary --------------------------------------------
     // `log_tree_diff()` bails out on a commit with more than one parent unless a
@@ -3755,6 +3787,44 @@ struct StagedIndex {
 /// Where the pre-staging index is parked for the duration of a `-a`/`-i` commit.
 /// Beside the index, so putting it back is a rename on the same filesystem.
 const PRESTAGE_INDEX: &str = "index.zvcs-commit-orig";
+
+/// `determine_author_info()`'s three `export_one()` calls (builtin/commit.c:603-611,
+/// :686-688), held for the life of one `commit()` and undone on drop.
+///
+/// Stock's export dies with the `git commit` process; this port also runs `commit()`
+/// inside `rebase`, `merge --continue` and the sequencer, whose later picks must not
+/// inherit one pick's author, so the previous values come back when it returns.
+struct ExportedAuthor {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl ExportedAuthor {
+    fn export(author: &gix::actor::Signature) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let date = format!("@{}", author.time);
+        let values: [(&'static str, &[u8]); 3] = [
+            ("GIT_AUTHOR_NAME", author.name.as_slice()),
+            ("GIT_AUTHOR_EMAIL", author.email.as_slice()),
+            ("GIT_AUTHOR_DATE", date.as_bytes()),
+        ];
+        let saved = values.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in values {
+            std::env::set_var(k, std::ffi::OsStr::from_bytes(v));
+        }
+        ExportedAuthor { saved }
+    }
+}
+
+impl Drop for ExportedAuthor {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
 
 /// `<git-dir>/index.lock` as a `COMMIT_NORMAL` commit's hooks see it.
 ///

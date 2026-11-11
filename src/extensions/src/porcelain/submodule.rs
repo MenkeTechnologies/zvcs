@@ -4238,7 +4238,7 @@ fn is_empty_dir(path: &std::path::Path) -> bool {
 /// the containment check `validate_submodule_git_dir()` runs over the result — is
 /// not ported, and is refused here rather than silently resolved to the plain path
 /// it deliberately replaces.
-fn submodule_name_to_gitdir(repo: &gix::Repository, name: &BStr) -> Result<std::path::PathBuf> {
+pub(super) fn submodule_name_to_gitdir(repo: &gix::Repository, name: &BStr) -> Result<std::path::PathBuf> {
     if repo
         .config_snapshot()
         .boolean("extensions.submodulePathConfig")
@@ -4610,7 +4610,7 @@ fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
 /// `[core "a" b]` as the whole of `.gitmodules`, `git submodule status` exits 0
 /// in a superproject with no gitlink in its index and exits 128 with
 /// `fatal: bad config line 1 in file <abs>/.gitmodules` once one is added.
-fn submodules(repo: &gix::Repository) -> Result<Vec<gix::Submodule<'_>>> {
+pub(super) fn submodules(repo: &gix::Repository) -> Result<Vec<gix::Submodule<'_>>> {
     if !index_holds_a_gitlink(repo) {
         return Ok(Vec::new());
     }
@@ -4661,7 +4661,7 @@ fn find_submodule<'a, 'repo>(
 /// fully checked-out submodule and `--recursive` silently refuses to descend
 /// into it. git matches the path through the index pathspec machinery, which is
 /// what `repo.pathspec` reproduces here (`match_pathspec(..., is_dir = 1)`).
-fn is_submodule_active(
+pub(super) fn is_submodule_active(
     repo: &gix::Repository,
     index: &gix::index::State,
     sub: &gix::Submodule<'_>,

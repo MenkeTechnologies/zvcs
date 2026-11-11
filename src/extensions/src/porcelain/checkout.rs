@@ -323,9 +323,9 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
     // `--recurse-submodules[=<pathspec>]` / `--no-recurse-submodules`. `None` =
-    // fall back to `submodule.recurse` config; `Some(b)` = explicit flag. After a
-    // switch, each initialized submodule's worktree is moved to the gitlink the
-    // superproject now records (git's `submodule_move_head` via the worktree updater).
+    // fall back to `submodule.recurse` config; `Some(b)` = explicit flag. With it on,
+    // the unpack moves every submodule it touches through `submodule_move_head()`
+    // (see [`super::submodule_move`]).
     let mut recurse_submodules: Option<bool> = None;
     // `-U`/`--unified`, `--inter-hunk-context`, `--[no-]auto-advance`: the
     // interactive-hunk-selector options, shared verbatim with `git reset` and
@@ -907,9 +907,8 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // Resolve submodule recursion: explicit flag wins, else `submodule.recurse`.
-    let recurse_submodules = recurse_submodules
-        .unwrap_or_else(|| repo.config_snapshot().boolean("submodule.recurse") == Some(true));
+    // `should_update_submodules()`: the explicit flag wins, else `submodule.recurse`.
+    set_recurse_submodules(super::submodule_move::should_update_submodules(&repo, recurse_submodules));
 
     // `if (opts->source_tree && (opts->merge || opts->writeout_stage))`
     // (builtin/checkout.c): the three-way and stage-picking forms read the
@@ -1119,7 +1118,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
                 .detach();
             let commit = head.attach(&repo).object()?.peel_to_commit()?;
             let code = detached_checkout(&repo, "HEAD", commit, quiet, true, force, merge_opt(merge, &conflict_style, "HEAD"))?;
-            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
         // `git checkout` with neither a ref nor a pathspec is not an error:
@@ -1127,7 +1125,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         // commit, and `update_refs_for_switch()` then does nothing to any ref.
         // Only the worktree reconciliation happens.
         let code = checkout_head_in_place(&repo, quiet, force, merge_opt(merge, &conflict_style, "HEAD"))?;
-        maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
         return Ok(code);
     }
 
@@ -1185,7 +1182,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             }
             let code =
                 switch_to_branch_opts(&repo, spec, quiet, force, None, merge_opt(merge, &conflict_style, spec), true)?;
-            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
         // `git checkout HEAD` (and its `@` spelling) is not a detach: with no
@@ -1194,7 +1190,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         // every ref alone. Only the worktree reconciliation runs.
         if !detach && matches!(spec, "HEAD" | "@") && !is_branch && rev.is_some() {
             let code = checkout_head_in_place(&repo, quiet, force, merge_opt(merge, &conflict_style, "HEAD"))?;
-            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
         // `get_oid_mb()`, not a bare `rev_parse_single()`: a full-length hex name
@@ -1224,7 +1219,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             };
             let code =
                 detached_checkout(&repo, spec, commit, quiet, detach, force, merge_opt(merge, &conflict_style, spec))?;
-            maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
         }
         // DWIM (`--guess`, default on via `checkout.guess`): a bare name that is
@@ -1255,7 +1249,6 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
                         super::switch::resolve_track(&repo, None, false),
                         true, force, merge_opt(merge, &conflict_style, spec), new_branch_log,
                     )?;
-                    maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                     return Ok(code);
                 }
                 Dwim::Many { remotes } => {
@@ -1438,75 +1431,6 @@ pub(super) fn classify_tree_ish(repo: &gix::Repository, id: ObjectId) -> Result<
         Ok(tree) => Ok(TreeIsh::Tree(tree.id)),
         Err(_) => crate::git_fatal!("unable to read tree ({id})"),
     }
-}
-
-/// After a switch that changed `HEAD`, move each active, initialized submodule's
-/// worktree to the commit the superproject now records for it — git's
-/// `--recurse-submodules` worktree updater (`submodule_move_head` in submodule.c).
-///
-/// Implemented by re-executing this binary's own `checkout <gitlink>` inside each
-/// submodule, so the move stays faithful (dirty-worktree refusal, nested
-/// recursion) without duplicating checkout logic. Uninitialized submodules (no
-/// repo of their own) are skipped, exactly like git.
-pub(super) fn maybe_recurse_submodules(
-    repo: &gix::Repository,
-    recurse: bool,
-    quiet: bool,
-) -> Result<()> {
-    if !recurse {
-        return Ok(());
-    }
-    // Re-open the repository so the index reflects the checkout that just ran: the
-    // `repo` handed in was opened before the worktree/index update and its cached
-    // index snapshot still records the OLD submodule gitlinks, which would make
-    // `index_id()` match `head_id()` and skip every move.
-    let repo = gix::open(repo.git_dir())?;
-    let Some(subs) = repo.submodules()? else {
-        return Ok(());
-    };
-    let Some(workdir) = repo.workdir() else {
-        return Ok(());
-    };
-    let exe = crate::hosted::git_exe()?;
-    for sm in subs {
-        if !sm.is_active().unwrap_or(false) {
-            continue;
-        }
-        // The gitlink the just-checked-out superproject index records for this path
-        // (both `index_id` and gix's `head_id` are the *superproject's* view — they
-        // match after a checkout, so they can't tell us whether the submodule needs
-        // moving; the submodule's actual worktree HEAD is what to compare against).
-        let Ok(Some(target)) = sm.index_id() else {
-            continue;
-        };
-        // Only recurse into an initialized submodule (one with its own repo).
-        let Some(sub_repo) = sm.open().ok().flatten() else {
-            continue;
-        };
-        // The submodule's ACTUAL checked-out commit. Already at the recorded gitlink
-        // → nothing to move.
-        let actual = sub_repo.head_id().ok().map(|id| id.detach());
-        if actual == Some(target) {
-            continue;
-        }
-        let Ok(rel) = sm.path() else {
-            continue;
-        };
-        let sub_path = workdir.join(gix::path::from_bstr(rel.as_bstr()));
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("-C")
-            .arg(&sub_path)
-            .arg("checkout")
-            .arg("--recurse-submodules");
-        if quiet {
-            cmd.arg("-q");
-        }
-        cmd.arg(target.to_string());
-        // `start_command()`'s `fflush(NULL)` (run-command.c:743).
-        crate::cstdio::before_spawn();
-        let _ = cmd.status();
-    }
-    Ok(())
 }
 
 /// git's "nothing to do" ref case: `new_branch_info->name` is "HEAD" and there is
@@ -3652,7 +3576,15 @@ pub(super) fn switch_gate(
     let index = crate::held_index::peek_or_read(repo)?;
     // `topts->initial_checkout = is_index_unborn(the_repository->index)` (builtin/checkout.c:829).
     let initial_checkout = index.entries().is_empty() && index.timestamp().unix_seconds() == 0;
-    let clobber = crate::merge_guard::verify_two_way_initial(repo, cur_tree, target_tree, &index, initial_checkout)?;
+    let subs = submodule_recursion(repo)?;
+    let clobber = crate::merge_guard::verify_two_way_recursing(
+        repo,
+        cur_tree,
+        target_tree,
+        &index,
+        initial_checkout,
+        subs.as_ref(),
+    )?;
     if clobber.is_empty() {
         return Ok(Gate::Clean);
     }
@@ -3973,6 +3905,23 @@ pub(super) fn set_force(on: bool) {
     FORCE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `should_update_submodules()` (submodule.c:745-748) for this `checkout`/`switch`:
+/// `--[no-]recurse-submodules`, else `submodule.recurse`. Every other caller of the
+/// unpack paths below — `rebase` checking out its branch — leaves it off.
+static RECURSE_SUBMODULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record this `checkout`/`switch` invocation's `should_update_submodules()`.
+pub(super) fn set_recurse_submodules(on: bool) {
+    RECURSE_SUBMODULES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `submodule_from_ce()`'s view for an unpack this invocation runs: `None` unless
+/// it recurses into submodules.
+fn submodule_recursion(repo: &gix::Repository) -> Result<Option<super::submodule_move::Recursion>> {
+    let on = RECURSE_SUBMODULES.load(std::sync::atomic::Ordering::Relaxed);
+    super::submodule_move::Recursion::new(repo, on, None)
+}
+
 /// `verify_absent(merge, ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN, o)` for
 /// `merged_entry()` under `UNPACK_RESET_PROTECT_UNTRACKED` (unpack-trees.c:2479-2535), the
 /// entry `path` of `mode` being one `old` does not hold: what stands in its way, as
@@ -4196,10 +4145,21 @@ pub(super) fn update_worktree_to_tree(
         }
         None => None,
     };
+    // `submodule_from_ce()` under `--recurse-submodules`: `merged_entry()`'s gitlinks
+    // are moved by `checkout_entry()` and `deleted_entry()`'s by `unlink_entry()`, through
+    // `submodule_move_head()`. What stands at each gitlink is read before anything moves.
+    let mut subs = submodule_recursion(repo)?;
+    let gitlinks = match &subs {
+        Some(subs) => {
+            let backing = subset.path_backing();
+            subs.gitlinks(&subset, subset.entries().iter().map(|e| e.path_in(backing)))
+        }
+        None => Vec::new(),
+    };
     let updating = unpack_progress(touched.len())?;
     for path in &remove {
         updating.tick();
-        unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
+        unlink_entry_recursing(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode), subs.as_ref())?;
     }
     // `check_updates()` sets `state.istate = index` — `&o->result`, the index the
     // two-way merge just produced (unpack-trees.c:399), not the paths it is about to
@@ -4234,7 +4194,14 @@ pub(super) fn update_worktree_to_tree(
             written
         }
     };
+    if subs.is_some() {
+        written.remove_entries(|_, _, e| e.mode == Mode::COMMIT);
+    }
     checkout_subset(repo, &mut written, &result_attrs, &should_interrupt, &updating)?;
+    if let Some(subs) = subs.as_mut() {
+        let wrote_gitmodules = written.entry_by_path(".gitmodules".into()).is_some();
+        subs.checkout_gitlinks(&gitlinks, wrote_gitmodules)?;
+    }
     updating.stop();
 
     let untracked_before = super::write_tree::untracked_entry_states(&old);
@@ -4352,6 +4319,16 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         eprintln!("error: Entry '{path}' not uptodate. Cannot merge.");
         return Err(anyhow::Error::new(crate::fatal::Silent(128)));
     }
+    // `merged_entry()`'s forced dry run of each submodule the tree moves, with the
+    // same plumbing report and 128 (unpack-trees.c:315-333, :2592-2627).
+    let mut subs = submodule_recursion(repo)?;
+    if let Some(subs) = &subs {
+        let protect = !FORCE.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(path) = subs.oneway_reset_refusal(&old, &new_index, protect)? {
+            eprintln!("error: Submodule '{path}' cannot checkout new HEAD.");
+            return Err(anyhow::Error::new(crate::fatal::Silent(128)));
+        }
+    }
     // `reset_tree()` installs no porcelain messages, and `-f` is `UNPACK_RESET_OVERWRITE_UNTRACKED`
     // with `preserve_ignored` clear (builtin/checkout.c:763-767).
     let sparse = crate::unpack_sparse::SparseCheckout::begin(
@@ -4462,6 +4439,19 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         }
         None => None,
     };
+    // Under `--recurse-submodules` every gitlink of the result is `CE_UPDATE`: a kept one
+    // because `verify_uptodate()` passes it under `o->reset` (unpack-trees.c:3045-3047),
+    // a moved one as `merged_entry()` leaves it. `checkout_entry()` then moves each
+    // submodule, forced, onto its commit (entry.c:517-535).
+    let gitlinks = match &subs {
+        Some(subs) => {
+            let backing = new_index.path_backing();
+            let gitlinks = subs.gitlinks(&new_index, new_index.entries().iter().map(|e| e.path_in(backing)));
+            subset.remove_entries(|_, _, e| e.mode == Mode::COMMIT);
+            gitlinks
+        }
+        None => Vec::new(),
+    };
     let updating = match &sparse_result {
         Some((_, remove)) => unpack_progress(subset.entries().len() + remove.len())?,
         None => unpack_progress(subset.entries().len() + dropped)?,
@@ -4470,7 +4460,8 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         Some((_, remove)) => {
             for path in remove {
                 updating.tick();
-                unlink_entry(repo, path.as_bstr(), old.entry_by_path(path.as_bstr()).map(|e| e.mode));
+                let mode = old.entry_by_path(path.as_bstr()).map(|e| e.mode);
+                unlink_entry_recursing(repo, path.as_bstr(), mode, subs.as_ref())?;
             }
         }
         None => {
@@ -4479,7 +4470,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
                 let path = e.path_in(backing);
                 if !new_paths.contains(&path.to_owned()) {
                     updating.tick();
-                    unlink_entry(repo, path, Some(e.mode));
+                    unlink_entry_recursing(repo, path, Some(e.mode), subs.as_ref())?;
                 }
             }
         }
@@ -4501,6 +4492,10 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     // `oneway_merge()` builds `o->result` out of the tree alone, so the index
     // `check_updates()` reads attributes from is the new tree's (unpack-trees.c:399).
     checkout_subset(repo, &mut subset, &new_index, &should_interrupt, &updating)?;
+    if let Some(subs) = subs.as_mut() {
+        let wrote_gitmodules = subset.entry_by_path(".gitmodules".into()).is_some();
+        subs.checkout_gitlinks(&gitlinks, wrote_gitmodules)?;
+    }
     updating.stop();
 
     // "Take the stat information from stage0, take the data from stage1": an entry
@@ -4673,9 +4668,25 @@ pub(super) fn checkout_interleaved(
 /// `schedule_dir_for_removal()`. A submodule directory that still holds its checkout is
 /// therefore `warning: unable to rmdir '<path>': Directory not empty` and stays.
 pub(super) fn unlink_entry(repo: &gix::Repository, path: &BStr, mode: Option<Mode>) {
+    let _ = unlink_entry_recursing(repo, path, mode, None);
+}
+
+/// [`unlink_entry`] whole (entry.c:594-607): under `--recurse-submodules` a gitlink
+/// naming a submodule is first moved to nothing,
+/// `submodule_move_head(ce->name, super_prefix, "HEAD", NULL, SUBMODULE_MOVE_HEAD_FORCE)`,
+/// which empties the directory the `rmdir` then takes.
+pub(super) fn unlink_entry_recursing(
+    repo: &gix::Repository,
+    path: &BStr,
+    mode: Option<Mode>,
+    subs: Option<&super::submodule_move::Recursion>,
+) -> Result<()> {
     let Some(full) = repo.workdir_path(path) else {
-        return;
+        return Ok(());
     };
+    if let (Some(subs), Some(Mode::COMMIT)) = (subs, mode) {
+        subs.unlink_entry(path)?;
+    }
     let (op, removed) = if mode == Some(Mode::COMMIT) {
         ("rmdir", std::fs::remove_dir(&full))
     } else {
@@ -4684,12 +4695,13 @@ pub(super) fn unlink_entry(repo: &gix::Repository, path: &BStr, mode: Option<Mod
     if let Err(err) = removed {
         if err.kind() != std::io::ErrorKind::NotFound {
             eprintln!("warning: unable to {op} '{path}': {}", crate::external::strerror(&err));
-            return;
+            return Ok(());
         }
     }
     if let Some(workdir) = repo.workdir() {
         crate::worktree::prune_empty_dirs(workdir, &full);
     }
+    Ok(())
 }
 
 /// Set `HEAD` to point symbolically at `branch` (attached), logging the move.

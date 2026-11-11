@@ -1277,7 +1277,7 @@ fn submodules_absorb_gitdir_if_needed(
 /// --recursive "test -f .git"` child run in the submodule under
 /// `prepare_submodule_repo_env()`, with no stdin, stdout or stderr, so that a nested
 /// submodule with a `.git` directory makes the answer no.
-fn submodule_uses_gitfile(dir: &std::path::Path, path: &str) -> Result<bool> {
+pub(super) fn submodule_uses_gitfile(dir: &std::path::Path, path: &str) -> Result<bool> {
     use crate::porcelain::rev_parse::{gitfile_error_message, read_gitfile_gently};
     let shown = format!("{path}/.git");
     match read_gitfile_gently(&dir.join(".git")) {

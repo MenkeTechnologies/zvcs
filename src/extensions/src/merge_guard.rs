@@ -53,6 +53,10 @@ pub struct Clobber {
     /// `ERROR_WOULD_LOSE_UNTRACKED_REMOVED` — `verify_absent()` for a path the
     /// new tree drops that the index no longer carries either.
     pub untracked_removed: Vec<BString>,
+    /// `ERROR_WOULD_LOSE_SUBMODULE` — `check_submodule_move_head()`: under
+    /// `--recurse-submodules`, the dry-run move of a submodule the checkout
+    /// touches was refused.
+    pub lost_submodule: Vec<BString>,
 }
 
 impl Clobber {
@@ -63,6 +67,7 @@ impl Clobber {
             && self.not_uptodate_dir.is_empty()
             && self.untracked_overwritten.is_empty()
             && self.untracked_removed.is_empty()
+            && self.lost_submodule.is_empty()
     }
 
     /// `display_error_msgs()`: one `error:` block per non-empty bucket in enum
@@ -126,6 +131,16 @@ impl Clobber {
             &format!("The following untracked working tree files would be removed by {cmd}:"),
             &move_advice,
         );
+        // `msgs[ERROR_WOULD_LOSE_SUBMODULE] = _("Cannot update submodule:\n%s")`
+        // (unpack-trees.c:194-195): no advice, so `error()`'s newline after the
+        // path list is the blank line.
+        if !self.lost_submodule.is_empty() {
+            eprintln!("error: Cannot update submodule:");
+            for path in &self.lost_submodule {
+                eprintln!("\t{}", quote_path(path));
+            }
+            eprintln!();
+        }
         if !self.is_empty() {
             eprintln!("Aborting");
         }
@@ -157,6 +172,7 @@ impl Clobber {
         block(&self.untracked_removed, |p| {
             format!("Untracked working tree file '{p}' would be removed by merge.")
         });
+        block(&self.lost_submodule, |p| format!("Submodule '{p}' cannot checkout new HEAD."));
     }
 }
 
@@ -245,6 +261,24 @@ pub fn verify_two_way_initial(
     new_tree: ObjectId,
     index: &gix::index::State,
     initial_checkout: bool,
+) -> Result<Clobber> {
+    verify_two_way_recursing(repo, old_tree, new_tree, index, initial_checkout, None)
+}
+
+/// [`verify_two_way_initial`] under `--recurse-submodules`: `subs` is
+/// `submodule_from_ce()`, and a gitlink naming a submodule is checked by dry-running
+/// its move (`check_submodule_move_head()`, unpack-trees.c:315-333) where a file
+/// would be checked by its stat data — in `verify_uptodate_1()` (:2244-2253),
+/// `verify_absent_1()` (:2510-2531) and `merged_entry()` itself (:2592-2598,
+/// :2621-2627). A gitlink is never `ce_uptodate()`: `refresh_cache_ent()` does
+/// not mark one (read-cache.c:1425-1428), so every touched submodule is asked.
+pub(crate) fn verify_two_way_recursing(
+    repo: &gix::Repository,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+    index: &gix::index::State,
+    initial_checkout: bool,
+    subs: Option<&crate::porcelain::submodule_move::Recursion>,
 ) -> Result<Clobber> {
     let old = flatten(repo, old_tree)?;
     let new = flatten(repo, new_tree)?;
@@ -370,11 +404,104 @@ pub fn verify_two_way_initial(
     // `unpack_callback()` stops at a name whose non-directory entry is
     // rejected, so the subtree under it is never traversed.
     let mut rejected: Vec<&BString> = Vec::new();
+    // The submodule `submodule_from_ce()` finds for an entry of `mode` at `path`.
+    let submodule = |path: &BString, mode: Mode| subs.filter(|s| mode == Mode::COMMIT && s.is_submodule(path.as_bstr()));
+    let present = |path: &BString| {
+        repo.workdir_path(path.as_bstr())
+            .is_some_and(|full| full.symlink_metadata().is_ok())
+    };
     for (path, check) in checks {
         let under_rejected = rejected
             .iter()
             .any(|r| path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/');
         if under_rejected {
+            continue;
+        }
+        let hex = |id: ObjectId| id.to_string();
+        // `verify_uptodate()` on the index entry at `path`, when it names a submodule
+        // that is there: the dry-run move from `HEAD` to it, refused as
+        // `ERROR_WOULD_LOSE_SUBMODULE` and then as `ERROR_NOT_UPTODATE_FILE`.
+        let submodule_uptodate = |clobber: &mut Clobber| -> Result<Option<bool>> {
+            let (id, mode) = cur[path];
+            let Some(subs) = submodule(path, mode).filter(|_| present(path)) else {
+                return Ok(None);
+            };
+            if subs.check_move_head(path.as_bstr(), Some("HEAD"), Some(&hex(id)), false)? {
+                clobber.lost_submodule.push(path.clone());
+                clobber.not_uptodate.push(path.clone());
+                return Ok(Some(false));
+            }
+            Ok(Some(true))
+        };
+        // `merged_entry()`'s own check of the new entry, from the entry it replaces.
+        let merged_submodule = |clobber: &mut Clobber, from: Option<ObjectId>| -> Result<bool> {
+            let Some((id, mode)) = new.get(path).copied() else { return Ok(true) };
+            let Some(subs) = submodule(path, mode).filter(|s| s.exists(path.as_bstr())) else {
+                return Ok(true);
+            };
+            if subs.check_move_head(path.as_bstr(), from.map(hex).as_deref(), Some(&hex(id)), false)? {
+                clobber.lost_submodule.push(path.clone());
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        // `verify_absent_1()`'s submodule arm for the entry `ce` names.
+        let absent_submodule = |clobber: &mut Clobber, ce: Option<(ObjectId, Mode)>| -> Result<Option<bool>> {
+            let Some((id, mode)) = ce else { return Ok(None) };
+            let Some(subs) = submodule(path, mode).filter(|_| present(path)) else {
+                return Ok(None);
+            };
+            if subs.check_move_head(path.as_bstr(), Some(&hex(id)), None, false)? {
+                clobber.lost_submodule.push(path.clone());
+                return Ok(Some(false));
+            }
+            Ok(Some(true))
+        };
+        let special: Option<bool> = match &check {
+            Check::Uptodate => {
+                let replaces_sub = submodule(path, cur[path].1).is_some();
+                let enters_sub = new.get(path).is_some_and(|(_, mode)| submodule(path, *mode).is_some());
+                match replaces_sub || enters_sub {
+                    false => None,
+                    true => {
+                        let ok = match submodule_uptodate(&mut clobber)? {
+                            Some(ok) => ok,
+                            None => {
+                                let ok = uptodate(path, cur[path].1);
+                                if !ok {
+                                    clobber.not_uptodate.push(path.clone());
+                                }
+                                ok
+                            }
+                        };
+                        Some(ok && merged_submodule(&mut clobber, Some(cur[path].0))?)
+                    }
+                }
+            }
+            // `deleted_entry()`: `verify_absent_if_directory()`, then `verify_uptodate()`.
+            Check::Deleted(mode) if submodule(path, *mode).is_some() && present(path) => {
+                match absent_submodule(&mut clobber, old.get(path).copied())? {
+                    Some(false) => Some(false),
+                    _ => Some(submodule_uptodate(&mut clobber)?.unwrap_or(true)),
+                }
+            }
+            // `verify_absent()`, then for a new entry `merged_entry()`'s own check.
+            Check::Absent(mode, error) if submodule(path, *mode).is_some() && present(path) => {
+                let ce = match error {
+                    AbsentError::Overwritten => new.get(path).copied(),
+                    AbsentError::Removed => old.get(path).copied(),
+                };
+                match absent_submodule(&mut clobber, ce)? {
+                    Some(false) => Some(false),
+                    _ => Some(!matches!(error, AbsentError::Overwritten) || merged_submodule(&mut clobber, None)?),
+                }
+            }
+            _ => None,
+        };
+        if let Some(ok) = special {
+            if !ok {
+                rejected.push(path);
+            }
             continue;
         }
         let ok = match check {

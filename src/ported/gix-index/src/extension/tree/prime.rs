@@ -86,7 +86,14 @@ fn prime_one(
 ) -> Result<u32, Error> {
     it.id = id.to_owned();
     let mut buf = Vec::new();
-    let entries: TreeRefIter<'_> = objects.find_tree_iter(id, &mut buf)?;
+    // `parse_tree()` finds the empty tree whether or not the odb holds it
+    // (`find_cached_object()`, odb/source-inmemory.c:16-35), which is what lets `submodule_move_head()` run
+    // `read-tree -u --reset <empty tree>` in a submodule that never wrote one.
+    let entries: TreeRefIter<'_> = if id.to_owned() == ObjectId::empty_tree(id.kind()) {
+        TreeRefIter::from_bytes(&[], id.kind())
+    } else {
+        objects.find_tree_iter(id, &mut buf)?
+    };
 
     let base_path_len = tree_path.len();
     let mut count = 0_u32;

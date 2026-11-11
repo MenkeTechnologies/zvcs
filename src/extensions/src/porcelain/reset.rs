@@ -79,9 +79,10 @@
 //! parse, and `submodule.recurse` supplies the default when neither the flag nor
 //! its `--no-` form is given. It rides only on the worktree-updating modes —
 //! `--hard`, `--merge`, `--keep` — because git routes it through
-//! `unpack_trees()`, which `--soft`/`--mixed` never run. Each active, initialized
-//! submodule whose worktree HEAD differs from the gitlink the reset just recorded
-//! is moved to it (the shared [`super::checkout::maybe_recurse_submodules`]).
+//! `unpack_trees()`, which `--soft`/`--mixed` never run. There every submodule the
+//! unpack touches goes through `submodule_move_head()` ([`super::submodule_move`]):
+//! `--hard` force-resets each one onto its gitlink, moved or not, and `--merge`/`--keep`
+//! dry-run each move first and refuse one that would lose changes.
 //!
 //! ## The interactive-hunk options
 //!
@@ -1026,7 +1027,6 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             head_moved = move_head_reporting(&repo, commit.id, reflog_spec)?;
         }
         remove_branch_state(&repo, false)?;
-        super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
         // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
         // silence even though they touch the worktree.
@@ -1059,6 +1059,22 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
             return Ok(ExitCode::from(128));
         }
+        // ...and so does `merged_entry()`'s forced dry run of every submodule the
+        // reset moves (unpack-trees.c:315-333, :2592-2627), under `--recurse-submodules`.
+        if let Some(subs) = super::submodule_move::Recursion::new(&repo, recurse_submodules, None)? {
+            if let Some(path) = subs.oneway_reset_refusal(&old_index, &target, false)? {
+                eprintln!("error: Submodule '{path}' cannot checkout new HEAD.");
+                eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+    // `reset_index()` and the index write come before `reset_refs()`
+    // (builtin/reset.c:520-536): a `die()` in `check_updates()` — a submodule
+    // `submodule_move_head()` cannot move — leaves `HEAD` where it was.
+    if mode == ResetMode::Hard {
+        let should_interrupt = AtomicBool::new(false);
+        reset_worktree_hard(&repo, &old_index, target_tree, recurse_submodules, &should_interrupt)?;
     }
     let mut head_moved = true;
     if let Some(commit) = &head_commit {
@@ -1076,12 +1092,6 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             finish_mixed(&repo, &old_index, &mut index, quiet, refresh, false)?;
         }
         ResetMode::Hard => {
-            let should_interrupt = AtomicBool::new(false);
-            reset_worktree_hard(&repo, &old_index, target_tree, recurse_submodules, &should_interrupt)?;
-            // `--recurse-submodules` only reaches the worktree-updating modes: git
-            // routes it through `unpack_trees()`, which `--soft`/`--mixed` never run.
-            // The move itself is silent in git, hence the unconditional quiet flag.
-            super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
             // `print_new_head_line()` sits inside the same `!unborn` guard as
             // `reset_refs()`, so an unborn `--hard` empties the worktree silently.
             if !quiet && head_moved {
@@ -1611,21 +1621,6 @@ pub(super) fn carry_stat_of_unchanged(old: &gix::index::File, new_index: &mut gi
     }
 }
 
-/// The paths `is_submodule_active()` (submodule.c) says yes to, each mapped to
-/// the submodule name `submodule_unset_core_worktree()` locates its gitdir by, read from
-/// `.gitmodules` plus `submodule.<name>.url` / `submodule.active`.
-///
-/// Empty when the repository has no `.gitmodules` at all, which is the common
-/// case and costs one failed open.
-fn active_submodule_paths(repo: &gix::Repository) -> HashMap<BString, BString> {
-    let Ok(Some(subs)) = repo.submodules() else {
-        return HashMap::new();
-    };
-    subs.filter(|sm| sm.is_active().unwrap_or(false))
-        .filter_map(|sm| sm.path().ok().map(|p| (p, sm.name().to_owned())))
-        .collect()
-}
-
 /// `unlink_entry()` (entry.c:224-236):
 ///
 /// ```c
@@ -1645,12 +1640,13 @@ fn active_submodule_paths(repo: &gix::Repository) -> HashMap<BString, BString> {
 /// }
 /// ```
 ///
-/// `submodule_from_ce()` (unpack-trees.c) is NULL unless the entry is a gitlink
+/// `submodule_from_ce()` (submodule.c:750-758) is NULL unless the entry is a gitlink
 /// *and* `should_update_submodules()` — i.e. `--recurse-submodules` /
-/// `submodule.recurse` — which is exactly why a plain `git reset --hard` across a
-/// submodule-adding commit leaves `sub/` behind with a
+/// `submodule.recurse`, which is when `subs` is given — which is exactly why a plain
+/// `git reset --hard` across a submodule-adding commit leaves `sub/` behind with a
 /// `warning: unable to rmdir 'sub': Directory not empty`, while the recursing
-/// spelling takes the whole directory.
+/// spelling moves the submodule to nothing first (`submodule_move_head()`,
+/// [`super::submodule_move`]) and the whole directory goes.
 ///
 /// The `check_leading_path()` early return is expressed here as "warn only if the
 /// path is still there": both guard the same thing — not complaining about a path
@@ -1661,15 +1657,14 @@ fn unlink_entry(
     workdir: &std::path::Path,
     path: &BStr,
     mode: Option<Mode>,
-    recurse_submodules: bool,
-    active_submodules: &HashMap<BString, BString>,
-) {
+    subs: Option<&super::submodule_move::Recursion>,
+) -> Result<()> {
     let Some(full) = repo.workdir_path(path) else {
-        return;
+        return Ok(());
     };
     if mode == Some(Mode::COMMIT) {
-        if let Some(name) = active_submodules.get(&path.to_owned()).filter(|_| recurse_submodules) {
-            submodule_move_head_to_nothing(repo, workdir, path, name.as_ref(), &full);
+        if let Some(subs) = subs {
+            subs.unlink_entry(path)?;
         }
         // `remove_or_warn()` (entry.c:200-203) sends a gitlink to `rmdir_or_warn()`.
         if let Err(err) = std::fs::remove_dir(&full) {
@@ -1678,7 +1673,7 @@ fn unlink_entry(
                     "warning: unable to rmdir '{path}': {}",
                     crate::external::strerror(&err)
                 );
-                return;
+                return Ok(());
             }
         }
     } else {
@@ -1687,108 +1682,7 @@ fn unlink_entry(
     // `unlink_entry()`'s `schedule_dir_for_removal()`: the directory whose last
     // file just went goes with it.
     crate::worktree::prune_empty_dirs(workdir, &full);
-}
-
-/// `submodule_move_head(path, "HEAD", NULL, SUBMODULE_MOVE_HEAD_FORCE)`
-/// (submodule.c:2108-2229) — the "the superproject no longer has this submodule"
-/// direction, which is the only one `unlink_entry()` asks for:
-///
-/// ```c
-/// if (old_head) {
-///         if (!submodule_uses_gitfile(path))
-///                 absorb_git_dir_into_superproject(path);
-/// }
-/// …
-/// strvec_pushl(&cp.args, "read-tree", "--recurse-submodules", NULL);
-/// strvec_push(&cp.args, "-u");
-/// strvec_push(&cp.args, "--reset");
-/// strvec_push(&cp.args, new_head ? new_head : empty_tree_oid_hex());
-/// …
-/// } else {
-///         strbuf_addf(&sb, "%s/.git", path);
-///         unlink_or_warn(sb.buf);
-///         if (is_empty_dir(path))
-///                 rmdir_or_warn(path);
-///         submodule_unset_core_worktree(sub);
-/// }
-/// ```
-///
-/// The `read-tree -u --reset <empty tree>` child is done in-process here: an
-/// empty target tree is "remove every tracked path and leave an empty index",
-/// and the empty tree object is not in the submodule's own object database, so
-/// spawning the child answers
-/// `An object with id 4b825dc… could not be found`. Untracked files in the
-/// submodule survive it — as they do under git — which is what leaves the
-/// directory behind, and the `rmdir` warning with it.
-fn submodule_move_head_to_nothing(
-    repo: &gix::Repository,
-    workdir: &std::path::Path,
-    rela: &BStr,
-    name: &BStr,
-    full: &std::path::Path,
-) {
-    if !full.is_dir() {
-        return;
-    }
-    // `if (!submodule_uses_gitfile(path)) absorb_git_dir_into_superproject(path)`:
-    // a submodule that still keeps its own `.git` *directory* has its history
-    // moved under the superproject's `.git/modules/` first, so removing the work
-    // tree cannot destroy it. `git submodule absorbgitdirs` is that function's
-    // own entry point, and prints the `Migrating git directory of …` lines.
-    if full.join(".git").is_dir() {
-        if let Ok(exe) = crate::hosted::git_exe() {
-            crate::cstdio::before_spawn();
-            let _ = std::process::Command::new(&exe)
-                .arg("-C")
-                .arg(workdir)
-                .args(["submodule", "absorbgitdirs", "--"])
-                .arg(gix::path::from_bstr(rela).as_ref())
-                .status();
-        }
-    }
-
-    if let Ok(sub) = gix::open(full) {
-        if let Ok(snapshot) = sub.index_or_empty() {
-            let mut emptied = (*snapshot).clone();
-            let backing = emptied.path_backing().to_vec();
-            for entry in emptied.entries() {
-                if let Some(path) = sub.workdir_path(entry.path_in(&backing)) {
-                    let _ = std::fs::remove_file(&path);
-                    crate::worktree::prune_empty_dirs(full, &path);
-                }
-            }
-            emptied.remove_entries(|_, _, _| true);
-            // `unpack_trees()` ends in
-            // `prime_cache_tree(the_repository, &o->internal.result, ...)`, so the
-            // index the child leaves behind carries a cache-tree for the tree it
-            // read — here the empty tree, with no entries and no children.
-            // `prime_cache_tree()` cannot build it: it reads the tree object, and
-            // the empty tree is not in the submodule's object database (which is
-            // also why stock's own `fsck --strict` on the finished submodule
-            // reports `missing tree 4b825dc…`). Leaving the old cache-tree in
-            // place made the written index say `<root>=1/0:<old tree>` where
-            // stock says `<root>=0/0:4b825dc…`.
-            emptied.set_tree(Some(gix::index::extension::Tree {
-                name: Default::default(),
-                id: sub.object_hash().empty_tree(),
-                num_entries: Some(0),
-                children: Vec::new(),
-            }));
-            let _ = crate::index_racy::write(&sub, &mut emptied);
-        }
-    }
-
-    let _ = std::fs::remove_file(full.join(".git"));
-    if std::fs::read_dir(full).is_ok_and(|mut d| d.next().is_none()) {
-        let _ = std::fs::remove_dir(full);
-    }
-    // `submodule_unset_core_worktree(sub)` (submodule.c:2059-2074): the absorbed
-    // gitdir still records a `core.worktree` pointing at the directory that has
-    // just gone. git edits `<gitdir>/config` in-process through
-    // `repo_config_set_in_file_gently()`; a `git --git-dir=<gitdir> config
-    // --unset` child instead sets up that gitdir first, chases the vanished
-    // `core.worktree`, and dies `cannot chdir` before unsetting anything.
-    crate::porcelain::submodule::unset_core_worktree(repo, name, &rela.to_string());
+    Ok(())
 }
 
 /// `--hard`: overwrite the worktree and index from `tree`, discarding local changes
@@ -1807,7 +1701,7 @@ fn reset_worktree_hard(
         .to_owned();
     // Read before the checkout below: `is_submodule_active()` consults
     // `.gitmodules`, and a reset that drops the submodule drops that file too.
-    let active_submodules = active_submodule_paths(repo);
+    let mut subs = super::submodule_move::Recursion::new(repo, recurse_submodules, None)?;
 
     // The full target index; checking it out overwrites every tracked file whose content
     // the reset changes (thus discarding worktree modifications) and back-fills fresh
@@ -1945,6 +1839,19 @@ fn reset_worktree_hard(
         None => None,
     };
 
+    // Under `--recurse-submodules` every gitlink of the result is `CE_UPDATE`: a kept one
+    // because `verify_uptodate()` passes it under `o->reset` (unpack-trees.c:3045-3047),
+    // a moved one as `merged_entry()` leaves it, and `checkout_entry()` moves each
+    // submodule, forced, onto its commit (entry.c:517-535). What stands at each is read
+    // before anything is removed.
+    let gitlinks = match &subs {
+        Some(subs) => {
+            let backing = new_index.path_backing();
+            subs.gitlinks(&new_index, new_index.entries().iter().map(|e| e.path_in(backing)))
+        }
+        None => Vec::new(),
+    };
+
     // Remove files tracked before the reset but absent from the target tree —
     // first, as `check_updates()` (unpack-trees.c:455-469) unlinks every
     // `CE_WT_REMOVE` entry before it checks a single `CE_UPDATE` one out. On a
@@ -1958,9 +1865,8 @@ fn reset_worktree_hard(
                     &workdir,
                     path.as_ref(),
                     old.entry_by_path(path.as_ref()).map(|e| e.mode),
-                    recurse_submodules,
-                    &active_submodules,
-                );
+                    subs.as_ref(),
+                )?;
             }
         }
         None => {
@@ -1973,9 +1879,8 @@ fn reset_worktree_hard(
                         &workdir,
                         path,
                         Some(e.mode),
-                        recurse_submodules,
-                        &active_submodules,
-                    );
+                        subs.as_ref(),
+                    )?;
                 }
             }
         }
@@ -1994,10 +1899,10 @@ fn reset_worktree_hard(
             .filter(|(_, e)| {
                 let path = e.path_in(&backing);
                 !e.flags.contains(Flags::SKIP_WORKTREE)
-                    && match &sparse_sets {
+                    && (match &sparse_sets {
                         Some((update, _)) => !update.contains(path),
                         None => settled.contains(path),
-                    }
+                    } || (subs.is_some() && e.mode == Mode::COMMIT))
             })
             .map(|(i, _)| i)
             .collect()
@@ -2027,6 +1932,12 @@ fn reset_worktree_hard(
         new_index.entries_mut()[i].flags.insert(Flags::SKIP_WORKTREE);
     }
     written?;
+    if let Some(subs) = subs.as_mut() {
+        let wrote_gitmodules = new_index
+            .entry_index_by_path(".gitmodules".into())
+            .is_ok_and(|i| !hidden.contains(&i));
+        subs.checkout_gitlinks(&gitlinks, wrote_gitmodules)?;
+    }
 
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
@@ -2058,6 +1969,12 @@ enum Refusal {
     /// `ERROR_WOULD_LOSE_UNTRACKED_REMOVED` — `deleted_entry()` with no index entry
     /// runs `verify_absent()` on the path the merge removes (unpack-trees.c:2683-2686).
     WouldLoseUntrackedRemoved,
+    /// `ERROR_WOULD_LOSE_SUBMODULE` — `check_submodule_move_head()` refused the dry-run
+    /// move of a submodule under `--recurse-submodules` (unpack-trees.c:315-333).
+    LostSubmodule,
+    /// `verify_uptodate_1()`'s submodule arm (unpack-trees.c:2244-2253): the refused
+    /// dry run reports `ERROR_WOULD_LOSE_SUBMODULE`, then `ERROR_NOT_UPTODATE_FILE`.
+    SubmoduleNotUptodate,
 }
 
 impl Refusal {
@@ -2073,6 +1990,10 @@ impl Refusal {
             Refusal::WouldLoseUntrackedRemoved => {
                 format!("Untracked working tree file '{path}' would be removed by merge.")
             }
+            Refusal::LostSubmodule => format!("Submodule '{path}' cannot checkout new HEAD."),
+            Refusal::SubmoduleNotUptodate => format!(
+                "Submodule '{path}' cannot checkout new HEAD.\nerror: Entry '{path}' not uptodate. Cannot merge."
+            ),
         }
     }
 }
@@ -2164,7 +2085,10 @@ fn reset_two_tree(
 
     // Read before anything is written, for the same reason as in
     // [`reset_worktree_hard`]: `.gitmodules` may itself be on the way out.
-    let active_submodules = active_submodule_paths(repo);
+    let mut subs = super::submodule_move::Recursion::new(repo, recurse_submodules, None)?;
+    // `oneway_merge()` (`--merge`) gives a kept gitlink `CE_UPDATE` once `verify_uptodate()`
+    // passes it (unpack-trees.c:3045-3047).
+    let mut kept_gitlinks: Vec<BString> = Vec::new();
 
     let target = tree_map(repo, target_tree)?;
     let head = if keep {
@@ -2210,6 +2134,65 @@ fn reset_two_tree(
         } else {
             classify_merge(t, i)
         };
+        // Under `--recurse-submodules` a gitlink naming a submodule is checked by
+        // dry-running its move, not by its stat data. The traversal stops at the first
+        // refusal, so no later submodule is asked once one path was refused.
+        if let Some(subs) = subs.as_ref().filter(|_| conflicts.is_empty()) {
+            let p = BStr::new(path);
+            let is_sub = |entry: Option<&(Mode, ObjectId)>| {
+                entry.is_some_and(|(mode, _)| *mode == Mode::COMMIT) && subs.is_submodule(p)
+            };
+            let present = repo.workdir_path(p).is_some_and(|f| f.symlink_metadata().is_ok());
+            let hex = |entry: Option<&(Mode, ObjectId)>| entry.map(|(_, id)| id.to_string());
+            // `verify_uptodate(old)`'s submodule arm, with the index entry.
+            let uptodate_refused = || -> Result<bool> {
+                if !is_sub(i) || !present || unmerged.contains_key(path) {
+                    return Ok(false);
+                }
+                subs.check_move_head(p, Some("HEAD"), hex(i).as_deref(), false)
+            };
+            let refusal = match act {
+                // `oneway_merge()`'s `same(old, a)` arm: a refusal is reported but fails
+                // nothing, and only a gitlink that passes is written.
+                Act::Keep if !keep && i.is_some_and(|(mode, _)| *mode == Mode::COMMIT) => {
+                    if uptodate_refused()? {
+                        eprintln!("error: {}", Refusal::SubmoduleNotUptodate.message(p));
+                    } else {
+                        kept_gitlinks.push(path.clone());
+                    }
+                    None
+                }
+                Act::Keep | Act::Conflict | Act::VerifyAbsent => None,
+                // `deleted_entry()`: `verify_absent_if_directory(ce)`, then `verify_uptodate(old)`.
+                Act::Delete => {
+                    let ce = if keep { head.get(path) } else { i };
+                    if is_sub(ce) && present && subs.check_move_head(p, hex(ce).as_deref(), None, false)? {
+                        Some(Refusal::LostSubmodule)
+                    } else if uptodate_refused()? {
+                        Some(Refusal::SubmoduleNotUptodate)
+                    } else {
+                        None
+                    }
+                }
+                // `merged_entry()`: `verify_uptodate(old)` or `verify_absent(merge)`, then
+                // its own check of the move from the entry it replaces.
+                Act::Update => {
+                    if i.is_some() && uptodate_refused()? {
+                        Some(Refusal::SubmoduleNotUptodate)
+                    } else if i.is_none() && is_sub(t) && present && subs.check_move_head(p, hex(t).as_deref(), None, false)? {
+                        Some(Refusal::LostSubmodule)
+                    } else if is_sub(t) && subs.exists(p) && subs.check_move_head(p, hex(i).as_deref(), hex(t).as_deref(), false)? {
+                        Some(Refusal::LostSubmodule)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(refusal) = refusal {
+                conflicts.insert((path.clone(), refusal));
+                continue;
+            }
+        }
         // The `CE_CONFLICTED` marker `read_index_unmerged()` left behind: git
         // skips the uptodate check for it outright, so the half-merged worktree
         // file is overwritten rather than protected.
@@ -2340,6 +2323,19 @@ fn reset_two_tree(
             .collect();
     }
 
+    // `checkout_entry()` moves each gitlink written, from what stood at it before
+    // anything was removed (entry.c:517-535).
+    let gitlinks = match &subs {
+        Some(subs) => subs.gitlinks(
+            &new_index,
+            upd.iter().chain(kept_gitlinks.iter()).map(|p| BStr::new(p)),
+        ),
+        None => Vec::new(),
+    };
+    if subs.is_some() {
+        upd.retain(|p| !gitlinks.iter().any(|g| &g.path == p));
+    }
+
     // `check_updates()` unlinks every `CE_WT_REMOVE` entry before it checks out a
     // single `CE_UPDATE` one (unpack-trees.c:455-469).
     for (p, mode) in &deletes {
@@ -2348,9 +2344,8 @@ fn reset_two_tree(
             &workdir,
             BStr::new(p),
             *mode,
-            recurse_submodules,
-            &active_submodules,
-        );
+            subs.as_ref(),
+        )?;
     }
 
     // Write the changed files to the worktree by checking out a filtered copy that
@@ -2386,6 +2381,9 @@ fn reset_two_tree(
         // Copy the fresh stats back onto the persisted index so the just-written
         // files are not reported modified before the next refresh.
         crate::worktree::carry_written_stat(&wt, &mut new_index);
+    }
+    if let Some(subs) = subs.as_mut() {
+        subs.checkout_gitlinks(&gitlinks, upd.contains(&BString::from(".gitmodules")))?;
     }
 
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`

@@ -185,6 +185,9 @@ struct Parsed<'a> {
     /// `--ignore-other-worktrees` → `opts->ignore_other_worktrees`, which turns
     /// off the `die_if_checked_out()` guard.
     ignore_other_worktrees: bool,
+    /// `--[no-]recurse-submodules[=<bool>]`, the worktree updater's switch;
+    /// `None` leaves `submodule.recurse` to decide.
+    recurse_submodules: Option<bool>,
     positionals: Vec<&'a str>,
 }
 
@@ -212,6 +215,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         track_inherit: false,
         guess: None,
         ignore_other_worktrees: false,
+        recurse_submodules: None,
         positionals: Vec::new(),
     };
     let mut only_positional = false;
@@ -342,20 +346,23 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 "progress" => p.progress = Some(true),
                 "no-progress" => p.progress = Some(false),
                 // Silently-accepted no-ops that do not change deterministic output.
-                "overwrite-ignore"
-                | "no-overwrite-ignore"
-                | "no-recurse-submodules" => {}
+                "overwrite-ignore" | "no-overwrite-ignore" => {}
+                "no-recurse-submodules" => p.recurse_submodules = Some(false),
                 // `option_parse_recurse_submodules_worktree_updater()`
                 // (submodule.c:2093) reads the optional value with
                 // `git_parse_maybe_bool` and dies on anything else, before the
                 // command has looked at the repository.
                 "recurse-submodules" => {
-                    if let Some(v) = attached {
-                        if crate::optint::maybe_bool(v).is_none() {
-                            return fatal(format!("bad recurse-submodules argument: {v}"))
-                                .map(Parse::Failed);
-                        }
-                    }
+                    p.recurse_submodules = match attached {
+                        Some(v) => match crate::optint::maybe_bool(v) {
+                            Some(on) => Some(on),
+                            None => {
+                                return fatal(format!("bad recurse-submodules argument: {v}"))
+                                    .map(Parse::Failed)
+                            }
+                        },
+                        None => Some(true),
+                    };
                 }
                 "ignore-other-worktrees" => p.ignore_other_worktrees = true,
                 "no-ignore-other-worktrees" => p.ignore_other_worktrees = false,
@@ -564,6 +571,11 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
     );
     // `opts->force` apart from `--discard-changes`, for `reset_tree()`.
     super::checkout::set_force(p.force);
+    // `should_update_submodules()`: the unpack moves the submodules it touches.
+    super::checkout::set_recurse_submodules(super::submodule_move::should_update_submodules(
+        &repo,
+        p.recurse_submodules,
+    ));
 
     if let Some(name) = p.orphan {
         if p.track.is_some() {

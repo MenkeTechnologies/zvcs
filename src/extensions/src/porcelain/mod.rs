@@ -825,6 +825,7 @@ mod stripspace;
 mod submodule;
 #[allow(non_snake_case)] // maps to git's `submodule--helper` subcommand
 mod submodule__helper;
+pub(crate) mod submodule_move;
 mod subtree;
 mod switch;
 mod symbolic_ref;

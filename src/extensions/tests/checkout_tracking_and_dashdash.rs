@@ -12,6 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 struct Fixture {
@@ -51,7 +54,11 @@ impl Fixture {
     }
 
     fn cmd(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        self.cmd_with(BIN, dir, args)
+    }
+
+    fn cmd_with(&self, bin: &str, dir: &Path, args: &[&str]) -> Command {
+        let mut c = Command::new(bin);
         c.args(args)
             .current_dir(dir)
             .env("HOME", &self.root)
@@ -177,12 +184,16 @@ fn blame_accepts_a_utf8_encoding_request() {
         assert_eq!(out.stdout, plain.stdout, "{spelling} changed the output");
     }
 
-    // An encoding that would need transcoding is refused rather than guessed at.
-    let out = f.run(&work, &["blame", "--encoding=ISO-8859-1", "f.txt"]);
-    assert_ne!(out.status.code(), Some(0), "{out:?}");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only utf-8 and none are ported"),
-        "{out:?}"
+    // An encoding that needs transcoding is honoured as stock's is.
+    let Some(stock) = stock_git::stock_git() else {
+        return;
+    };
+    let args = ["blame", "--encoding=ISO-8859-1", "f.txt"];
+    let out = f.run(&work, &args);
+    let want = f.cmd_with(stock, &work, &args).output().unwrap();
+    assert_eq!(
+        (out.status.code(), &out.stdout, &out.stderr),
+        (want.status.code(), &want.stdout, &want.stderr)
     );
 }
 

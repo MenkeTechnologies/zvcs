@@ -82,6 +82,22 @@ fn base_repo(stock: &str, root: &Path) {
     }
 }
 
+/// Date the checked-out `paths` in the past before the `check` commands run. Whether
+/// stock's `status` hashes a file, and so loads the sparse patterns for its
+/// attributes and warns, otherwise depends on whether it was written in the same
+/// second as the index (read-cache.c:355-366 is_racy_stat()); a past mtime makes
+/// every entry stat-dirty on both sides, so the content check always runs.
+fn backdate(root: &Path, paths: &[&str]) {
+    let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    for path in paths {
+        let path = root.join(path);
+        if path.is_file() {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(past).unwrap();
+        }
+    }
+}
+
 /// Run `steps` (a subdirectory and the arguments for the binary under test) on twin
 /// fixtures `prepare` builds with stock git, then `check` (stock-git commands that
 /// report the resulting state), and compare everything, along with which of the
@@ -110,11 +126,14 @@ fn compare(
         prepare(stock, &root);
         let cut = |s: String| s.replace(root.to_str().unwrap(), "ROOT");
         let mut out = Vec::new();
-        for (bin, list) in [(bin, steps), (stock, check)] {
-            for (dir, args) in list {
-                let (o, e, c) = run(bin, &root.join(dir), args);
-                out.push((cut(o), cut(e), c));
-            }
+        for (dir, args) in steps {
+            let (o, e, c) = run(bin, &root.join(dir), args);
+            out.push((cut(o), cut(e), c));
+        }
+        backdate(&root, paths);
+        for (dir, args) in check {
+            let (o, e, c) = run(stock, &root.join(dir), args);
+            out.push((cut(o), cut(e), c));
         }
         for path in paths {
             out.push((

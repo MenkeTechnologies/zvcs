@@ -10828,6 +10828,9 @@ pub(crate) fn format_commit(
 ) -> Result<Vec<u8>> {
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
+    // `%P`/`%p` walk `commit->parents` (pretty.c:1586-1599): with no revision
+    // walk to rewrite them, those are the parents the commit object records.
+    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
     let ctx = RenderCtx {
         abbrev_commit: false,
         abbrev: &abbrev,
@@ -10851,7 +10854,7 @@ pub(crate) fn format_commit(
         repo,
         mark: "",
         revision_mark: ">",
-        parents: &[],
+        parents: &parents,
         // No `--graph` behind either of these callers.
         graph_width: 0,
         expand_tabs: None,

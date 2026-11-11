@@ -189,7 +189,13 @@ impl Search {
                     }
                 }
             }
-            if is_match && (!pattern.is_excluded() || pattern.always_matches()) {
+            // An exclude carrying `:(attr:…)` never writes a directory off: git's
+            // `do_match()` calls every directory interesting once an attribute
+            // item reaches it, since files below may still differ in their
+            // attributes (tree-walk.c:1183-1200, :1271-1275).
+            if is_match
+                && (!pattern.is_excluded() || (pattern.always_matches() && pattern.attributes.is_empty()))
+            {
                 return !pattern.is_excluded();
             }
         }

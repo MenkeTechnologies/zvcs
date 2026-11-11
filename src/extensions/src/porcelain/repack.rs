@@ -593,6 +593,7 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
                     .store_ref()
                     .alternate_db_paths()
                     .is_ok_and(|alternates| !alternates.is_empty()),
+                precious_objects: super::prune::precious_objects(&repo),
             };
             let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
                 Ok(limit) => limit,
@@ -1925,12 +1926,14 @@ fn write_bitmaps_config(repo: &gix::Repository) -> Result<Option<bool>, String> 
     Ok(found)
 }
 
-/// The two facts about the repository `cmd_repack()` resolves `write_bitmaps`
-/// against: `is_bare_repository()` and `odb_has_alternates()`.
+/// The facts about the repository `cmd_repack()` resolves `write_bitmaps`
+/// against — `is_bare_repository()` and `odb_has_alternates()` — and
+/// `repo->repository_format_precious_objects`, which refuses `-d`.
 #[derive(Default)]
 struct RepoFacts {
     bare: bool,
     has_alternates: bool,
+    precious_objects: bool,
 }
 
 /// `revs->pending` as the `pack-objects` this command drives fills it, which is
@@ -3911,6 +3914,12 @@ fn promisor_objects_in_odb_order(repo: &gix::Repository) -> Vec<ObjectId> {
 /// The option conflicts stock git rejects before it does any work, in git's own
 /// order. Each prints `fatal: <msg>` on stderr and exits 128.
 fn preflight(st: &mut State, midx: &MidxConfig, facts: &RepoFacts) -> Option<ExitCode> {
+    // `if (delete_redundant && repo->repository_format_precious_objects)
+    // die(_("cannot delete packs in a precious-objects repo"));`
+    // (builtin/repack.c:397-398), after the `--drop-filtered` block.
+    if st.delete_redundant && facts.precious_objects {
+        return Some(fatal("cannot delete packs in a precious-objects repo"));
+    }
     // die_for_incompatible_opt3(-A, -k/--keep-unreachable, --cruft)
     let triad = [
         (st.loosen_unreachable, "-A"),

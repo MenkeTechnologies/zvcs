@@ -106,13 +106,7 @@
 //! git's `git_attr_set_direction(GIT_ATTR_INDEX)` does, plus
 //! `$GIT_DIR/info/attributes`, `core.attributesFile`, `core.autocrlf` and
 //! `core.eol`. `--worktree-attributes` additionally consults the working copy.
-//!
-//! Not covered — this fails loudly rather than emitting an archive that would
-//! silently differ from git's:
-//!   * One pathspec-magic corner that needs substrate this port does not wire
-//!     into `git archive`: an `:(attr:<name>)` spec is matched as if no
-//!     attribute were set, so an `:(attr:…)` spec selects nothing. Every other
-//!     magic works.
+//! `:(attr:<name>)` pathspec magic is matched against those same attributes.
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -135,11 +129,6 @@ const PREFIX_MAX: usize = 155;
 const SIZE_MAX: u64 = 0o77777777777;
 
 const ZEROS: [u8; RECORD] = [0; RECORD];
-
-/// The built-in formats: `tar`, git's two pre-seeded tar filters, then `zip`.
-/// `FORMATS[..3]` are the tar family, which is what decides whether a
-/// compression level is a filter's to accept.
-const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
 
 /// The command `init_tar_archiver()` pre-seeds `tgz` and `tar.gz` with; a filter
 /// still carrying it is the in-process gzip rather than a command to spawn.
@@ -275,26 +264,32 @@ impl TarConfig {
     /// archive-zip.c); a filter has it only through `tar.<name>.remote`, which
     /// the two pre-seeded ones start out with.
     fn remote_allowed(&self, format: &str) -> bool {
-        format == "tar"
-            || format == "zip"
-            || self.filters.iter().any(|f| f.name == format && f.command.is_some() && f.remote)
+        match self.filter(format) {
+            Some(f) => f.remote,
+            None => format == "tar" || format == "zip",
+        }
+    }
+
+    /// The filter `lookup_archiver()` lands on for `format`: the first archiver
+    /// of that name in `archivers[]` order (archive.c:383-395). `tar` is
+    /// registered ahead of every filter, so a `tar.tar.command` never wins,
+    /// while `zip` comes after them all, so a `tar.zip.command` shadows the
+    /// zip writer.
+    fn filter(&self, format: &str) -> Option<&TarFilter> {
+        if format == "tar" {
+            return None;
+        }
+        self.filters.iter().find(|f| f.name == format && f.command.is_some())
     }
 
     /// The command a registered filter spawns, or `None` for `tar`, `zip`, and
     /// a filter still carrying the in-process gzip.
     fn spawn_command(&self, format: &str) -> Option<String> {
-        self.filters
-            .iter()
-            .find(|f| f.name == format)
+        self.filter(format)
             .and_then(|f| f.command.clone())
             .filter(|cmd| cmd != INTERNAL_GZIP)
     }
 }
-
-/// The formats carrying git's `ARCHIVER_WANT_COMPRESSION_LEVELS`. A `-<digits>`
-/// given for any other format is fatal, which is the only way a compression
-/// level is observable from here since none of these three can be produced yet.
-const LEVEL_FORMATS: &[&str] = &["tgz", "tar.gz", "zip"];
 
 /// `parse_archive_args()`'s `struct option opts[]` (archive.c), in table order, as
 /// [`super::resolve_long`] reads it.
@@ -482,7 +477,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         }
     }
     if outer.remote.is_some() {
-        return run_remote_archiver(&outer, here.as_ref());
+        return run_remote_archiver(&outer, here.as_ref(), &tar);
     }
 
     let mut opts = Opts::default();
@@ -661,9 +656,8 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         None => opts
             .output
             .as_deref()
-            .and_then(format_from_filename)
-            .unwrap_or("tar")
-            .to_string(),
+            .and_then(|name| format_from_filename(&tar, name))
+            .unwrap_or_else(|| "tar".to_string()),
     };
     // The registry is config-driven, so a `tar.<name>.command` makes `<name>` a format git
     // knows — which is why this is checked against the configured list and not the built-in
@@ -687,9 +681,13 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // `deflateInit2()` fails, which is after the tree walk (see below). The level
     // reported is the last `-<digits>` parsed, not the first one given.
     if let Some(level) = opts.level {
-        let filter_format = !FORMATS.contains(&format.as_str());
-        let reject = (!LEVEL_FORMATS.contains(&format.as_str()) && !filter_format)
-            || (format == "zip" && level > 9);
+        // Every filter, `tgz` and `tar.gz` included, is registered with
+        // `ARCHIVER_WANT_COMPRESSION_LEVELS | ARCHIVER_HIGH_COMPRESSION_LEVELS`
+        // (archive-tar.c:391-392); the zip writer wants levels but not high ones.
+        let reject = match tar.filter(&format) {
+            Some(_) => false,
+            None => format != "zip" || level > 9,
+        };
         if reject {
             eprintln!("fatal: Argument not supported for format '{format}': -{level}");
             return Ok(ExitCode::from(128));
@@ -759,7 +757,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     let cwd_prefix = repo.prefix()?.map(std::path::Path::to_path_buf);
     let cwd_prefix_bytes = crate::setup::prefix_bytes(&repo);
 
-    let mut conv = Convert::new(&repo, &tree, opts.worktree_attributes)?;
+    let mut conv = Convert::new(&repo, &tree, opts.worktree_attributes, is_remote)?;
 
     // Parse the trailing pathspecs into a `gix-pathspec` search so the whole
     // magic grammar is matched exactly as git's `match_pathspec()` does. git
@@ -859,7 +857,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         // `../` is refused before its existence is tested — `../x` and `:/x`
         // name real files but still die here.
         if !cwd_prefix_bytes.is_empty()
-            && tree_walk_hits(&repo, tree.clone(), b"", &mut one, false, &mut |path| {
+            && tree_walk_hits(&repo, tree.clone(), b"", &mut one, &mut conv.attrs, false, &mut |path| {
                 !path.starts_with(&cwd_prefix_bytes)
             })?
         {
@@ -879,7 +877,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         // matched the directory. And it is the plain tree walk, not the archive walk:
         // `export-ignore` plays no part, so a spec naming only ignored paths exists and
         // yields an empty archive rather than a miss.
-        if !tree_walk_hits(&repo, tree.clone(), b"", &mut one, true, &mut |_| true)? {
+        if !tree_walk_hits(&repo, tree.clone(), b"", &mut one, &mut conv.attrs, true, &mut |_| true)? {
             eprintln!(
                 "fatal: pathspec '{}' did not match any files",
                 opts.paths[idx]
@@ -926,7 +924,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     let base = opts.prefix.clone().unwrap_or_default();
 
     // `write_zip_archive()`: the same walk, a different container.
-    if format == "zip" {
+    if format == "zip" && filter.is_none() {
         return write_zip(&repo, &tree, items, &opts, &base, commit_id, mtime, level as i32, &mut conv, subst_commit.as_ref());
     }
     // ```c
@@ -951,14 +949,20 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             if let Some(level) = opts.level {
                 line.push_str(&format!(" -{level}"));
             }
-            let mut spawned = std::process::Command::new("sh");
-            spawned.arg("-c").arg(&line).stdin(std::process::Stdio::piped());
+            // `filter.use_shell = 1` goes through `prepare_shell_cmd()`: a command
+            // with no shell metacharacter is exec'd directly, one with any runs as
+            // `sh -c <cmd> <cmd>`, so the shell names itself after the command in
+            // its own diagnostics (run-command.c:288-309).
+            let mut spawned = crate::external::prepare_shell_cmd_str(&line, crate::external::NO_ARGS);
+            spawned.stdin(std::process::Stdio::piped());
             if let Some(path) = &opts.output {
                 spawned.stdout(std::fs::File::create(path)?);
             }
             let mut spawned = match spawned.spawn() {
                 Ok(child) => child,
-                Err(e) => crate::git_fatal!("cannot spawn {line}: {e}"),
+                // `die_errno(_("unable to start '%s' filter"), cmd.buf)`
+                // (archive-tar.c:504-505), reached when the exec itself fails.
+                Err(e) => crate::git_fatal!("unable to start '{line}' filter: {}", crate::external::strerror(&e)),
             };
             let stdin = spawned.stdin.take().expect("stdin is piped");
             child = Some((spawned, line));
@@ -1003,8 +1007,10 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     for item in items {
         let mut path = base.clone().into_bytes();
         path.extend_from_slice(&item.path);
-        let data = entry_data(&repo, &mut conv, &item, subst_commit.as_ref())?;
+        // `write_archive_entry()` reports the path before it reads the blob
+        // (archive.c:206-207), so `-v` names an entry whose read then dies.
         report(opts.verbose, &path);
+        let (data, _streamed) = entry_data(&repo, &mut conv, &item, subst_commit.as_ref())?;
         tar.entry(&path, item.kind, &item.oid, &data)?;
     }
 
@@ -1294,7 +1300,7 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
 /// The `--format` inferred from `-o`'s filename goes first *so that an explicit
 /// `--format` later on the command line overrides it* — the server keeps the last
 /// one it is given. Then `ACK`, a flush, and the archive itself on sideband 1.
-fn run_remote_archiver(outer: &Outer, here: Option<&gix::Repository>) -> Result<ExitCode> {
+fn run_remote_archiver(outer: &Outer, here: Option<&gix::Repository>, tar: &TarConfig) -> Result<ExitCode> {
     // `_remote = remote_get(remote); transport_get(_remote, _remote->url.v[0])`
     // (builtin/archive.c:32-33): a configured remote's name stands for its first
     // URL, and `url.<base>.insteadOf` rewrites either.
@@ -1341,7 +1347,7 @@ fn run_remote_archiver(outer: &Outer, here: Option<&gix::Repository>) -> Result<
     };
     let mut to_server = child.stdin.take().expect("piped stdin");
     let mut request: Vec<u8> = Vec::new();
-    if let Some(format) = outer.output.as_deref().and_then(format_from_filename) {
+    if let Some(format) = outer.output.as_deref().and_then(|name| format_from_filename(tar, name)) {
         pkt_line(&mut request, format!("argument --format={format}\n").as_bytes());
     }
     for arg in &outer.rest {
@@ -1698,13 +1704,20 @@ fn now() -> i64 {
 // `--mtime=bogus-time` both resolve to the current time exactly as stock git does.
 use crate::date::approxidate;
 
-/// git's `filename_to_archive_format()`: the format whose name the output file's
-/// extension spells, or `None` to fall back to `tar`.
-fn format_from_filename(name: &str) -> Option<&'static str> {
-    FORMATS
-        .iter()
-        .copied()
-        .find(|f| name.len() > f.len() + 1 && name.ends_with(&format!(".{f}")))
+/// git's `archive_format_from_filename()`: the first registered archiver whose
+/// name the output file's extension spells, or `None` to fall back to `tar`.
+///
+/// The archivers are every one `init_archivers()` registered, in that order —
+/// `tar`, then each `tar.<name>.command` filter, then `zip` — so a configured
+/// filter claims its own extension (archive.c:800-827, archive-tar.c:530-543).
+/// `match_extension()` wants a `.` before the extension and at least one byte
+/// before that.
+fn format_from_filename(tar: &TarConfig, name: &str) -> Option<String> {
+    tar.formats().into_iter().find(|f| {
+        let ext = f.as_bytes();
+        let name = name.as_bytes();
+        name.len() >= ext.len() + 2 && name.ends_with(ext) && name[name.len() - ext.len() - 1] == b'.'
+    })
 }
 
 /// The process umask, read the way git reads it for `tar.umask=user`: set it to
@@ -1753,6 +1766,14 @@ struct Convert<'r> {
     /// Needed by [`Convert::is_binary`] to resolve a `diff=<name>` attribute
     /// through `diff.<name>.binary`, the way `userdiff_find_by_name()` does.
     repo: &'r gix::Repository,
+    /// `repo_settings_get_big_file_threshold()`: a plain blob larger than this
+    /// is streamed raw rather than converted (archive.c:216-220). The setting
+    /// is parsed on first use, so a malformed value dies only once a plain
+    /// blob reaches that check — kept here as the `die()` message.
+    big_file_threshold: std::result::Result<u64, String>,
+    /// `describe_status.max_invocations = 1` (archive.c:766): one `%(describe)`
+    /// per archive runs `git describe`, every later one stays literal.
+    describe_budget: u32,
 }
 
 /// What `get_archive_attrs()` yields for one path.
@@ -1764,17 +1785,28 @@ struct Export {
 
 impl<'r> Convert<'r> {
     /// Build the lookup state for archiving `tree`.
-    fn new(repo: &'r gix::Repository, tree: &gix::Tree<'_>, worktree_attributes: bool) -> Result<Self> {
+    fn new(
+        repo: &'r gix::Repository,
+        tree: &gix::Tree<'_>,
+        worktree_attributes: bool,
+        is_remote: bool,
+    ) -> Result<Self> {
         use gix::worktree::stack::state::attributes::Source;
-        // git's `unpack_trees()` into a scratch index, so in-tree
-        // `.gitattributes` are read from the archived tree. `--worktree-attributes`
-        // is git's `GIT_ATTR_CHECKIN`-like direction: the working copy wins where
-        // it has a file, the tree is the fallback.
-        let index = repo.index_from_tree(&tree.id)?;
-        let source = if worktree_attributes {
-            Source::WorktreeThenIdMapping
+        // Without `--worktree-attributes`, git's `unpack_trees()` into a scratch
+        // index and `GIT_ATTR_INDEX`, so in-tree `.gitattributes` are read from
+        // the archived tree (archive.c:526-548).
+        //
+        // With it, neither happens: the direction stays `GIT_ATTR_CHECKIN` and
+        // `args->repo->index` is never read, so `read_attr()` finds a working-copy
+        // file or nothing — and in a bare repository not even that
+        // (attr.c:851-866). The serving side of `--remote` runs from the git
+        // directory `enter_repo()` chdir'd into, where no work tree is checked out.
+        let (index, source) = if !worktree_attributes {
+            (repo.index_from_tree(&tree.id)?.into(), Source::IdMapping)
+        } else if repo.is_bare() || is_remote {
+            (gix::index::State::new(repo.object_hash()), Source::IdMapping)
         } else {
-            Source::IdMapping
+            (gix::index::State::new(repo.object_hash()), Source::WorktreeThenIdMapping)
         };
         // The pipeline consumes its stack, so attribute lookup and content
         // conversion each get their own; they read the same files.
@@ -1784,6 +1816,11 @@ impl<'r> Convert<'r> {
             outcome: gix::attrs::search::Outcome::default(),
             pipeline,
             repo,
+            // `repo_cfg_ulong(repo, "core.bigfilethreshold", ..., 512 * 1024 * 1024)`
+            // (repo-settings.c:167-173).
+            big_file_threshold: crate::config::config_ulong(repo, "core.bigfilethreshold")
+                .map(|v| v.unwrap_or(512 * 1024 * 1024)),
+            describe_budget: 1,
         })
     }
 
@@ -1908,17 +1945,37 @@ fn driver_is_binary(repo: &gix::Repository, name: &str) -> Option<bool> {
 /// `write_archive_entry()` hands `NULL` content to the writer for a directory or
 /// a gitlink, and `object_file_to_archive()` only runs the conversion when
 /// `S_ISREG(mode)` — so a symlink's target is archived verbatim.
+///
+/// The flag that comes back says the blob was *streamed*:
+///
+/// ```c
+/// if (S_ISREG(mode) && !args->convert &&
+///     odb_read_object_info(args->repo->objects, oid, &size) == OBJ_BLOB &&
+///     size > repo_settings_get_big_file_threshold(the_repository))
+///         return write_entry(args, oid, path.buf, path.len, mode, NULL, size);
+/// ```
+///
+/// (`write_archive_entry()`, archive.c:216-220.) Such a blob reaches the writer
+/// as a NULL buffer and is read straight from the object store, so it skips
+/// `convert_to_working_tree()` altogether, and the zip writer frames it with a
+/// data descriptor.
 fn entry_data(
     repo: &gix::Repository,
     conv: &mut Convert<'_>,
     item: &Item,
     subst_commit: Option<&gix::Commit<'_>>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     match item.kind {
-        EntryKind::Tree | EntryKind::Commit => Ok(Vec::new()),
-        EntryKind::Link => Ok(repo.find_object(item.oid)?.data.clone()),
+        EntryKind::Tree | EntryKind::Commit => Ok((Vec::new(), false)),
+        EntryKind::Link => Ok((repo.find_object(item.oid)?.data.clone(), false)),
         _ => {
             let raw = repo.find_object(item.oid)?.data.clone();
+            if !item.subst {
+                let threshold = conv.big_file_threshold.clone().map_err(crate::fatal::die)?;
+                if raw.len() as u64 > threshold {
+                    return Ok((raw, true));
+                }
+            }
             let converted = conv.content(&item.path, raw)?;
             // ```c
             // const struct commit *commit = args->convert ? args->commit : NULL;
@@ -1933,8 +1990,8 @@ fn entry_data(
             // tree-ish peeled to a commit — archiving a bare tree leaves
             // `args->commit` NULL, so `$Format:…$` stays literal.
             match (item.subst, subst_commit) {
-                (true, Some(commit)) => format_subst(repo, commit, &converted),
-                _ => Ok(converted),
+                (true, Some(commit)) => Ok((format_subst(repo, commit, &converted, &mut conv.describe_budget)?, false)),
+                _ => Ok((converted, false)),
             }
         }
     }
@@ -1965,6 +2022,7 @@ fn format_subst(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     src: &[u8],
+    describe_budget: &mut u32,
 ) -> Result<Vec<u8>> {
     const MARK: &[u8] = b"$Format:";
     let mut out: Vec<u8> = Vec::with_capacity(src.len());
@@ -1979,7 +2037,7 @@ fn format_subst(
         };
         out.extend_from_slice(&rest[..b]);
         let fmt = String::from_utf8_lossy(&after[..close]).into_owned();
-        out.extend_from_slice(&archive_format_commit(repo, commit, &fmt)?);
+        out.extend_from_slice(&archive_format_commit(repo, commit, &fmt, describe_budget)?);
         rest = &after[close + 1..];
     }
     out.extend_from_slice(rest);
@@ -2002,6 +2060,7 @@ fn archive_format_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     fmt: &str,
+    describe_budget: &mut u32,
 ) -> Result<Vec<u8>> {
     let hexsz = repo.object_hash().len_in_hex();
     let len = crate::abbrev::configured_abbrev(repo, hexsz);
@@ -2022,6 +2081,18 @@ fn archive_format_commit(
             'p' => {
                 let parents: Vec<String> = commit.parent_ids().map(|p| abbrev(p.detach())).collect();
                 expanded.push_str(&parents.join(" "));
+            }
+            // `skip_prefix(placeholder, "(describe", &arg)` spends one
+            // invocation before the arguments are even looked at, and once
+            // none is left the placeholder is not one: `return 0` leaves the
+            // `%` literal (pretty.c:1511-1523). `%%` makes the renderer do that.
+            '(' if chars[i + 2..].starts_with(&['d', 'e', 's', 'c', 'r', 'i', 'b', 'e']) => {
+                if *describe_budget == 0 {
+                    expanded.push_str("%%(");
+                } else {
+                    *describe_budget -= 1;
+                    expanded.push_str("%(");
+                }
             }
             other => {
                 expanded.push('%');
@@ -2093,19 +2164,14 @@ fn collect(
         }
 
         // A file (blob, executable blob, symlink or submodule gitlink) is matched
-        // as a non-directory. Attribute-driven pathspecs (`:(attr:…)`) are matched
-        // as if no attribute were set — see the module header.
+        // as a non-directory. `:(attr:…)` elements are checked against the same
+        // attributes `get_archive_attrs()` reads, since `match_pathspec()` runs
+        // `git_check_attr()` on `args->repo->index` (dir.c, archive.c:401-403).
         let selected = match search.as_deref_mut() {
             None => true,
-            Some(s) => {
-                let mut no_attrs = |_: &gix::bstr::BStr,
-                                    _: gix::pathspec::attributes::glob::pattern::Case,
-                                    _: bool,
-                                    _: &mut gix::pathspec::attributes::search::Outcome|
-                 -> bool { false };
-                s.pattern_matching_relative_path(path.as_bstr(), Some(false), &mut no_attrs)
-                    .is_some_and(|m| !m.is_excluded())
-            }
+            Some(s) => s
+                .pattern_matching_relative_path(path.as_bstr(), Some(false), &mut pathspec_attrs(&mut conv.attrs))
+                .is_some_and(|m| !m.is_excluded()),
         };
         if !selected {
             continue;
@@ -2136,6 +2202,34 @@ fn collect(
     Ok(())
 }
 
+/// The attribute half of `match_pathspec_item()`: an `:(attr:…)` element asks
+/// `git_check_attr()` about the path (dir.c's `match_pathspec_attrs()`), which
+/// `git archive` points at the index it built from the archived tree, or at the
+/// working copy with `--worktree-attributes` (archive.c:530-547) — the stack
+/// [`Convert`] already reads `export-ignore` from.
+fn pathspec_attrs<'s, 'r: 's>(
+    attrs: &'s mut gix::AttributeStack<'r>,
+) -> impl FnMut(
+    &gix::bstr::BStr,
+    gix::pathspec::attributes::glob::pattern::Case,
+    bool,
+    &mut gix::pathspec::attributes::search::Outcome,
+) -> bool
+       + use<'s, 'r> {
+    // `git_check_attr()` folds case by `core.ignorecase` alone, whatever
+    // `:(icase)` says about the path part, so the stack keeps its own case.
+    move |path, _case, is_dir, out| {
+        let mode = if is_dir {
+            gix::index::entry::Mode::DIR
+        } else {
+            gix::index::entry::Mode::FILE
+        };
+        attrs
+            .at_entry(path, Some(mode))
+            .is_ok_and(|platform| platform.matching_attributes(out))
+    }
+}
+
 /// The plain `read_tree()` walk `path_exists()` runs twice (archive.c:397-452):
 /// every entry `search` finds interesting, attributes playing no part.
 ///
@@ -2149,6 +2243,7 @@ fn tree_walk_hits(
     tree: gix::Tree<'_>,
     base: &[u8],
     search: &mut Search,
+    attrs: &mut gix::AttributeStack<'_>,
     dir_hits: bool,
     hit: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<bool> {
@@ -2158,11 +2253,6 @@ fn tree_walk_hits(
         .iter()
         .map(|e| (e.mode.kind(), e.filename.to_vec(), e.oid.to_owned()))
         .collect();
-    let mut no_attrs = |_: &gix::bstr::BStr,
-                        _: gix::pathspec::attributes::glob::pattern::Case,
-                        _: bool,
-                        _: &mut gix::pathspec::attributes::search::Outcome|
-     -> bool { false };
     for (kind, filename, oid) in entries {
         let mut path = base.to_vec();
         path.extend_from_slice(&filename);
@@ -2171,7 +2261,7 @@ fn tree_walk_hits(
             continue;
         }
         let matched = search
-            .pattern_matching_relative_path(path.as_bstr(), Some(is_dir), &mut no_attrs)
+            .pattern_matching_relative_path(path.as_bstr(), Some(is_dir), &mut pathspec_attrs(attrs))
             .is_some_and(|m| !m.is_excluded());
         if !is_dir {
             if matched && hit(&path) {
@@ -2184,7 +2274,7 @@ fn tree_walk_hits(
         }
         path.push(b'/');
         let child = repo.find_object(oid)?.peel_to_tree()?;
-        if tree_walk_hits(repo, child, &path, search, dir_hits, hit)? {
+        if tree_walk_hits(repo, child, &path, search, attrs, dir_hits, hit)? {
             return Ok(true);
         }
     }
@@ -2255,17 +2345,22 @@ fn write_zip(
             len -= 1;
         }
         report(opts.verbose, &base.as_bytes()[..len]);
-        zip.entry(&base.as_bytes()[..len], EntryKind::Tree, &[], level, false)?;
+        zip.entry(&base.as_bytes()[..len], EntryKind::Tree, &[], level, false, false)?;
     }
     for item in items {
         let mut path = base.as_bytes().to_vec();
         path.extend_from_slice(&item.path);
-        let data = entry_data(repo, conv, &item, subst_commit)?;
+        // `write_archive_entry()` reports the path before it reads the blob
+        // (archive.c:206-207).
+        report(opts.verbose, &path);
+        let (data, streamed) = entry_data(repo, conv, &item, subst_commit)?;
         // `entry_is_binary()` is asked about `path_without_prefix`, and about the
         // converted buffer — which is what `item.path` and `data` already are.
-        let binary = conv.is_binary(&item.path, &data)?;
-        report(opts.verbose, &path);
-        zip.entry(&path, item.kind, &data, level, binary)?;
+        // A streamed blob is judged by its first `STREAM_BUFFER_SIZE` read alone
+        // (archive-zip.c:292, :427-438).
+        let sniff = if streamed { &data[..data.len().min(16 * 1024)] } else { &data[..] };
+        let binary = conv.is_binary(&item.path, sniff)?;
+        zip.entry(&path, item.kind, &data, level, binary, streamed)?;
     }
     for added in &opts.added {
         match added {
@@ -2275,13 +2370,13 @@ fn write_zip(
                 let data = std::fs::read(disk)?;
                 let kind = if *exec { EntryKind::BlobExecutable } else { EntryKind::Blob };
                 let binary = conv.is_binary(name, &data)?;
-                zip.entry(&path, kind, &data, level, binary)?;
+                zip.entry(&path, kind, &data, level, binary, false)?;
             }
             Added::Virtual { name, content } => {
                 let mut path = crate::setup::prefix_bytes(repo);
                 path.extend_from_slice(name);
                 let binary = conv.is_binary(name, content)?;
-                zip.entry(&path, EntryKind::Blob, content, level, binary)?;
+                zip.entry(&path, EntryKind::Blob, content, level, binary, false)?;
             }
         }
     }
@@ -2369,7 +2464,22 @@ impl<W: Write> Zip<W> {
     /// `is_binary` is `entry_is_binary()`'s verdict for this entry; it is only
     /// consulted for non-directories, matching `write_zip_entry()`, which leaves
     /// its `is_binary` at `-1` for a directory so `!is_binary` writes 0.
-    fn entry(&mut self, path: &[u8], kind: EntryKind, data: &[u8], level: i32, is_binary: bool) -> Result<()> {
+    ///
+    /// `streamed` is a blob `write_archive_entry()` handed over as a NULL buffer
+    /// (see [`entry_data`]). `write_zip_entry()` then sets `ZIP_STREAM`, writes
+    /// the local header before it knows the CRC or the deflated size, deflates
+    /// whatever the size turns out to be, and follows the data with a
+    /// descriptor carrying the real values (archive-zip.c:343-352, :383-397,
+    /// :419-505, :237-258).
+    fn entry(
+        &mut self,
+        path: &[u8],
+        kind: EntryKind,
+        data: &[u8],
+        level: i32,
+        is_binary: bool,
+        streamed: bool,
+    ) -> Result<()> {
         let is_dir = matches!(kind, EntryKind::Tree | EntryKind::Commit);
         let mut name = path.to_vec();
         if is_dir && !name.ends_with(b"/") {
@@ -2379,6 +2489,8 @@ impl<W: Write> Zip<W> {
         // `archive-zip.c`: deflate into a buffer and keep it only if it shrank.
         let (method, payload) = if is_dir {
             (0u16, Vec::new())
+        } else if streamed && level != 0 {
+            (8u16, gzip::deflate_raw(data, level))
         } else if data.is_empty() || level == 0 {
             // `-0` stores every entry; an empty file has nothing to compress.
             (0u16, data.to_vec())
@@ -2399,10 +2511,21 @@ impl<W: Write> Zip<W> {
         };
         // `ZIP_UTF8` (bit 11): git marks a name that is not pure ASCII as UTF-8, in
         // both headers, so an unzip that honours the flag decodes it correctly.
-        let flags: u16 = if name.iter().any(|b| *b >= 0x80) { 1 << 11 } else { 0 };
+        let mut flags: u16 = if name.iter().any(|b| *b >= 0x80) { 1 << 11 } else { 0 };
+        // `ZIP_STREAM` (bit 3): the CRC and sizes follow the data.
+        if streamed {
+            flags |= 1 << 3;
+        }
         let extra = self.extra();
         let offset = self.offset;
 
+        // A streamed entry's local header carries `crc32(0, NULL, 0)` and, for
+        // a deflated one, a compressed size of 0: neither is known yet.
+        let (header_crc, header_csize) = match (streamed, method) {
+            (true, 8) => (0, 0),
+            (true, _) => (0, payload.len() as u32),
+            (false, _) => (crc, payload.len() as u32),
+        };
         let mut hdr = Vec::with_capacity(30 + name.len() + extra.len());
         hdr.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
         hdr.extend_from_slice(&10u16.to_le_bytes()); // version needed
@@ -2410,8 +2533,8 @@ impl<W: Write> Zip<W> {
         hdr.extend_from_slice(&method.to_le_bytes());
         hdr.extend_from_slice(&self.dos.0.to_le_bytes());
         hdr.extend_from_slice(&self.dos.1.to_le_bytes());
-        hdr.extend_from_slice(&crc.to_le_bytes());
-        hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&header_crc.to_le_bytes());
+        hdr.extend_from_slice(&header_csize.to_le_bytes());
         hdr.extend_from_slice(&(data.len() as u32).to_le_bytes());
         hdr.extend_from_slice(&(name.len() as u16).to_le_bytes());
         hdr.extend_from_slice(&(extra.len() as u16).to_le_bytes());
@@ -2419,6 +2542,15 @@ impl<W: Write> Zip<W> {
         hdr.extend_from_slice(&extra);
         self.raw(&hdr)?;
         self.raw(&payload)?;
+        if streamed {
+            // `write_zip_data_desc()`.
+            let mut desc = Vec::with_capacity(16);
+            desc.extend_from_slice(&0x0807_4b50u32.to_le_bytes());
+            desc.extend_from_slice(&crc.to_le_bytes());
+            desc.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            desc.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            self.raw(&desc)?;
+        }
 
         self.central.push(ZipCentral {
             made_by,

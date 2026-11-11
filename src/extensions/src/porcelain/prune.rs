@@ -288,6 +288,14 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
+    // `if (repo->repository_format_precious_objects) die(_("cannot prune in a
+    // precious-objects repo"));` (builtin/prune.c:179-180), after the options
+    // and before any `<head>` is looked at.
+    if precious_objects(&repo) {
+        eprintln!("fatal: cannot prune in a precious-objects repo");
+        return Ok(ExitCode::from(128));
+    }
+
     // Command-line `<head>`s are resolved before any reachability work — and
     // before anything is unlinked — so an unusable one fails exactly where
     // git's `die()` does, leaving the object store untouched.
@@ -432,10 +440,14 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         } else {
             objdir.join(rel)
         };
+        // `prune_tmp_file(mkpath("%s/%s", path, de->d_name))` (builtin/prune.c:149):
+        // `mkpath()`'s `strbuf_cleanup_path()` drops a leading "./" (path.c:52-57),
+        // which the loose-object paths of the phases above keep.
+        let root = display_root.strip_prefix(".").unwrap_or(&display_root);
         let shown_dir = if rel.is_empty() {
-            display_root.clone()
+            root.to_path_buf()
         } else {
-            display_root.join(rel)
+            root.join(rel)
         };
         let Some(names) = read_dir_raw(&dir) else {
             continue;
@@ -503,7 +515,7 @@ fn reachability<'a>(
     if cache.is_none() {
         let mut roots: Vec<ObjectId> = heads.to_vec();
         collect_roots(repo, &mut roots, PrunedReflogWarning::Print)?;
-        collect_recent_roots(objdir, repo.object_hash(), expire, &mut roots)?;
+        collect_recent_roots(objdir, &display_objdir(repo, objdir), repo.object_hash(), expire, &mut roots)?;
         // The only failure `collect_hook_roots` reports is git's
         // `unable to enumerate additional recent objects` at 128, which it has
         // already printed.
@@ -640,6 +652,7 @@ use crate::date::parse_expiry_date;
 /// than by inflating anything, so it has no equivalent failure to reproduce.
 fn collect_recent_roots(
     objdir: &Path,
+    shown: &Path,
     hash: gix::hash::Kind,
     expire: i64,
     roots: &mut Vec<ObjectId>,
@@ -653,8 +666,21 @@ fn collect_recent_roots(
     for fanout in 0u16..256 {
         let prefix = format!("{fanout:02x}");
         let sub = objdir.join(&prefix);
-        let Some(names) = read_dir_raw(&sub) else {
-            continue;
+        // `for_each_file_in_obj_subdir()`: a fan-out entry that is missing is
+        // skipped, any other `opendir()` failure is `error_errno(_("unable to
+        // open %s"))` and ends the walk (object-file.c:1062-1067), which
+        // `mark_reachable_objects()` turns into its `die()` (reachable.c:349-351).
+        let names: Vec<OsString> = match fs::read_dir(&sub) {
+            Ok(read) => read.filter_map(|e| e.ok()).map(|e| e.file_name()).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!(
+                    "error: unable to open {}: {}",
+                    shown.join(&prefix).display(),
+                    crate::external::strerror(&e)
+                );
+                return Err(crate::fatal::die("unable to mark recent objects"));
+            }
         };
         for name in names {
             let name = name.to_string_lossy().into_owned();
@@ -908,6 +934,24 @@ pub(super) fn read_dir_raw(dir: &Path) -> Option<Vec<OsString>> {
 /// would have chdir'd into: the worktree top for a normal repository, the
 /// current directory for a bare one. Falls back to the path as opened.
 fn display_objdir(repo: &gix::Repository, objdir: &Path) -> PathBuf {
+    // Discovered from inside the git directory, setup takes the bare branch:
+    // `repo_discover_bare_gitdir()` names the git directory "." when the cwd is
+    // that directory and its absolute path when the cwd lies below it
+    // (setup.c:1303-1311), and the object directory is that name plus
+    // "/objects".
+    if std::env::var_os("GIT_DIR").is_none() {
+        let real = |p: &Path| p.canonicalize().ok();
+        if let (Some(cwd), Some(git_dir)) = (std::env::current_dir().ok().and_then(|c| real(&c)), real(repo.git_dir())) {
+            if real(objdir).as_deref() == Some(git_dir.join("objects").as_path()) {
+                if cwd == git_dir {
+                    return PathBuf::from("./objects");
+                }
+                if cwd.starts_with(&git_dir) {
+                    return git_dir.join("objects");
+                }
+            }
+        }
+    }
     let base = repo
         .workdir()
         .map(Path::to_path_buf)
@@ -1506,4 +1550,22 @@ pub(super) fn add_reflogs_to_pending(
 pub(super) enum PrunedReflogWarning {
     Print,
     Silent,
+}
+
+/// `repo->repository_format_precious_objects`: `extensions.preciousObjects`
+/// as `read_repository_format()` saw it in the repository's own config file,
+/// which `handle_extension_v0()` honours whatever the format version
+/// (setup.c:616-621, :1815-1816). A `-c` on the command line never reaches it.
+pub(super) fn precious_objects(repo: &gix::Repository) -> bool {
+    let Ok(bytes) = std::fs::read(repo.common_dir().join("config")) else {
+        return false;
+    };
+    let Ok(file) = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    ) else {
+        return false;
+    };
+    matches!(file.boolean("extensions.preciousObjects"), Ok(Some(true)))
 }

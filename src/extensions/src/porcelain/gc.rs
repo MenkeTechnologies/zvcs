@@ -23,7 +23,7 @@
 //!     exit 129 (git's `parse_max_cruft_size()` reports through `error()`, not
 //!     through `usage_with_options()`; confirmed by `od -c` on git 2.55.0)
 //!   * `--max-cruft-size=<n>` with `0 < n < 1 MiB` → `warning: minimum pack size
-//!     limit is 1 MiB` on stderr, then a normal run. `0` means "unlimited" and
+//!     limit is 1 MiB` on stderr, once, from the cruft repack, then a normal run. `0` means "unlimited" and
 //!     warns nothing. `gc.maxCruftSize` supplies the default when
 //!     `--max-cruft-size` is absent; git validates it eagerly through
 //!     `git_config_ulong`, so a value it cannot read is fatal (exit 128, `bad
@@ -78,9 +78,9 @@
 //!   * **`rerere gc`**, delegated to [`super::rerere::rerere`], guarded on the
 //!     `rr-cache` directory existing so the delegate's `read_dir` error path is
 //!     never entered for a repository that simply never recorded a resolution.
-//!   * **`prune`**, delegated to [`super::prune::prune`] — but *only* when the
-//!     effective expiry is `now`, because that is the one expiry whose semantics
-//!     the delegate implements. See below.
+//!   * **`prune --expire <expiry>`**, delegated to [`super::prune::prune`] for
+//!     every expiry but `--no-prune`'s, as `odb_optimize()` runs it after the
+//!     repack (odb/source-files.c:734-753).
 //!
 //!   * **Repacking**, delegated to [`super::repack::repack`] with the argument
 //!     list [`repack_argv`] builds. `gc` writes no pack of its own: it assembles
@@ -139,8 +139,8 @@
 //!      is in the pack writer, not here.
 //!   2. **Writing `gc.log`.** A failure is reported on stderr here rather than
 //!      captured to a file, there being no detached child whose output would
-//!      otherwise be lost, and the file is not removed after a successful run
-//!      either (`builtin/gc.c:99-101`). Reading one *is* done — see
+//!      otherwise be lost. A successful run does remove one, as git's
+//!      non-daemonized run does (`builtin/gc.c:741-745`). Reading one *is* done — see
 //!      [`report_last_gc_error`] — because a `gc.log` stock git left in a shared
 //!      repository has to stop this `gc` for as long as it stops that one.
 //!
@@ -155,7 +155,8 @@
 //! `--quiet` suppresses the progress meters the pack write reports, which git
 //! writes to stderr and only on a terminal; see [`crate::progress`].
 //!
-//! No `gc.pid` lock is taken, so `--force` has nothing to override.
+//! `gc.pid` is taken for the whole run (`lock_repo_for_gc()`), and `--force`
+//! overrides a live one.
 
 use anyhow::Result;
 use std::path::Path;
@@ -233,28 +234,6 @@ const USAGE_ALL: &str = r#"usage: git gc [<options>]
 /// flag.
 const VALUE_OPTS: [&str; 2] = ["max-cruft-size", "expire-to"];
 
-/// git's minimum cruft pack size; anything smaller (but non-zero) draws a
-/// warning and is then ignored.
-const MIN_CRUFT_SIZE: u64 = 1024 * 1024;
-
-/// The effective prune expiry, reduced to the distinction that changes where
-/// unreachable objects end up.
-///
-/// A *dated* expiry and a disabled one behave identically on any repository
-/// whose unreachable objects are younger than the cutoff, which is every
-/// repository `gc` sees in practice moments after the objects were written. The
-/// distinction that matters is `now` — "expire everything" — versus not.
-#[derive(PartialEq, Clone, Copy)]
-enum Prune {
-    /// `--no-prune`, or an expiry of `never`.
-    Disabled,
-    /// `--prune=now`, or `gc.pruneExpire=now` — every unreachable object expires,
-    /// which is precisely bare `git prune`'s behaviour.
-    Now,
-    /// A dated expiry, `2.weeks.ago` by default.
-    Dated,
-}
-
 /// `git gc` — housekeeping driver.
 ///
 /// Returns 0 with git's own usage output for `-h`, 129 for every malformed
@@ -277,10 +256,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `-q`: suppress the progress meters the pack write reports. Progress is on
     // a terminal only, so a piped or redirected run is quiet either way.
     let mut quiet = false;
-    // `None` until a `--prune` form is seen, so `gc.pruneExpire` can supply the
-    // default only when the command line was silent — matching git, where the
-    // command line overrides the config.
-    let mut prune: Option<Prune> = None;
+    // `OPT_BOOL_F(0, "force", &force, ...)`: overrides `lock_repo_for_gc()`'s
+    // check for a live `gc.pid` (builtin/gc.c:440).
+    let mut force = false;
     // `--expire-to=<dir>`, git's `cfg.repack_expire_to`. It is forwarded to the
     // `repack` child verbatim (builtin/gc.c:642-643) and nowhere else, which is
     // why the value is kept rather than dropped with the rest of `VALUE_OPTS`.
@@ -347,12 +325,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             "--prune" => {
                 // An `OPTARG` whose `defval` is the sentinel: it puts the sentinel back, so an earlier
                 // `--prune=<v>` is forgotten (builtin/gc.c:868-872).
-                prune = Some(Prune::Dated);
                 prune_raw = None;
                 prune_expire_arg = None;
             }
             "--no-prune" => {
-                prune = Some(Prune::Disabled);
                 prune_raw = None;
                 prune_expire_arg = Some(None);
             }
@@ -393,7 +369,8 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             // packs.
             "--keep-largest-pack" => keep_largest_pack = Some(true),
             "--no-keep-largest-pack" => keep_largest_pack = Some(false),
-            "--force" | "--no-force" => {}
+            "--force" => force = true,
+            "--no-force" => force = false,
             // `--no-expire-to` is a valid negation (USAGE spells it `--[no-]expire-to`);
             // `--max-cruft-size` has no `--no-` form, so one is left to error out.
             // An `OPT_STRING` unset stores a NULL rather than a value, so the
@@ -405,7 +382,6 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
                 // checked once, after parsing, on whichever occurrence came last.
                 prune_raw = Some(a["--prune=".len()..].to_string());
                 prune_expire_arg = Some(Some(a["--prune=".len()..].to_string()));
-                prune = Some(Prune::Dated);
             }
             _ if VALUE_OPTS
                 .iter()
@@ -537,21 +513,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // sees only the last `--prune=` on the line — `--prune== --prune=2.weeks.ago`
     // is accepted for exactly that reason.
     if let Some(raw) = &prune_raw {
-        let Some(expiry) = crate::date::parse_expiry_date(raw) else {
+        if crate::date::parse_expiry_date(raw).is_none() {
             eprintln!("fatal: failed to parse prune expiry value {raw}");
             return Ok(ExitCode::from(128));
-        };
-        // `parse_expiry_date()` folds four words to the two extremes:
-        // `never`/`false` expire nothing, `all`/`now` expire everything.
-        // Comparing the resolved timestamp catches all four without spelling
-        // them out a second time.
-        prune = Some(if expiry == 0 {
-            Prune::Disabled
-        } else if expiry == i64::MAX {
-            Prune::Now
-        } else {
-            Prune::Dated
-        });
+        }
     }
 
     // `gc --auto` is a no-op below the thresholds; git returns before touching
@@ -572,6 +537,27 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             None => return Ok(ExitCode::SUCCESS),
         },
     };
+    // ```c
+    // if (!opts.quiet) {
+    //         if (opts.detach > 0)
+    //                 fprintf(stderr, _("Auto packing the repository in background for optimum performance.\n"));
+    //         else
+    //                 fprintf(stderr, _("Auto packing the repository for optimum performance.\n"));
+    //         fprintf(stderr, _("See \"git help gc\" for manual housekeeping.\n"));
+    // }
+    // ```
+    //
+    // (builtin/gc.c:656-662.) `opts.detach` was raised from `gc.autoDetach`
+    // just above (:644-645).
+    if auto && !quiet {
+        let detaching = detach.unwrap_or_else(|| repo.config_snapshot().boolean("gc.autoDetach").unwrap_or(true));
+        if detaching {
+            eprintln!("Auto packing the repository in background for optimum performance.");
+        } else {
+            eprintln!("Auto packing the repository for optimum performance.");
+        }
+        eprintln!("See \"git help gc\" for manual housekeeping.");
+    }
 
     // `prepare_repo_settings()` is lazy in git: `cmd_gc()` reaches it through the children it
     // spawns, so a usage error, an unreadable `--prune` date and a below-threshold `--auto` run
@@ -603,27 +589,30 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // git prints this from the repack itself, not from option parsing, so it is
-    // gated on the run actually happening: a below-threshold `--auto` returns
-    // above and warns nothing. `0` means "no limit" and is silent; any other
-    // value below git's 1 MiB floor warns and is then ignored — this port
-    // applies no size limit (see the module docs), so the warning is its only
-    // observable effect, whether the value came from `--max-cruft-size` or from
-    // `gc.maxCruftSize`.
-    if max_cruft_size.is_some_and(|size| size > 0 && size < MIN_CRUFT_SIZE) {
-        eprintln!("warning: minimum pack size limit is 1 MiB");
-    }
-
-    let prune = prune.unwrap_or_else(|| {
-        // git's built-in default is "2.weeks.ago", which lands on `Dated` along
-        // with every other unparsed value.
-        let expire = repo.config_snapshot().string("gc.pruneExpire");
-        match expire.as_ref().and_then(|v| v.to_str().ok()) {
-            Some("now") => Prune::Now,
-            Some("never") => Prune::Disabled,
-            _ => Prune::Dated,
+    // `lock_repo_for_gc()` (builtin/gc.c:419-483). A detaching run takes the
+    // lock for its foreground tasks first and walks away quietly when another
+    // gc holds it (:675-679); otherwise an `--auto` run is quiet about it and a
+    // manual one dies (:690-698). This port does not fork, so the one lock
+    // covers the whole run, and the guard deletes `gc.pid` when `gc` returns,
+    // as the registered tempfile does at exit.
+    let _pidfile = match lock_repo_for_gc(&repo, force) {
+        Ok(guard) => guard,
+        Err(GcLock::Held { host, pid }) => {
+            if auto || (detach_positive && !skip_foreground_tasks) {
+                return Ok(ExitCode::SUCCESS);
+            }
+            eprintln!("fatal: gc is already running on machine '{host}' pid {pid} (use --force if not)");
+            return Ok(ExitCode::from(128));
         }
-    });
+        Err(GcLock::Unlockable(message)) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
+    // `warning: minimum pack size limit is 1 MiB` belongs to the `pack-objects`
+    // the repack child runs (builtin/pack-objects.c:5387), and only a cruft
+    // repack is handed `--max-cruft-size`, so the delegate prints it, once.
 
     // `cfg.prune_expire` itself, as the text `add_repack_all_option()` forwards.
     // `GC_CONFIG_INIT` seeds it with `"2.weeks.ago"` (builtin/gc.c:161),
@@ -718,6 +707,40 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `worktree prune --expire <gc.worktreePruneExpire>`, then `rerere gc`: git
+    // 2.56 runs both after the foreground tasks and before the object-store
+    // optimisation (builtin/gc.c:718-726), removing the administrative directory of every linked worktree
+    // whose checkout has vanished and whose `index` has aged past the expiry.
+    prune_worktrees(&repo)?;
+
+    // Guarded on the directory: `rerere gc` returns early when rerere is
+    // disabled, but a repository with rerere on and no `rr-cache` yet would hit
+    // the delegate's `read_dir` error path, which git does not have.
+    // The child dies on a configuration it cannot read whether or not `rr-cache` exists.
+    if super::rerere::gc_child_runs(&repo) {
+        // `rerere()` is handed the arguments the verb was dispatched with, so the
+        // verb itself is not one of them: a leading "rerere" reads as an unknown
+        // subcommand and prints the usage block instead of collecting anything.
+        // `run_command(&rerere)` failing is `die(FAILED_RUN, "rerere")`: the child's own
+        // diagnostic (an unreadable `rerere.enabled` / `rerere.autoUpdate`, say) comes first.
+        if let Err(err) = super::rerere::rerere(&["gc".to_string()]) {
+            match err.downcast::<crate::fatal::Fatal>() {
+                Ok(fatal) => eprintln!("fatal: {fatal}"),
+                Err(err) if err.is::<crate::fatal::Silent>() => {}
+                Err(err) => return Err(err),
+            }
+            eprintln!("fatal: failed to run rerere");
+            return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+        }
+    }
+
+    // `maintenance_task_odb()` → `odb_optimize()` does nothing at all in a
+    // precious-objects repository: `if (repo->repository_format_precious_objects)
+    // return 0;` comes before the `repack` child and the `prune` child are
+    // built (odb/source-files.c:620-621), so none of their diagnostics, effects
+    // or the loose-object warning happen either.
+    let precious = super::prune::precious_objects(&repo);
+
     // The `repack` child's own argument diagnostics, which `gc` reaches here —
     // after `pack-refs` and `reflog expire` have already run, and after the
     // `--auto` gate, so a below-threshold `gc --auto` never sees them. git
@@ -733,8 +756,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // A bad spec is rejected while parse-options is still running
     // (`builtin/repack.c`'s `OPT_PARSE_LIST_OBJECTS_FILTER`), so it beats the
     // `--filter-to` pairing check at `builtin/repack.c:407-408`.
-    if let Some(code) = check_repack_filter(repack_filter.as_deref(), repack_filter_to.as_deref()) {
-        return Ok(code);
+    if !precious {
+        if let Some(code) = check_repack_filter(repack_filter.as_deref(), repack_filter_to.as_deref()) {
+            return Ok(code);
+        }
     }
 
     // `git_pack_config()`'s `pack.useBitmaps` and `pack.allowPackReuse`, which
@@ -748,6 +773,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
     {
         Ok(_) => {}
+        Err(_) if precious => {}
         Err(message) => {
             eprintln!("fatal: {message}");
             report_failed_child();
@@ -810,7 +836,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // child's stderr, so the child's line is rendered here, in its place, before
     // `gc`'s own. An error that is neither of git's two shapes is this port
     // speaking for itself and is left to the caller to render as such.
-    if let Err(err) = super::repack::repack(&argv) {
+    if let Err(err) = (!precious).then(|| super::repack::repack(&argv)).transpose() {
         // An index the `pack-objects` grandchild cannot decode for `--indexed-objects`
         // is `do_read_index()`'s `die()` in that child (read-cache.c:1826).
         let index_fatal = crate::fatal::index_entry_format_fatal(&err);
@@ -824,40 +850,62 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         return Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)));
     }
 
-    // `repack` has already removed every unreachable object under `Drop`, so the
-    // delegate finds nothing left to do; it still runs, because it also sweeps
-    // the stale temporary files that repacking does not touch.
-    if prune == Prune::Now {
+    // ```c
+    // if (opts->strategy != ODB_OPTIMIZE_GEOMETRIC && opts->prune_expire) {
+    //         strvec_pushl(&prune_cmd.args, "prune", "--expire", NULL);
+    //         /* run `git prune` even if using cruft packs */
+    //         strvec_push(&prune_cmd.args, opts->prune_expire);
+    //         if (!(opts->flags & ODB_OPTIMIZE_VERBOSE))
+    //                 strvec_push(&prune_cmd.args, "--no-progress");
+    //         if (repo_has_promisor_remote(repo))
+    //                 strvec_push(&prune_cmd.args, "--exclude-promisor-objects");
+    // ```
+    //
+    // (odb/source-files.c:734-753.) Every expiry runs the child, `never`
+    // included: a dated one removes the unreachable loose objects older than
+    // the cutoff that a cruft repack left behind, and the stale temporary files
+    // the repack never touches. Only `--no-prune` (a NULL expiry) skips it.
+    if let Some(expire) = prune_expire.as_ref().filter(|_| !precious) {
+        let mut argv = vec!["prune".to_string(), "--expire".to_string(), expire.clone()];
+        if quiet {
+            argv.push("--no-progress".to_string());
+        }
+        if super::rev_list::has_promisor_remote(&repo) {
+            argv.push("--exclude-promisor-objects".to_string());
+        }
         // git forks `prune` (builtin/gc.c), so its buffered stdout is its own
         // and is flushed by its exit before gc goes on.
         let _child = crate::cstdio::run_command();
-        super::prune::prune(&["prune".to_string()])?;
-    }
-
-    // `worktree prune --expire <gc.worktreePruneExpire>`: git runs this after
-    // `prune`, removing the administrative directory of every linked worktree
-    // whose checkout has vanished and whose `index` has aged past the expiry.
-    prune_worktrees(&repo)?;
-
-    // Guarded on the directory: `rerere gc` returns early when rerere is
-    // disabled, but a repository with rerere on and no `rr-cache` yet would hit
-    // the delegate's `read_dir` error path, which git does not have.
-    // The child dies on a configuration it cannot read whether or not `rr-cache` exists.
-    if super::rerere::gc_child_runs(&repo) {
-        // `rerere()` is handed the arguments the verb was dispatched with, so the
-        // verb itself is not one of them: a leading "rerere" reads as an unknown
-        // subcommand and prints the usage block instead of collecting anything.
-        // `run_command(&rerere)` failing is `die(FAILED_RUN, "rerere")`: the child's own
-        // diagnostic (an unreadable `rerere.enabled` / `rerere.autoUpdate`, say) comes first.
-        if let Err(err) = super::rerere::rerere(&["gc".to_string()]) {
-            match err.downcast::<crate::fatal::Fatal>() {
-                Ok(fatal) => eprintln!("fatal: {fatal}"),
-                Err(err) if err.is::<crate::fatal::Silent>() => {}
-                Err(err) => return Err(err),
+        // `ret = error("failed to run %s", prune_cmd.args.v[0])`, then
+        // `cmd_gc()`'s `die(NULL)` (odb/source-files.c:748-751). The child has
+        // already said why, through its own exit or its own `fatal:`.
+        let failed = match super::prune::prune(&argv) {
+            Ok(code) => code != ExitCode::SUCCESS,
+            Err(err) => {
+                match err.downcast_ref::<crate::fatal::Fatal>() {
+                    Some(fatal) => eprintln!("fatal: {fatal}"),
+                    None if err.downcast_ref::<crate::fatal::Silent>().is_none() => return Err(err),
+                    None => {}
+                }
+                true
             }
-            eprintln!("fatal: failed to run rerere");
-            return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+        };
+        if failed {
+            eprintln!("error: failed to run prune");
+            return Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)));
         }
+    }
+    // ```c
+    // if (opts->flags & ODB_OPTIMIZE_AUTO && too_many_loose_objects(files, gc_auto_threshold))
+    //         warning(_("There are too many unreachable loose objects; "
+    //                 "run 'git prune' to remove them."));
+    // ```
+    //
+    // (odb/source-files.c:756-758.) `too_many_loose_objects()` answers 0 for
+    // a limit at or below zero (:311-312).
+    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
+    if !precious && auto && auto_threshold > 0 && too_many_loose_objects(&repo, auto_threshold) {
+        eprintln!("warning: There are too many unreachable loose objects; run 'git prune' to remove them.");
     }
 
     // `gc.writeCommitGraph` defaults to true.
@@ -880,13 +928,18 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 
     // `repack` refreshes `objects/info/packs` at the end of a successful run
     // unless `repack.updateServerInfo` turns it off.
-    if repo
+    if !precious
+        && repo
         .config_snapshot()
         .boolean("repack.updateServerInfo")
         .unwrap_or(true)
     {
         super::update_server_info::update_server_info(&["update-server-info".to_string()])?;
     }
+
+    // `if (!daemonized) unlink(git_path("gc.log"));` (builtin/gc.c:741-745): a
+    // run that got this far clears the report a failed detached run left.
+    let _ = std::fs::remove_file(repo.git_dir().join("gc.log"));
 
     Ok(ExitCode::SUCCESS)
 }
@@ -1698,4 +1751,117 @@ fn usage_error(msg: Option<&str>) -> ExitCode {
         None => eprint!("{USAGE}"),
     }
     ExitCode::from(129)
+}
+
+/// Why [`lock_repo_for_gc`] did not take `gc.pid`.
+enum GcLock {
+    /// Another gc holds it: the host and pid it recorded.
+    Held { host: String, pid: u64 },
+    /// `hold_lock_file_for_update(..., LOCK_DIE_ON_ERROR)` failed; the
+    /// `unable_to_lock_message()` text `die()` prints.
+    Unlockable(String),
+}
+
+/// `gc.pid` while this gc owns it: `register_tempfile(pidfile_path)` deletes
+/// it when the process exits (builtin/gc.c:480).
+struct PidFile(std::path::PathBuf);
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `lock_repo_for_gc()` (builtin/gc.c:419-483).
+///
+/// ```c
+/// fd = hold_lock_file_for_update(&lock, pidfile_path, LOCK_DIE_ON_ERROR);
+/// if (!force) {
+///         fp = fopen(pidfile_path, "r");
+///         should_exit =
+///                 fp != NULL &&
+///                 !fstat(fileno(fp), &st) &&
+///                 time(NULL) - st.st_mtime <= 12 * 3600 &&
+///                 fscanf(fp, scan_fmt, &pid, locking_host) == 2 &&
+///                 (strcmp(locking_host, my_host) || !kill(pid, 0) || errno == EPERM);
+///         [...]
+///         if (should_exit) { rollback_lock_file(&lock); return locking_host; }
+/// }
+/// strbuf_addf(&sb, "%"PRIuMAX" %s", (uintmax_t) getpid(), my_host);
+/// write_in_full(fd, sb.buf, sb.len);
+/// commit_lock_file(&lock);
+/// ```
+///
+/// A recorded gc on another host is trusted for twelve hours; one on this host
+/// only while its pid is alive. `scan_fmt` is `"%" SCNuMAX " %<HOST_NAME_MAX>s"`.
+fn lock_repo_for_gc(repo: &gix::Repository, force: bool) -> std::result::Result<PidFile, GcLock> {
+    let pid_path = repo.git_dir().join("gc.pid");
+    let lock_path = repo.git_dir().join("gc.pid.lock");
+    // `xgethostname()` failing leaves `my_host` at "unknown".
+    let my_host = gethostname().unwrap_or_else(|| "unknown".to_string());
+    let mut lock = match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(err) => return Err(GcLock::Unlockable(gix::lock::pid::unable_to_lock_message(&pid_path, &err))),
+    };
+    if !force {
+        if let Some((pid, host)) = recorded_gc(&pid_path) {
+            // `kill(pid, 0)`: 0 or EPERM means a process with that pid exists.
+            let alive = || {
+                // SAFETY: signal 0 performs only the existence/permission check.
+                let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+                rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            };
+            if host != my_host || alive() {
+                drop(lock);
+                let _ = std::fs::remove_file(&lock_path);
+                return Err(GcLock::Held { host, pid });
+            }
+        }
+    }
+    use std::io::Write as _;
+    let written = lock.write_all(format!("{} {my_host}", std::process::id()).as_bytes());
+    drop(lock);
+    if written.is_err() || std::fs::rename(&lock_path, &pid_path).is_err() {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+    Ok(PidFile(pid_path))
+}
+
+/// The `pid host` a fresh `gc.pid` records, or `None` when git's
+/// `should_exit` conditions already fail on the file itself: it is missing,
+/// older than twelve hours, or not two fields `fscanf()` can read.
+fn recorded_gc(path: &std::path::Path) -> Option<(u64, String)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let age = std::time::SystemTime::now().duration_since(meta.modified().ok()?).unwrap_or_default();
+    if age.as_secs() > 12 * 3600 {
+        return None;
+    }
+    let text = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&text);
+    // `%ju` skips leading whitespace and takes the longest run of digits; `%s`
+    // skips whitespace and takes up to HOST_NAME_MAX non-whitespace bytes.
+    let rest = text.trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let pid: u64 = rest[..digits].parse().ok()?;
+    let host: String = rest[digits..].split_whitespace().next()?.chars().take(HOST_NAME_MAX).collect();
+    Some((pid, host))
+}
+
+/// `HOST_NAME_MAX`: `<limits.h>`'s 64 on Linux, and compat/posix.h:470's
+/// fallback of 256 where the platform defines none, as on macOS.
+#[cfg(target_os = "linux")]
+const HOST_NAME_MAX: usize = 64;
+#[cfg(not(target_os = "linux"))]
+const HOST_NAME_MAX: usize = 256;
+
+/// `xgethostname()`: `gethostname()` into a `HOST_NAME_MAX + 1` buffer.
+fn gethostname() -> Option<String> {
+    let mut buf = [0u8; HOST_NAME_MAX + 1];
+    // SAFETY: the buffer is valid for `buf.len()` bytes and gethostname writes
+    // at most that many.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }

@@ -590,7 +590,11 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: revert failed");
             return Ok(ExitCode::from(128));
         }
-        let head = repo.head_id()?.detach();
+        // `if (repo_get_oid(r, "HEAD", &oid) && (opts->action == REPLAY_REVERT))`
+        // (sequencer.c:5746-5749).
+        let Some(head) = crate::sequencer::read_head_unresolved(&repo)? else {
+            return Ok(sequencer_failed("can't revert as initial commit"));
+        };
         crate::sequencer::save_head(git_dir, head)?;
         let xopts: Vec<&str> = o.xopts.iter().map(String::as_str).collect();
         crate::sequencer::save_opts(git_dir, &saved_opts(&o, &xopts, cleanup))?;
@@ -765,7 +769,11 @@ fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
             eprintln!("fatal: revert failed");
             return Ok(ExitCode::from(128));
         }
-        return reset_merge(repo.head_id()?.detach());
+        return match crate::sequencer::read_head_unresolved(repo)? {
+            Some(head) => reset_merge(head),
+            // `if (is_null_oid(&head_oid))` (sequencer.c:3564-3565).
+            None => Ok(sequencer_failed("cannot abort from a branch yet to be born")),
+        };
     };
     let Some(oid) = text
         .lines()
@@ -779,7 +787,7 @@ fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
         eprintln!("fatal: revert failed");
         return Ok(ExitCode::from(128));
     };
-    if crate::sequencer::rollback_is_safe(repo) {
+    if crate::sequencer::rollback_is_safe(repo)? {
         reset_merge(oid)?;
     } else {
         // A hand-made commit moved HEAD past the sequence; git declines the
@@ -799,7 +807,7 @@ fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path, edit: Optio
             eprintln!("fatal: revert failed");
             return Ok(ExitCode::from(128));
         }
-        if !crate::sequencer::rollback_is_safe(repo) {
+        if !crate::sequencer::rollback_is_safe(repo)? {
             eprintln!("error: there is nothing to skip");
             crate::advice::Advice::ResolveConflict
                 .advise_plain("have you committed already?\ntry \"git revert --continue\"");
@@ -807,8 +815,16 @@ fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path, edit: Optio
             return Ok(ExitCode::from(128));
         }
     }
-    // `skip_single_pick()` is `reset_merge(HEAD)`.
-    reset_merge(repo.head_id()?.detach())?;
+    // `skip_single_pick()` is `reset_merge(HEAD)`, and a null `HEAD` (an unborn
+    // branch) is a bare `reset --merge` (sequencer.c:3542-3576). A failed reset is
+    // `error(_("failed to skip the commit"))`.
+    let skipped = match crate::sequencer::read_head_unresolved(repo)? {
+        Some(head) => reset_merge(head)?,
+        None => super::reset::reset(&["--merge".to_string(), "--quiet".to_string()])?,
+    };
+    if skipped != ExitCode::SUCCESS {
+        return Ok(sequencer_failed("failed to skip the commit"));
+    }
     if !crate::sequencer::dir(git_dir).is_dir() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -854,7 +870,7 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path, edit: O
         eprintln!("fatal: revert failed");
         return Ok(ExitCode::from(128));
     }
-    let head_tree = repo.head_commit()?.tree_id()?.detach();
+    let head_tree = crate::sequencer::head_tree_or_die(repo)?;
     if index_tree(repo, &index)? != head_tree {
         eprintln!("error: your local changes would be overwritten by revert.");
         crate::advice::Advice::CommitBeforeMerge
@@ -929,19 +945,14 @@ fn revert_one(
     let parents: Vec<ObjectId> = target.parent_ids().map(|id| id.detach()).collect();
     let is_merge = parents.len() > 1;
 
-    let head = repo.head()?;
-    if head.is_unborn() {
-        eprintln!("fatal: Your current branch does not have any commits yet");
-        return Ok(Step::Failed(ExitCode::from(128)));
-    }
-    let head_id = head
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
-        .detach();
-    drop(head);
-
+    // `unborn = repo_get_oid(r, "HEAD", &head)`, then `oidcpy(&head, empty_tree)`
+    // (sequencer.c:2317-2326): a single revert onto a branch yet to be born merges
+    // against the empty tree and writes a root commit.
     let hash = repo.object_hash();
-    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+    let unborn_head = crate::sequencer::read_head_unresolved(repo)?;
+    let unborn = unborn_head.is_none();
+    let head_id = unborn_head.unwrap_or_else(|| ObjectId::empty_tree(hash));
+    let head_tree = if unborn { head_id } else { repo.find_commit(head_id)?.tree_id()?.detach() };
 
     // git checks the index before it even looks at the commit's parents, so an
     // unmerged or dirty index outranks "is a merge but no -m was given". Under
@@ -1331,6 +1342,15 @@ fn revert_one(
         if super::cherry_pick::continue_commit_identity(repo, repo.git_dir(), !verbatim).is_some() {
             return Ok(Step::Failed(ExitCode::from(1)));
         }
+        // On an unborn branch the child `git commit` reports with its commit-template
+        // wording, `Initial commit` (wt-status.c:2033-2036).
+        if unborn {
+            let whence = super::commit::determine_whence(repo);
+            let _child = crate::cstdio::run_command();
+            super::replay_commit::enter_toplevel(repo);
+            super::commit::refuse_nothing_to_commit(None, false, whence)?;
+            return Ok(Step::Failed(ExitCode::from(1)));
+        }
         if !wt.modified.is_empty() || !wt.untracked.is_empty() {
             // git finishes a no-op pick by running `git commit`, which finds
             // nothing to commit and prints the working-tree status — byte-identical
@@ -1402,7 +1422,8 @@ fn revert_one(
         &author.into(),
         message.as_bytes().as_bstr(),
         merged_tree,
-        vec![head_id],
+        // `try_to_commit()` takes parents only from a `current_head` (sequencer.c:1574-1577).
+        if unborn { Vec::new() } else { vec![head_id] },
         signer.as_ref(),
     );
     let new_id = match written {
@@ -1419,7 +1440,12 @@ fn revert_one(
                 force_create_reflog: false,
                 message: format!("revert: {subject}").into(),
             },
-            expected: PreviousValue::MustExistAndMatch(Target::Object(head_id)),
+            // `old_head ? &old_head->object.oid : null_oid()` (sequencer.c:1285-1287).
+            expected: if unborn {
+                PreviousValue::MustNotExist
+            } else {
+                PreviousValue::MustExistAndMatch(Target::Object(head_id))
+            },
             new: Target::Object(new_id),
         },
         name: "HEAD"

@@ -2822,6 +2822,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let reflog_action = std::env::var("GIT_REFLOG_ACTION").ok().filter(|a| !a.is_empty());
     let reflog_override: Option<String> = match &reflog_action {
         Some(action) => Some(reflog_line(action, &message)),
+        // `if (!current_head)` comes first (builtin/commit.c:1851-1853): concluding
+        // a pick onto an unborn branch is `commit (initial)`, which gix writes itself.
+        None if is_root => None,
         None if whence.is_cherry_pick() => Some(reflog_line("commit (cherry-pick)", &message)),
         None if whence.is_rebase() => Some(reflog_line("commit (rebase)", &message)),
         None => None,

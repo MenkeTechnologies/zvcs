@@ -947,14 +947,16 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         return Ok(sequencer_failed("empty commit set passed"));
     }
 
+    // `unborn = repo_get_oid(r, "HEAD", &head)` and, for an unborn branch,
+    // `oidcpy(&head, the_hash_algo->empty_tree)` (sequencer.c:2317-2326): the picks
+    // go onto the empty tree and the first commit is a root commit.
     let head = repo.head()?;
-    if head.is_unborn() {
-        crate::git_fatal!("cannot cherry-pick onto an unborn branch");
-    }
-    let head_id = head
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?
-        .detach();
+    let unborn = head.is_unborn();
+    let head_id = match head.id() {
+        Some(id) => id.detach(),
+        None if unborn => ObjectId::empty_tree(repo.object_hash()),
+        None => anyhow::bail!("HEAD does not point to a commit"),
+    };
     drop(head);
 
     // --- stage 7: start the sequence ---------------------------------------
@@ -984,7 +986,10 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         if crate::sequencer::create(&repo)?.is_err() {
             return Ok(sequencer_failed_tail());
         }
-        crate::sequencer::save_head(git_dir, head_id)?;
+        // `save_head(oid_to_hex(&oid))` after a `repo_get_oid(r, "HEAD", &oid)` that
+        // failed on an unborn branch (sequencer.c:5746-5751) writes an `oid` nothing
+        // initialised; the null id stands in for it here.
+        crate::sequencer::save_head(git_dir, if unborn { ObjectId::null(repo.object_hash()) } else { head_id })?;
         crate::sequencer::save_opts(git_dir, &saved_opts(&opts, cleanup))?;
         crate::sequencer::update_abort_safety_file(&repo)?;
     }
@@ -1013,6 +1018,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         // picks squashes onto each other while HEAD stays put.
         pending_tree: None,
         head_id,
+        unborn,
     };
     run_todo(&env, &mut state, &todo, 0, sequence)
 }
@@ -1093,7 +1099,10 @@ struct PickEnv<'a> {
 struct PickState {
     index: gix::index::File,
     pending_tree: Option<ObjectId>,
+    /// `head` in `do_pick_commit()`: the empty tree while `unborn`.
     head_id: ObjectId,
+    /// `HEAD` names a branch with no commit yet; cleared by the first commit.
+    unborn: bool,
 }
 
 /// Whether a pick landed or stopped the sequence.
@@ -1193,7 +1202,13 @@ fn pick_one(
             None => tree_from_index(&repo, &state.index)?,
         }
     } else {
-        let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+        let head_tree = if state.unborn {
+            // `index_differs_from(r, unborn ? empty_tree_oid_hex() : "HEAD", ...)`
+            // (sequencer.c:2327).
+            head_id
+        } else {
+            repo.find_commit(head_id)?.tree_id()?.detach()
+        };
         if unmerged_entries(&state.index).is_some() {
             // `error_dirty_index`'s first move is `repo_read_index_unmerged()`,
             // which hands an unmerged index to `error_resolve_conflict`: that
@@ -1255,7 +1270,9 @@ fn pick_one(
 
     // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
     // change is a fast-forward. git prints nothing in this case.
-    if opts.allow_ff && base_id == Some(head_id) {
+    // `(parent && oideq(&parent->object.oid, &head)) || (!parent && unborn)`
+    // (sequencer.c:2366-2368): a root commit fast-forwards an unborn branch.
+    if opts.allow_ff && (base_id == Some(head_id) || (base_id.is_none() && state.unborn)) {
         // `fast_forward_to()` (sequencer.c:657-676) checks the picked tree out with
         // `checkout_fast_forward()` before it opens the `HEAD` transaction, and a
         // transaction that fails is `error("%s", err.buf)` and `return -1` — which
@@ -1263,12 +1280,13 @@ fn pick_one(
         // `die(_("cherry-pick failed"))` with the index and work tree already moved.
         state.index = update_clean_worktree(&repo, &state.index, pick_tree, &should_interrupt)?;
         if let Some(message) =
-            held_ref_lock(advance_head(&repo, head_id, pick_id, "cherry-pick: fast-forward".into()))?
+            held_ref_lock(advance_head(&repo, (!state.unborn).then_some(head_id), pick_id, "cherry-pick: fast-forward".into()))?
         {
             eprintln!("error: {message}");
             return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
         }
         state.head_id = pick_id;
+        state.unborn = false;
         return Ok(PickOutcome::Done);
     }
 
@@ -1816,7 +1834,9 @@ fn pick_one(
         &author.to_owned()?,
         message.as_bstr(),
         tree_id,
-        vec![head_id],
+        // `try_to_commit()` gives a commit parents only from a `current_head`
+        // (sequencer.c:1574-1577), so the first pick onto an unborn branch is a root.
+        if state.unborn { Vec::new() } else { vec![head_id] },
         super::commit::sequencer_signer(&repo, opts.gpg_sign).as_ref(),
     );
     let new_id = match written {
@@ -1835,7 +1855,7 @@ fn pick_one(
     // sequencer.c:2474-2479 wrote before the commit all stay behind. Reported here
     // rather than returned, so a held branch lock is the command's own stop and not
     // lock contention for the dispatcher to re-run against that now-merged index.
-    if let Some(message) = held_ref_lock(advance_head(&repo, head_id, new_id, reflog))? {
+    if let Some(message) = held_ref_lock(advance_head(&repo, (!state.unborn).then_some(head_id), new_id, reflog))? {
         eprintln!("error: {message}");
         return Ok(PickOutcome::Stopped(ExitCode::FAILURE));
     }
@@ -1872,6 +1892,7 @@ fn pick_one(
     print_diffstat(head_tree, tree_id)?;
 
     state.head_id = new_id;
+    state.unborn = false;
     Ok(PickOutcome::Done)
 }
 
@@ -2053,7 +2074,7 @@ fn sequencer_continue(repo: &gix::Repository, edit: Option<bool>) -> Result<Exit
         );
         return Ok(sequencer_failed_tail());
     }
-    let head_tree = repo.head_commit()?.tree_id()?.detach();
+    let head_tree = crate::sequencer::head_tree_or_die(repo)?;
     if tree_from_index(repo, &index)? != head_tree {
         eprintln!("error: your local changes would be overwritten by cherry-pick.");
         crate::advice::Advice::CommitBeforeMerge
@@ -2131,10 +2152,21 @@ fn resume_todo(
         committer_ident: &committer_ident,
         should_interrupt: AtomicBool::new(false),
     };
+    // `do_pick_commit()` looks `HEAD` up afresh for every pick, so a sequence whose
+    // first pick was skipped on an unborn branch is still building a root commit.
+    let head = repo.head()?;
+    let unborn = head.is_unborn();
+    let head_id = match head.id() {
+        Some(id) => id.detach(),
+        None if unborn => ObjectId::empty_tree(repo.object_hash()),
+        None => anyhow::bail!("HEAD does not point to a commit"),
+    };
+    drop(head);
     let mut state = PickState {
         index: repo.index_or_load_from_head()?.into_owned(),
         pending_tree: None,
-        head_id: repo.head_id()?.detach(),
+        head_id,
+        unborn,
     };
     run_todo(&env, &mut state, todo, start, true)
 }
@@ -2164,7 +2196,7 @@ fn sequencer_rollback(repo: &gix::Repository) -> Result<ExitCode> {
         return Ok(sequencer_failed_tail());
     };
 
-    if crate::sequencer::rollback_is_safe(repo) {
+    if crate::sequencer::rollback_is_safe(repo)? {
         reset_merge(Some(oid))?;
     } else {
         // `warning()`, not an error: git declines the rewind and still succeeds.
@@ -2181,8 +2213,11 @@ fn rollback_single_pick(repo: &gix::Repository) -> Result<ExitCode> {
     {
         return Ok(sequencer_failed("no cherry-pick or revert in progress"));
     }
-    let head = repo.head_id()?.detach();
-    reset_merge(Some(head))
+    match crate::sequencer::read_head_unresolved(repo)? {
+        Some(head) => reset_merge(Some(head)),
+        // `if (is_null_oid(&head_oid))` (sequencer.c:3564-3565).
+        None => Ok(sequencer_failed("cannot abort from a branch yet to be born")),
+    }
 }
 
 /// `sequencer_skip()`: drop the stopped pick, then continue the sequence if one
@@ -2197,7 +2232,7 @@ fn sequencer_skip(repo: &gix::Repository, edit: Option<bool>) -> Result<ExitCode
         if crate::sequencer::get_last_command(&git_dir) != Some(crate::sequencer::Action::Pick) {
             return Ok(sequencer_failed("no cherry-pick in progress"));
         }
-        if !crate::sequencer::rollback_is_safe(repo) {
+        if !crate::sequencer::rollback_is_safe(repo)? {
             eprintln!("error: there is nothing to skip");
             crate::advice::Advice::ResolveConflict.advise_plain(
                 "have you committed already?\ntry \"git cherry-pick --continue\"",
@@ -2205,9 +2240,13 @@ fn sequencer_skip(repo: &gix::Repository, edit: Option<bool>) -> Result<ExitCode
             return Ok(sequencer_failed_tail());
         }
     }
-    // `skip_single_pick()` is `reset_merge(HEAD)`.
-    let head = repo.head_id()?.detach();
-    reset_merge(Some(head))?;
+    // `skip_single_pick()` is `reset_merge(HEAD)`, and a null `HEAD` (an unborn
+    // branch) is a bare `reset --merge` (sequencer.c:3542-3576). A failed reset is
+    // `error(_("failed to skip the commit"))`.
+    let head = crate::sequencer::read_head_unresolved(repo)?;
+    if reset_merge(head)? != ExitCode::SUCCESS {
+        return Ok(sequencer_failed("failed to skip the commit"));
+    }
     if !crate::sequencer::dir(&git_dir).is_dir() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -2516,7 +2555,9 @@ fn held_ref_lock(moved: Result<()>) -> Result<Option<String>> {
 /// `reflog` as the reflog message, requiring `old` to still be the current tip.
 fn advance_head(
     repo: &gix::Repository,
-    old: ObjectId,
+    // `None` for an unborn branch: the transaction's old value is `null_oid()`
+    // (sequencer.c:666-668, :1285-1287), so `HEAD` must not exist yet.
+    old: Option<ObjectId>,
     new: ObjectId,
     reflog: BString,
 ) -> Result<()> {
@@ -2530,7 +2571,10 @@ fn advance_head(
                 force_create_reflog: false,
                 message: reflog,
             },
-            expected: PreviousValue::MustExistAndMatch(Target::Object(old)),
+            expected: match old {
+                Some(old) => PreviousValue::MustExistAndMatch(Target::Object(old)),
+                None => PreviousValue::MustNotExist,
+            },
             new: Target::Object(new),
         },
         name,

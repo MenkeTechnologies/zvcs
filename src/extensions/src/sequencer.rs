@@ -1470,9 +1470,11 @@ pub fn update_abort_safety_file(repo: &gix::Repository) -> Result<()> {
     if !dir(git_dir).exists() {
         return Ok(());
     }
+    // `write_file(path, "%s", "")` on an unborn `HEAD` (sequencer.c:640-643):
+    // `write_file()` completes only a non-empty line, so the file is empty.
     let body = match repo.head_id() {
         Ok(id) => format!("{}\n", id.detach()),
-        Err(_) => "\n".to_string(),
+        Err(_) => String::new(),
     };
     std::fs::write(abort_safety_path(git_dir), body)?;
     Ok(())
@@ -1483,12 +1485,23 @@ pub fn update_abort_safety_file(repo: &gix::Repository) -> Result<()> {
 ///
 /// A missing `abort-safety` file compares against the null id, exactly as git's
 /// `ENOENT` branch does — so it is only "safe" when `HEAD` is unreadable too.
-pub fn rollback_is_safe(repo: &gix::Repository) -> bool {
-    let expected = std::fs::read_to_string(abort_safety_path(repo.git_dir()))
-        .ok()
-        .and_then(|text| ObjectId::from_hex(text.trim().as_bytes()).ok());
+pub fn rollback_is_safe(repo: &gix::Repository) -> Result<bool> {
+    // A file that is there but holds no object id dies (sequencer.c:3522-3529): the
+    // empty one an unborn `HEAD` left behind included. A missing file is the null id.
+    let path = abort_safety_path(repo.git_dir());
+    let expected = match std::fs::read_to_string(&path) {
+        Ok(text) => match ObjectId::from_hex(text.trim().as_bytes()) {
+            Ok(id) => Some(id),
+            // `git_path()` names it from the work tree top: `.git/...`, not `./.git/...`.
+            Err(_) => {
+                let shown = path.strip_prefix(".").unwrap_or(&path);
+                return Err(crate::fatal::die(format!("could not parse {}", shown.display())));
+            }
+        },
+        Err(_) => None,
+    };
     let actual = repo.head_id().ok().map(|id| id.detach());
-    expected == actual
+    Ok(expected == actual)
 }
 
 /// `sequencer_remove_state()`: the sequence is over, the directory goes.
@@ -1758,6 +1771,31 @@ pub fn init_config_cleanup(repo: Option<&gix::Repository>) -> Option<String> {
         }
     }
     mode
+}
+
+/// `refs_read_ref_full(store, "HEAD", 0, &oid, NULL)` as `rollback_single_pick()` and
+/// `skip_single_pick()` read it (sequencer.c:3562, :3573): without
+/// `RESOLVE_REF_READING` a branch yet to be born reads as the null id, which is
+/// `None` here.
+pub fn read_head_unresolved(repo: &gix::Repository) -> Result<Option<ObjectId>> {
+    let head = repo.head()?;
+    if head.is_unborn() {
+        return Ok(None);
+    }
+    Ok(Some(head.id().ok_or_else(|| anyhow::anyhow!("HEAD does not point to a commit"))?.detach()))
+}
+
+/// The tree of `HEAD` for `index_differs_from(r, "HEAD", NULL, 0)`, whose
+/// `setup_revisions()` dies through `diagnose_missing_default()` on a branch yet to
+/// be born (revision.c:3023-3035).
+pub fn head_tree_or_die(repo: &gix::Repository) -> Result<ObjectId> {
+    let head = repo.head()?;
+    if head.is_unborn() {
+        let name = head.referent_name().map(|n| n.shorten().to_string()).unwrap_or_default();
+        return Err(crate::fatal::die(format!("your current branch '{name}' does not have any commits yet")));
+    }
+    drop(head);
+    Ok(repo.head_commit()?.tree_id()?.detach())
 }
 
 /// `read_populate_opts()`: load `sequencer/opts`, or the defaults when the file

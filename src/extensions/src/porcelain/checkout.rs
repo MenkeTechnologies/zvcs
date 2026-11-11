@@ -3583,6 +3583,7 @@ pub(super) fn switch_gate(
         target_tree,
         &index,
         initial_checkout,
+        merge_preserves_ignored(),
         subs.as_ref(),
     )?;
     if clobber.is_empty() {
@@ -3905,6 +3906,27 @@ pub(super) fn set_force(on: bool) {
     FORCE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `opts->overwrite_ignore`, on unless `--no-overwrite-ignore` (builtin/checkout.c:1818,
+/// :1897). `init_topts()` makes it `topts->preserve_ignored = !overwrite_ignore` (:835)
+/// and `reset_tree()` `!o->force && !o->overwrite_ignore` (:767). `switch` records its
+/// own; every other caller keeps git's default.
+static OVERWRITE_IGNORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Record this `switch` invocation's `opts->overwrite_ignore`.
+pub(super) fn set_overwrite_ignore(on: bool) {
+    OVERWRITE_IGNORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `topts->preserve_ignored` for `merge_working_tree()`'s two-way unpack (:835).
+fn merge_preserves_ignored() -> bool {
+    !OVERWRITE_IGNORE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `opts.preserve_ignored` for `reset_tree()`'s one-way unpack (:767).
+fn reset_preserves_ignored() -> bool {
+    !FORCE.load(std::sync::atomic::Ordering::Relaxed) && merge_preserves_ignored()
+}
+
 /// `should_update_submodules()` (submodule.c:745-748) for this `checkout`/`switch`:
 /// `--[no-]recurse-submodules`, else `submodule.recurse`. Every other caller of the
 /// unpack paths below — `rebase` checking out its branch — leaves it off.
@@ -4111,6 +4133,7 @@ pub(super) fn update_worktree_to_tree(
         crate::unpack_sparse::Opts {
             porcelain: true,
             quiet,
+            preserve_ignored: merge_preserves_ignored(),
             ..Default::default()
         },
     );
@@ -4337,6 +4360,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
         crate::unpack_sparse::Opts {
             overwrite_untracked: FORCE.load(std::sync::atomic::Ordering::Relaxed),
             reset: true,
+            preserve_ignored: reset_preserves_ignored(),
             ..Default::default()
         },
     );
@@ -4354,11 +4378,14 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             let backing = old.path_backing();
             old.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
         };
-        // `preserve_ignored = !o->force && !o->overwrite_ignore` (:767), and `switch`
-        // defaults `overwrite_ignore` on (:1897): the standard excludes are consulted.
-        let mut excludes = repo
-            .excludes(&old, None, gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped)
-            .ok();
+        // `preserve_ignored = !o->force && !o->overwrite_ignore` (:767): unless
+        // `--no-overwrite-ignore` cleared it the standard excludes are consulted.
+        let mut excludes = match reset_preserves_ignored() {
+            true => None,
+            false => repo
+                .excludes(&old, None, gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped)
+                .ok(),
+        };
         let backing = new_index.path_backing();
         for e in new_index.entries() {
             let path = e.path_in(backing);

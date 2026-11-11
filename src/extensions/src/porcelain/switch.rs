@@ -187,6 +187,9 @@ struct Parsed<'a> {
     ignore_other_worktrees: bool,
     /// `--[no-]recurse-submodules[=<bool>]`, the worktree updater's switch;
     /// `None` leaves `submodule.recurse` to decide.
+    /// `--[no-]overwrite-ignore` → `opts->overwrite_ignore`, on by default
+    /// (builtin/checkout.c:1818, :1897).
+    overwrite_ignore: bool,
     recurse_submodules: Option<bool>,
     positionals: Vec<&'a str>,
 }
@@ -215,6 +218,7 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         track_inherit: false,
         guess: None,
         ignore_other_worktrees: false,
+        overwrite_ignore: true,
         recurse_submodules: None,
         positionals: Vec::new(),
     };
@@ -345,8 +349,8 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                 }
                 "progress" => p.progress = Some(true),
                 "no-progress" => p.progress = Some(false),
-                // Silently-accepted no-ops that do not change deterministic output.
-                "overwrite-ignore" | "no-overwrite-ignore" => {}
+                "overwrite-ignore" => p.overwrite_ignore = true,
+                "no-overwrite-ignore" => p.overwrite_ignore = false,
                 "no-recurse-submodules" => p.recurse_submodules = Some(false),
                 // `option_parse_recurse_submodules_worktree_updater()`
                 // (submodule.c:2093) reads the optional value with
@@ -571,6 +575,8 @@ fn switch_main(args: &[String]) -> Result<ExitCode> {
     );
     // `opts->force` apart from `--discard-changes`, for `reset_tree()`.
     super::checkout::set_force(p.force);
+    // `opts->overwrite_ignore`, for both unpacks.
+    super::checkout::set_overwrite_ignore(p.overwrite_ignore);
     // `should_update_submodules()`: the unpack moves the submodules it touches.
     super::checkout::set_recurse_submodules(super::submodule_move::should_update_submodules(
         &repo,

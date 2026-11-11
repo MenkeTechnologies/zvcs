@@ -262,7 +262,7 @@ pub fn verify_two_way_initial(
     index: &gix::index::State,
     initial_checkout: bool,
 ) -> Result<Clobber> {
-    verify_two_way_recursing(repo, old_tree, new_tree, index, initial_checkout, None)
+    verify_two_way_recursing(repo, old_tree, new_tree, index, initial_checkout, false, None)
 }
 
 /// [`verify_two_way_initial`] under `--recurse-submodules`: `subs` is
@@ -272,12 +272,15 @@ pub fn verify_two_way_initial(
 /// `verify_absent_1()` (:2510-2531) and `merged_entry()` itself (:2592-2598,
 /// :2621-2627). A gitlink is never `ce_uptodate()`: `refresh_cache_ent()` does
 /// not mark one (read-cache.c:1425-1428), so every touched submodule is asked.
+/// `preserve_ignored` is `o->preserve_ignored`, which leaves an ignored file in the way
+/// protected like an untracked one (see [`scan`]).
 pub(crate) fn verify_two_way_recursing(
     repo: &gix::Repository,
     old_tree: ObjectId,
     new_tree: ObjectId,
     index: &gix::index::State,
     initial_checkout: bool,
+    preserve_ignored: bool,
     subs: Option<&crate::porcelain::submodule_move::Recursion>,
 ) -> Result<Clobber> {
     let old = flatten(repo, old_tree)?;
@@ -345,7 +348,7 @@ pub(crate) fn verify_two_way_recursing(
     });
     let worktree = match checks.iter().all(|(_, check)| matches!(check, Check::Reject)) {
         true => Worktree::default(),
-        false => scan(repo, want_untracked)?,
+        false => scan(repo, want_untracked, preserve_ignored)?,
     };
 
     // `verify_uptodate()`: the file must still match the index. A directory
@@ -764,7 +767,7 @@ pub fn verify_three_way(
         return Ok(clobber);
     }
     let want_untracked = !absent_overwritten.is_empty() || !absent_removed.is_empty();
-    let worktree = scan(repo, want_untracked)?;
+    let worktree = scan(repo, want_untracked, false)?;
     for path in uptodate {
         if worktree.modified.contains(path) {
             clobber.not_uptodate.push(path.clone());
@@ -839,7 +842,7 @@ struct Worktree {
     untracked: HashSet<BString>,
 }
 
-fn scan(repo: &gix::Repository, want_untracked: bool) -> Result<Worktree> {
+fn scan(repo: &gix::Repository, want_untracked: bool, preserve_ignored: bool) -> Result<Worktree> {
     use gix::status::index_worktree::Item as IndexWorktreeItem;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 
@@ -855,9 +858,20 @@ fn scan(repo: &gix::Repository, want_untracked: bool) -> Result<Worktree> {
         gix::status::UntrackedFiles::None
     };
     let patterns: Vec<BString> = Vec::new();
+    // `o->preserve_ignored` leaves `o->internal.dir` unset (unpack-trees.c:1922-1926), so
+    // `verify_absent_1()` has no `is_excluded()` to consult (:2437-2443) and
+    // `verify_clean_subdirectory()` reads the directory without the standard excludes
+    // (:2382-2384): an ignored file stands in the way like any untracked one, each file
+    // under an ignored directory included.
     let iter = repo
         .status(gix::progress::Discard)?
         .untracked_files(untracked_files)
+        .dirwalk_options(|opts| match preserve_ignored {
+            true => opts
+                .emit_ignored(Some(gix::dir::walk::EmissionMode::Matching))
+                .recurse_ignored_directories(true),
+            false => opts,
+        })
         .into_iter(patterns)?;
     for item in iter {
         let gix::status::Item::IndexWorktree(iw) = item? else {
@@ -884,11 +898,16 @@ fn scan(repo: &gix::Repository, want_untracked: bool) -> Result<Worktree> {
                     state.modified.insert(rela_path);
                 }
             },
-            IndexWorktreeItem::DirectoryContents { entry, .. } => {
-                if matches!(entry.status, gix::dir::entry::Status::Untracked) {
+            IndexWorktreeItem::DirectoryContents { entry, .. } => match entry.status {
+                gix::dir::entry::Status::Untracked => {
                     state.untracked.insert(entry.rela_path);
                 }
-            }
+                // The ignored directory itself is walked into, so only what is in it counts.
+                gix::dir::entry::Status::Ignored(_) if entry.disk_kind != Some(gix::dir::entry::Kind::Directory) => {
+                    state.untracked.insert(entry.rela_path);
+                }
+                _ => {}
+            },
             IndexWorktreeItem::Rewrite { .. } => {}
         }
     }

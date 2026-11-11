@@ -175,6 +175,12 @@ impl crate::Repository {
             .map_err(Into::into)
     }
 
+    /// The lock modes [`edit_references()`](Self::edit_references()) prepares its transaction with:
+    /// `core.filesRefLockTimeout` for each reference and `core.packedRefsTimeout` for `packed-refs`.
+    pub fn ref_lock_modes(&self) -> Result<(gix_lock::acquire::Fail, gix_lock::acquire::Fail), reference::edit::Error> {
+        Ok(self.config.lock_timeout()?)
+    }
+
     /// Apply `edits` like [edit_references(…)](Self::edit_references()), but in a transaction that may
     /// fail partially, git's `REF_TRANSACTION_ALLOW_FAILURE`: an edit refused for its values or name is
     /// left out and listed in the returned rejections, while the others are committed.

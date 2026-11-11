@@ -62,6 +62,13 @@ impl Transaction<'_, '_> {
                 // reflog first, then reference
                 Change::Update { log, new, expected } => {
                     let lock = change.lock.take();
+                    // A verification is neither committed nor logged: its update has neither
+                    // `REF_NEEDS_COMMIT` nor `REF_LOG_ONLY` (refs/files-backend.c:3355-3360), and
+                    // dropping the lock rolls it back. The log-only halves split off one do log.
+                    if change.verify_only && log.mode != RefLog::Only {
+                        drop(lock);
+                        continue;
+                    }
                     let (update_ref, update_reflog) = match log.mode {
                         RefLog::Only => (false, true),
                         RefLog::AndReference => (true, true),

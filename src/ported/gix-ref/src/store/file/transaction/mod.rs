@@ -93,8 +93,7 @@ pub struct Rejection {
     pub message: BString,
 }
 
-/// git's transaction flags that a [`RefEdit`] cannot express. Only a store with
-/// the reftable backend reads them; the files backend prepares as before.
+/// git's transaction flags that a [`RefEdit`] cannot express.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Options {
     /// `REF_TRANSACTION_ALLOW_FAILURE`.
@@ -108,6 +107,11 @@ pub(crate) struct Options {
     /// Log an update to a symbolic value as the files backend does; see
     /// [`Transaction::log_symref_updates()`].
     pub log_symref_updates: bool,
+    /// Refuse an existing reference for [`PreviousValue::MustNotExist`] whatever it holds; see
+    /// [`Transaction::must_not_exist_strictly()`].
+    ///
+    /// [`PreviousValue::MustNotExist`]: crate::transaction::PreviousValue::MustNotExist
+    pub must_not_exist_strictly: bool,
 }
 
 /// One reflog entry written as given, git's `ref_transaction_update_reflog()`
@@ -185,6 +189,12 @@ pub(in crate::store_impl::file) struct Edit {
     /// over it (refs/files-backend.c:3352, :3400, :3434), but the `reference-transaction` hook
     /// still lists it (`transaction_hook_feed_stdin()`, refs.c:2602-2640).
     rejected: bool,
+    /// The update only verifies its expected value, git's `ref_transaction_verify()` (refs.c:1537-1554,
+    /// v2.56.0): it carries no new value (`REF_HAVE_NEW` unset), so `lock_ref_for_update()` locks the
+    /// reference and checks its old value but writes nothing (refs/files-backend.c:2857-2860), and
+    /// `files_transaction_finish()` neither commits nor logs it (:3355-3360). An update split off one
+    /// inherits it, as `split_symref_update()` and `split_head_update()` copy the flags.
+    verify_only: bool,
     /// The update was split off one that was refused before `lock_ref_for_update()` split it, so it
     /// is not part of git's transaction at all: `split_symref_update()` and `split_head_update()`
     /// run for an update only once it is locked (refs/files-backend.c:2707-2792). gix splits every
@@ -266,7 +276,10 @@ impl<'p> Transaction<'_, 'p> {
     /// (`REF_HAVE_NEW` is unset), so its `new` is ignored, nothing is written and
     /// no reflog entry is made for it.
     ///
-    /// Only a store with the reftable backend honours it.
+    /// Both backends honour it. In the files backend the update locks its reference and
+    /// checks the old value, and the log-only updates split off it still log, with the null
+    /// id as their new value (`lock_ref_for_update()`, refs/files-backend.c:2687-2905;
+    /// `parse_and_write_reflog()`, :3134-3185).
     pub fn verify_only(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
         self.options.verify_only.extend(indices);
         self
@@ -292,12 +305,32 @@ impl<'p> Transaction<'_, 'p> {
         self
     }
 
+    /// Make [`PreviousValue::MustNotExist`] refuse a reference that exists whatever it holds,
+    /// as `check_old_oid()` refuses one for an update whose old value is the null id
+    /// (refs/files-backend.c:2647-2652, v2.56.0). Without it the files backend accepts a
+    /// reference that already holds the new value.
+    ///
+    /// The reftable backend always refuses it.
+    ///
+    /// [`PreviousValue::MustNotExist`]: crate::transaction::PreviousValue::MustNotExist
+    pub fn must_not_exist_strictly(mut self) -> Self {
+        self.options.must_not_exist_strictly = true;
+        self
+    }
+
     /// Add reflog entries to write as they are given, see [`ReflogUpdate`].
     ///
     /// Only a store with the reftable backend honours it.
     pub fn update_reflogs(mut self, entries: impl IntoIterator<Item = ReflogUpdate>) -> Self {
         self.options.reflog_updates.extend(entries);
         self
+    }
+
+    /// The lines a prepared transaction feeds the `reference-transaction` hook at `prepared`
+    /// (`transaction_hook_feed_stdin()`, refs.c:2602-2640), for a writer that runs the hook
+    /// itself (see [`without_transaction_hook()`](crate::file::without_transaction_hook())).
+    pub fn hook_stdin(&self) -> Option<&[u8]> {
+        self.hook.as_ref().map(|feed| feed.lines.as_slice())
     }
 
     /// The updates a prepared transaction that [may fail partially](Self::allow_failure())

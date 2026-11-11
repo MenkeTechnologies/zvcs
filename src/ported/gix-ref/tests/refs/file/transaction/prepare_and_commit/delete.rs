@@ -561,7 +561,7 @@ fn a_loose_ref_with_old_value_check_and_outdated_packed_refs_value_deletes_both_
 }
 
 #[test]
-fn all_contained_references_deletes_the_packed_ref_file_too() -> crate::Result {
+fn all_contained_references_leave_a_header_only_packed_ref_file() -> crate::Result {
     for mode in ["must-exist", "may-exist"] {
         let (_keep, store) = store_writable("make_packed_ref_repository.sh")?;
         let edits = store
@@ -588,10 +588,16 @@ fn all_contained_references_deletes_the_packed_ref_file_too() -> crate::Result {
             )?
             .commit(committer().to_ref(&mut TimeBuf::default()))?;
 
-        assert!(!store.packed_refs_path().is_file(), "packed-refs was entirely removed");
+        // As git's write_with_updates() does (refs/packed-backend.c:1407-1418), the file
+        // is rewritten with its header even when no ref is left in it.
+        assert_eq!(
+            std::fs::read(store.packed_refs_path())?,
+            b"# pack-refs with: peeled fully-peeled sorted \n",
+            "packed-refs keeps only its header"
+        );
 
-        let packed = store.open_packed_buffer()?;
-        assert!(packed.is_none(), "it won't make up packed refs");
+        let packed = store.open_packed_buffer()?.expect("header-only packed-refs");
+        assert_eq!(packed.iter()?.count(), 0, "it won't make up packed refs");
         // `refs/heads/main` is among the packed refs and `HEAD` points at it, so the batch
         // also carries git's `REF_LOG_ONLY` mirror onto `HEAD`. That one deletes nothing —
         // it exists to append `<old> <null>` to a log that stays — so only the real

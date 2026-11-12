@@ -677,12 +677,23 @@ pub fn is_lock_contention(err: &anyhow::Error) -> bool {
 /// verbs yield `gix::reference::edit::Error`, and a bare transaction yields the
 /// `prepare::Error` itself.
 ///
-/// Only `ReferenceOutOfDate` counts — the other variants (a malformed name, an
-/// IO failure) are real errors that a re-run would hit again.
+/// Only a stale old value counts (`ReferenceOutOfDate`, or a `Reftable` error of kind
+/// `IncorrectOldValue`) — the other variants (a malformed name, an IO failure) are
+/// real errors that a re-run would hit again.
 pub fn is_ref_race(err: &anyhow::Error) -> bool {
-    /// The one variant that means "someone else won the race".
+    /// The variants that mean "someone else won the race": gix's own, and the stale old
+    /// value of an update split off a symref, which is worded as git words it,
+    /// `REF_TRANSACTION_ERROR_INCORRECT_OLD_VALUE` (refs/files-backend.c:2661-2665).
     fn lost_cas(e: &gix::refs::file::transaction::prepare::Error) -> bool {
-        matches!(e, gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. })
+        use gix::refs::file::transaction::{prepare::Error, ErrorKind};
+        matches!(
+            e,
+            Error::ReferenceOutOfDate { .. }
+                | Error::Reftable {
+                    kind: ErrorKind::IncorrectOldValue,
+                    ..
+                }
+        )
     }
 
     err.chain().any(|e| {

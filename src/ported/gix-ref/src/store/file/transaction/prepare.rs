@@ -92,6 +92,25 @@ impl Transaction<'_, '_> {
         None
     }
 
+    /// Whether the symref chain starting at `start` ends on a reference that does not
+    /// exist, which `refs_resolve_ref_unsafe()` without `RESOLVE_REF_READING` resolves to
+    /// the null id, rather than in a cycle or deeper than git's `SYMREF_MAXDEPTH`, which it
+    /// cannot resolve at all (refs.c:2147-2199).
+    fn symref_chain_is_dangling(store: &file::Store, start: &FullName, packed: Option<&packed::Buffer>) -> bool {
+        let mut name = start.clone();
+        for _ in 0..5 {
+            match Self::read_existing_ref(store, name.as_ref(), packed) {
+                Ok(None) => return true,
+                Ok(Some(Reference {
+                    target: Target::Symbolic(next),
+                    ..
+                })) => name = next,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn lock_ref_and_apply_change(
         store: &file::Store,
         lock_fail_mode: gix_lock::acquire::Fail,
@@ -200,6 +219,24 @@ impl Transaction<'_, '_> {
                 {
                     previous_is_symbolic = true;
                     symref_previous_oid = Self::resolve_symref_chain(store, referent, packed);
+                    // `refs_resolve_ref_unsafe()` of the referent of a symref updated with
+                    // `REF_NO_DEREF` fails on a chain it cannot read, a cycle or one deeper
+                    // than `SYMREF_MAXDEPTH`, which refuses an update with an old value
+                    // (refs/files-backend.c:2771-2781); a missing referent is the null id.
+                    let have_old = !matches!(expected, PreviousValue::Any | PreviousValue::MustExist);
+                    if have_old
+                        && symref_previous_oid.is_none()
+                        && !Self::symref_chain_is_dangling(store, referent, packed)
+                    {
+                        return Err(Error::Reftable {
+                            kind: ErrorKind::Generic,
+                            message: format!(
+                                "cannot lock ref '{}': error reading reference",
+                                change.update.name.as_bstr()
+                            )
+                            .into(),
+                        });
+                    }
                 }
 
                 match (&expected, &existing_ref) {
@@ -382,69 +419,19 @@ impl Transaction<'_, '_> {
                 verify_only: self.options.verify_only.contains(&idx),
             })
             .collect();
-        // A transaction that may fail partially splits each update as `lock_ref_for_update()`
-        // reaches it (refs/files-backend.c:2699-2702, :2781-2793), so a split that runs into
-        // another update refuses the one update it came from; see [`Self::split_on_lock()`].
-        // Any other transaction splits up front, where such a split fails it.
+        // Every update is split as `lock_ref_for_update()` reaches it, in the one loop of
+        // `files_transaction_prepare()` (refs/files-backend.c:2699-2702, :2781-2793,
+        // :3020-3033): a split that runs into another update fails that update, which
+        // refuses it alone when the transaction may fail partially and fails the
+        // transaction otherwise.
         let allow_failure = self.options.allow_failure;
-        if allow_failure {
-            // `ref_update_reject_duplicates()` (refs.c:2708-2710).
-            updates.assure_one_name_has_one_edit().map_err(|name| {
-                Error::PreprocessingFailed(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("A reference named '{name}' has multiple edits"),
-                ))
-            })?;
-        } else {
-            updates
-                .pre_process(
-                    &mut |name| {
-                        let symbolic_refs_are_never_packed = None;
-                        store
-                            .find_existing_inner(name, symbolic_refs_are_never_packed)
-                            .map(|r| r.target)
-                            .ok()
-                    },
-                    &mut |idx, update| Edit {
-                        update,
-                        lock: None,
-                        parent_index: Some(idx),
-                        leaf_referent_previous_oid: None,
-                        log_only_split: false,
-                        previous_is_symbolic: false,
-                        rejected: false,
-                        dropped: false,
-                        verify_only: false,
-                    },
-                )
-                .map_err(Error::PreprocessingFailed)?;
-            // The splits come after their parents, so one pass hands the flag down a chain.
-            for idx in 0..updates.len() {
-                if let Some(parent) = updates[idx].parent_index {
-                    if updates[parent].verify_only {
-                        mark_verify_split(&mut updates, idx, parent, store.object_hash);
-                    }
-                }
-            }
-        }
-
-        // Identify the halves that are git's `REF_LOG_ONLY` rather than a caller asking for
-        // gix's reflog-only deletion — see [`Edit::log_only_split`]. `split_symref_update()`
-        // hands the referent the caller's original mode and forces `RefLog::Only` on the
-        // symbolic half, so a child that still deletes its reference marks its parent as the
-        // log-only mirror of a real deletion.
-        for idx in 0..updates.len() {
-            let Some(parent) = updates[idx].parent_index else { continue };
-            if matches!(
-                updates[idx].update.change,
-                Change::Delete {
-                    log: RefLog::AndReference,
-                    ..
-                }
-            ) {
-                updates[parent].log_only_split = true;
-            }
-        }
+        // `ref_update_reject_duplicates()` (refs.c:2708-2710).
+        updates.assure_one_name_has_one_edit().map_err(|name| {
+            Error::PreprocessingFailed(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("A reference named '{name}' has multiple edits"),
+            ))
+        })?;
 
         // `split_head_update()` (refs/files-backend.c): "If update is a direct update of
         // head_ref (the reference pointed to by HEAD), then add an extra REF_LOG_ONLY update
@@ -477,22 +464,6 @@ impl Transaction<'_, '_> {
         };
         // `(index of the branch update, index of the HEAD log-only update)`.
         let mut head_split_indices: Vec<(usize, usize)> = Vec::new();
-        if let (Some(head_ref), false) = (&head_ref, allow_failure) {
-            // git errors out on a transaction that already touches HEAD; we simply
-            // leave such a transaction alone, since the caller has stated what the
-            // HEAD entry should be and `assure_one_name_has_one_edit` above would
-            // otherwise have to be re-run.
-            let head_already_edited = updates.iter().any(|e| e.update.name == head_name);
-            // At most one edit can name `head_ref` — `pre_process` above already
-            // rejected duplicates — and at most one HEAD entry may exist.
-            let branch = (!head_already_edited)
-                .then(|| (0..updates.len()).find(|&idx| needs_head_split(&updates, idx, head_ref)))
-                .flatten();
-            if let Some(idx) = branch {
-                updates.push(head_mirror(&updates[idx], &head_name, self.options.log_symref_updates, store.object_hash));
-                head_split_indices.push((idx, updates.len() - 1));
-            }
-        }
 
         // `files_transaction_prepare()` locks `packed-refs` for any transaction
         // holding a deletion that is not log-only (`refs/files-backend.c:2982-3036`),
@@ -505,16 +476,11 @@ impl Transaction<'_, '_> {
         if takes_packed_refs_lock {
             file::packed_refs_lock();
         }
-        // A transaction that may fail partially locks the loose references first and
-        // builds the nested `packed-refs` transaction from the updates that were not
-        // refused, as `files_transaction_prepare()` does (refs/files-backend.c:3019-3058);
-        // until then `packed-refs` is read unlocked (:3060-3073). Otherwise it is
-        // prepared up front.
-        if allow_failure {
-            self.packed_buffer = self.store.assure_packed_refs_uptodate()?;
-        } else {
-            self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;
-        }
+        // The loose references are locked first and the nested `packed-refs` transaction
+        // is built from the updates that were not refused, as `files_transaction_prepare()`
+        // does (refs/files-backend.c:3019-3058); until then `packed-refs` is read unlocked
+        // (:3060-3073).
+        self.packed_buffer = self.store.assure_packed_refs_uptodate()?;
 
         // The packed transaction's buffer when there is one, the unlocked snapshot otherwise —
         // see [`Transaction::packed_buffer`][file::Transaction].
@@ -531,7 +497,7 @@ impl Transaction<'_, '_> {
         // is not among them, so the lines are put together once the locking is done.
         let kind = self.store.object_hash;
         let mut update_lines: Vec<Vec<u8>> = Vec::with_capacity(updates.len());
-        // `transaction->refnames` for the splits of a transaction that may fail partially:
+        // `transaction->refnames` for the splits:
         // the names of the updates queued that are not `REF_LOG_ONLY`, sorted by
         // `ref_transaction_prepare()` (refs.c:2708), then each referent a split adds
         // appended unsorted (refs.c:1356-1361) — see [`string_list_find()`].
@@ -554,7 +520,7 @@ impl Transaction<'_, '_> {
             if cid >= updates.len() {
                 break;
             }
-            if allow_failure && split_off_refused(&updates, cid, &head_split_indices) {
+            if split_off_refused(&updates, cid, &head_split_indices) {
                 updates[cid].dropped = true;
                 update_lines.push(Vec::new());
                 continue;
@@ -563,22 +529,20 @@ impl Transaction<'_, '_> {
             // `split_symref_update()` once it is (refs/files-backend.c:2699-2702, :2781-2793).
             let mut head_conflict = None;
             let mut symref_conflict = None;
-            if allow_failure {
-                if let Some(head_ref) = &head_ref {
-                    head_conflict = split_head_update(
-                        &mut updates,
-                        cid,
-                        head_ref,
-                        &head_name,
-                        &refnames,
-                        &mut head_split_indices,
-                        self.options.log_symref_updates,
-                        kind,
-                    );
-                }
-                if head_conflict.is_none() && !ref_locks.contains(&updates[cid].name()) {
-                    symref_conflict = split_symref_update(store, &mut updates, cid, &mut refnames);
-                }
+            if let Some(head_ref) = &head_ref {
+                head_conflict = split_head_update(
+                    &mut updates,
+                    cid,
+                    head_ref,
+                    &head_name,
+                    &refnames,
+                    &mut head_split_indices,
+                    self.options.log_symref_updates,
+                    kind,
+                );
+            }
+            if head_conflict.is_none() && !ref_locks.contains(&updates[cid].name()) {
+                symref_conflict = split_symref_update(store, &mut updates, cid, &mut refnames);
             }
             update_lines.push(match &packing_lines {
                 Some(_) => Vec::new(),
@@ -597,19 +561,10 @@ impl Transaction<'_, '_> {
                     line
                 }
             });
-            if let Some(message) = head_conflict {
-                reject(
-                    &mut updates,
-                    cid,
-                    ErrorKind::NameConflict,
-                    message,
-                    &mut rejections,
-                    &mut refnames,
-                    kind,
-                );
-                continue;
-            }
-            let (locked, refusal) = if allow_failure && ref_locks.contains(&updates[cid].name()) {
+            // `split_head_update()` fails the update before `lock_raw_ref()` is reached.
+            let (locked, refusal) = if let Some(message) = head_conflict {
+                (Ok(()), Some((ErrorKind::NameConflict, message)))
+            } else if ref_locks.contains(&updates[cid].name()) {
                 let head_split = head_split_indices.iter().any(|&(_, head)| head == cid);
                 match self.reused_lock(&updates, cid, packed_for_lookups, head_split) {
                     Ok(refusal) => (Ok(()), refusal),
@@ -664,14 +619,31 @@ impl Transaction<'_, '_> {
                     );
                     continue;
                 }
-                // Any other transaction fails on `lock_raw_ref()`'s name conflict with
-                // the text `refs_verify_refname_available()` gave it
-                // (refs/files-backend.c:795-829, :903-934), which the other refusals
-                // already carry in their own error.
-                Some((kind @ ErrorKind::NameConflict, message)) => Err(Error::Reftable {
-                    kind,
-                    message: message.into(),
-                }),
+                // Any other transaction fails with the refusal's text, which names the
+                // update the caller queued and the reference it was split onto
+                // (refs/files-backend.c:2720-2727, :2615-2666, refs.c:3150-3156). A held
+                // lock keeps gix's error, whose holder and path the callers word, and so
+                // does a stale old value of an update that was not split, which says what
+                // the text says and which a caller may take for a lost race.
+                Some((kind, message))
+                    if !matches!(
+                        (&locked, updates[cid].parent_index),
+                        (Err(Error::LockAcquire { .. }), _)
+                            | (
+                                Err(Error::ReferenceOutOfDate {
+                                    actual: Target::Object(_),
+                                    expected: Target::Object(_),
+                                    ..
+                                }),
+                                None
+                            )
+                    ) =>
+                {
+                    Err(Error::Reftable {
+                        kind,
+                        message: message.into(),
+                    })
+                }
                 _ => locked,
             };
             if let Err(err) = locked {
@@ -776,9 +748,7 @@ impl Transaction<'_, '_> {
             }
         }
         self.rejections = rejections;
-        if allow_failure {
-            self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;
-        }
+        self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;
         let packed_for_lookups = self
             .packed_transaction
             .as_ref()
@@ -1131,6 +1101,33 @@ impl Transaction<'_, '_> {
     ) -> Option<(ErrorKind, String)> {
         let name = updates[cid].update.name.as_bstr();
         let original = original_name(updates, cid);
+        // `ref_update_check_old_target()` of a symbolic reference updated with
+        // `REF_NO_DEREF` (refs.c:3163-3185, refs/files-backend.c:2783-2784), and the old
+        // target of a regular reference (:2806-2817), which word the message themselves.
+        if let Error::ReferenceOutOfDate {
+            expected: Target::Symbolic(old),
+            actual,
+            ..
+        } = err
+        {
+            return Some(match actual {
+                Target::Symbolic(referent) => (
+                    ErrorKind::IncorrectOldValue,
+                    format!(
+                        "verifying symref target: '{original}': is at {} but expected {}",
+                        referent.as_bstr(),
+                        old.as_bstr()
+                    ),
+                ),
+                Target::Object(_) => (
+                    ErrorKind::ExpectedSymref,
+                    format!(
+                        "cannot lock ref '{original}': expected symref with target '{}': but is a regular ref",
+                        old.as_bstr()
+                    ),
+                ),
+            });
+        }
         let (kind, reason) = match err {
             // `lock_raw_ref()` with `mustexist` (refs/files-backend.c:885-897, :922-930).
             Error::DeleteReferenceMustExist { .. } | Error::MustExist { .. } => (
@@ -1341,14 +1338,16 @@ fn reject(
     let expected = match &edit.update.change {
         Change::Update { expected, .. } | Change::Delete { expected, .. } => expected,
     };
-    // `REF_HAVE_OLD`, with the null id for a reference that must not exist yet.
+    // `REF_HAVE_OLD`, with the null id for a reference that must not exist yet. An old
+    // target sets it too and leaves `old_oid` null, which is what the rejection carries
+    // (refs.c:1430-1431, :3064-3068).
     let (old_oid, old_target) = match expected {
         PreviousValue::MustExistAndMatch(Target::Object(oid)) => (Some(*oid), None),
-        PreviousValue::MustExistAndMatch(Target::Symbolic(name)) => (None, Some(name.as_bstr().to_owned())),
+        PreviousValue::MustExistAndMatch(Target::Symbolic(name)) => (Some(hash.null()), Some(name.as_bstr().to_owned())),
         PreviousValue::MustNotExist => (Some(hash.null()), None),
         _ => (None, None),
     };
-    // A verification has no `REF_HAVE_NEW`.
+    // A verification has no `REF_HAVE_NEW`; a new target sets it with a null `new_oid`.
     let (new_oid, new_target) = match &edit.update.change {
         Change::Update { .. } if edit.verify_only => (None, None),
         Change::Update {
@@ -1357,7 +1356,7 @@ fn reject(
         Change::Update {
             new: Target::Symbolic(name),
             ..
-        } => (None, Some(name.as_bstr().to_owned())),
+        } => (Some(gix_hash::ObjectId::null(hash)), Some(name.as_bstr().to_owned())),
         Change::Delete { .. } => (Some(gix_hash::ObjectId::null(hash)), None),
     };
     rejections.push(Rejection {
@@ -1473,9 +1472,9 @@ fn mark_verify_split(updates: &mut [Edit], child: usize, parent: usize, hash: gi
     }
 }
 
-/// `split_head_update()` (refs/files-backend.c:2499-2547) for update `cid` of a transaction
-/// that may fail partially: add the log-only `HEAD` update of an update of `head_ref`, or
-/// the message refusing the update when `HEAD` is already in the transaction.
+/// `split_head_update()` (refs/files-backend.c:2499-2547) for update `cid`: add the log-only
+/// `HEAD` update of an update of `head_ref`, or the message refusing the update when `HEAD`
+/// is already in the transaction.
 fn split_head_update(
     updates: &mut Vec<Edit>,
     cid: usize,
@@ -1501,10 +1500,10 @@ fn split_head_update(
     None
 }
 
-/// `split_symref_update()` (refs/files-backend.c:2555-2607) for update `cid` of a transaction
-/// that may fail partially, once it is dereferenced through a symbolic reference: the update
-/// becomes `REF_LOG_ONLY` without its old value, and one of the referent with the values
-/// is appended, which is split in turn when it is reached.
+/// `split_symref_update()` (refs/files-backend.c:2555-2607) for update `cid`, once it is
+/// dereferenced through a symbolic reference: the update becomes `REF_LOG_ONLY` without its
+/// old value, and one of the referent with the values is appended, which is split in turn
+/// when it is reached.
 ///
 /// When the referent is already in the transaction the update is refused instead: the
 /// message and the update's change as it was are returned, and the change is left as the

@@ -322,48 +322,15 @@ pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr:
         }
     };
 
-    // The reftable backend checks names, old values and conflicts itself
-    // (`reftable_be_transaction_prepare()`, refs/reftable-backend.c:1314-1416).
-    if crate::refstore::is_reftable(repo) {
-        return Ok(match reftable_commit(repo, vec![edit], &Default::default(), false) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(reason) => transaction_failure(name, &reason, w.delete, onerr),
-        });
-    }
-
-    // `refs_update_ref()` runs the same transaction the `--stdin` form does, so
-    // the availability check that `files_transaction_prepare()` performs
-    // (refs/files-backend.c:3024-3029) applies here too — and it names the
-    // reference standing in the way. gitoxide reaches the file system instead and
-    // reports whatever `open(2)` said, so `update-ref refs/heads/b/sub <oid>` over
-    // an existing `refs/heads/b` came back as `File exists (os error 17)` and, for
-    // the other direction, as a reflog that `Is a directory`.
-    if let Some(reason) =
-        transaction_conflicts(repo, std::slice::from_ref(&edit))?.into_iter().flatten().next()
-    {
-        return Ok(transaction_failure(name, &reason, w.delete, onerr));
-    }
-    // A null `<old-oid>` finds any existing ref "reference already exists", whatever
-    // it holds (check_old_oid(), refs/files-backend.c:2647-2651). gitoxide's `MustNotExist` passes a
-    // ref that already holds the new value, a leniency clone and fetch rely on, so
-    // the check is made here.
-    if let (Val::Zero, Val::Oid(_)) = (old, new) {
-        let absent = Absent {
-            name: name.to_string(),
-            deref: w.deref,
-            at: 0,
-            guards_edit: true,
-        };
-        if absent_violated(repo, &absent)? {
-            let reason = format!("cannot lock ref '{name}': reference already exists");
-            return Ok(transaction_failure(name, &reason, w.delete, onerr));
-        }
-    }
-
-    match repo.edit_reference(edit) {
-        Ok(_) => Ok(ExitCode::SUCCESS),
-        Err(e) => Ok(transaction_failure(name, &lock_error(repo, &e), w.delete, onerr)),
-    }
+    // `refs_update_ref()` runs the transaction the `--stdin` form does: the reftable
+    // backend checks names, old values and conflicts in
+    // `reftable_be_transaction_prepare()` (refs/reftable-backend.c:1314-1416), the files
+    // backend as `files_transaction_prepare()` locks each update (refs/files-backend.c:
+    // 2949-3132).
+    Ok(match reftable_commit(repo, vec![edit], &Default::default(), false) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(reason) => transaction_failure(name, &reason, w.delete, onerr),
+    })
 }
 
 /// A transaction that failed to prepare or commit, reported the way its caller
@@ -978,12 +945,6 @@ struct Batch {
     /// requirement onto the referent, while the diagnostic keeps naming the ref
     /// the command asked for (refs/files-backend.c:2502-2551, v2.55.0).
     absent: Vec<Absent>,
-    /// The reflog lines a `symref-create`/`symref-update` owes, paired with the
-    /// index of the edit in `edits` that has to succeed first. gitoxide writes no
-    /// reflog for a symbolic-target update at all (its transaction has no oid to
-    /// log), so [`SymrefLog`] carries what git's `parse_and_write_reflog()` would
-    /// have written and [`apply`] appends it once the edit has landed.
-    symref_logs: Vec<(usize, SymrefLog)>,
     /// Indices in `edits` staged by a `verify`/`symref-verify`.
     ///
     /// `ref_transaction_verify()` passes `NULL` for both `new_oid` and
@@ -1026,127 +987,6 @@ struct Absent {
     /// Whether the edit at `at` belongs to this precondition and has to be
     /// dropped with it. A `verify` stages no edit of its own.
     guards_edit: bool,
-}
-
-/// The reflog lines one `symref-create`/`symref-update` leaves behind.
-///
-/// `ref_transaction_prepare()` turns a single symref command into a *chain* of
-/// updates: `split_symref_update()` (refs/files-backend.c:2502-2551, git 2.55.0)
-/// re-points the update at the symref's referent and demotes the original to
-/// `REF_LOG_ONLY | REF_NO_DEREF`, and repeats for as long as the referent is
-/// itself symbolic. Every one of those updates still carries `new_target`, so
-/// every one of them earns a reflog line — which is why `chain` is a list and not
-/// a single name.
-struct SymrefLog {
-    /// One entry per update in that chain, outermost first: the ref's full name
-    /// and the object id it resolved to *before* the transaction, which is the
-    /// `lock->old_oid` `parse_and_write_reflog()` opens its line with.
-    chain: Vec<(FullName, Option<ObjectId>)>,
-    /// `split_head_update()`'s extra `REF_LOG_ONLY` update for `HEAD`
-    /// (refs/files-backend.c:2446-2491): present when the ref at the end of the
-    /// chain is the one `HEAD` points at. It is added with `&update->new_oid` and
-    /// a NULL `new_target`, and a symref update never sets `new_oid`, so this
-    /// line's new value is the null id rather than the resolved target.
-    head_mirror: Option<Option<ObjectId>>,
-    /// The `new_target` every chain line resolves for its new value.
-    target: FullName,
-    /// `update->msg` — `update-ref -m <reason>`, empty without one.
-    message: String,
-}
-
-/// `refs_resolve_ref_unsafe(refs, "HEAD", RESOLVE_REF_NO_RECURSE, …)` — the
-/// `head_ref` `ref_transaction_prepare()` compares every update against. `None`
-/// when `HEAD` is detached, which is when `split_head_update()` has nothing to
-/// mirror onto.
-fn head_referent(repo: &gix::Repository) -> Option<FullName> {
-    repo.refs.try_find("HEAD").ok().flatten().and_then(|r| match r.target {
-        Target::Symbolic(name) => Some(name),
-        Target::Object(_) => None,
-    })
-}
-
-/// Plan the reflog [`apply`] owes for one `symref-create`/`symref-update`.
-///
-/// Reads the pre-transaction state only: the old ids the lines open with are the
-/// ones the ref store holds now, and the new id is resolved at write time the way
-/// `parse_and_write_reflog()` resolves `update->new_target` during the commit.
-fn plan_symref_log(
-    repo: &gix::Repository,
-    name: &FullName,
-    target: &FullName,
-    deref: bool,
-    msg: Option<&str>,
-) -> Result<SymrefLog> {
-    use gix::bstr::ByteSlice;
-
-    let head_ref = head_referent(repo);
-
-    let mut chain = Vec::new();
-    let mut current = name.clone();
-    // git's `SYMREF_MAXDEPTH`; a cycle stops splitting rather than looping.
-    for _ in 0..5 {
-        let old = super::symbolic_ref::leaf_object_id(repo, current.as_bstr())?;
-        chain.push((current.clone(), old));
-        if !deref {
-            break;
-        }
-        // A split happens only while the ref actually *is* a symref.
-        let referent = repo
-            .refs
-            .try_find(current.as_bstr().to_str_lossy().as_ref())
-            .ok()
-            .flatten();
-        match referent.map(|r| r.target) {
-            Some(Target::Symbolic(next)) => current = next,
-            _ => break,
-        }
-    }
-
-    // `split_head_update()` fires for the one update in the chain that is not
-    // `REF_LOG_ONLY` — the last — and never when `split_symref_update()` marked
-    // the chain `REF_UPDATE_VIA_HEAD`, which it does exactly when the command
-    // named `HEAD` and was then split.
-    let via_head = chain.len() > 1 && chain[0].0.as_bstr() == b"HEAD".as_bstr();
-    let head_mirror = match (&head_ref, chain.last()) {
-        (Some(head_ref), Some((last, _))) if !via_head && last == head_ref => Some(
-            super::symbolic_ref::leaf_object_id(repo, b"HEAD".as_bstr())?,
-        ),
-        _ => None,
-    };
-
-    Ok(SymrefLog {
-        chain,
-        head_mirror,
-        target: target.clone(),
-        message: msg.unwrap_or_default().to_string(),
-    })
-}
-
-/// Write one planned symref reflog, after its edit has landed.
-///
-/// ```c
-/// if (update->new_target) {
-///         if (!refs_resolve_ref_unsafe(&refs->base, update->new_target,
-///                                      RESOLVE_REF_READING, &update->new_oid, NULL))
-///                 return 0;
-/// }
-/// ```
-/// (refs/files-backend.c:3101-3116, git 2.55.0) — a dangling target is not logged
-/// at all. The `HEAD` mirror is exempt because `split_head_update()` gives it no
-/// `new_target`, so it is written with the null id whatever the target resolves to.
-fn write_symref_log(repo: &gix::Repository, plan: &SymrefLog) -> Result<()> {
-    let new = super::symbolic_ref::leaf_object_id(repo, plan.target.as_bstr())?;
-    if let Some(new) = new {
-        for (name, old) in &plan.chain {
-            super::symbolic_ref::append_reflog(repo, name.as_ref().as_bstr(), *old, &new, &plan.message)?;
-        }
-    }
-    if let Some(old) = plan.head_mirror {
-        let zero = ObjectId::null(repo.object_hash());
-        let head = refname("HEAD")?;
-        super::symbolic_ref::append_reflog(repo, head.as_ref().as_bstr(), old, &zero, &plan.message)?;
-    }
-    Ok(())
 }
 
 /// The `--stdin` transaction state, mirroring git's `enum update_refs_state`.
@@ -1409,223 +1249,6 @@ fn print_rejections(rejections: &[gix::refs::file::transaction::Rejection]) {
     }
 }
 
-/// Every reference the store already holds, by full name — the set
-/// `refs_verify_refname_available()` reads through `refs_read_raw_ref()` and its
-/// prefix iterator (refs.c:2828-2906, v2.55.0). Packed and loose alike, because
-/// git checks both stores (refs/files-backend.c:900-912 for the loose lock,
-/// :3024-3026 for the packed one).
-fn existing_refnames(repo: &gix::Repository) -> Result<std::collections::BTreeSet<String>> {
-    let mut names = std::collections::BTreeSet::new();
-    for reference in repo.references()?.all()?.filter_map(Result::ok) {
-        names.insert(reference.name().as_bstr().to_string());
-    }
-    Ok(names)
-}
-
-/// The reference that stops `name` from being created, worded as
-/// `refs_verify_refname_available()` words it (refs.c:2778-2930, v2.55.0).
-///
-/// git walks the prefixes of `name` first — a reference at `refs/foo` is a file
-/// standing where `refs/foo/bar` needs a directory — and then the names *under*
-/// it, which conflict for the same reason in the other direction:
-///
-/// ```c
-/// strbuf_addf(err, _("'%s' exists; cannot create '%s'"), dirname.buf, refname);
-/// …
-/// strbuf_addf(err, _("cannot process '%s' and '%s' at the same time"),
-///             refname, extra_refname);
-/// ```
-///
-/// `extras` are the other refnames of the same transaction
-/// (`&transaction->refnames`, refs/files-backend.c:3024-3026). They do not exist
-/// yet, so a collision with one of them is reported with the second wording.
-fn availability_conflict(
-    existing: &std::collections::BTreeSet<String>,
-    extras: &std::collections::BTreeSet<String>,
-    name: &str,
-) -> Option<String> {
-    let mut end = 0;
-    while let Some(slash) = name[end..].find('/') {
-        end += slash;
-        let prefix = &name[..end];
-        if existing.contains(prefix) {
-            return Some(format!("'{prefix}' exists; cannot create '{name}'"));
-        }
-        // No `extras` test here on purpose. A name the transaction is creating
-        // does not exist yet, so it never stands in the way as a *file*: git
-        // reaches this pair from the other end, checking the shorter name against
-        // the longer one — either at :3024, where `refnames_to_check` holds both
-        // and the shorter comes first, or from `lock_raw_ref()`, when the longer
-        // one's lock already made the directory. Testing it here as well reported
-        // the same collision twice and with the operands the wrong way round:
-        // stock's `cannot process 'refs/heads/z' and 'refs/heads/z/r'` came back
-        // as `cannot process 'refs/heads/z/r' and 'refs/heads/z'`.
-        end += 1;
-    }
-    // The leaf: `refname` itself never conflicts with `refname`, but anything in
-    // the `refname/` namespace does.
-    let under = format!("{name}/");
-    if let Some(other) = existing.range(under.clone()..).next().filter(|n| n.starts_with(&under)) {
-        return Some(format!("'{other}' exists; cannot create '{name}'"));
-    }
-    extras
-        .range(under.clone()..)
-        .next()
-        .filter(|n| n.starts_with(&under))
-        .map(|other| format!("cannot process '{name}' and '{other}' at the same time"))
-}
-
-/// The refname each edit will actually write, and whether it needs an
-/// availability check at all.
-///
-/// `lock_raw_ref()` adds a name to `refnames_to_check` only "if the ref did not
-/// exist and we are creating it" (refs/files-backend.c:915-932), so an update of
-/// a reference that is already there is not re-checked — it cannot have grown a
-/// conflict since it was created. A deref'd update writes the symref's referent,
-/// not the symref: `split_symref_update()` re-points the update at it and demotes
-/// the original to `REF_LOG_ONLY | REF_NO_DEREF` (refs/files-backend.c:2502-2551),
-/// which is the name that then reaches the check.
-fn written_refname(repo: &gix::Repository, edit: &RefEdit) -> String {
-    deref_chain(repo, &edit.name.as_bstr().to_string(), edit.deref)
-}
-
-/// The reference an update on `name` finally writes: `name` itself under
-/// `REF_NO_DEREF`, otherwise the end of its symref chain.
-///
-/// `split_symref_update()` (refs/files-backend.c:2502-2551, v2.55.0) re-points
-/// the update at the referent and repeats for as long as that is symbolic too;
-/// `SYMREF_MAXDEPTH` (refs.c) bounds the walk at 5.
-fn deref_chain(repo: &gix::Repository, name: &str, deref: bool) -> String {
-    let mut name = name.to_string();
-    if !deref {
-        return name;
-    }
-    for _ in 0..5 {
-        let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {
-            break;
-        };
-        match reference.target() {
-            gix::refs::TargetRef::Symbolic(target) => name = target.as_bstr().to_string(),
-            gix::refs::TargetRef::Object(_) => break,
-        }
-    }
-    name
-}
-
-/// `refs_verify_refnames_available()` over a whole transaction: the conflict, if
-/// any, that each edit's written name runs into. `None` for an edit git does not
-/// check (see [`written_refname`]).
-/// Whether the name conflict `refs_verify_refname_available()` found is the one
-/// `lock_raw_ref()` runs into while taking the lock, rather than the one
-/// `files_transaction_prepare()` defers.
-///
-/// The two are worded differently: only the first is wrapped in
-/// `cannot lock ref '<ref>': ` by its caller,
-///
-/// ```c
-/// ret = lock_raw_ref(refs, transaction, update_idx, mustexist,
-///                    refnames_to_check, &lock, &referent, err);
-/// if (ret) {
-///         char *reason;
-///
-///         reason = strbuf_detach(err, NULL);
-///         strbuf_addf(err, "cannot lock ref '%s': %s",
-///                     ref_update_original_update_refname(update), reason);
-/// ```
-///
-/// (refs/files-backend.c:2665-2674). `lock_raw_ref()` reaches its own
-/// availability check in exactly two cases: `safe_create_leading_directories()`
-/// answered `SCLD_EXISTS` because a *file* sits where a leading directory has to
-/// go (:743-753), and the reference read back `EISDIR` over a directory that
-/// would not come away empty (:864-884). Both are on-disk states. A conflict that
-/// exists only in `packed-refs`, or only among the transaction's own names, leaves
-/// the lock unobstructed and is reported bare from :3024 instead — which is why
-/// `update-ref refs/heads/b1/sub <oid>` is `cannot lock ref …` while the same
-/// command after `pack-refs --all` is not.
-fn loose_collision(repo: &gix::Repository, name: &str) -> bool {
-    let bases = [repo.git_dir(), repo.common_dir()];
-    // A loose reference file standing where one of `name`'s leading directories
-    // has to go.
-    let mut end = 0;
-    while let Some(slash) = name[end..].find('/') {
-        end += slash;
-        if bases.iter().any(|base| base.join(&name[..end]).is_file()) {
-            return true;
-        }
-        end += 1;
-    }
-    // A directory in the way that `remove_dir_recursively(REMOVE_DIR_EMPTY_ONLY)`
-    // would refuse to take away.
-    bases
-        .iter()
-        .any(|base| std::fs::read_dir(base.join(name)).is_ok_and(|mut dir| dir.next().is_some()))
-}
-
-/// One availability failure, worded as the backend that found it words it.
-fn conflict_error(repo: &gix::Repository, name: &str, reason: &str) -> String {
-    match loose_collision(repo, name) {
-        true => format!("cannot lock ref '{name}': {reason}"),
-        false => reason.to_string(),
-    }
-}
-
-fn transaction_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Vec<Option<String>>> {
-    let existing = existing_refnames(repo)?;
-    let names: Vec<String> = edits.iter().map(|e| written_refname(repo, e)).collect();
-    // `&transaction->refnames` holds every refname in the transaction, deletions
-    // included, and a name is never compared against itself.
-    let extras: std::collections::BTreeSet<String> = names.iter().cloned().collect();
-    Ok(names
-        .iter()
-        .zip(edits)
-        .enumerate()
-        .map(|(index, (name, edit))| {
-            let creating =
-                matches!(edit.change, Change::Update { .. }) && !existing.contains(name);
-            creating
-                .then(|| availability_conflict(&existing, &extras, name))
-                .flatten()
-                .map(|reason| {
-                    // git takes the locks in the order the commands arrived, so a
-                    // name created *under* `name` earlier in the batch has already
-                    // put a directory in the way by the time `name` is locked: that
-                    // conflict comes out of `lock_raw_ref()` and is wrapped, where
-                    // one whose sibling comes later is only caught by the deferred
-                    // check at refs/files-backend.c:3024 and is reported bare.
-                    let under = format!("{name}/");
-                    let blocked = names[..index].iter().any(|other| other.starts_with(&under));
-                    match blocked {
-                        true => format!("cannot lock ref '{name}': {reason}"),
-                        false => conflict_error(repo, name, &reason),
-                    }
-                })
-        })
-        .collect())
-}
-
-/// The `<ref> must not exist` half of a `create`/`verify`: git spells it as an
-/// old value of the null oid, so `lock_ref_for_update()` enforces it on the ref
-/// the update finally writes — the referent when the named ref is a symref the
-/// update derefs through — while the failure still names the ref the command
-/// asked for (`cannot lock ref '<refname>'`, refs/files-backend.c:2666-2690).
-fn check_absent(repo: &gix::Repository, absent: &[Absent]) -> Result<()> {
-    for entry in absent {
-        if absent_violated(repo, entry)? {
-            crate::git_fatal!(
-                "cannot lock ref '{}': reference already exists",
-                entry.name
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Whether one [`Absent`] precondition is broken right now.
-fn absent_violated(repo: &gix::Repository, entry: &Absent) -> Result<bool> {
-    let target = deref_chain(repo, &entry.name, entry.deref);
-    Ok(repo.try_find_reference(target.as_str())?.is_some())
-}
-
 /// What [`validate_prepare`] leaves for the hook's `prepared` run.
 #[derive(Default)]
 struct Prepared {
@@ -1655,55 +1278,16 @@ fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) 
     // (builtin/update-ref.c:706-707, :829-830), so a refusal of one update is
     // recorded for `commit` to report rather than failing `prepare`.
     let reftable = crate::refstore::is_reftable(repo);
-    if batch_updates || reftable {
-        let (edits, verify) = reftable_batch(repo, batch)?;
-        if let Some(message) = duplicate_update(&edits).filter(|_| !reftable) {
-            crate::git_fatal!("{message}");
-        }
-        let (rejections, lines) =
-            reftable_transaction(repo, edits, &verify, batch_updates, true).map_err(|e| anyhow!(e))?;
-        return Ok(Prepared {
-            refused: rejections.iter().map(|r| r.refname.to_string()).collect(),
-            hook_lines: lines,
-        });
-    }
-    if let Some(message) = duplicate_update(&batch.edits) {
+    let (edits, verify) = reftable_batch(repo, batch)?;
+    if let Some(message) = duplicate_update(&edits).filter(|_| !reftable) {
         crate::git_fatal!("{message}");
     }
-    if let Some(conflict) = split_conflicts(repo, &batch.edits)?.first() {
-        crate::git_fatal!("{}", conflict.message);
-    }
-    check_absent(repo, &batch.absent)?;
-    if batch.edits.is_empty() {
-        return Ok(Prepared::default());
-    }
-    let mut edits = Vec::new();
-    for edit in &batch.edits {
-        let mut edit = edit.clone();
-        if let Err(refused) = settle_old_value(repo, &mut edit) {
-            crate::git_fatal!("{}", refused.message);
-        }
-        edits.push(edit);
-    }
-    // `ref_transaction_prepare()` refuses a name conflict before it takes any
-    // lock (refs/files-backend.c:3024-3029), so `prepare` fails here exactly as
-    // `commit` would.
-    let conflicts = transaction_conflicts(repo, &batch.edits)?;
-    if let Some(reason) = conflicts.iter().flatten().next() {
-        crate::git_fatal!("{reason}");
-    }
-    let prepared = repo
-        .refs
-        .transaction()
-        .verify_only(batch.verify_edits.iter().copied())
-        .prepare(
-            edits,
-            gix::lock::acquire::Fail::Immediately,
-            gix::lock::acquire::Fail::Immediately,
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-    drop(prepared); // rolls the acquired locks back, writing nothing.
-    Ok(Prepared::default())
+    let (rejections, lines) =
+        reftable_transaction(repo, edits, &verify, batch_updates, true).map_err(|e| anyhow!(e))?;
+    Ok(Prepared {
+        refused: rejections.iter().map(|r| r.refname.to_string()).collect(),
+        hook_lines: lines,
+    })
 }
 
 /// Read `--stdin` instructions, then apply them as one atomic transaction.
@@ -1936,13 +1520,10 @@ fn run_stdin(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Commit one accumulated batch: absence checks first, then the ref edits.
-///
-/// Without `--batch-updates` the edits go through one all-or-nothing gitoxide
-/// transaction. With it, and in a reftable store, the transaction is git's own:
-/// `REF_TRANSACTION_ALLOW_FAILURE` under the flag, so a rejection leaves the rest
-/// of the batch in place, which is the whole point of the flag.
-fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Result<()> {
+/// Commit one accumulated batch as git's own transaction, `REF_TRANSACTION_ALLOW_FAILURE`
+/// under `--batch-updates` (builtin/update-ref.c:706-707, :829-830), so a rejection
+/// leaves the rest of the batch in place, and all-or-nothing otherwise.
+fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()> {
     for entry in &batch.absent {
         refname(&entry.name)?; // reject malformed names the same way an edit would
     }
@@ -1950,87 +1531,13 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
         return Ok(());
     }
     let reftable = crate::refstore::is_reftable(repo);
-    if batch_updates || reftable {
-        let (edits, verify) = reftable_batch(repo, &batch)?;
-        if let Some(message) = duplicate_update(&edits).filter(|_| !reftable) {
-            crate::git_fatal!("{message}");
-        }
-        let rejections = reftable_commit(repo, edits, &verify, batch_updates).map_err(|e| anyhow!(e))?;
-        print_rejections(&rejections);
-        return Ok(());
-    }
-    if let Some(message) = duplicate_update(&batch.edits) {
+    let (edits, verify) = reftable_batch(repo, &batch)?;
+    if let Some(message) = duplicate_update(&edits).filter(|_| !reftable) {
         crate::git_fatal!("{message}");
     }
-    // The split comes first in `lock_ref_for_update()`: a `create` whose symref
-    // chain conflicts never reaches the existence check at its end.
-    if let Some(conflict) = split_conflicts(repo, &batch.edits)?.first() {
-        crate::git_fatal!("{}", conflict.message);
-    }
-    // `refs_verify_refnames_available()` runs over the whole transaction before
-    // any reference is written (refs/files-backend.c:3024-3029), which is what
-    // names the reference standing in the way; reaching the file system instead
-    // reported only that some path already existed.
-    let conflicts = transaction_conflicts(repo, &batch.edits)?;
-    check_absent(repo, &batch.absent)?;
-    for edit in &mut batch.edits {
-        if let Err(refused) = settle_old_value(repo, edit) {
-            crate::git_fatal!("{}", refused.message);
-        }
-    }
-    if let Some(reason) = conflicts.into_iter().flatten().next() {
-        crate::git_fatal!("{reason}");
-    }
-    if let Err(e) = edit_verifying(repo, batch.edits, &batch.verify_edits) {
-        crate::git_fatal!("{}", lock_error(repo, &e));
-    }
-    for (_, plan) in &batch.symref_logs {
-        write_symref_log(repo, plan)?;
-    }
+    let rejections = reftable_commit(repo, edits, &verify, batch_updates).map_err(|e| anyhow!(e))?;
+    print_rejections(&rejections);
     Ok(())
-}
-
-/// [`gix::Repository::edit_references()`] with the edits at `verify` made
-/// `ref_transaction_verify()`s, which write nothing and log only through the
-/// log-only updates split off them (see
-/// [`gix::refs::file::Transaction::verify_only()`]).
-fn edit_verifying(
-    repo: &gix::Repository,
-    edits: Vec<RefEdit>,
-    verify: &std::collections::BTreeSet<usize>,
-) -> std::result::Result<(), gix::reference::edit::Error> {
-    let (file_lock, packed_lock) = repo.ref_lock_modes()?;
-    let committer = repo.committer().transpose()?;
-    repo.refs
-        .transaction()
-        .verify_only(verify.iter().copied())
-        .prepare(edits, file_lock, packed_lock)?
-        .commit(committer)?;
-    Ok(())
-}
-
-/// `REF_HAVE_OLD` and `update->old_oid` for a staged edit: `create` and a zero
-/// old value pass the null id, no old value leaves the flag unset. `Err` for an
-/// old symref target, which carries no object id.
-fn have_old(edit: &RefEdit, zero: ObjectId) -> std::result::Result<Option<ObjectId>, ()> {
-    let expected = match &edit.change {
-        Change::Update { expected, .. } | Change::Delete { expected, .. } => expected,
-    };
-    match expected {
-        PreviousValue::MustExistAndMatch(Target::Object(id)) | PreviousValue::ExistingMustMatch(Target::Object(id)) => {
-            Ok(Some(*id))
-        }
-        PreviousValue::MustExistAndMatch(Target::Symbolic(_)) | PreviousValue::ExistingMustMatch(Target::Symbolic(_)) => {
-            Err(())
-        }
-        PreviousValue::MustNotExist => Ok(Some(zero)),
-        PreviousValue::Any | PreviousValue::MustExist => Ok(None),
-    }
-}
-
-/// A name conflict `files_transaction_prepare()` raises while it splits updates.
-struct SplitConflict {
-    message: String,
 }
 
 /// `ref_update_reject_duplicates()` (refs.c:2560-2582), which
@@ -2043,307 +1550,6 @@ fn duplicate_update(edits: &[RefEdit]) -> Option<String> {
         .windows(2)
         .find(|pair| pair[0] == pair[1])
         .map(|pair| format!("multiple updates for ref '{}' not allowed", pair[0]))
-}
-
-/// The splits `lock_ref_for_update()` makes, and the conflicts they run into
-/// (refs/files-backend.c:2455-2551, :2640-2700), in the order the C meets them:
-/// every queued update first, then each split-off update, which the split
-/// appends to the transaction.
-///
-/// * An update of the branch `HEAD` names (unless it came *through* `HEAD`)
-///   gets a log-only `HEAD` update — refused when `HEAD` is already in the
-///   transaction: `multiple updates for 'HEAD' (including one via its referent
-///   '<ref>') are not allowed`.
-/// * An update of a symref without `REF_NO_DEREF` is moved onto its referent —
-///   refused when the referent is already in the transaction: `multiple updates
-///   for '<referent>' (including one via symref '<ref>') are not allowed`. A
-///   symref cycle ends there too, the second time round.
-///
-/// Under `--batch-updates` a refused update is `ref_transaction_maybe_set_rejected()`'s
-/// (refs.c:1276-1312), which takes its name back out of `transaction->refnames`,
-/// so a later update no longer meets it. `lock_ref_for_update()` keeps the lock
-/// it took before refusing, though (refs/files-backend.c:2714-2733), and a later
-/// update of the same name reuses that lock without `lock_raw_ref()` ever setting
-/// its `type`. The log-only `HEAD` update split off the checked-out branch then
-/// reads as no symref at all, which is `HEAD has been racily updated`
-/// (refs/files-backend.c:2735-2757), a `REF_TRANSACTION_ERROR_GENERIC` that
-/// dies: `update HEAD <A> <A>` refused over the branch it points at, followed by
-/// an update of that branch, ends there.
-fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Vec<SplitConflict>> {
-    let head_ref = match repo.try_find_reference("HEAD") {
-        Ok(Some(head)) => match head.target() {
-            gix::refs::TargetRef::Symbolic(target) => Some(target.as_bstr().to_string()),
-            gix::refs::TargetRef::Object(_) => None,
-        },
-        _ => None,
-    };
-    // `transaction->refnames`: `ref_transaction_add_update()` appends every update
-    // that is not `REF_LOG_ONLY` (refs.c:1356-1363), so the log-only `HEAD` update
-    // `split_head_update()` adds is not among them. `ref_transaction_prepare()`
-    // sorts it (refs.c:2708) and the splits then append to it unsorted, while
-    // every lookup and removal is the binary search of `get_entry_index()`
-    // (string-list.c:17-40) — so a name appended behind the sorted part can go
-    // unseen, which decides what the splits below run into.
-    let mut refnames: Vec<String> =
-        edits.iter().filter(|e| !log_only(e)).map(|e| e.name.as_bstr().to_string()).collect();
-    refnames.sort();
-    // `backend_data->ref_locks`: every name `lock_ref_for_update()` has locked.
-    let mut locked: std::collections::HashSet<String> = Default::default();
-    // `lock->old_oid` of each lock: what the reference held when it was taken, or
-    // for the lock the log-only `HEAD` update took, its `old_oid` when it has one
-    // and else the parent branch's (refs/files-backend.c:2735-2763).
-    let mut lock_old: std::collections::HashMap<String, Option<ObjectId>> = Default::default();
-    // One update in `transaction->updates`, as `lock_ref_for_update()` takes it.
-    struct Update {
-        /// The update the input queued.
-        at: usize,
-        name: String,
-        deref: bool,
-        /// `REF_UPDATE_VIA_HEAD`.
-        via_head: bool,
-        /// `REF_LOG_VIA_SPLIT`: the log-only `HEAD` update `split_head_update()` adds.
-        head_split: bool,
-    }
-    let mut queue: std::collections::VecDeque<Update> = edits
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| !log_only(e))
-        .map(|(at, e)| Update {
-            at,
-            name: e.name.as_bstr().to_string(),
-            deref: e.deref,
-            via_head: false,
-            head_split: false,
-        })
-        .collect();
-    let mut conflicts = Vec::new();
-    while let Some(update) = queue.pop_front() {
-        // The first conflict fails `lock_ref_for_update()` and with it the whole
-        // `files_transaction_prepare()`.
-        if !conflicts.is_empty() {
-            break;
-        }
-        let Update { at, name, deref, via_head, head_split } = update;
-        let mut refuse = |message: String| conflicts.push(SplitConflict { message });
-        if head_split {
-            // `lock = strmap_get(&backend_data->ref_locks, update->refname)`: a
-            // lock taken earlier is reused and `update->type` stays 0, so the
-            // `REF_ISSYMREF` test fails.
-            if !locked.insert(name.clone()) {
-                crate::git_fatal!("HEAD has been racily updated");
-            }
-            let old = match have_old(&edits[at], ObjectId::null(repo.object_hash())) {
-                Ok(Some(old)) => Some(old),
-                _ => resolve_to_oid(repo, &name),
-            };
-            lock_old.insert(name, old);
-            continue;
-        }
-        if !via_head && head_ref.as_deref() == Some(name.as_str()) {
-            if string_list_find(&refnames, "HEAD").is_some() {
-                refuse(
-                    format!("multiple updates for 'HEAD' (including one via its referent '{name}') are not allowed"),
-                );
-                continue;
-            }
-            queue.push_back(Update {
-                at,
-                name: "HEAD".into(),
-                deref: false,
-                via_head: false,
-                head_split: true,
-            });
-        }
-        // A reused lock leaves `update->type` 0, so the update is not split as a
-        // symref's would be: it takes the regular-ref branch of
-        // `lock_ref_for_update()` and, holding a new value other than the
-        // `lock->old_oid` read when the lock was taken, writes it through
-        // `write_ref_to_lockfile()` — into a lock whose file the first user
-        // already closed, so the write fails, a `REF_TRANSACTION_ERROR_GENERIC`
-        // that dies with `--batch-updates` too (refs/files-backend.c:2714-2733,
-        // :2856-2885, :2056-2076). An update through a symref that points at
-        // `HEAD`, beside an update of the branch `HEAD` names, meets the lock
-        // `split_head_update()`'s log-only `HEAD` update took.
-        if !locked.insert(name.clone()) {
-            if let Change::Update { new: Target::Object(new), .. } = &edits[at].change {
-                // Every update the input queued is locked before any split, so an
-                // old value one of them refuses is met first, and this update's own
-                // old value is checked against the lock before the write
-                // (`check_old_oid()`, refs/files-backend.c:2615-2660).
-                let refused = |i: usize| !log_only(&edits[i]) && check_old_value(repo, &edits[i]).is_err();
-                if (0..edits.len()).any(refused) {
-                    break;
-                }
-                let lock_old = lock_old.get(&name).copied().flatten();
-                let old_matches = match have_old(&edits[at], ObjectId::null(repo.object_hash())) {
-                    Ok(Some(old)) => lock_old == Some(old),
-                    Ok(None) => true,
-                    Err(()) => false,
-                };
-                if !refused(at) && old_matches && lock_old != Some(*new) {
-                    let path = std::path::absolute(ref_file_path(repo, &name))?;
-                    crate::git_fatal!(
-                        "cannot update ref '{name}': couldn't write '{}.lock'",
-                        path.display()
-                    );
-                }
-            }
-            continue;
-        }
-        lock_old.insert(name.clone(), resolve_to_oid(repo, &name));
-        if !deref {
-            continue;
-        }
-        let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {
-            continue;
-        };
-        let gix::refs::TargetRef::Symbolic(referent) = reference.target() else {
-            continue;
-        };
-        let referent = referent.as_bstr().to_string();
-        if string_list_find(&refnames, &referent).is_some() {
-            refuse(
-                format!("multiple updates for '{referent}' (including one via symref '{name}') are not allowed"),
-            );
-            continue;
-        }
-        refnames.push(referent.clone());
-        queue.push_back(Update {
-            at,
-            name: referent,
-            deref: true,
-            via_head: name == "HEAD",
-            head_split: false,
-        });
-    }
-    Ok(conflicts)
-}
-
-/// `get_entry_index()`'s exact match (string-list.c:17-40): a binary search that
-/// assumes `list` is sorted, whether it still is or not.
-fn string_list_find(list: &[String], name: &str) -> Option<usize> {
-    let (mut left, mut right) = (0, list.len());
-    while left < right {
-        let middle = left + (right - left) / 2;
-        match name.cmp(list[middle].as_str()) {
-            std::cmp::Ordering::Less => right = middle,
-            std::cmp::Ordering::Greater => left = middle + 1,
-            std::cmp::Ordering::Equal => return Some(middle),
-        }
-    }
-    None
-}
-
-/// Why `lock_ref_for_update()`'s old-value check refused an update.
-struct OldValueRefused {
-    message: String,
-}
-
-/// The old-value half of `lock_ref_for_update()` (refs/files-backend.c:2680-2785)
-/// for one edit that names an old value, walked as the C walks it.
-///
-/// * A symref updated with `REF_NO_DEREF` is checked where it stands: its referent
-///   has to resolve (`cannot lock ref '<ref>': error reading reference`, a
-///   missing one being the null id), an old
-///   target is compared with that referent by `ref_update_check_old_target()`
-///   (refs.c:3149-3171, `verifying symref target: …`), and an old oid with the oid
-///   the referent resolves to — not with the symref's own contents.
-/// * Without it `split_symref_update()` moves the update onto the referent, for as
-///   long as that is symbolic too.
-/// * A regular reference with an old *target* is `expected symref with target
-///   '<old>': but is a regular ref`; with an old oid, `check_old_oid()`.
-///
-/// Every message names the reference the command asked for
-/// (`ref_update_original_update_refname()`). `Ok(true)` is a check that passed
-/// here and must not be repeated by gitoxide, which would compare a symref's
-/// contents with an oid; `Ok(false)` leaves the edit to it — nothing to check, or
-/// a reference that is not there.
-fn check_old_value(repo: &gix::Repository, edit: &RefEdit) -> std::result::Result<bool, OldValueRefused> {
-    let expected = match &edit.change {
-        Change::Update { expected: PreviousValue::MustExistAndMatch(t), .. }
-        | Change::Delete { expected: PreviousValue::MustExistAndMatch(t), .. } => t,
-        _ => return Ok(false),
-    };
-    let original = edit.name.as_bstr().to_string();
-    let lock = |reason: String| OldValueRefused {
-        message: format!("cannot lock ref '{original}': {reason}"),
-    };
-    let mut name = original.clone();
-    for _ in 0..5 {
-        let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {
-            return Ok(false);
-        };
-        let referent = match reference.target() {
-            gix::refs::TargetRef::Symbolic(referent) => referent.as_bstr().to_string(),
-            gix::refs::TargetRef::Object(id) => {
-                return match expected {
-                    Target::Symbolic(old) => Err(lock(
-                        format!("expected symref with target '{}': but is a regular ref", old.as_bstr()),
-                    )),
-                    Target::Object(old) if old.as_ref() != id => Err(lock(
-                        format!("is at {id} but expected {old}"),
-                    )),
-                    Target::Object(_) => Ok(true),
-                };
-            }
-        };
-        if !edit.deref {
-            // A referent that cannot be resolved at all — a cycle, a chain past
-            // `SYMREF_MAXDEPTH` — is `error reading reference`; a missing one
-            // resolves to the null id, which `check_old_oid()`
-            // (refs/files-backend.c:2562-2610) reports as missing.
-            let Some(resolved) = resolve_to_oid(repo, &referent) else {
-                return Err(lock("error reading reference".into()));
-            };
-            return match expected {
-                Target::Symbolic(old) if old.as_bstr() != referent.as_str() => Err(OldValueRefused {
-                    message: format!(
-                        "verifying symref target: '{original}': is at {referent} but expected {}",
-                        old.as_bstr()
-                    ),
-                }),
-                Target::Object(old) if *old != resolved && resolved.is_null() => Err(lock(
-                    format!("reference is missing but expected {old}"),
-                )),
-                Target::Object(old) if *old != resolved => Err(lock(
-                    format!("is at {resolved} but expected {old}"),
-                )),
-                _ => Ok(true),
-            };
-        }
-        name = referent;
-    }
-    Ok(false)
-}
-
-/// `refs_resolve_ref_unsafe(refname, 0, …)`: follow symrefs to an object id — the
-/// null id for a reference that is not there — or `None` for a chain past
-/// `SYMREF_MAXDEPTH`, which a cycle always is.
-fn resolve_to_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
-    let mut name = name.to_string();
-    for _ in 0..=5 {
-        let Some(reference) = repo.try_find_reference(name.as_str()).ok()? else {
-            return Some(ObjectId::null(repo.object_hash()));
-        };
-        match reference.target() {
-            gix::refs::TargetRef::Object(id) => return Some(id.to_owned()),
-            gix::refs::TargetRef::Symbolic(target) => name = target.as_bstr().to_string(),
-        }
-    }
-    None
-}
-
-/// Run [`check_old_value`] over `edit` and, when it settled the check, leave
-/// gitoxide only the existence half of it.
-fn settle_old_value(repo: &gix::Repository, edit: &mut RefEdit) -> std::result::Result<(), OldValueRefused> {
-    if check_old_value(repo, edit)? {
-        match &mut edit.change {
-            Change::Update { expected, .. } | Change::Delete { expected, .. } => {
-                *expected = PreviousValue::MustExist;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The check every `parse_cmd_*` that takes arguments closes with
@@ -2517,8 +1723,6 @@ fn stage_symref_command(
                 .ok_or_else(|| anyhow!("symref-create {name}: missing <new-target>"))?;
             extra_input(cur, cmd, name)?;
             let (name, target) = (refname(name)?, refname(&target)?);
-            let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
-            batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
@@ -2576,8 +1780,6 @@ fn stage_symref_command(
             };
             extra_input(cur, cmd, name)?;
             let (name, target) = (refname(name)?, refname(&target)?);
-            let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
-            batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),

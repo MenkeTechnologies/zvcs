@@ -1559,7 +1559,7 @@ fn emit_diff_of_diff(
         // Neither caller looks at `show_range_diff()`'s result (builtin/log.c:1484,
         // log-tree.c:736): an inner `git log` that fails has said so on stderr, the
         // block stays empty and the series goes on.
-        let _reported = super::range_diff::show_range_diff(repo, r1, r2, creation_factor, notes_on, out)?;
+        let _reported = super::range_diff::show_range_diff(repo, r1, r2, creation_factor, notes_on, &opts.output_encoding, out)?;
     }
     Ok(Ok(()))
 }
@@ -3508,18 +3508,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
 
     o.branch_name = find_branch_name(repo, &o);
     o.output_encoding = crate::revfilter::log_output_encoding(repo, o.encoding_opt.as_deref());
-    // `repo_logmsg_reencode()` returns a bare `char *`, so `pretty_print_commit()`
-    // reads a UTF-16 or UTF-32 commit as the C string that ends at its first NUL:
-    // no `From:`, an empty subject. The renderer below reads the header block out
-    // of the whole buffer instead, so the family is refused as `git log` and
-    // `git show` refuse it rather than answered with a different message.
-    if super::mailinfo::is_utf16_or_32_name(&o.output_encoding) {
-        bail!(
-            "unsupported flag \"--encoding={}\" (the UTF-16 and UTF-32 families are not ported; \
-             every other charset is)",
-            o.output_encoding
-        );
-    }
 
     // builtin/log.c: the stat+summary block is format-patch's default, but only
     // when the caller asked for no output format of its own — that is what makes
@@ -5496,44 +5484,49 @@ fn render_message_body(
     let encoding = opts.output_encoding.as_str();
     let mut buffer = commit.data.clone();
     super::log::logmsg_reencode(&mut buffer, encoding);
-    let (header, raw) = match buffer.find(b"\n\n") {
-        Some(at) => (&buffer[..at + 1], &buffer[at + 2..]),
-        None => (&buffer[..], &b""[..]),
-    };
-    // `pp_header()` → `pp_user_info(pp, "Author", …)` on the `author ` line.
+    // The re-coded buffer is a C string to every reader in pretty.c, so a UTF-16
+    // or UTF-32 one ends at its first NUL: no `author` line, no subject, no body.
+    super::log::logmsg_c_string(&mut buffer);
+    let (header, raw) = super::log::pp_header_lines(&buffer);
+    // `pp_header()` → `pp_user_info(pp, "Author", …)` on each `author ` line that
+    // splits (pretty.c:2097-2100, :530-532); a buffer without one writes no
+    // `From:`/`Date:` pair, and `--from`'s in-body `From:` is never queued.
     let author = header
-        .lines()
-        .find_map(|line| line.strip_prefix(b"author "))
-        .and_then(split_ident_line)
-        .ok_or_else(|| anyhow!("commit {} has no author", commit.id))?;
-    let date = commit
-        .author()?
-        .time()?
-        .format(gix::date::time::format::GIT_RFC2822)?;
+        .iter()
+        .filter_map(|line| line.strip_prefix(b"author "))
+        .find_map(|line| split_ident_line(line.strip_suffix(b"\n").unwrap_or(line)));
+    let mut in_body_from = None;
+    if let Some(author) = &author {
+        let date = commit
+            .author()?
+            .time()?
+            .format(gix::date::time::format::GIT_RFC2822)?;
 
-    // `--from`: the header names the given identity and the commit's own author
-    // moves into an in-body `From:`, unless the two already agree (git's
-    // `use_in_body_from()`, which `--force-in-body-from` short-circuits).
-    let (header_ident, in_body_from) = match &opts.from {
-        Some(from) if opts.force_in_body_from || !ident_eq(from, &author) => {
-            let mut h = b"From: ".to_vec();
-            h.extend_from_slice(&author.name);
-            h.extend_from_slice(b" <");
-            h.extend_from_slice(&author.mail);
-            h.extend_from_slice(b">\n");
-            (from, Some(h))
-        }
-        Some(from) => (from, None),
-        None => (&author, None),
-    };
-    write_identity_headers(
-        &mut sb,
-        &header_ident.name,
-        &header_ident.mail,
-        &date,
-        opts.encode_email_headers,
-        encoding,
-    );
+        // `--from`: the header names the given identity and the commit's own author
+        // moves into an in-body `From:`, unless the two already agree (git's
+        // `use_in_body_from()`, which `--force-in-body-from` short-circuits).
+        let header_ident = match &opts.from {
+            Some(from) if opts.force_in_body_from || !ident_eq(from, author) => {
+                let mut h = b"From: ".to_vec();
+                h.extend_from_slice(&author.name);
+                h.extend_from_slice(b" <");
+                h.extend_from_slice(&author.mail);
+                h.extend_from_slice(b">\n");
+                in_body_from = Some(h);
+                from
+            }
+            Some(from) => from,
+            None => author,
+        };
+        write_identity_headers(
+            &mut sb,
+            &header_ident.name,
+            &header_ident.mail,
+            &date,
+            opts.encode_email_headers,
+            encoding,
+        );
+    }
 
     // Subject: — the first paragraph, folded onto one logical line, unless
     // `-k`/`--keep-subject` asked for the raw first paragraph (newlines and all).
@@ -6348,11 +6341,14 @@ fn emit_shortlog(
     let mut groups: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
     for id in commits {
         let commit = repo.find_object(*id)?.try_into_commit()?;
-        // `shortlog_add_commit()` sets `ctx.output_encoding =
-        // get_log_output_encoding()` (builtin/shortlog.c:251), so `%s` and `%aN`
-        // are both read out of the re-coded commit buffer.
+        // `shortlog_add_commit()` expands `%s` and the `%aN` group key with
+        // `repo_format_commit_message()` under `ctx.output_encoding =
+        // get_log_output_encoding()` (builtin/shortlog.c:231-258): each is expanded
+        // against the commit re-coded to UTF-8 (pretty.c:1730-1734) and the result
+        // converted into the output encoding (pretty.c:2026-2046).
         let mut buffer = commit.data.clone();
-        super::log::logmsg_reencode(&mut buffer, output_encoding);
+        super::log::logmsg_reencode(&mut buffer, "UTF-8");
+        super::log::logmsg_c_string(&mut buffer);
         let (header, body) = match buffer.find(b"\n\n") {
             Some(at) => (&buffer[..at + 1], &buffer[at + 2..]),
             None => (&buffer[..], &b""[..]),
@@ -6360,16 +6356,29 @@ fn emit_shortlog(
         let ident = header
             .lines()
             .find_map(|line| line.strip_prefix(b"author "))
-            .and_then(split_ident_line)
-            .ok_or_else(|| anyhow!("commit {} has no author", commit.id))?;
-        let (author, _) = mailmap.mapped(&ident.name, &ident.mail);
-        let (title, _) = format_subject(skip_blank_lines(body));
-        // `oneline_str = oneline.len ? oneline.buf : "<none>"`.
+            .and_then(split_ident_line);
+        // `format_person_part()` answers 0 for an `N` whose ident does not split
+        // (pretty.c:856-865), and `repo_format_commit_message()` then keeps the
+        // `%` and copies `aN` as text (pretty.c:2021-2022): a commit whose
+        // `encoding` header misnames its bytes groups under a literal `%aN`.
+        let mut author = match &ident {
+            Some(ident) => mailmap.mapped(&ident.name, &ident.mail).0.to_vec(),
+            None => b"%aN".to_vec(),
+        };
+        super::log::user_format_to_output_encoding(&mut author, output_encoding);
+        let (mut title, _) = format_subject(skip_blank_lines(body));
+        super::log::user_format_to_output_encoding(&mut title, output_encoding);
+        // `oneline_str = oneline.len ? oneline.buf : "<none>"`: the length is the
+        // converted record's, and `insert_one_record()` reads both strings as C
+        // strings (builtin/shortlog.c:59-85), so a UTF-16 or UTF-32 one ends at
+        // its first NUL.
         let title = if title.is_empty() {
             b"<none>".to_vec()
         } else {
+            super::log::logmsg_c_string(&mut title);
             title
         };
+        super::log::logmsg_c_string(&mut author);
         // insert_one_record() (builtin/shortlog.c:73-85): skip leading
         // whitespace, drop a "[PATCH...]" prefix that closes on the first line,
         // skip the blanks after it, then fold the rest with format_subject().

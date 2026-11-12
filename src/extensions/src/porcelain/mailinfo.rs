@@ -1654,7 +1654,15 @@ impl WideForm {
             (_, true) => out.extend_from_slice(&unit.to_be_bytes()),
             (_, false) => out.extend_from_slice(&unit.to_le_bytes()),
         };
-        if mark {
+        // The marks git writes itself are copied in front whatever the length
+        // (utf8.c:620-621). The one iconv writes for plain `UTF-16`/`UTF-32` comes
+        // with the first character under macOS's libiconv, so an empty string
+        // re-codes to nothing there: `reencode_string_iconv()` starts with no room
+        // for output when the input is empty (utf8.c:493-497), and stock
+        // `git log --encoding=UTF-16 --format=%an` of an unsplittable ident prints a
+        // bare newline.
+        let iconv_marked = matches!(self.order, ByteOrder::Marked);
+        if mark && !(iconv_marked && text.is_empty() && cfg!(target_os = "macos")) {
             push(0xFEFF);
         }
         for c in text.chars() {

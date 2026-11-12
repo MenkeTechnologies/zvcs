@@ -555,6 +555,8 @@ fn unsupported_flag(flag: &str) -> String {
 /// One commit rendered into its canonical patch text: upstream's
 /// `struct patch_util` fused with the `string_list` item holding the text.
 struct Patch {
+    /// The commit, upstream's `util->oid`.
+    id: ObjectId,
     /// Position within its range, upstream's `util->i`.
     index: usize,
     /// `find_unique_abbrev()` of the commit id, for the pair header.
@@ -2266,6 +2268,7 @@ pub(super) fn show_range_diff(
     range2: &str,
     creation_factor: i64,
     notes_on: bool,
+    header_encoding: &str,
     out: &mut Vec<u8>,
 ) -> Result<std::result::Result<(), ExitCode>> {
     // `get_notes_args()`: `format-patch` forwards a bare `--notes` (the default
@@ -2335,6 +2338,16 @@ pub(super) fn show_range_diff(
         Ok(p) => p,
         Err(code) => return Ok(Err(code)),
     };
+    // The patches come out of a `git log` child, which takes its output encoding
+    // from the configuration alone, but the pair header is `pp_commit_easy()` in
+    // format-patch's own process (range-diff.c:463, pretty.c:2315-2316), where
+    // `--encoding=` set `get_log_output_encoding()`.
+    for patch in a.iter_mut().chain(b.iter_mut()) {
+        let mut buffer = repo.find_object(patch.id)?.data.clone();
+        super::log::logmsg_reencode(&mut buffer, header_encoding);
+        super::log::logmsg_c_string(&mut buffer);
+        patch.subject = subject_of(super::log::pp_header_lines(&buffer).1.into());
+    }
 
     find_exact_matches(&mut a, &mut b);
     if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
@@ -3433,34 +3446,37 @@ fn build_patch(
     notes: &[super::notes::Tree],
     order: &mut OrderFile<'_>,
 ) -> Result<Option<Patch>> {
-    let mut commit = repo.find_object(id)?.try_into_commit()?;
+    let commit = repo.find_object(id)?.try_into_commit()?;
     // The patches are `git log --pretty=medium` output (range-diff.c:54-70), and
     // the header line is `pp_commit_easy()` (range-diff.c:463): both render the
-    // commit re-coded to the log output encoding (pretty.c:2315-2316).
+    // commit re-coded to the log output encoding (pretty.c:2315-2316), and read
+    // that buffer as a C string, so a UTF-16 or UTF-32 one ends at its first NUL
+    // (see [`super::log::logmsg_c_string`]).
     let output_encoding = crate::revfilter::log_output_encoding(repo, None);
-    // `read_patches()` reads them out of a `git log` child (range-diff.c:54-75),
-    // and this port's `git log` refuses the UTF-16 and UTF-32 families.
-    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
-        anyhow::bail!(
-            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
-             families are not ported; every other charset is)"
-        );
-    }
-    super::log::logmsg_reencode(&mut commit.data, &output_encoding);
+    let mut buffer = commit.data.clone();
+    super::log::logmsg_reencode(&mut buffer, &output_encoding);
+    super::log::logmsg_c_string(&mut buffer);
+    let (header, raw) = super::log::pp_header_lines(&buffer);
 
     // ` ## Metadata ##` — only the `Author:` line of `--pretty=medium` survives
-    // upstream's header filter; `Date:` and `commit` are dropped.
+    // upstream's header filter; `Date:` and `commit` are dropped. `pp_header()`
+    // prints one per `author` line that splits (pretty.c:2097-2100, :530-532), and
+    // `read_patches()` opens the two sections at each (range-diff.c:176-180), so a
+    // buffer cut short before its `author` line has neither.
     let mut text: Vec<u8> = Vec::new();
-    let sig = commit.author()?;
-    let (mut name, mut email): (&[u8], &[u8]) = (sig.name.as_ref(), sig.email.as_ref());
-    mailmap.map_user(&mut email, &mut name);
-    text.extend_from_slice(b" ## Metadata ##\nAuthor: ");
-    text.extend_from_slice(name);
-    text.extend_from_slice(b" <");
-    text.extend_from_slice(email);
-    text.extend_from_slice(b">\n\n ## Commit message ##\n");
+    for line in header.iter().filter_map(|line| line.strip_prefix(b"author ")) {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let Some(sig) = super::log::split_ident(line) else { continue };
+        let (mut name, mut email): (&[u8], &[u8]) = (sig.name.as_ref(), sig.email.as_ref());
+        mailmap.map_user(&mut email, &mut name);
+        text.extend_from_slice(b" ## Metadata ##\nAuthor: ");
+        text.extend_from_slice(name);
+        text.extend_from_slice(b" <");
+        text.extend_from_slice(email);
+        text.extend_from_slice(b">\n\n ## Commit message ##\n");
+    }
 
-    let raw = commit.message_raw()?;
+    let raw: &BStr = raw.into();
     for line in message_lines(raw) {
         // `pp_remainder()` writes a 4-space indent which `read_patches()` keeps,
         // then right-trims — so a blank message line collapses to nothing.
@@ -3479,7 +3495,9 @@ fn build_patch(
     // ` ## Notes (alt) ##`. Every other in-header line is kept only if it
     // carries `git log`'s four-space indent, right-trimmed (range-diff.c:187-192).
     if !notes.is_empty() {
-        let note = super::notes::format_display(repo, notes, id, false)?;
+        // The child's `show_log()` formats them in the log output encoding
+        // (log-tree.c:857-863).
+        let note = super::notes::format_display_encoded(repo, notes, id, false, &output_encoding)?;
         for line in note.split(|&b| b == b'\n') {
             if line.starts_with(b"Notes") && line.last() == Some(&b':') {
                 text.extend_from_slice(b"\n\n ## ");
@@ -3545,6 +3563,7 @@ fn build_patch(
     }
 
     Ok(Some(Patch {
+        id,
         index,
         abbrev: abbrev_id(repo, id, abbrev)?,
         subject: subject_of(raw),
@@ -4615,6 +4634,12 @@ fn pair_header(
     }
     line.push(b' ');
     line.extend_from_slice(&anchor.subject);
+    // `pp_commit_easy()` ends in `strbuf_rtrim(sb)` over the whole header buffer
+    // (pretty.c:2363), so an empty subject — a wide encoding's, cut at its first
+    // NUL — takes the separating space with it.
+    while line.last().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+        line.pop();
+    }
     line.extend_from_slice(reset.as_bytes());
     line.push(b'\n');
     out.extend_from_slice(&line);

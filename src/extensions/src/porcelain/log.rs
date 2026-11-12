@@ -6006,18 +6006,6 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // keys write the *same* two slots the option does, so `--encoding=none` (the
     // empty string) still beats a configured `i18n.logOutputEncoding`.
     let output_encoding = crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref());
-    // `reencode_string_len()` delegates to `iconv(3)`; this port's stand-in is
-    // `encoding_rs`, which has no UTF-16/UTF-32 *encoder* — see
-    // `crate::porcelain::mailinfo::encode_to`. git's own UTF-16 output is
-    // platform-dependent there too (`ICONV_OMITS_BOM` decides whether it writes the
-    // byte-order mark itself), so rather than emit bytes that are neither, the
-    // request is refused outright.
-    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
-        bail!(
-            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
-             families are not ported; every other charset is)"
-        );
-    }
 
     // The anchor list is final once the option scan is; it reaches the blob differ
     // through the process-wide slot. See [`super::diff_pairs::set_anchor_texts`].
@@ -6278,6 +6266,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
             expand_walk_only(&mut block, fmt, node, abbrev_commit, &abbrev_cache, &repo);
+            // The record is still converted out of UTF-8 (pretty.c:2026-2046).
+            user_format_to_output_encoding(&mut block, &output_encoding);
             if terminator && !empty_user_format {
                 block.push(rec_term);
             }
@@ -8188,6 +8178,7 @@ fn entry_block_from(
     // (pretty.c`s `setup_commit_format`), so it takes the user-format road too.
     let user_format = matches!(p.pretty, Pretty::User(_) | Pretty::Reference);
     logmsg_reencode(&mut commit.data, if user_format { "UTF-8" } else { p.output_encoding });
+    logmsg_c_string(&mut commit.data);
     // `--parents` then `--children` decorate the header with ids, in that order
     // (`show_log` prints `print_parents` before `children`). A child list is what
     // the walk saw, so it names only commits this run reached.
@@ -8278,9 +8269,6 @@ fn entry_block_from(
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
-    if user_format {
-        user_format_to_output_encoding(&mut block, p.output_encoding);
-    }
     // A `tformat:` record is terminated by a newline. git still terminates a
     // record whose expansion happened to be empty (so `%d` prints one line per
     // commit); only the genuinely empty user format emits no terminator.
@@ -11351,9 +11339,14 @@ fn expand_one(
             &ctx.abbrev.borrow_mut().get(commit.id()),
             auto_commit_color(ctx, *auto),
         ),
-        'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-'t' => {
-            out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.tree_id()?).as_bytes());
+        // `get_commit_tree_oid(commit)` (pretty.c:1578-1585): the parsed object's
+        // tree, whatever the re-coded message buffer holds — a commit whose
+        // `encoding` header misnames its bytes re-codes into text with no `tree`
+        // line at all.
+        'T' => out.extend_from_slice(stored_tree_id(ctx.repo, commit)?.to_string().as_bytes()),
+        't' => {
+            let tree = stored_tree_id(ctx.repo, commit)?;
+            out.extend_from_slice(ctx.abbrev.borrow_mut().get(tree.attach(ctx.repo)).as_bytes());
         }
         'P' => write_parents(out, false, ctx.abbrev, ctx.parents, ctx.repo),
         'p' => write_parents(out, true, ctx.abbrev, ctx.parents, ctx.repo),
@@ -11396,11 +11389,15 @@ fn expand_one(
             if ctx.notes.is_empty() {
                 return Ok(true);
             }
-            out.extend_from_slice(&super::notes::format_display(
+            // `show_log()` formats `notes_message` in the log output encoding
+            // (log-tree.c:857-863), and the record holding it is converted again
+            // afterwards, as if it were UTF-8 (pretty.c:2026-2046).
+            out.extend_from_slice(&super::notes::format_display_encoded(
                 ctx.repo,
                 ctx.notes,
                 commit.id().detach(),
                 true,
+                ctx.email.output_encoding,
             )?);
         }
         // `case 'f'` (pretty.c:1765-1767) sanitizes only the subject's first
@@ -11524,8 +11521,10 @@ fn expand_one(
             // verification per commit, shared by all seven placeholders.
             let sig = match gsig {
                 Some(sig) => sig,
+                // Over the stored buffer, as `parse_signed_commit()` reads it
+                // (commit.c:1184-1195), not the re-coded copy.
                 None => gsig.insert(
-                    checked_signature(ctx.repo, &commit.data)?
+                    checked_signature(ctx.repo, &ctx.repo.find_object(commit.id)?.data)?
                         .map(|(check, _)| check)
                         .unwrap_or_default(),
                 ),
@@ -13085,7 +13084,11 @@ pub(crate) fn rev_list_pretty_body(
     // commit re-coded to UTF-8 and converts afterwards (pretty.c:1734, 2026-2046).
     let user_format = matches!(pretty, Pretty::User(_) | Pretty::Reference);
     let mut recoded = repo.find_object(commit.id)?.try_into_commit()?;
+    // `add_merge_info()` lists `commit->parents`, the parsed object's, whatever
+    // the re-coded buffer holds.
+    let stored_parents: Vec<ObjectId> = recoded.parent_ids().map(|p| p.detach()).collect();
     logmsg_reencode(&mut recoded.data, if user_format { "UTF-8" } else { output_encoding });
+    logmsg_c_string(&mut recoded.data);
     let commit = &recoded;
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
@@ -13166,27 +13169,29 @@ pub(crate) fn rev_list_pretty_body(
             // `pp_header()` copies every header line of the object through
             // unchanged under `CMIT_FMT_RAW` — including `gpgsig`, `encoding` and
             // `mergetag`, which a reconstruction from the parsed fields would
-            // drop — and stops at the blank line without emitting it.
-            let data = commit.data.as_slice();
-            let header_len = data
-                .windows(2)
-                .position(|w| w == b"\n\n")
-                .map_or(data.len(), |at| at + 1);
-            out.extend_from_slice(&data[..header_len]);
+            // drop — and stops at the blank line without emitting it
+            // (pretty.c:2061-2076). A wide re-coding leaves only the stub before
+            // its first NUL, copied as it is.
+            let (header, rest) = pp_header_lines(&commit.data);
+            for line in header {
+                out.extend_from_slice(line);
+            }
             // `pretty_print_commit()` adds the blank line, then `pp_remainder()`
             // indents the message four spaces with no tab expansion for `raw`.
             out.push(b'\n');
-            indent_message(&mut out, 0, commit_message(&commit.data), false, ctx.expand_tabs.unwrap_or(0));
+            indent_message(&mut out, 0, rest, false, ctx.expand_tabs.unwrap_or(0));
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
             // `pp_header()` folds the `parent` lines of a merge into one `Merge:`
-            // line of abbreviated ids.
-            let parents: Vec<_> = commit.parent_ids().collect();
-            if parents.len() > 1 {
+            // line of abbreviated ids, at the first header line that is not a
+            // `parent` line (pretty.c:2084-2090): a wide re-coding that ends
+            // before one has none.
+            let header_seen = pp_header_lines(&commit.data).0.iter().any(|l| !l.starts_with(b"parent "));
+            if stored_parents.len() > 1 && header_seen {
                 out.extend_from_slice(b"Merge:");
-                for pid in &parents {
+                for pid in &stored_parents {
                     out.push(b' ');
-                    out.extend_from_slice(abbrev.borrow_mut().get(*pid).as_bytes());
+                    out.extend_from_slice(abbrev.borrow_mut().get(pid.attach(repo)).as_bytes());
                 }
                 out.push(b'\n');
             }
@@ -13299,8 +13304,10 @@ impl<'r> EntryRenderer<'r> {
         opts: &ShowEntry<'_>,
     ) -> Result<()> {
         // `cmd_show` never simplifies history, so the effective parent list the
-        // `Merge:` line prints is the commit's own.
-        let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+        // `Merge:` line prints is the commit's own: `commit->parents`, parsed from
+        // the stored object, not from the re-coded copy handed in here.
+        let stored = self.repo.find_object(commit.id)?.try_into_commit()?;
+        let parents: Vec<ObjectId> = stored.parent_ids().map(|p| p.detach()).collect();
         let ctx = RenderCtx {
             abbrev_commit: opts.abbrev_commit,
             abbrev: &self.abbrev,
@@ -13464,7 +13471,9 @@ fn notes_block(commit: &gix::Commit<'_>, ctx: &RenderCtx<'_>) -> Result<Vec<u8>>
     if ctx.notes.is_empty() {
         return Ok(Vec::new());
     }
-    super::notes::format_display(ctx.repo, ctx.notes, commit.id().detach(), false)
+    // `format_display_notes(&commit->object.oid, &notebuf, get_log_output_encoding(), raw)`
+    // (log-tree.c:857-863): each note is re-coded into the log output encoding.
+    super::notes::format_display_encoded(ctx.repo, ctx.notes, commit.id().detach(), false, ctx.email.output_encoding)
 }
 
 /// `show_signature()` (log-tree.c:580) plus `show_sig_lines()` (log-tree.c:564).
@@ -13496,7 +13505,11 @@ fn write_signature_block(
     if !ctx.show_signature {
         return Ok(());
     }
-    let Some((check, min_trust)) = checked_signature(ctx.repo, &commit.data)? else {
+    // `parse_signed_commit()` reads the stored buffer through
+    // `repo_get_commit_buffer()` (commit.c:1184-1195), not the re-coded copy the
+    // message is rendered from.
+    let stored = ctx.repo.find_object(commit.id)?;
+    let Some((check, min_trust)) = checked_signature(ctx.repo, &stored.data)? else {
         return Ok(());
     };
     // `status` is `check_signature()`'s return value: 0 only for a signature that both
@@ -13611,6 +13624,7 @@ fn render_entry(
                 out.extend_from_slice(show_ident_date(author.time, date_mode, ctx.now).as_bytes());
             }
             out.push(b')');
+            user_record_to_output_encoding(out, msg_start, ctx);
         }
         // ```c
         // if (cmit_fmt_is_mail(opt->commit_format)) {
@@ -13655,6 +13669,7 @@ fn render_entry(
             write_signature_block(out, commit, ctx)?;
             msg_start = out.len();
             expand_format(out, commit, fmt, ctx)?;
+            user_record_to_output_encoding(out, msg_start, ctx);
         }
         Pretty::Raw => {
             // `show_log()` prints one `commit <name>` line for every non-mail,
@@ -13677,10 +13692,6 @@ fn render_entry(
             write_reflog_header(out, ctx);
             write_signature_block(out, commit, ctx)?;
             msg_start = out.len();
-            writeln!(out, "tree {}", commit.tree_id()?)?;
-            for pid in commit.parent_ids() {
-                writeln!(out, "parent {pid}")?;
-            }
             // ```c
             // if (pp->fmt == CMIT_FMT_RAW) {
             //         strbuf_add(sb, line, linelen);
@@ -13689,17 +13700,17 @@ fn render_entry(
             // ```
             //
             // (`pp_header()`, pretty.c:2073-2076.) `raw` copies **every** header line
-            // of the commit through, so the ones this port does not reconstruct by
-            // name — `author` and `committer` as stored, a malformed one included,
-            // `encoding`, `gpgsig`, `mergetag` — come out in the order they are
-            // stored, behind `tree` and `parent`.
-            for line in extra_headers(commit.data.as_slice()) {
+            // of the re-coded commit through as `get_one_line()` hands it out —
+            // `tree`, `parent`, `author` and `committer` as stored, a malformed one
+            // included, `encoding`, `gpgsig`, `mergetag` — and a buffer a wide
+            // encoding cut short at its first NUL gives up its stub, newline or not.
+            let (header, rest) = pp_header_lines(&commit.data);
+            for line in header {
                 out.extend_from_slice(line);
-                out.push(b'\n');
             }
             out.push(b'\n');
             // `raw` prints the message as stored: its table entry has no tab width.
-            indent_message(out, msg_start, commit_message(&commit.data), false, ctx.expand_tabs.unwrap_or(0));
+            indent_message(out, msg_start, rest, false, ctx.expand_tabs.unwrap_or(0));
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Medium | Pretty::Short | Pretty::Full | Pretty::Fuller => {
@@ -13725,7 +13736,12 @@ fn render_entry(
             // The list is the *effective* one: history simplification rewrites
             // parents before anything is printed, so a merge whose sides
             // collapsed onto one line is no longer shown as a merge.
-            if ctx.parents.len() > 1 {
+            // `pp_header()` calls `add_merge_info()` at the first header line that
+            // is not a `parent` line (pretty.c:2084-2090), so a re-coded buffer
+            // that ends before such a line — a UTF-16LE `t`, the bare `00 00 FE FF`
+            // of a UTF-32 one — has no `Merge:` line.
+            let header_seen = pp_header_lines(&commit.data).0.iter().any(|l| !l.starts_with(b"parent "));
+            if ctx.parents.len() > 1 && header_seen {
                 out.extend_from_slice(b"Merge:");
                 for pid in ctx.parents {
                     out.push(b' ');
@@ -13750,6 +13766,16 @@ fn render_entry(
         out.splice(msg_start..msg_start, size.into_bytes());
     }
     Ok(())
+}
+
+/// `repo_format_commit_message()` converts the record it expanded, `msgbuf`, out
+/// of UTF-8 before `show_log()` sees it (pretty.c:2026-2046), so `--log-size`
+/// counts the converted bytes and `--graph` lays out the converted lines
+/// (log-tree.c:901-915); the signature block in front of it is not part of it.
+fn user_record_to_output_encoding(out: &mut Vec<u8>, msg_start: usize, ctx: &RenderCtx<'_>) {
+    let mut record = out.split_off(msg_start);
+    user_format_to_output_encoding(&mut record, ctx.email.output_encoding);
+    out.extend_from_slice(&record);
 }
 
 /// `next_commentary_block()`'s side effect, `opt->shown_dashes`: the mail formats
@@ -15894,7 +15920,7 @@ pub(super) fn render_graph(
             if !msg.is_empty() {
                 out.extend_from_slice(&record.lead);
             }
-            graph_write_lines(&mut out, &mut graph, msg, &[], bare_out);
+            graph_write_message(&mut out, &mut graph, msg);
 
             // Rows the commit's message did not consume: the `|\` of a merge and the
             // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
@@ -16010,6 +16036,30 @@ fn push_graph_block(
 ///
 /// A line that opens one of the `bare` spans of `buf` gets no row: the diff
 /// prefix callback is never asked for it. Its span in `out` goes to `bare_out`.
+/// `graph_show_commit()`'s row and then `graph_show_strbuf()` (graph.c:1948-1973)
+/// over the commit message: the message is walked with `strchr()`, so a line
+/// break past a NUL is never found and everything from that line to the end is
+/// written in one piece, and no graph row is drawn in front of a line that
+/// begins with a NUL — a record converted into UTF-16 or UTF-32 is laid out by
+/// its newline bytes only up to its first NUL.
+fn graph_write_message(out: &mut Vec<u8>, graph: &mut Graph, msg: &[u8]) {
+    out.extend_from_slice(&graph.next_line());
+    let mut p = 0;
+    while p < msg.len() {
+        let rest = &msg[p..];
+        let c_str = &rest[..rest.iter().position(|&b| b == 0).unwrap_or(rest.len())];
+        let Some(nl) = c_str.iter().position(|&b| b == b'\n') else {
+            out.extend_from_slice(rest);
+            break;
+        };
+        out.extend_from_slice(&rest[..=nl]);
+        p += nl + 1;
+        if msg.get(p).is_some_and(|&b| b != 0) {
+            out.extend_from_slice(&graph.next_line());
+        }
+    }
+}
+
 fn graph_write_lines(
     out: &mut Vec<u8>,
     graph: &mut Graph,
@@ -17284,6 +17334,30 @@ pub(crate) fn commit_ident<'a>(
     split_ident(line)
 }
 
+/// `pp_header()`'s walk over the re-coded buffer (pretty.c:2061-2071): each line
+/// `get_one_line()` hands out, newline included, up to the one-byte line that
+/// ends the header, and the rest of the buffer after it. `get_one_line()` stops
+/// at a NUL (pretty.c:227-240), and a stub one byte long ends the header whether
+/// or not it is a newline.
+pub(crate) fn pp_header_lines(data: &[u8]) -> (Vec<&[u8]>, &[u8]) {
+    let c_str = &data[..data.iter().position(|&b| b == 0).unwrap_or(data.len())];
+    let mut lines = Vec::new();
+    let mut msg = c_str;
+    loop {
+        let linelen = msg.iter().position(|&b| b == b'\n').map_or(msg.len(), |p| p + 1);
+        if linelen == 0 {
+            break;
+        }
+        let (line, rest) = msg.split_at(linelen);
+        msg = rest;
+        if linelen == 1 {
+            break;
+        }
+        lines.push(line);
+    }
+    (lines, msg)
+}
+
 /// The header lines of a commit object, up to the blank line that ends them.
 fn header_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     data.split(|&b| b == b'\n').take_while(|line| !line.is_empty())
@@ -17297,7 +17371,7 @@ fn header_value<'a>(line: &'a [u8], field: &str) -> Option<&'a [u8]> {
 
 /// `split_ident_line()` (ident.c:275-346) over one ident value; see
 /// [`commit_ident`].
-fn split_ident(line: &[u8]) -> Option<gix::actor::SignatureRef<'_>> {
+pub(crate) fn split_ident(line: &[u8]) -> Option<gix::actor::SignatureRef<'_>> {
     use gix::bstr::ByteSlice;
     // `for (cp = line; *cp && cp < line + len; cp++) if (*cp == '<')`: a NUL
     // ends the scan.
@@ -17686,6 +17760,26 @@ pub(crate) fn logmsg_reencode(data: &mut Vec<u8>, output_encoding: &str) {
     replace_encoding_header(data, output_encoding);
 }
 
+/// The tree of the commit as stored, for `%T`/`%t`: `commit` may be the re-coded
+/// copy a user format expands against.
+fn stored_tree_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<ObjectId> {
+    Ok(repo.find_object(commit.id)?.try_into_commit()?.tree_id()?.detach())
+}
+
+/// `repo_logmsg_reencode()` hands its caller a bare `const char *`, and every
+/// reader of it in pretty.c walks it as a C string: `get_one_line()` stops at
+/// the first NUL (pretty.c:227-240), as do `pp_header()`, `pp_title_line()`,
+/// `pp_remainder()` and `format_commit_one()`'s `parse_commit_header()`
+/// (pretty.c:2053-2107, :1730-1734, :915-939). A message re-coded into UTF-16 or UTF-32
+/// therefore ends at the NUL its first ASCII character carries, and a stored
+/// buffer holding a NUL ends there too. This is that read: the re-coded buffer
+/// cut at its first NUL.
+pub(crate) fn logmsg_c_string(data: &mut Vec<u8>) {
+    if let Some(nul) = data.iter().position(|&b| b == 0) {
+        data.truncate(nul);
+    }
+}
+
 /// The tail of `repo_format_commit_message()`: a user format was expanded against
 /// the commit re-coded to UTF-8, and the finished record is converted out of UTF-8.
 ///
@@ -17779,37 +17873,6 @@ fn replace_encoding_header(data: &mut Vec<u8>, encoding: &str) {
         let value_at = start + b"encoding ".len();
         data.splice(value_at..end - 1, encoding.bytes());
     }
-}
-
-/// The header lines of a commit that [`Pretty::Raw`] does not reconstruct from the
-/// parsed object: everything that is not `tree` or `parent`, continuation lines (a
-/// leading space, as `gpgsig` uses) included. The idents are copied as stored, as
-/// `pp_header()` copies every line (pretty.c:2073-2076), so one that does not
-/// split still prints.
-///
-/// The scan stops at the blank line that ends the header block, so a body line
-/// starting with one of those words is never mistaken for a header.
-fn extra_headers(data: &[u8]) -> Vec<&[u8]> {
-    const RECONSTRUCTED: [&[u8]; 2] = [b"tree ", b"parent "];
-    let mut out = Vec::new();
-    let mut in_reconstructed = false;
-    for line in data.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            break;
-        }
-        // A continuation line belongs to whatever header opened it.
-        if line.starts_with(b" ") {
-            if !in_reconstructed {
-                out.push(line);
-            }
-            continue;
-        }
-        in_reconstructed = RECONSTRUCTED.iter().any(|k| line.starts_with(k));
-        if !in_reconstructed {
-            out.push(line);
-        }
-    }
-    out
 }
 
 /// Whether `cmd_log_init_finish()`'s `parse_options()` pass claims `a` before

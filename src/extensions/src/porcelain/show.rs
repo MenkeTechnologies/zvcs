@@ -2303,8 +2303,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let (cfg_subject_prefix, cfg_encode_email_headers) = super::log::email_config(&repo);
     // `get_log_output_encoding()` (environment.c:189-198): `--encoding=` wins, then
     // `i18n.logOutputEncoding`, then `i18n.commitEncoding`, and UTF-8 when none of
-    // them is set. Resolved exactly as `git log` resolves it — same precedence, same
-    // refusal for the encoders `reencode()` does not have.
+    // them is set. Resolved exactly as `git log` resolves it, with the same precedence.
     let output_encoding = match log_encoding {
         Some(v) => v,
         None => {
@@ -2315,12 +2314,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 .unwrap_or_else(|| "UTF-8".to_string())
         }
     };
-    if super::mailinfo::is_utf16_or_32_name(&output_encoding) {
-        bail!(
-            "unsupported flag \"--encoding={output_encoding}\" (the UTF-16 and UTF-32 \
-             families are not ported; every other charset is)"
-        );
-    }
     let renderer = super::log::EntryRenderer::with_color(&repo, want_color);
     let rename_warn = std::cell::RefCell::new(RenameWarnState::default());
     let diff_status = std::cell::Cell::new((false, false));
@@ -4118,22 +4111,30 @@ fn show_commit_record(
     // bytes, and the finished record converted out of UTF-8 afterwards
     // (pretty.c:2026-2046). Same split `git log` makes, through the same re-coder.
     let user_format = matches!(pretty, Pretty::User(_) | Pretty::Reference);
+    // Whatever comes back is read as a C string, so a re-coded UTF-16 or UTF-32
+    // buffer ends at its first NUL (see [`super::log::logmsg_c_string`]).
+    // The diff below still reads the stored object, so the copy gets a name of
+    // its own.
     let mut recoded;
-    let commit = if disp.output_encoding.is_empty() {
+    // A user format is re-coded to UTF-8 even under `--encoding=none`.
+    let reencode = user_format || !disp.output_encoding.is_empty();
+    let rendered = if !reencode && !commit.data.contains(&0) {
         commit
     } else {
         recoded = commit.clone();
-        super::log::logmsg_reencode(
-            &mut recoded.data,
-            if user_format { "UTF-8" } else { disp.output_encoding },
-        );
+        if reencode {
+            super::log::logmsg_reencode(
+                &mut recoded.data,
+                if user_format { "UTF-8" } else { disp.output_encoding },
+            );
+        }
+        super::log::logmsg_c_string(&mut recoded.data);
         &recoded
     };
-    let record_start = out.len();
     let reflog = disp.reflog.borrow().clone();
     disp.renderer.render(
         out,
-        commit,
+        rendered,
         pretty,
         &super::log::ShowEntry {
             abbrev_commit: disp.abbrev_commit,
@@ -4157,20 +4158,9 @@ fn show_commit_record(
     if super::log::mail_notes_shown_dashes(repo, disp.notes, pretty, commit.id().detach())? {
         disp.shown_dashes.set(true);
     }
-    // `repo_format_commit_message()`'s tail: the *rendered record* is converted out
-    // of UTF-8 into the requested encoding, and a conversion that cannot be done
-    // leaves the UTF-8 bytes in place (pretty.c:2026-2046). Only a user format takes
-    // this road; the built-in formats were already re-coded above.
-    if user_format
-        && !disp.output_encoding.is_empty()
-        && !super::mailinfo::same_encoding("UTF-8", disp.output_encoding)
-    {
-        let block = out.split_off(record_start);
-        match super::mailinfo::reencode(&block, "UTF-8", disp.output_encoding) {
-            Some(converted) => out.extend_from_slice(&converted),
-            None => out.extend_from_slice(&block),
-        }
-    }
+    // `repo_format_commit_message()`'s tail, converting a user format's record out
+    // of UTF-8 (pretty.c:2026-2046), runs inside the renderer, ahead of the
+    // `log size` line it is measured for.
     // The closing half of `show_log()`: a terminator format ends each record with
     // `opt->diffopt.line_termination`, except the genuinely empty user format,
     // which emits nothing at all (log-tree.c:915-919).

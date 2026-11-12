@@ -1102,11 +1102,7 @@ fn verify_tags(
     for name in names {
         // `refs_read_ref(…, "refs/tags/<name>")`, so a missing ref is reported and
         // the remaining names are still tried.
-        let id = repo
-            .try_find_reference(&format!("refs/tags/{name}"))
-            .ok()
-            .flatten()
-            .and_then(|r| r.try_id().map(|id| id.detach()));
+        let id = read_ref(repo, &format!("refs/tags/{name}"));
         let Some(id) = id else {
             eprintln!("error: tag '{name}' not found.");
             had_error = true;
@@ -1478,9 +1474,9 @@ fn create_tag(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let prev = repo
-        .try_find_reference(ref_name.as_str())?
-        .and_then(|r| r.try_id().map(|id| id.detach()));
+    // `if (refs_read_ref(…, ref.buf, &prev)) oidclr(&prev, …);` (builtin/tag.c:675-676):
+    // a tag that is a symbolic ref is the object its target names.
+    let prev = read_ref(repo, &ref_name);
 
     if prev.is_some() && !force {
         return fatal(&format!("tag '{name}' already exists"));
@@ -1761,6 +1757,20 @@ fn create_tag(
         }
         return fatal(&format!("cannot lock ref '{ref_name}': {reason}"));
     }
+    // lock_raw_ref() reads the ref it has locked, and a loose ref whose content
+    // does not parse fails the update whatever the old value or -f
+    // (refs/files-backend.c:956-959, :2724), through the same transaction death.
+    if repo.try_find_reference(ref_name.as_str()).is_err() {
+        if annotate {
+            eprintln!(
+                "The tag message has been left in {}",
+                tag_editmsg_shown(repo)
+            );
+        }
+        return fatal(&format!(
+            "cannot lock ref '{ref_name}': unable to resolve reference '{ref_name}': reference broken"
+        ));
+    }
 
     // git always computes a reflog message describing the *target* object (built
     // before the tag object exists) and hands it to the transaction, which writes it
@@ -1783,7 +1793,9 @@ fn create_tag(
             new: Target::Object(new_id),
         },
         name: full,
-        deref: false,
+        // No REF_NO_DEREF among the flags builtin/tag.c:694-696 passes, so a
+        // symbolic tag moves the ref it points at.
+        deref: true,
     })?;
     // `if (path) { unlink_or_warn(path); free(path); }` (builtin/tag.c:704-707):
     // the editor buffer is discarded only once the reference is in place.
@@ -1878,19 +1890,21 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut had_failure = false;
-    let mut to_delete: Vec<(String, FullName, Option<gix::ObjectId>)> = Vec::new();
+    let mut to_delete: Vec<(String, FullName, gix::ObjectId)> = Vec::new();
     for name in positionals {
         let ref_name = format!("refs/tags/{name}");
-        let found = match FullName::try_from(ref_name.as_str()) {
-            Ok(full) => repo.try_find_reference(ref_name.as_str())?.map(|r| (full, r)),
-            Err(_) => None,
-        };
-        let Some((full, r)) = found else {
+        // `refs_read_ref()` (builtin/tag.c:96) resolves the name through any
+        // symbolic ref to the object it ends at, and fails, as "not found", for a
+        // name, a ref file or a symref target it cannot read.
+        let found = FullName::try_from(ref_name.as_str())
+            .ok()
+            .and_then(|full| Some((full, read_ref(repo, &ref_name)?)));
+        let Some((full, oid)) = found else {
             eprintln!("error: tag '{name}' not found.");
             had_failure = true;
             continue;
         };
-        to_delete.push((name.to_string(), full, r.try_id().map(|id| id.detach())));
+        to_delete.push((name.to_string(), full, oid));
     }
 
     // `ref_transaction_add_update()` refuses a second update of the same ref for
@@ -1913,8 +1927,16 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
             name: full.clone(),
             deref: false,
         });
+        // refs_delete_refs() (refs.c:3108-3115) names the ref when it was the
+        // only one, and the transaction's err text is the lock message of
+        // whichever lock (the ref's own or packed-refs) it could not take.
         if let Err(err) = repo.edit_references(edits) {
-            eprintln!("error: could not delete references: {err}");
+            let err = anyhow::Error::from(err);
+            let reason = crate::fatal::lock_held_fatal(&err).unwrap_or_else(|| err.to_string());
+            match to_delete.as_slice() {
+                [(_, full, _)] => eprintln!("error: could not delete reference {full}: {reason}"),
+                _ => eprintln!("error: could not delete references: {reason}"),
+            }
             had_failure = true;
         }
     }
@@ -1923,10 +1945,7 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
         if repo.try_find_reference(full.as_ref())?.is_some() {
             continue;
         }
-        match old {
-            Some(id) => println!("Deleted tag '{name}' (was {})", short_hex(repo, *id)),
-            None => println!("Deleted tag '{name}'"),
-        }
+        println!("Deleted tag '{name}' (was {})", short_hex(repo, *old));
     }
 
     Ok(if had_failure {
@@ -1934,6 +1953,14 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `refs_read_ref()`: the object `name` resolves to, through any symbolic ref,
+/// or `None` for a name, a ref file or a symref target that cannot be read
+/// (refs.c `refs_resolve_ref_unsafe()` with `RESOLVE_REF_READING`).
+fn read_ref(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    let mut r = repo.try_find_reference(name).ok()??;
+    r.follow_to_object().ok().map(|id| id.detach())
 }
 
 /// Report a git `fatal:` failure on stderr and yield git's exit code for it.

@@ -381,7 +381,21 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             dst_sparse,
             &mut st_is_dir,
         ) {
-            Ok(Planned::SparseSkip(src)) => only_match_skip_worktree.push(src),
+            Ok(Planned::SparseSkip(plan)) => {
+                only_match_skip_worktree.push(plan.src_rel.clone());
+                // `goto act_on_entry` with `bad` unset (builtin/mv.c:337-340) keeps
+                // the entry, with neither INDEX nor SPARSE in its mode, so `-k`
+                // goes on to move it after the advice (:566-572):
+                // needs_worktree_rename() tries the rename(), which fails for a
+                // path not on disk and is skipped, unless the destination is
+                // itself outside the cone, which moves the entry in the index
+                // alone (:52-56, :585-611). The late sparse checks are not
+                // reached and the destination joins no `src_for_dst`.
+                if skip {
+                    plans.push(plan);
+                }
+            }
+            Ok(Planned::Die(msg)) => return fatal(msg),
             Ok(Planned::Move(plan)) => {
                 // Both ends are checked, and both are named in the report.
                 if let Some(sp) = sparsity.as_ref().filter(|_| !plan.is_dir && !ignore_sparse) {
@@ -854,7 +868,11 @@ fn empty_dir_has_sparse_contents(index: &gix::index::File, name: &str) -> bool {
 /// sparse-checkout definition that `advise_on_updating_sparse_paths()` will name.
 enum Planned {
     Move(Plan),
-    SparseSkip(String),
+    SparseSkip(Plan),
+    /// A `die()` of the checking loop that `-k` does not skip: the ones
+    /// submodule_gitfile_path() raises (builtin/mv.c:109-112), as opposed to the
+    /// `bad` reasons act_on_entry: lets `ignore_errors` drop (:524-528).
+    Die(String),
 }
 
 fn plan_source(
@@ -967,7 +985,18 @@ fn plan_source(
                 return Err(anyhow!("bad source, source={src_rel}, destination={dst_rel}"));
             }
             if !ignore_sparse {
-                return Ok(Planned::SparseSkip(src_rel));
+                return Ok(Planned::SparseSkip(Plan {
+                    src_abs,
+                    dst_abs,
+                    src_rel: src_rel.clone(),
+                    dst_rel: dst_rel.clone(),
+                    remaps: vec![(src_rel, dst_rel)],
+                    submodule: None,
+                    is_dir: false,
+                    index_only: false,
+                    skip_worktree_dir: false,
+                    sparse_remaps: Vec::new(),
+                }));
             }
             if is_tracked(index, &dst_rel) && !force {
                 crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
@@ -993,28 +1022,41 @@ fn plan_source(
     let is_dir = meta.as_ref().map_or(*st_is_dir, |m| m.is_dir());
     let mut submodule = None;
     let remaps: Vec<(String, String)> = if is_dir {
+        // ```c
+        // if (S_ISDIR(st.st_mode)
+        //     && lstat(dst, &dest_st) == 0) {
+        //         bad = _("destination already exists");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:355-359.) A directory destination that already exists
+        // on disk, a dangling symlink included, can't be merged here (only file
+        // destinations honor -f), and the test comes before `dir_check`, so
+        // before a submodule's `.gitmodules` check and the `source directory is
+        // empty` one. A `SKIP_WORKTREE_DIR` source jumped past it to `dir_check`.
+        if !skip_worktree_dir && std::fs::symlink_metadata(&dst_abs).is_ok() {
+            crate::git_fatal!("destination already exists, source={src_rel}, destination={dst_rel}");
+        }
         // `dir_check`: an index entry *at* the directory itself is a gitlink, so
         // this is a submodule move rather than a subtree remap. git refuses to
         // touch `.gitmodules` while it has unstaged edits, since it is about to
         // rewrite and restage it.
         if let Some(mode) = tracked_mode(index, &src_rel) {
             if mode != Mode::COMMIT {
-                crate::git_fatal!("Directory {src_rel} is in index and no submodule?");
+                return Ok(Planned::Die(format!(
+                    "Directory {src_rel} is in index and no submodule?"
+                )));
             }
             if gitmodules_has_unstaged_changes(index, workdir)? {
-                crate::git_fatal!(
-                    "Please stage your changes to .gitmodules or stash them to proceed"
-                );
+                return Ok(Planned::Die(
+                    "Please stage your changes to .gitmodules or stash them to proceed".into(),
+                ));
             }
             // `read_gitfile()`: `Some(path)` for a `.git` file (a separate git
             // dir that has to be repointed), `None` for an embedded `.git`
             // directory (git's `SUBMODULE_WITH_GITDIR`).
             submodule = Some(read_gitfile(&src_abs.join(".git")));
-            if dst_abs.exists() {
-                crate::git_fatal!(
-                    "destination already exists, source={src_rel}, destination={dst_rel}"
-                );
-            }
             return Ok(Planned::Move(Plan {
                 src_abs,
                 dst_abs,
@@ -1057,13 +1099,6 @@ fn plan_source(
         // problem: the directory has nothing tracked under it to move.
         if remaps.is_empty() {
             crate::git_fatal!("source directory is empty, source={src_rel}, destination={dst_rel}");
-        }
-        // A directory destination that already exists on disk can't be merged
-        // here; git refuses it too (only file destinations honor -f). A
-        // `SKIP_WORKTREE_DIR` source jumped past this test to `dir_check`
-        // (builtin/mv.c:355-359).
-        if !skip_worktree_dir && dst_abs.exists() {
-            crate::git_fatal!("destination already exists, source={src_rel}, destination={dst_rel}");
         }
         remaps
     } else {
@@ -1571,6 +1606,15 @@ fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)], refre
     // directory removes the `lnk` entry. Renames apply one at a time, so an
     // earlier one's result can be in the way of a later one.
     for (stat, id, flags, mode, new) in pushes {
+        // add_index_entry_with_check() refuses a name verify_path_internal()
+        // rejects with `error(invalid path)` (read-cache.c:1299-1302) after the
+        // old entry is gone (:171), and rename_index_entry_at() ignores the
+        // failure (:182-185): `git mv a .git/x` renames the file, drops `a`
+        // from the index, and exits 0.
+        if !super::apply::verify_path(&new, mode.bits()) {
+            eprintln!("error: invalid path '{new}'");
+            continue;
+        }
         let new_bytes = BString::from(new);
         let in_way =
             super::update_index::file_directory_conflicts(index, new_bytes.as_bstr(), Stage::Unconflicted);

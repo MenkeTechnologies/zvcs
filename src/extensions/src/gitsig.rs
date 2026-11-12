@@ -1081,12 +1081,20 @@ fn sign_buffer_gpg(payload: &[u8], program: &str, key: &str) -> Result<Vec<u8>, 
         .spawn()
     {
         Ok(child) => child,
-        // `start_command()` fails in the parent when the program cannot be found
-        // and reports `error_errno("cannot run %s", cmd->args.v[0])`
-        // (run-command.c); the status stream is then empty, which is what makes
-        // the caller's diagnostic `(no gpg output)`.
+        // `start_command()` fails in the parent when prepare_cmd()'s PATH lookup
+        // of a name without a dir separator finds nothing, and reports
+        // `error_errno("cannot run %s", cmd->args.v[0])` (run-command.c:432-441,
+        // :757-763); a path with one is exec'd as given, and the child's failed
+        // execve() reports `cannot exec '%s'` through the die routine
+        // (run-command.c:403-404, :867-873). The status stream is then empty,
+        // which is what makes the caller's diagnostic `(no gpg output)`.
         Err(e) => {
-            eprintln!("error: cannot run {program}: {}", crate::external::strerror(&e));
+            let reason = crate::external::strerror(&e);
+            if program.contains('/') {
+                eprintln!("fatal: cannot exec '{program}': {reason}");
+            } else {
+                eprintln!("error: cannot run {program}: {reason}");
+            }
             return Err(fail(b""));
         }
     };
@@ -1246,8 +1254,9 @@ pub struct Signer {
     /// rather than reported: `git_gpg_config()` rejects it, but only once
     /// `gpg_interface_lazy_init()` runs — which is the first sign or verify, not
     /// startup. So `git status` in the same repository is unaffected, and this is
-    /// raised by [`Self::sign`].
-    bad_format: Option<String>,
+    /// raised by [`Self::sign`]. The second string is git_die_config_linenr()'s
+    /// text for where the value came from.
+    bad_format: Option<(String, String)>,
     /// The committer ident (`Name <email>`), git's `get_signing_key()` fallback
     /// for openpgp/x509 when `user.signingKey` is unset.
     committer: Option<String>,
@@ -1296,7 +1305,9 @@ impl Signer {
             .as_deref()
             .and_then(SigFormat::from_name)
             .unwrap_or(SigFormat::OpenPgp);
-        let bad_format = configured_format.filter(|v| SigFormat::from_name(v).is_none());
+        let bad_format = configured_format
+            .filter(|v| SigFormat::from_name(v).is_none())
+            .map(|v| (v, crate::config::die_config_linenr(Some(repo), "gpg.format")));
         let committer = repo.committer().transpose().ok().flatten().map(|c| {
             // `git_committer_info(IDENT_STRICT | IDENT_NO_DATE)`: name and email only.
             format!("{} <{}>", c.name, c.email)
@@ -1318,14 +1329,13 @@ impl Signer {
     ///
     /// git prints `error: invalid value for 'gpg.format': '<value>'` and then dies
     /// through the config reader, whose second line names the file and line the
-    /// value came from. That line is not reproduced — gix's config parser does not
-    /// carry per-entry line numbers — so this reports the first and stops, rather
-    /// than inventing a location.
+    /// value came from (configset_iter(), config.c:1654-1673).
     fn check_format(&self) -> Result<(), SignFailure> {
         match &self.bad_format {
             None => Ok(()),
-            Some(value) => {
+            Some((value, die)) => {
                 eprintln!("error: invalid value for 'gpg.format': '{value}'");
+                eprintln!("fatal: {die}");
                 Err(SignFailure::Silent)
             }
         }

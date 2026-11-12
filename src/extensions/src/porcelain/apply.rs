@@ -4581,7 +4581,7 @@ fn verify_dotfile(rest: &[u8], is_symlink: bool) -> bool {
 /// `is_ntfs_dotgit()`), and the Windows-only `has_dos_drive_prefix()` /
 /// `is_valid_path()` gates — on POSIX the latter two are compiled out
 /// (git-compat-util.h:224-229, :265).
-fn verify_path(path: &str, mode: u32) -> bool {
+pub(crate) fn verify_path(path: &str, mode: u32) -> bool {
     let is_symlink = mode & 0o170000 == 0o120000;
     let b = path.as_bytes();
     let mut i = 0usize;

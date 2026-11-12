@@ -426,10 +426,10 @@ fn compile(pattern: &str) -> std::result::Result<regex::bytes::Regex, String> {
 /// own error text is its own.
 ///
 /// git compiles with the platform's `regcomp()`, so the wording — and which
-/// patterns are refused at all — is the C library's. On Linux that library is
-/// asked directly; elsewhere [`syntax_error`] reproduces the Darwin `regcomp()`
-/// git's macOS build links against. `-L`'s own patterns are BRE, hence the
-/// default.
+/// patterns are refused at all — is the C library's. On Linux and macOS that
+/// library is asked directly; elsewhere [`syntax_error`] reproduces the Darwin
+/// `regcomp()` git's macOS build links against. `-L`'s own patterns are BRE,
+/// hence the default.
 pub(crate) fn bre_syntax_error(pattern: &str) -> Option<String> {
     platform_regcomp_error(pattern, false)
 }
@@ -443,10 +443,23 @@ pub(crate) fn ere_syntax_error(pattern: &str) -> Option<String> {
 /// failure, `regerror()`'s text — the call `compile_regexp()` (grep.c:563-568) and
 /// `regcomp_or_die()` make. A pattern holding a NUL is the C string before it, as
 /// it is for git.
-#[cfg(target_os = "linux")]
+///
+/// On macOS git builds with `USE_ENHANCED_BASIC_REGULAR_EXPRESSIONS`
+/// (config.mak.uname:162), so every `regcomp()` in git is `git_regcomp()`
+/// (git-compat-util.h:1008-1011), which adds `REG_ENHANCED` to a basic
+/// expression (compat/regcomp_enhanced.c:11-12): `a**` is then
+/// `repetition-operator operand invalid`, as stock prints it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
     let c_pattern = std::ffi::CString::new(pattern.split('\0').next().unwrap_or_default()).ok()?;
-    let flags = libc::REG_NEWLINE | if extended { libc::REG_EXTENDED } else { 0 };
+    #[allow(unused_mut)]
+    let mut flags = libc::REG_NEWLINE | if extended { libc::REG_EXTENDED } else { 0 };
+    // `REG_ENHANCED` is `0400` in Darwin's <_regex.h>; the libc crate does not
+    // export it.
+    #[cfg(target_os = "macos")]
+    if !extended {
+        flags |= 0o400;
+    }
     // SAFETY: `regex_t` is plain data that `regcomp()` initialises; it is freed
     // with `regfree()` only after a successful compile, since a failed one has
     // already released what it allocated.
@@ -463,7 +476,7 @@ fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
     syntax_error(pattern, extended).map(str::to_owned)
 }
@@ -473,7 +486,7 @@ fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
 /// In an extended regular expression the grouping and interval operators are the
 /// *bare* `(`/`)` and `{`/`}` — the escaped forms are literals — which is the one
 /// difference between the two dialects here.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
     let b = pattern.as_bytes();
     let (mut parens, mut braces) = (0i32, 0i32);

@@ -1908,8 +1908,15 @@ fn read_pattern_file(path: &str) -> Result<Vec<String>, ExitCode> {
         std::fs::read(path)
     };
     match read(path) {
+        // `strbuf_getline()` (builtin/grep.c:960) drops a CR before the LF too
+        // (strbuf.c:737-741), so a CRLF pattern file's `foo\r\n` is the pattern
+        // `foo`; an unterminated last line keeps its CR.
         Ok(bytes) => Ok(bytes
-            .split(|&b| b == b'\n')
+            .split_inclusive(|&b| b == b'\n')
+            .map(|line| match line.strip_suffix(b"\n") {
+                Some(body) => body.strip_suffix(b"\r").unwrap_or(body),
+                None => line,
+            })
             .filter(|line| !line.is_empty())
             .map(|line| String::from_utf8_lossy(line).into_owned())
             .collect()),
@@ -1959,6 +1966,9 @@ fn collect_trees(
             Some(id) => repo.find_object(id)?,
             None => repo.rev_parse_single(rev.as_str())?.object()?,
         };
+        // `grep_objects()` hands `grep_object()` the object `deref_tag()` reached
+        // (builtin/grep.c:867-889).
+        let object = object.peel_tags_to_end()?;
         // `grep_object()` dispatches on the object's own type, and a blob is
         // grepped straight away — `grep_oid(opt, &obj->oid, name, 0, path)` —
         // under the name the user spelled and with the pathspec never consulted.
@@ -1982,9 +1992,20 @@ fn collect_trees(
                 }
                 _ => BString::default(),
             };
-            cands.push((rev.as_bytes().to_vec(), rela, Source::Blob(object.id)));
+            // The name goes through `grep_source_name()` with a `tree_name_len`
+            // of 0 (builtin/grep.c:328-358, :367), so it is made relative to the
+            // current directory and quoted like any path: `HEAD:../a.c` from
+            // `doc/` prints as `../HEAD:../a.c`.
+            let name = display_name(rev.as_bytes().as_bstr(), prefix, opts);
+            cands.push((name, rela, Source::Blob(object.id)));
             continue;
         }
+        // `grep_tree(…, obj->type == OBJ_COMMIT)` (builtin/grep.c:845-846): only a
+        // commit's tree hands its paths on as `grep_source.path`. A tree object's
+        // files are grepped with no path at all, so no `.gitattributes` applies to
+        // them — no `-diff`, no textconv, no funcname driver (grep.c:2003-2006).
+        let check_attr = object.kind == gix::object::Kind::Commit;
+        let first_new = cands.len();
         let tree = object.peel_to_tree()?;
         let mut entries = tree.traverse().breadthfirst.files()?;
         // git prints tree matches in path order; the breadth-first walk yields
@@ -2047,7 +2068,18 @@ fn collect_trees(
         }
         if !sub_cands.is_empty() {
             cands.append(&mut sub_cands);
-            cands.sort_by(|a, b| a.1.cmp(&b.1));
+            // Only this revision's files: `grep_objects()` greps the revisions
+            // one after another (builtin/grep.c:863-895).
+            cands[first_new..].sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        if !check_attr {
+            // A submodule's own files keep theirs: `grep_submodule()` passes
+            // `object_type == OBJ_COMMIT` for the gitlink (builtin/grep.c:522-523).
+            for cand in &mut cands[first_new..] {
+                if !matches!(cand.2, Source::SubBlob(..)) {
+                    cand.1 = BString::default();
+                }
+            }
         }
     }
     Ok(())
@@ -2991,6 +3023,11 @@ impl<'r> DiffAttrs<'r> {
     /// The value of the path's `diff` attribute, i.e. the diff driver name, or
     /// `None` when it is unset, unspecified, or a bare boolean.
     fn driver_of(&mut self, rela: &BStr) -> Result<Option<String>> {
+        // No path, as for a tree object's files or a blob named by its id:
+        // `grep_source_load_driver()` looks nothing up (grep.c:2003-2006).
+        if rela.is_empty() {
+            return Ok(None);
+        }
         let mode = Some(gix::index::entry::Mode::FILE);
         // The first descent loads the `.gitattributes` along the path so the
         // collection knows every attribute name before the outcome is sized.
@@ -3011,6 +3048,10 @@ impl<'r> DiffAttrs<'r> {
     /// `grep_source_is_binary()` consults it — see
     /// [`super::cat_file::diff_attr_binary`].
     fn binary_attr(&mut self, rela: &BStr) -> Result<Option<bool>> {
+        // See [`Self::driver_of`]: no path, no attributes.
+        if rela.is_empty() {
+            return Ok(None);
+        }
         super::cat_file::diff_attr_binary(self.repo, &mut self.stack, &mut self.outcome, rela)
     }
 
@@ -3455,15 +3496,15 @@ fn write_line_header(
     let sep: &[u8] = if opts.nul { b"\0" } else { std::slice::from_ref(&sign) };
     if opts.show_names && !opts.heading {
         write_field(out, name, c_filename(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     if opts.line_number {
         write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     if opts.column && col != 0 {
         write_field(out, col.to_string().as_bytes(), c_column(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     Ok(())
 }
@@ -3631,11 +3672,11 @@ fn write_context_prefix(out: &mut impl Write, name: &[u8], lno: usize, opts: &Op
     let sep: &[u8] = if opts.nul { b"\0" } else { b"-" };
     if opts.show_names && !opts.heading {
         write_field(out, name, c_filename(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     if opts.line_number {
         write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     Ok(())
 }
@@ -3799,7 +3840,7 @@ fn search_file(
     if opts.count && count > 0 {
         if opts.show_names {
             write_field(out, name, c_filename(), opts.color)?;
-            write_field(out, if opts.nul { b"\0" } else { b":" }, c_sep(), opts.color)?;
+            output_sep(out, b":", opts)?;
         }
         writeln!(out, "{count}")?;
     }
@@ -3821,17 +3862,28 @@ fn write_prefix(
     let sep: &[u8] = if opts.nul { b"\0" } else { b":" };
     if opts.show_names && !opts.heading {
         write_field(out, name, c_filename(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     if opts.line_number {
         write_field(out, lno.to_string().as_bytes(), c_lineno(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     if opts.column {
         write_field(out, column.to_string().as_bytes(), c_column(), opts.color)?;
-        write_field(out, sep, c_sep(), opts.color)?;
+        output_sep(out, sep, opts)?;
     }
     Ok(())
+}
+
+/// `output_sep()` (grep.c:894-900): under `-z` the separator is a bare NUL that
+/// `color.grep.separator` never wraps; otherwise `sep` in that colour.
+fn output_sep(out: &mut impl Write, sep: &[u8], opts: &Opts) -> Result<()> {
+    if opts.nul {
+        out.write_all(b"\0")?;
+        Ok(())
+    } else {
+        write_field(out, sep, c_sep(), opts.color)
+    }
 }
 
 /// Write one output field, wrapped in `code`/reset when `color` is set and left
@@ -4053,72 +4105,174 @@ impl Engine {
     }
 }
 
-/// A compiled search: the `-e` patterns (OR'd) as one regex, plus git's `-w`
-/// word-boundary constraint and the empty-pattern "matches every line" rule.
-struct Matcher {
-    /// `None` when every pattern is empty (then `match_all` carries the result).
+/// One `-e`/`-f` pattern, compiled as `compile_regexp()` compiles one
+/// `struct grep_pat` (grep.c:492-573): git keeps its patterns apart and asks
+/// each in turn, never through one alternation.
+struct Atom {
+    /// `None` for an empty pattern, which matches at every position with a
+    /// zero length, as `regexec()` does with an empty expression.
     re: Option<Engine>,
-    /// The same alternation compiled for a whole-buffer haystack, which is what
-    /// git's `look_ahead()` (grep.c:1456) searches. git compiles its patterns
-    /// with `REG_NEWLINE`/`PCRE2_MULTILINE` (grep.c:300), so `^` and `$` are line
-    /// anchors there while the per-line haystack makes them subject anchors —
-    /// hence a second compilation rather than a second use of `re`.
+    /// For a `regcomp()` pattern, the same syntax as an anchored lazy DFA that
+    /// keeps every match state. `regexec()` is POSIX leftmost-*longest* while the
+    /// `regex` crate is leftmost-*first*, so `-E 'fooba|foobar'` stops at `fooba`
+    /// there; an anchored `MatchKind::All` search from the match start runs on to
+    /// the longest end (see `diff_color::WordRegex`, which does the same for
+    /// `--word-diff`). `None` for `-P` (PCRE2 is leftmost-first itself), `-F`, an
+    /// empty pattern, a backtracking-only pattern, or a DFA that would not build.
+    longest: Option<(
+        regex_automata::hybrid::dfa::DFA,
+        std::cell::RefCell<regex_automata::hybrid::dfa::Cache>,
+    )>,
+}
+
+impl Atom {
+    fn build(pattern: &str, dialect: Dialect, ignore_case: bool) -> Result<Self> {
+        if pattern.is_empty() {
+            return Ok(Self { re: None, longest: None });
+        }
+        let translated = translate_pattern(pattern, dialect)?;
+        let re = compile_engine(&translated, ignore_case, false)?;
+        let longest = match (&re, dialect) {
+            (Engine::Bytes(_), Dialect::Basic | Dialect::Extended) => {
+                regex_automata::hybrid::dfa::DFA::builder()
+                    .configure(
+                        regex_automata::hybrid::dfa::DFA::config()
+                            .match_kind(regex_automata::MatchKind::All)
+                            .starts_for_each_pattern(false),
+                    )
+                    .syntax(
+                        regex_automata::util::syntax::Config::new()
+                            .case_insensitive(ignore_case)
+                            .unicode(false)
+                            .utf8(false),
+                    )
+                    .build(&translated)
+                    .ok()
+                    .map(|dfa| {
+                        let cache = std::cell::RefCell::new(dfa.create_cache());
+                        (dfa, cache)
+                    })
+            }
+            _ => None,
+        };
+        Ok(Self { re: Some(re), longest })
+    }
+
+    /// `patmatch()`: the first match at or after `bol`, as `(start, end)`, with
+    /// `regexec()`'s leftmost-longest end for a `regcomp()` pattern.
+    fn patmatch(&self, line: &[u8], bol: usize) -> Option<(usize, usize)> {
+        let Some(re) = self.re.as_ref() else {
+            return Some((bol, bol));
+        };
+        let (start, mut end) = re.find_at(line, bol)?;
+        if let Some((dfa, cache)) = &self.longest {
+            let input = regex_automata::Input::new(line)
+                .range(start..)
+                .anchored(regex_automata::Anchored::Yes);
+            // A cache past its budget gives up; the leftmost-first end is then
+            // the best answer there is.
+            if let Ok(Some(hm)) = dfa.try_search_fwd(&mut cache.borrow_mut(), &input) {
+                end = end.max(hm.offset());
+            }
+        }
+        Some((start, end))
+    }
+
+    /// `headerless_match_one_pattern()` (grep.c:946-1008) from `bol`, including
+    /// its `-w` loop: a hit must start the line or follow a non-word byte, end it
+    /// or precede one, and be at least one byte long; otherwise the search
+    /// resumes past the next non-word byte after the failed start.
+    fn match_one(&self, line: &[u8], at: usize, word: bool) -> Option<(usize, usize)> {
+        let mut bol = at;
+        loop {
+            let (so, eo) = self.patmatch(line, bol)?;
+            if !word {
+                return Some((so, eo));
+            }
+            if (so == bol || !word_char(line[so - 1]))
+                && (eo == line.len() || !word_char(line[eo]))
+                && so != eo
+            {
+                return Some((so, eo));
+            }
+            if so + 1 >= line.len() {
+                return None;
+            }
+            bol = so + 1;
+            while word_char(line[bol - 1]) && bol < line.len() {
+                bol += 1;
+            }
+            if bol >= line.len() {
+                return None;
+            }
+        }
+    }
+}
+
+/// grep.c's `word_char()`: `isalnum(ch) || ch == '_'`.
+fn word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// A compiled search over git's flat pattern list: one [`Atom`] per pattern,
+/// git's `-w` constraint, and the whole-buffer alternation `look_ahead()` asks.
+struct Matcher {
+    atoms: Vec<Atom>,
+    /// The alternation of every pattern compiled for a whole-buffer haystack,
+    /// which is what git's `look_ahead()` (grep.c:1456) searches. git compiles its
+    /// patterns with `REG_NEWLINE`/`PCRE2_MULTILINE` (grep.c:300), so `^` and `$`
+    /// are line anchors there while the per-line haystack makes them subject
+    /// anchors — hence a separate compilation.
     buf_re: Option<Engine>,
     word: bool,
-    /// An empty `-e` pattern matches all lines (git's documented behaviour).
+    /// An empty pattern is present, so `look_ahead()` always finds a hit.
     match_all: bool,
 }
 
 impl Matcher {
     fn build(patterns: &[String], dialect: Dialect, ignore_case: bool, word: bool) -> Result<Self> {
         let match_all = patterns.iter().any(|p| p.is_empty());
+        let atoms = patterns
+            .iter()
+            .map(|p| Atom::build(p, dialect, ignore_case))
+            .collect::<Result<Vec<_>>>()?;
         let nonempty: Vec<&String> = patterns.iter().filter(|p| !p.is_empty()).collect();
-        let (re, buf_re) = if nonempty.is_empty() {
-            (None, None)
+        let buf_re = if nonempty.is_empty() {
+            None
         } else {
             let combined = nonempty
                 .iter()
                 .map(|p| Ok(format!("(?:{})", translate_pattern(p, dialect)?)))
                 .collect::<Result<Vec<_>>>()?
                 .join("|");
-            (
-                Some(compile_engine(&combined, ignore_case, false)?),
-                // A failure here cannot happen once the line engine compiled —
-                // same pattern, one flag apart — but it is reported the same way
-                // rather than unwrapped.
-                Some(compile_engine(&combined, ignore_case, true)?),
-            )
+            Some(compile_engine(&combined, ignore_case, true)?)
         };
         Ok(Self {
-            re,
+            atoms,
             buf_re,
             word,
             match_all,
         })
     }
 
-    /// The next match in `line` at or after `at`, as `(start, len)`. Ties go to
-    /// the leftmost match; `-w` skips matches not sitting on word boundaries.
+    /// `grep_next_match()` over the pattern list (grep.c:1173-1204): every
+    /// pattern is asked from `at`, and `match_next_pattern()` (grep.c:1151-1171) keeps the earliest
+    /// start, the longer match on a tie. Returned as `(start, len)`.
     fn find_at(&self, line: &[u8], at: usize) -> Option<(usize, usize)> {
         if at > line.len() {
             return None;
         }
-        if self.match_all {
-            return Some((at, 0));
-        }
-        let re = self.re.as_ref()?;
-        let mut from = at;
-        loop {
-            let (s, e) = re.find_at(line, from)?;
-            if !self.word || word_bounded(line, s, e) {
-                return Some((s, e - s));
-            }
-            // This match straddles a word char; look past its start for another.
-            from = s + 1;
-            if from > line.len() {
-                return None;
+        let mut best: Option<(usize, usize)> = None;
+        for atom in &self.atoms {
+            let Some((so, eo)) = atom.match_one(line, at, self.word) else {
+                continue;
+            };
+            match best {
+                Some((bso, beo)) if so > bso || (so == bso && eo < beo) => {}
+                _ => best = Some((so, eo)),
             }
         }
+        best.map(|(so, eo)| (so, eo - so))
     }
 
     /// Whether any pattern still matches somewhere in `content` at or after `bol`
@@ -4181,9 +4335,54 @@ fn translate_pattern(pattern: &str, dialect: Dialect) -> Result<String> {
     Ok(match dialect {
         Dialect::Fixed => regex::escape(pattern),
         Dialect::Extended => ere_to_regex(pattern)?,
-        Dialect::Perl => pattern.to_string(),
+        Dialect::Perl => pcre_to_regex(pattern),
         Dialect::Basic => bre_to_regex(pattern),
     })
+}
+
+/// PCRE2 → `regex`-crate syntax, for the escapes the two grammars spell alike
+/// and read differently.
+///
+/// * **`\<` and `\>` are the literal `<` and `>`.** PCRE2 gives a backslash
+///   before any non-alphanumeric character no meaning beyond quoting it
+///   (pcre2pattern(3), "Backslash"); the crate reads these two as word-start and
+///   word-end assertions, so `-P '\<foo\>'` matched every `foo` where stock
+///   matches nothing.
+/// * **`\Q…\E` quotes everything between**, up to `\E` or the end of the pattern
+///   (pcre2pattern(3), "Backslash"), which the crate does not support at all.
+fn pcre_to_regex(p: &str) -> String {
+    let cs: Vec<char> = p.chars().collect();
+    let mut out = String::with_capacity(p.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '\\' || i + 1 >= cs.len() {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        match cs[i + 1] {
+            '<' | '>' => {
+                out.push(cs[i + 1]);
+                i += 2;
+            }
+            'Q' => {
+                i += 2;
+                while i < cs.len() && !(cs[i] == '\\' && cs.get(i + 1) == Some(&'E')) {
+                    out.push_str(&regex::escape(cs[i].encode_utf8(&mut [0; 4])));
+                    i += 1;
+                }
+                i += 2;
+            }
+            // `\E` with no `\Q` open is ignored.
+            'E' => i += 2,
+            c => {
+                out.push('\\');
+                out.push(c);
+                i += 2;
+            }
+        }
+    }
+    out
 }
 
 /// POSIX ERE → `regex`-crate syntax.
@@ -4222,6 +4421,10 @@ fn ere_to_regex(p: &str) -> Result<String> {
     let mut i = 0;
     // Whether an expression precedes this position for a quantifier to bind to.
     let mut repeatable = false;
+    // Groups still open. A `)` that closes none is an ordinary character to
+    // `regcomp()` (stock `-E 'a)'` matches the text `a)`), and the crate needs it
+    // escaped.
+    let mut depth = 0usize;
     let badrpt = || {
         crate::fatal::die(format!(
             "command line, '{p}': repetition-operator operand invalid"
@@ -4256,11 +4459,20 @@ fn ere_to_regex(p: &str) -> Result<String> {
                 i = end;
             }
             '(' | '|' => {
+                if cs[i] == '(' {
+                    depth += 1;
+                }
                 out.push(cs[i]);
                 repeatable = false;
                 i += 1;
             }
+            ')' if depth == 0 => {
+                out.push_str("\\)");
+                repeatable = true;
+                i += 1;
+            }
             ')' => {
+                depth -= 1;
                 out.push(')');
                 repeatable = true;
                 i += 1;
@@ -4720,6 +4932,12 @@ mod tests {
 /// [`super::line_log::bre_syntax_error`] / [`super::line_log::ere_syntax_error`].
 fn regcomp_failure(patterns: &[String], origins: &[String], dialect: Dialect) -> Option<String> {
     patterns.iter().zip(origins).find_map(|(p, origin)| {
+        // `if (p->fixed || p->is_fixed)` hands the pattern to PCRE2 instead
+        // (grep.c:510-556), so `regcomp()` never sees, say, the empty pattern it
+        // would refuse as `empty (sub)expression`.
+        if is_fixed(p) {
+            return None;
+        }
         let text = match dialect {
             Dialect::Basic => super::line_log::bre_syntax_error(p),
             Dialect::Extended => super::line_log::ere_syntax_error(p),
@@ -4727,4 +4945,11 @@ fn regcomp_failure(patterns: &[String], origins: &[String], dialect: Dialect) ->
         }?;
         Some(format!("{origin}'{p}': {text}"))
     })
+}
+
+/// grep.c's `is_fixed()` (grep.c:235-245): no byte of the pattern is
+/// `is_regex_special()`, i.e. `GIT_GLOB_SPECIAL | GIT_REGEX_SPECIAL` in git's
+/// ctype table (ctype.c:12-13, :23-28): `$ ( ) * + . ? [ \ ^ { |`.
+fn is_fixed(pattern: &str) -> bool {
+    !pattern.bytes().any(|b| b"$()*+.?[\\^{|".contains(&b))
 }

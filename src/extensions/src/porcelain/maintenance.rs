@@ -653,8 +653,11 @@ fn run_tasks(
     // git reports a failing task on stderr and keeps going, then exits 1 â
     // `error: task 'incremental-repack' failed` on a repository with no packs,
     // observed on git 2.55.0.
+    //
+    // A condition or a task that dies does so in this process: `fatal:` and 128,
+    // the lock removed on the way out as the tempfile's atexit handler does.
     let mut failed = false;
-    let mut run_phase = |phase: Phase| {
+    let mut run_phase = |phase: Phase| -> std::result::Result<(), String> {
         for &task in &order {
             // `maybe_run_task()` (builtin/gc.c:1758-1783): a task with nothing
             // to do in this phase is skipped before its condition is asked, and
@@ -663,21 +666,28 @@ fn run_tasks(
             if !has_phase(task, phase) {
                 continue;
             }
-            if opts.auto && !auto_condition(repo, task) {
+            if opts.auto && !auto_condition(repo, task)? {
                 continue;
             }
-            if !run_task(repo, task, phase, opts) {
+            if !run_task(repo, task, phase, opts)? {
                 eprintln!("error: task '{task}' failed");
                 failed = true;
             }
         }
+        Ok(())
     };
-    run_phase(Phase::Foreground);
-    // "Failure to daemonize is ok, we'll continue in foreground."
-    if opts.detach == Some(true) {
-        let _ = crate::setup::daemonize();
+    let mut phases = || -> std::result::Result<(), String> {
+        run_phase(Phase::Foreground)?;
+        // "Failure to daemonize is ok, we'll continue in foreground."
+        if opts.detach == Some(true) {
+            let _ = crate::setup::daemonize();
+        }
+        run_phase(Phase::Background)
+    };
+    if let Err(message) = phases() {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
     }
-    run_phase(Phase::Background);
 
     Ok(if failed {
         ExitCode::from(1)
@@ -763,7 +773,12 @@ impl Drop for MaintenanceLock {
 ///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
 ///   * **`prefetch`** — [`prefetch`], one `git fetch <remote> --prefetch ...` per
 ///     configured remote, which is what `fetch_remote()` spawns.
-fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> bool {
+fn run_task(
+    repo: &gix::Repository,
+    task: &str,
+    phase: Phase,
+    opts: RunOpts,
+) -> std::result::Result<bool, String> {
     let pack_refs = || {
         let mut args = vec!["pack-refs", "--all", "--prune"];
         if opts.auto {
@@ -771,7 +786,7 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
         }
         spawn_git(repo, &args)
     };
-    match (task, phase) {
+    Ok(match (task, phase) {
         // A child, as `maintenance_task_pack_refs()` runs it (`run_command(&cmd)`,
         // builtin/gc.c): a value `pack-refs` dies on at ref-store setup or at
         // `packed_refs_lock()` — `core.logAllRefUpdates`, `core.packedRefsTimeout` —
@@ -784,11 +799,11 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
             // `cmd_gc()` resolves it against the repository.
             if super::gc::pack_refs_setting(repo).unwrap_or(true) && !pack_refs() {
                 eprintln!("error: failed to run pack-refs");
-                return false;
+                return Ok(false);
             }
             if super::gc::reflog_expire_enabled(repo) && !spawn_git(repo, &["reflog", "expire", "--all"]) {
                 eprintln!("error: failed to run reflog");
-                return false;
+                return Ok(false);
             }
             true
         }
@@ -801,26 +816,7 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
             args.extend(["--no-detach", "--skip-foreground-tasks"]);
             spawn_git(repo, &args)
         }
-        // `maintenance_task_geometric_repack()`: `git repack -d -l
-        // --geometric=<splitFactor> --quiet --write-midx`, read off `GIT_TRACE=1`
-        // under git 2.55.0. There is no `--cruft` in it — a cruft repack is the
-        // `gc` task.
-        ("geometric-repack", _) => {
-            let factor = repo
-                .config_snapshot()
-                .integer("maintenance.geometric-repack.splitFactor")
-                .unwrap_or(2)
-                .max(0);
-            let geometric = format!("--geometric={factor}");
-            delegate(super::repack::repack(&strings(&[
-                "repack",
-                "-d",
-                "-l",
-                &geometric,
-                "--quiet",
-                "--write-midx",
-            ])))
-        }
+        ("geometric-repack", _) => return geometric_repack(repo, opts),
         ("rerere-gc", _) => {
             // `run_command(&rerere)`: a child, so that what it dies with (an unreadable
             // `rerere.*` or `merge.conflictStyle`) reaches stderr whole, `fatal:` line included.
@@ -835,7 +831,83 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
         ("incremental-repack", _) => incremental_repack(repo, opts.quiet),
         ("prefetch", _) => prefetch(repo, opts.quiet),
         _ => true,
+    })
+}
+
+/// `maintenance_task_geometric_repack()` (builtin/gc.c:1240-1252), which is
+/// `odb_optimize()` under `ODB_OPTIMIZE_GEOMETRIC` (odb/source-files.c:605-731):
+///
+/// ```c
+/// strvec_pushl(&repack_cmd.args, "repack", "-d", "-l", NULL);
+/// [...]
+/// if (!(opts->flags & ODB_OPTIMIZE_VERBOSE))
+///         strvec_push(&repack_cmd.args, "-q");
+/// [...]
+/// if (geometry.split < geometry.pack_nr) {
+///         strvec_pushf(&repack_cmd.args, "--geometric=%d",
+///                      geometry.split_factor);
+/// } else {
+///         add_repack_all_option(repo, opts, NULL, &repack_cmd.args);
+/// }
+/// if (repo->settings.core_multi_pack_index)
+///         strvec_push(&repack_cmd.args, "--write-midx");
+/// ```
+///
+/// (:626-635, :695-718.) When the split would roll up every pack there is no
+/// progression left to keep, and the task repacks everything instead, with the
+/// cruft options `gc` would use. `Err` is a `die()` in this process: the
+/// optimisation reads `gc.auto`, `gc.autoPackLimit` and `gc.bigPackThreshold`
+/// before anything else ([`super::gc::OdbConfig`]), so `-c gc.auto=abc
+/// maintenance run` dies at 128 after the foreground tasks ran. There is no
+/// `prune` child: "Geometric repacking uses cruft packs" (:736).
+fn geometric_repack(repo: &gix::Repository, opts: RunOpts) -> std::result::Result<bool, String> {
+    super::gc::OdbConfig::read(repo)?;
+    if super::prune::precious_objects(repo) {
+        return Ok(true);
     }
+
+    let factor = geometric_split_factor(repo);
+    let (split, pack_nr) = geometric_layout(repo);
+    let mut cmd = super::gc::RepackCommand {
+        argv: strings(&["repack", "-d", "-l"]),
+        filter: None,
+        filter_to: None,
+    };
+    if opts.quiet {
+        cmd.argv.push("-q".to_string());
+    }
+    if split < pack_nr {
+        cmd.argv.push(format!("--geometric={factor}"));
+    } else {
+        // `OPTIMIZE_FIELDS_FROM_GC_CONFIG(cfg, 0)` (builtin/gc.c:409-415): the
+        // `gc_config()` values, which `maintenance run` has already validated,
+        // and no `--expire-to`.
+        let snapshot = repo.config_snapshot();
+        let prune_expire = snapshot
+            .string("gc.pruneExpire")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "2.weeks.ago".to_string());
+        let cruft = snapshot.boolean("gc.cruftPacks").unwrap_or(true);
+        drop(snapshot);
+        let max_cruft_size = crate::config::config_ulong(repo, "gc.maxCruftSize").ok().flatten();
+        let args = super::gc::RepackArgs {
+            aggressive: false,
+            quiet: opts.quiet,
+            auto: false,
+            prune_expire: Some(&prune_expire),
+            cruft,
+            max_cruft_size,
+            expire_to: None,
+            keep_largest_pack: None,
+        };
+        if let Err(rejection) = super::gc::add_repack_all_option(repo, &mut cmd, &args, &[]) {
+            return Err(rejection.into_fatal());
+        }
+    }
+    if repo.config_snapshot().boolean("core.multiPackIndex").unwrap_or(true) {
+        cmd.argv.push("--write-midx".to_string());
+    }
+    Ok(delegate(super::repack::repack(&cmd.argv)))
 }
 
 /// Which tasks run, in the order they run.
@@ -1272,9 +1344,20 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
     if auto {
         // git's loop stops at the first task whose condition says yes. The task
         // set is the *manual* one â `is-needed` has no `--schedule`.
-        let needed = plan(&repo, &selected, None, strategy)
-            .into_iter()
-            .any(|task| auto_condition(&repo, task));
+        let mut needed = false;
+        for task in plan(&repo, &selected, None, strategy) {
+            match auto_condition(&repo, task) {
+                Ok(false) => continue,
+                Ok(true) => {
+                    needed = true;
+                    break;
+                }
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
         return Ok(if needed {
             ExitCode::SUCCESS
         } else {
@@ -1319,19 +1402,21 @@ fn gate(repo: &gix::Repository, key: &str, default: i64) -> Gate {
 /// `prefetch` is the one selectable task git's table leaves without an
 /// `auto_condition`, and `maybe_run_task` treats a missing condition as "do not
 /// run", so `--auto` never prefetches.
-fn auto_condition(repo: &gix::Repository, task: &str) -> bool {
-    match task {
+fn auto_condition(repo: &gix::Repository, task: &str) -> std::result::Result<bool, String> {
+    Ok(match task {
         "pack-refs" => pack_refs_condition(repo),
         "reflog-expire" => reflog_expire_condition(repo),
         "worktree-prune" => worktree_prune_condition(repo),
-        "gc" => super::gc::gc_needed(repo) && pre_auto_gc_allows(repo),
+        // `gc_condition()` (builtin/gc.c:948-955) is `odb_optimize_required()`,
+        // which dies on what it cannot read.
+        "gc" => super::gc::gc_needed(repo)? && pre_auto_gc_allows(repo),
         "loose-objects" => loose_objects_condition(repo),
         "commit-graph" => commit_graph_condition(repo),
         "rerere-gc" => rerere_gc_condition(repo),
         "incremental-repack" => incremental_repack_condition(repo),
         "geometric-repack" => geometric_repack_condition(repo),
         _ => false,
-    }
+    })
 }
 
 /// The tail of git's `need_to_gc()`: once a heuristic has tripped, the
@@ -1667,12 +1752,22 @@ fn geometric_repack_condition(repo: &gix::Repository) -> bool {
 /// `maintenance.geometric-repack.splitFactor` (default 2) is the progression's
 /// ratio â the same value the task passes to `repack --geometric=`.
 pub(super) fn geometric_split(repo: &gix::Repository) -> usize {
-    let factor = repo
-        .config_snapshot()
+    geometric_layout(repo).0
+}
+
+/// `maintenance.geometric-repack.splitFactor`, default 2.
+fn geometric_split_factor(repo: &gix::Repository) -> i64 {
+    repo.config_snapshot()
         .integer("maintenance.geometric-repack.splitFactor")
         .unwrap_or(2)
-        .max(0) as u64;
+}
 
+/// `pack_geometry_init()` then `pack_geometry_split()` (repack-geometry.c):
+/// `geometry.split` and `geometry.pack_nr`, the packs below the split and the
+/// packs the progression weighs at all — local, not kept, not cruft and not
+/// promisor packs.
+fn geometric_layout(repo: &gix::Repository) -> (usize, usize) {
+    let factor = geometric_split_factor(repo).max(0) as u64;
     let pack_dir = repo.objects.store_ref().path().join("pack");
     let mut weights: Vec<u64> = local_packs(&pack_dir, repo.object_hash())
         .into_iter()
@@ -1680,7 +1775,7 @@ pub(super) fn geometric_split(repo: &gix::Repository) -> usize {
         .map(|p| p.objects)
         .collect();
     weights.sort_unstable();
-    compute_split(&weights, factor)
+    (compute_split(&weights, factor), weights.len())
 }
 
 /// `compute_pack_geometry_split()`. `weights` is ascending; the answer is the

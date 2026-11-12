@@ -490,23 +490,6 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    // `gc.repackFilter` / `gc.repackFilterTo`, read by `gc_config()` immediately
-    // after `gc.logExpiry` (builtin/gc.c:222-230) and forwarded verbatim to the
-    // `repack` child as `--filter=<v>` / `--filter-to=<v>` (:653-656), each only
-    // when it is set *and* non-empty. Nothing is validated at this point; the
-    // child's own parse-options does that, which is why the check below sits
-    // beside the repack rather than here.
-    let snap = repo.config_snapshot();
-    let repack_filter = snap
-        .string("gc.repackFilter")
-        .map(|v| v.to_string())
-        .filter(|v| !v.is_empty());
-    let repack_filter_to = snap
-        .string("gc.repackFilterTo")
-        .map(|v| v.to_string())
-        .filter(|v| !v.is_empty());
-    drop(snap);
-
     // `cmd_gc()`: `if (prune_expire_arg && parse_expiry_date(prune_expire_arg, &dummy))
     // die(_("failed to parse prune expiry value %s"), prune_expire_arg)`. It runs
     // after `parse_options()` and after the stray-positional usage error, and it
@@ -519,24 +502,28 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `gc --auto` is a no-op below the thresholds; git returns before touching
-    // anything, so nothing below this point may run either. `need_to_gc()`
-    // decides in two steps and the second one was missing here: the counters
-    // first, and then the `pre-auto-gc` hook, which gets the last word.
+    // ```c
+    // if (!odb_optimize_required(the_repository->objects, &optimize_opts) ||
+    //     run_hooks(the_repository, "pre-auto-gc")) {
+    // ```
     //
-    // The decision also *is* the repack's argument list on this path: git calls
-    // `need_to_gc()` with the half-built `repack_args` and lets it append, so
-    // which of the two counters tripped is what separates a full rewrite from
-    // an incremental one. It runs here, ahead of the foreground tasks
-    // (builtin/gc.c:936 versus :1012), so the counts it reads are the ones from
-    // before `pack-refs` and `reflog expire` touched anything.
-    let auto_repack = match auto {
-        false => None,
-        true => match auto_repack_choice(&repo).filter(|_| pre_auto_gc_allows(&repo)) {
-            Some(choice) => Some(choice),
-            None => return Ok(ExitCode::SUCCESS),
-        },
-    };
+    // (builtin/gc.c:650-654.) `gc --auto` is a no-op below the thresholds; git
+    // returns before touching anything, so nothing below this point may run
+    // either. The counters decide first, and then the `pre-auto-gc` hook gets
+    // the last word. Which counter tripped, and so the repack's argument list,
+    // is decided again by the optimisation itself, after the foreground tasks
+    // (odb/source-files.c:657-686).
+    if auto {
+        match gc_needed(&repo) {
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+            Ok(false) => return Ok(ExitCode::SUCCESS),
+            Ok(true) if !pre_auto_gc_allows(&repo) => return Ok(ExitCode::SUCCESS),
+            Ok(true) => {}
+        }
+    }
     // ```c
     // if (!opts.quiet) {
     //         if (opts.detach > 0)
@@ -559,13 +546,21 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         eprintln!("See \"git help gc\" for manual housekeeping.");
     }
 
-    // `prepare_repo_settings()` is lazy in git: `cmd_gc()` reaches it through the children it
-    // spawns, so a usage error, an unreadable `--prune` date and a below-threshold `--auto` run
-    // are all answered first, and only a run that gets this far dies on `index.sparse=bogus`.
-    if let Err(message) = crate::repo_settings::RepoSettings::load(&repo) {
-        eprintln!("fatal: {message}");
-        return Ok(ExitCode::from(128));
-    }
+    // `prepare_repo_settings()` is lazy in git: `cmd_gc()` itself never reaches it
+    // on a manual run, only the children it spawns do — `pack-refs`, `reflog
+    // expire` and `worktree prune` each die on `index.sparse=bogus` in turn, and
+    // `gc` reports each failure as it reports any other failing child:
+    //
+    // ```text
+    // $ git -c index.sparse=bogus gc
+    // fatal: bad boolean config value 'bogus' for 'index.sparse'
+    // error: failed to run pack-refs
+    // fatal: bad boolean config value 'bogus' for 'index.sparse'
+    // fatal: failed to run worktree
+    // ```
+    //
+    // An `--auto` run has already died on it above, in the pack count.
+    let settings_refusal = crate::repo_settings::RepoSettings::load(&repo).err();
 
     // `cmd_gc()`: `if (cfg.detach_auto && opts.detach < 0) opts.detach = 1;`
     // inside the `--auto` branch (builtin/gc.c:930-931), so only `--auto` lets
@@ -673,7 +668,15 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         if auto {
             argv.push("--auto".to_string());
         }
-        if super::pack_refs::pack_refs(&argv)? != ExitCode::SUCCESS {
+        // A child that dies in `prepare_repo_settings()` says why first.
+        let failed = match &settings_refusal {
+            Some(message) => {
+                eprintln!("fatal: {message}");
+                true
+            }
+            None => super::pack_refs::pack_refs(&argv)? != ExitCode::SUCCESS,
+        };
+        if failed {
             eprintln!("error: failed to run pack-refs");
             pack_refs_failed = true;
         }
@@ -692,7 +695,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         // as `error: failed to run reflog` and the run carries on with the other tasks; it
         // does not end `gc`. The child's own diagnostics come first — a configured expiry it
         // cannot parse dies in `reflog_expire_config()` before anything is expired.
-        let failed = match crate::cmd_config::validate_reflog_expire(&repo) {
+        let refused = match &settings_refusal {
+            Some(message) => Err(crate::default_config::Rejection::Die(message.clone())),
+            None => crate::cmd_config::validate_reflog_expire(&repo),
+        };
+        let failed = match refused {
             Err(rejection) => {
                 let fatal = rejection.into_fatal();
                 if !fatal.is_empty() {
@@ -711,6 +718,12 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // 2.56 runs both after the foreground tasks and before the object-store
     // optimisation (builtin/gc.c:718-726), removing the administrative directory of every linked worktree
     // whose checkout has vanished and whose `index` has aged past the expiry.
+    // The child dying is `die(FAILED_RUN, "worktree")` (builtin/gc.c:720-722).
+    if let Some(message) = &settings_refusal {
+        eprintln!("fatal: {message}");
+        eprintln!("fatal: failed to run worktree");
+        return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+    }
     prune_worktrees(&repo)?;
 
     // Guarded on the directory: `rerere gc` returns early when rerere is
@@ -734,12 +747,50 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `maintenance_task_odb()` → `odb_optimize()` does nothing at all in a
-    // precious-objects repository: `if (repo->repository_format_precious_objects)
-    // return 0;` comes before the `repack` child and the `prune` child are
-    // built (odb/source-files.c:620-621), so none of their diagnostics, effects
-    // or the loose-object warning happen either.
+    // `maintenance_task_odb()` → `odb_optimize()`, whose first act is to read
+    // `gc.auto`, `gc.autoPackLimit` and `gc.bigPackThreshold` (see [`OdbConfig`]).
+    // A value it cannot parse is `die()` in this process: one `fatal:` line, 128.
+    let odb = match OdbConfig::read(&repo) {
+        Ok(odb) => odb,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+        }
+    };
+
+    // It does nothing else at all in a precious-objects repository:
+    // `if (repo->repository_format_precious_objects) return 0;` comes before the
+    // `repack` child and the `prune` child are built (odb/source-files.c:620-621),
+    // so none of their diagnostics, effects or the loose-object warning happen
+    // either.
     let precious = super::prune::precious_objects(&repo);
+
+    // The command line, built before the child starts; the config reads made on
+    // the way (`gc.repackFilter*`, the memory estimate's two) die in this process.
+    let repack_cmd = match precious {
+        true => None,
+        false => match repack_argv(
+            &repo,
+            &RepackArgs {
+                aggressive,
+                quiet,
+                auto,
+                prune_expire: prune_expire.as_deref(),
+                cruft,
+                max_cruft_size,
+                expire_to: expire_to.as_deref(),
+                keep_largest_pack,
+            },
+            &odb,
+        ) {
+            Ok(cmd) => Some(cmd),
+            Err(rejection) => {
+                let fatal = rejection.into_fatal();
+                eprintln!("fatal: {fatal}");
+                return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+            }
+        },
+    };
 
     // The `repack` child's own argument diagnostics, which `gc` reaches here —
     // after `pack-refs` and `reflog expire` have already run, and after the
@@ -756,8 +807,8 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // A bad spec is rejected while parse-options is still running
     // (`builtin/repack.c`'s `OPT_PARSE_LIST_OBJECTS_FILTER`), so it beats the
     // `--filter-to` pairing check at `builtin/repack.c:407-408`.
-    if !precious {
-        if let Some(code) = check_repack_filter(repack_filter.as_deref(), repack_filter_to.as_deref()) {
+    if let Some(cmd) = &repack_cmd {
+        if let Some(code) = check_repack_filter(cmd.filter.as_deref(), cmd.filter_to.as_deref()) {
             return Ok(code);
         }
     }
@@ -771,6 +822,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // [`super::pack_objects::PackConfig`].
     match crate::repo_settings::RepoSettings::load(&repo)
         .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
+        .and_then(|_| super::pack_objects::delta_config_refusal(&repo).map_or(Ok(()), Err))
     {
         Ok(_) => {}
         Err(_) if precious => {}
@@ -806,21 +858,6 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `repack -d -l --cruft --cruft-expiration=2.weeks.ago` — already produced
     // `7e6496f9…` under *both* binaries. So the divergence was never in the
     // pack writer; it was in `gc` having a second one.
-    let argv = repack_argv(
-        &repo,
-        &RepackArgs {
-            aggressive,
-            quiet,
-            auto: auto_repack.as_ref(),
-            prune_expire: prune_expire.as_deref(),
-            cruft,
-            max_cruft_size,
-            expire_to: expire_to.as_deref(),
-            keep_largest_pack,
-            repack_filter: repack_filter.as_deref(),
-            repack_filter_to: repack_filter_to.as_deref(),
-        },
-    );
     // The child has already said what went wrong; `odb_optimize()` adds one
     // `error:` line and `gc` exits 128 through a silent `die(NULL)` (see
     // [`report_failed_child`]):
@@ -836,7 +873,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // child's stderr, so the child's line is rendered here, in its place, before
     // `gc`'s own. An error that is neither of git's two shapes is this port
     // speaking for itself and is left to the caller to render as such.
-    if let Err(err) = (!precious).then(|| super::repack::repack(&argv)).transpose() {
+    if let Err(err) = repack_cmd.as_ref().map(|cmd| super::repack::repack(&cmd.argv)).transpose() {
         // An index the `pack-objects` grandchild cannot decode for `--indexed-objects`
         // is `do_read_index()`'s `die()` in that child (read-cache.c:1826).
         let index_fatal = crate::fatal::index_entry_format_fatal(&err);
@@ -903,8 +940,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     //
     // (odb/source-files.c:756-758.) `too_many_loose_objects()` answers 0 for
     // a limit at or below zero (:311-312).
-    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
-    if !precious && auto && auto_threshold > 0 && too_many_loose_objects(&repo, auto_threshold) {
+    if !precious && auto && odb.auto_threshold > 0 && too_many_loose_objects(&repo, odb.auto_threshold) {
         eprintln!("warning: There are too many unreachable loose objects; run 'git prune' to remove them.");
     }
 
@@ -946,155 +982,118 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
 
 // --- repacking -------------------------------------------------------------
 //
-// `gc` never writes a pack. It assembles one `repack` command line and runs it
-// (`builtin/gc.c:897` seeds it, :919-927 and :948-959 finish it, :1016-1022 runs
-// it), so everything below is argument construction and the packing itself
-// belongs to [`super::repack`].
+// `gc` never writes a pack. `odb_source_files_optimize()` assembles one
+// `repack` command line and runs it (odb/source-files.c:605-731), so everything
+// below is argument construction and the packing itself belongs to
+// [`super::repack`].
 
-/// What `need_to_gc()` appended to the repack's arguments, which is also which
-/// of its two counters tripped.
+/// The three values `odb_source_files_optimize()` reads before it does anything
+/// else, the precious-objects check included:
 ///
 /// ```c
-/// if (too_many_packs(cfg)) {
-///         [...]
-///         add_repack_all_option(cfg, &keep_pack, repack_args);
-/// } else if (too_many_loose_objects(cfg->gc_auto_threshold))
-///         add_repack_incremental_option(repack_args);
-/// else
+/// repo_config_get_int(repo, "gc.auto", &gc_auto_threshold);
+/// repo_config_get_int(repo, "gc.autopacklimit", &gc_auto_pack_limit);
+/// repo_config_get_ulong(repo, "gc.bigpackthreshold", &big_pack_threshold);
+///
+/// if (repo->repository_format_precious_objects)
 ///         return 0;
 /// ```
 ///
-/// (`builtin/gc.c:679-710`, git 2.55.0.) The two are not interchangeable: too
-/// many *packs* asks for the rewrite that reduces their number, while too many
-/// loose *objects* asks only that the loose ones be gathered, leaving every
-/// existing pack where it is.
-enum AutoRepack {
-    /// `too_many_packs()`: the full rewrite, carrying the `--keep-pack=` names
-    /// `find_base_packs()` chose.
-    AllIntoOne(Vec<String>),
-    /// `too_many_loose_objects()`: `add_repack_incremental_option()`, which is
-    /// `--no-write-bitmap-index` and nothing else (`builtin/gc.c:659-662`).
-    Incremental,
-}
-
-/// `need_to_gc()`'s counters, and the arguments the winning one implies.
+/// (odb/source-files.c:616-621.) git 2.56 moved these reads out of
+/// `gc_config()`, so a value they cannot parse dies only once `gc` gets here —
+/// after `pack-refs`, `reflog expire`, `worktree prune` and `rerere gc`:
 ///
-/// `None` is git's `return 0` — no collection is due — which `cmd_gc()` turns
-/// into an exit before anything is touched. The `pre-auto-gc` veto that closes
-/// the same function is [`pre_auto_gc_allows`], applied by the caller.
-///
-/// # The memory estimate, and why the kept pack is dropped here
-///
-/// git's `too_many_packs` branch keeps the largest pack only when repacking it
-/// would not fit in half of physical RAM:
-///
-/// ```c
-/// struct packed_git *p = find_base_packs(&keep_pack, 0);
-/// mem_have = total_ram();
-/// mem_want = estimate_repack_memory(cfg, p);
-/// if (!mem_have || mem_want < mem_have / 2)
-///         string_list_clear(&keep_pack, 0);
+/// ```text
+/// $ git -c gc.auto=abc gc
+/// fatal: bad numeric config value 'abc' for 'gc.auto': invalid unit
 /// ```
 ///
-/// (`builtin/gc.c:690-702`.) `estimate_repack_memory()` (:574-618) is a sum of
-/// C `sizeof`s — `struct object_entry`, `struct blob`, `struct tree`,
-/// `struct object *`, `off_t + uint32_t` — times the approximate object count,
-/// plus the pack's own bytes and the two delta caches. Those sizes are the C
-/// build's, not anything observable from here, so the estimate is not
-/// reproducible byte for byte. What *is* certain is the comparison's outcome
-/// for any repository at which `gc` is a fast operation: the per-object terms
-/// come to a few hundred bytes, so a repository would need on the order of ten
-/// million objects before the estimate reached half the RAM of a machine that
-/// could hold it. This port therefore takes the branch git takes there and
-/// clears the list. `gc.bigPackThreshold` is unaffected — it is the other
-/// branch, and it is reproduced exactly.
-fn auto_repack_choice(repo: &gix::Repository) -> Option<AutoRepack> {
-    // `gc.auto` at zero or below disables automatic gc outright — git returns
-    // before it ever counts packs, so a repository over `gc.autoPackLimit` is
-    // still left alone.
-    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
-    if auto_threshold <= 0 {
-        return None;
-    }
-    if too_many_packs(repo) {
-        let pack_dir = repo.objects.store_ref().path().join("pack");
-        let keep = match big_pack_threshold(repo) {
-            0 => Vec::new(),
-            threshold => {
-                let kept = find_base_packs(&pack_dir, threshold);
-                // ```c
-                // if (keep_pack.nr >= cfg->gc_auto_pack_limit) {
-                //         cfg->big_pack_threshold = 0;
-                //         string_list_clear(&keep_pack, 0);
-                //         find_base_packs(&keep_pack, 0);
-                // }
-                // ```
-                //
-                // (`builtin/gc.c:684-688`.) Keeping as many packs as the limit
-                // allows would leave the collection with nothing to do, so the
-                // threshold is abandoned and only the largest pack is kept.
-                let limit = repo.config_snapshot().integer("gc.autoPackLimit").unwrap_or(50);
-                match i64::try_from(kept.len()).is_ok_and(|n| n >= limit) {
-                    true => find_base_packs(&pack_dir, 0),
-                    false => kept,
-                }
-            }
-        };
-        return Some(AutoRepack::AllIntoOne(keep));
-    }
-    match too_many_loose_objects(repo, auto_threshold) {
-        true => Some(AutoRepack::Incremental),
-        false => None,
+/// with `packed-refs` written and the reflogs expired. The maintenance
+/// `geometric-repack` task reads them in the same place.
+pub(super) struct OdbConfig {
+    /// `gc.auto`, default 6700.
+    pub(super) auto_threshold: i64,
+    /// `gc.autoPackLimit`, default 50.
+    pub(super) auto_pack_limit: i64,
+    /// `gc.bigPackThreshold`, zero when unset.
+    pub(super) big_pack_threshold: u64,
+}
+
+impl OdbConfig {
+    /// Read the three in git's order; `Err` is the `fatal:` message.
+    pub(super) fn read(repo: &gix::Repository) -> Result<Self, String> {
+        Ok(OdbConfig {
+            auto_threshold: crate::config::config_int(repo, "gc.auto")?.unwrap_or(6700),
+            auto_pack_limit: crate::config::config_int(repo, "gc.autopacklimit")?.unwrap_or(50),
+            big_pack_threshold: crate::config::config_ulong(repo, "gc.bigpackthreshold")?.unwrap_or(0),
+        })
     }
 }
 
-/// Everything `cmd_gc()` has resolved by the time it finishes the repack's
-/// argument list, gathered so [`repack_argv`] reads as the C does.
-struct RepackArgs<'a> {
+/// Everything `cmd_gc()` has resolved by the time `odb_optimize()` builds the
+/// repack's argument list — `OPTIMIZE_FIELDS_FROM_GC_CONFIG` (builtin/gc.c:409-415)
+/// plus the flags `maintenance_task_odb()` sets — gathered so [`repack_argv`]
+/// reads as the C does.
+pub(super) struct RepackArgs<'a> {
     /// `--aggressive`, which pushes `-f` plus the two `gc.aggressive*` values.
-    aggressive: bool,
+    pub(super) aggressive: bool,
     /// `opts.quiet`, which pushes `-q`.
-    quiet: bool,
-    /// `None` for a manual run — the `else` at `builtin/gc.c:948` — and `Some`
-    /// for an automatic one, carrying what `need_to_gc()` decided.
-    auto: Option<&'a AutoRepack>,
+    pub(super) quiet: bool,
+    /// `ODB_OPTIMIZE_AUTO`.
+    pub(super) auto: bool,
     /// `cfg.prune_expire`, verbatim. `None` is `--no-prune`'s NULL.
-    prune_expire: Option<&'a str>,
+    pub(super) prune_expire: Option<&'a str>,
     /// `cfg.cruft_packs`.
-    cruft: bool,
+    pub(super) cruft: bool,
     /// `cfg.max_cruft_size`; zero and unset are the same to git's `if`.
-    max_cruft_size: Option<u64>,
+    pub(super) max_cruft_size: Option<u64>,
     /// `cfg.repack_expire_to`.
-    expire_to: Option<&'a str>,
+    pub(super) expire_to: Option<&'a str>,
     /// `keep_largest_pack`, git's tri-state `int` at `-1` until asked.
-    keep_largest_pack: Option<bool>,
-    /// `gc.repackFilter`, already filtered to a non-empty value.
-    repack_filter: Option<&'a str>,
+    pub(super) keep_largest_pack: Option<bool>,
+}
+
+/// The `repack` command line, and the two config values
+/// `add_repack_all_option()` forwarded on it, which [`check_repack_filter`]
+/// answers for the child.
+pub(super) struct RepackCommand {
+    pub(super) argv: Vec<String>,
+    /// `gc.repackFilter`, when it was set, non-empty and forwarded.
+    pub(super) filter: Option<String>,
     /// `gc.repackFilterTo`, likewise.
-    repack_filter_to: Option<&'a str>,
+    pub(super) filter_to: Option<String>,
 }
 
 /// The `repack` command line `gc` runs, built in git's order.
 ///
 /// ```c
-/// strvec_pushl(&repack_args, "repack", "-d", "-l", NULL);
-/// [...]
-/// if (aggressive) {
-///         strvec_push(&repack_args, "-f");
-///         if (cfg.aggressive_depth > 0)
-///                 strvec_pushf(&repack_args, "--depth=%d", cfg.aggressive_depth);
-///         if (cfg.aggressive_window > 0)
-///                 strvec_pushf(&repack_args, "--window=%d", cfg.aggressive_window);
-/// }
-/// if (opts.quiet)
-///         strvec_push(&repack_args, "-q");
+/// strvec_pushl(&repack_cmd.args, "repack", "-d", "-l", NULL);
+/// if (opts->flags & ODB_OPTIMIZE_NO_REUSE_DELTAS)
+///         strvec_push(&repack_cmd.args, "-f");
+/// if (opts->depth > 0)
+///         strvec_pushf(&repack_cmd.args, "--depth=%d", opts->depth);
+/// if (opts->window > 0)
+///         strvec_pushf(&repack_cmd.args, "--window=%d", opts->window);
+/// if (!(opts->flags & ODB_OPTIMIZE_VERBOSE))
+///         strvec_push(&repack_cmd.args, "-q");
 /// ```
 ///
-/// (`builtin/gc.c:897, 919-927`, git 2.55.0.) The order matters only in that it
-/// is the order stock hands the child, and the child is the same port either
-/// way; it is reproduced because a divergence in it would be a divergence in
-/// what was read.
-fn repack_argv(repo: &gix::Repository, args: &RepackArgs<'_>) -> Vec<String> {
+/// (odb/source-files.c:626-635), then the `ODB_OPTIMIZE_INCREMENTAL` case
+/// (:648-694): a manual run always takes [`add_repack_all_option`], keeping the
+/// largest pack or the packs over `gc.bigPackThreshold`; an automatic one takes
+/// it only when there are too many packs, and asks for
+/// `add_repack_incremental_option()`'s `--no-write-bitmap-index` otherwise. The
+/// order is reproduced because a divergence in it would be a divergence in what
+/// was read: `gc.repackFilter` and `pack.deltaCacheSize` are read only on the
+/// branches that consult them.
+///
+/// `Err` is the refusal of a config value read on the way, for the caller to
+/// die with.
+pub(super) fn repack_argv(
+    repo: &gix::Repository,
+    args: &RepackArgs<'_>,
+    odb: &OdbConfig,
+) -> Result<RepackCommand, crate::default_config::Rejection> {
     let mut argv = vec!["repack".to_string(), "-d".to_string(), "-l".to_string()];
     if args.aggressive {
         // `-f` reaches `pack-objects` as `--no-reuse-delta`: the point of
@@ -1115,58 +1114,174 @@ fn repack_argv(repo: &gix::Repository, args: &RepackArgs<'_>) -> Vec<String> {
     if args.quiet {
         argv.push("-q".to_string());
     }
+    let mut cmd = RepackCommand { argv, filter: None, filter_to: None };
 
-    match args.auto {
-        Some(AutoRepack::Incremental) => argv.push("--no-write-bitmap-index".to_string()),
-        Some(AutoRepack::AllIntoOne(keep)) => add_repack_all_option(&mut argv, args, keep),
-        None => {
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    if !args.auto {
+        // ```c
+        // if (opts->keep_largest_pack != -1) {
+        //         if (opts->keep_largest_pack)
+        //                 find_base_packs(files, &keep_pack, 0);
+        // } else if (big_pack_threshold) {
+        //         find_base_packs(files, &keep_pack, big_pack_threshold);
+        // }
+        // ```
+        //
+        // (odb/source-files.c:651-657.) The flag is a tri-state that *overrides*
+        // `gc.bigPackThreshold` — `--no-keep-largest-pack` included, which
+        // keeps nothing at all where the config would have kept the big packs.
+        let keep = match args.keep_largest_pack {
+            Some(true) => find_base_packs(&pack_dir, 0),
+            Some(false) => Vec::new(),
+            None => match odb.big_pack_threshold {
+                0 => Vec::new(),
+                threshold => find_base_packs(&pack_dir, threshold),
+            },
+        };
+        add_repack_all_option(repo, &mut cmd, args, &keep)?;
+    } else if too_many_packs(repo, odb.auto_pack_limit) {
+        let keep = match odb.big_pack_threshold {
+            // # The memory estimate, and why the kept pack is dropped here
+            //
             // ```c
-            // if (keep_largest_pack != -1) {
-            //         if (keep_largest_pack)
-            //                 find_base_packs(&keep_pack, 0);
-            // } else if (cfg.big_pack_threshold) {
-            //         find_base_packs(&keep_pack, cfg.big_pack_threshold);
-            // }
+            // struct packed_git *p = find_base_packs(files, &keep_pack, 0);
+            // mem_have = total_ram();
+            // mem_want = estimate_repack_memory(files, p);
+            // if (!mem_have || mem_want < mem_have / 2)
+            //         string_list_clear(&keep_pack, 0);
             // ```
             //
-            // (`builtin/gc.c:951-956`.) The flag is a tri-state that *overrides*
-            // `gc.bigPackThreshold` — `--no-keep-largest-pack` included, which
-            // keeps nothing at all where the config would have kept the big packs.
-            let pack_dir = repo.objects.store_ref().path().join("pack");
-            let keep = match args.keep_largest_pack {
-                Some(true) => find_base_packs(&pack_dir, 0),
-                Some(false) => Vec::new(),
-                None => match big_pack_threshold(repo) {
-                    0 => Vec::new(),
-                    threshold => find_base_packs(&pack_dir, threshold),
-                },
-            };
-            add_repack_all_option(&mut argv, args, &keep);
-        }
+            // (odb/source-files.c:671-682.) `estimate_repack_memory()`
+            // (:415-466) is a sum of C `sizeof`s — `struct object_entry`,
+            // `struct blob`, `struct tree`, `struct object *`, `off_t +
+            // uint32_t` — times the approximate object count, plus the pack's
+            // own bytes and the two delta caches. Those sizes are the C build's,
+            // not anything observable from here, so the estimate is not
+            // reproducible byte for byte. What *is* certain is the comparison's
+            // outcome for any repository at which `gc` is a fast operation: the
+            // per-object terms come to a few hundred bytes, so a repository
+            // would need on the order of ten million objects before the estimate
+            // reached half the RAM of a machine that could hold it. This port
+            // therefore takes the branch git takes there and clears the list.
+            // The estimate's two config reads are still made, because a value
+            // they cannot parse dies there.
+            0 => {
+                let base = find_base_packs(&pack_dir, 0);
+                estimate_repack_memory(repo, &pack_dir, !base.is_empty())
+                    .map_err(crate::default_config::Rejection::Die)?;
+                Vec::new()
+            }
+            threshold => {
+                let kept = find_base_packs(&pack_dir, threshold);
+                // ```c
+                // if (keep_pack.nr >= (unsigned long) gc_auto_pack_limit) {
+                //         string_list_clear(&keep_pack, 0);
+                //         find_base_packs(files, &keep_pack, 0);
+                // }
+                // ```
+                //
+                // (odb/source-files.c:665-669.) Keeping as many packs as the
+                // limit allows would leave the collection with nothing to do, so
+                // the threshold is abandoned and only the largest pack is kept.
+                match i64::try_from(kept.len()).is_ok_and(|n| n >= odb.auto_pack_limit) {
+                    true => find_base_packs(&pack_dir, 0),
+                    false => kept,
+                }
+            }
+        };
+        add_repack_all_option(repo, &mut cmd, args, &keep)?;
+    } else {
+        // `add_repack_incremental_option()` (odb/source-files.c:517-520).
+        cmd.argv.push("--no-write-bitmap-index".to_string());
     }
-    argv
+    Ok(cmd)
 }
 
-/// `add_repack_all_option()` (`builtin/gc.c:628-657`, git 2.55.0).
+/// The config reads of `estimate_repack_memory()` (odb/source-files.c:415-433),
+/// whose arithmetic [`repack_argv`] does not reproduce:
 ///
 /// ```c
-/// if (cfg->prune_expire && !strcmp(cfg->prune_expire, "now")
-///         && !(cfg->cruft_packs && cfg->repack_expire_to))
+/// if (odb_source_count_objects(&files->base, ODB_COUNT_OBJECTS_APPROXIMATE,
+///                              &nr_objects) < 0)
+///         return 0;
+/// if (!pack || !nr_objects)
+///         return 0;
+/// repo_config_get_ulong(..., "pack.deltacachesize", &max_delta_cache_size);
+/// repo_config_get_ulong(..., "core.deltabasecachelimit", &delta_base_cache_limit);
+/// ```
+///
+/// The approximate count is the packed objects alone
+/// (`odb_source_files_count_objects()`, :143-167), so a store whose packs hold
+/// nothing reads neither key.
+fn estimate_repack_memory(repo: &gix::Repository, pack_dir: &Path, have_pack: bool) -> Result<(), String> {
+    if !have_pack || packed_object_count(repo, pack_dir) == 0 {
+        return Ok(());
+    }
+    crate::config::config_ulong(repo, "pack.deltacachesize")?;
+    crate::config::config_ulong(repo, "core.deltabasecachelimit")?;
+    Ok(())
+}
+
+/// The objects the repository's own packs hold, by their `.idx` headers.
+fn packed_object_count(repo: &gix::Repository, pack_dir: &Path) -> u64 {
+    let Some(names) = super::prune::read_dir_raw(pack_dir) else {
+        return 0;
+    };
+    names
+        .iter()
+        .filter_map(|name| name.to_str()?.strip_suffix(".idx").map(str::to_string))
+        .filter(|base| pack_dir.join(format!("{base}.pack")).exists())
+        .filter_map(|base| gix::odb::pack::index::File::at(pack_dir.join(format!("{base}.idx")), repo.object_hash()).ok())
+        .map(|index| u64::from(index.num_objects()))
+        .sum()
+}
+
+/// `repo_config_get_string()` for a reader that returns rather than dies: the
+/// last value of `key`, or the `config_error_nonbool()` refusal of a valueless
+/// one (config.c:2374-2383), whose `git_die_config()` the caller completes:
+///
+/// ```text
+/// error: missing value for 'gc.repackfilter'
+/// fatal: unable to parse 'gc.repackfilter' from command-line config
+/// ```
+fn config_string(repo: &gix::Repository, key: &str) -> Result<Option<String>, crate::default_config::Rejection> {
+    match crate::config::last_value_implicit(repo, key) {
+        None => Ok(None),
+        Some(Some(value)) => Ok(Some(value)),
+        Some(None) => Err(crate::default_config::Rejection::Reported {
+            errors: vec![format!("missing value for '{key}'")],
+            fatal: crate::config::die_config_linenr(Some(repo), key),
+        }),
+    }
+}
+
+/// `add_repack_all_option()` (odb/source-files.c:476-515).
+///
+/// ```c
+/// repo_config_get_string(repo, "gc.repackfilter", &repack_filter);
+/// repo_config_get_string(repo, "gc.repackfilterto", &repack_filter_to);
+///
+/// if (opts->prune_expire && !strcmp(opts->prune_expire, "now") &&
+///     !(opts->cruft_packs && opts->expire_to))
 ///         strvec_push(args, "-a");
-/// else if (cfg->cruft_packs) {
+/// else if (opts->cruft_packs) {
 ///         strvec_push(args, "--cruft");
-///         if (cfg->prune_expire)
-///                 strvec_pushf(args, "--cruft-expiration=%s", cfg->prune_expire);
-///         if (cfg->max_cruft_size)
-///                 strvec_pushf(args, "--max-cruft-size=%lu", cfg->max_cruft_size);
-///         if (cfg->repack_expire_to)
-///                 strvec_pushf(args, "--expire-to=%s", cfg->repack_expire_to);
+///         if (opts->prune_expire)
+///                 strvec_pushf(args, "--cruft-expiration=%s", opts->prune_expire);
+///         if (opts->max_cruft_size)
+///                 strvec_pushf(args, "--max-cruft-size=%lu", opts->max_cruft_size);
+///         if (opts->expire_to)
+///                 strvec_pushf(args, "--expire-to=%s", opts->expire_to);
 /// } else {
 ///         strvec_push(args, "-A");
-///         if (cfg->prune_expire)
-///                 strvec_pushf(args, "--unpack-unreachable=%s", cfg->prune_expire);
+///         if (opts->prune_expire)
+///                 strvec_pushf(args, "--unpack-unreachable=%s", opts->prune_expire);
 /// }
 /// ```
+///
+/// The two filter keys are read here, in git 2.56, and nowhere earlier, so a
+/// valueless `gc.repackFilter` dies after the foreground tasks and only on a
+/// run that rewrites everything — an incremental `gc --auto` never reads it.
 ///
 /// The first test is a literal `strcmp` against `"now"`, not a parsed expiry:
 /// `--prune=all` means the same date to `parse_expiry_date()` and still takes
@@ -1189,7 +1304,16 @@ fn repack_argv(repo: &gix::Repository, args: &RepackArgs<'_>) -> Vec<String> {
 /// `--unpack-unreachable=<date>` only loosens what is *older* than the date, and
 /// nothing in a fixture is; `--no-prune` drops the argument entirely and reaches
 /// the same place by never expiring at all.
-fn add_repack_all_option(argv: &mut Vec<String>, args: &RepackArgs<'_>, keep_pack: &[String]) {
+pub(super) fn add_repack_all_option(
+    repo: &gix::Repository,
+    cmd: &mut RepackCommand,
+    args: &RepackArgs<'_>,
+    keep_pack: &[String],
+) -> Result<(), crate::default_config::Rejection> {
+    let repack_filter = config_string(repo, "gc.repackfilter")?;
+    let repack_filter_to = config_string(repo, "gc.repackfilterto")?;
+
+    let argv = &mut cmd.argv;
     if args.prune_expire == Some("now") && !(args.cruft && args.expire_to.is_some()) {
         argv.push("-a".to_string());
     } else if args.cruft {
@@ -1210,38 +1334,25 @@ fn add_repack_all_option(argv: &mut Vec<String>, args: &RepackArgs<'_>, keep_pac
         }
     }
 
-    // `keep_one_pack()` (builtin/gc.c:621-626) pushes the *basename* of each
-    // pack `find_base_packs()` chose, which is the `.pack` file's name.
+    // `keep_one_pack()` (odb/source-files.c:469-474) pushes the *basename* of
+    // each pack `find_base_packs()` chose, which is the `.pack` file's name.
     for base in keep_pack {
         argv.push(format!("--keep-pack={base}.pack"));
     }
 
-    if let Some(filter) = args.repack_filter {
+    // `if (repack_filter && *repack_filter)`: set *and* non-empty.
+    if let Some(filter) = repack_filter.filter(|v| !v.is_empty()) {
         argv.push(format!("--filter={filter}"));
+        cmd.filter = Some(filter);
     }
-    if let Some(filter_to) = args.repack_filter_to {
+    if let Some(filter_to) = repack_filter_to.filter(|v| !v.is_empty()) {
         argv.push(format!("--filter-to={filter_to}"));
+        cmd.filter_to = Some(filter_to);
     }
+    Ok(())
 }
 
-/// `gc.bigPackThreshold`, in bytes, or zero when it is unset.
-///
-/// git's `find_base_packs()` turns it into a `--keep-pack=<name>` for every
-/// local pack at or above the size, which is the same instruction a `.keep` file
-/// carries: leave the pack where it is and do not copy its objects into the new
-/// one. Rewriting a pack that is already large is the expensive half of a `gc`
-/// and rarely buys anything, so this is how a big repository keeps `gc` cheap.
-///
-/// An unreadable value is treated as unset, matching git's `git_config_ulong`,
-/// which warns and moves on rather than dying here.
-fn big_pack_threshold(repo: &gix::Repository) -> u64 {
-    crate::config::config_ulong(repo, "gc.bigPackThreshold")
-        .ok()
-        .flatten()
-        .unwrap_or(0)
-}
-
-/// `find_base_packs()` (builtin/gc.c:485-505): the packs `gc` asks `repack` to
+/// `find_base_packs()` (odb/source-files.c:326-348): the packs `gc` asks `repack` to
 /// keep.
 ///
 /// ```c
@@ -1343,19 +1454,36 @@ pub(super) fn pre_auto_gc_allows(repo: &gix::Repository) -> bool {
     crate::hooks::run(repo, "pre-auto-gc", &[], None).unwrap_or(true)
 }
 
-/// `need_to_gc()`'s counters: true when either the loose-object or the
-/// pack-count heuristic trips. Ported from `builtin/gc.c`; both halves compare
-/// with `>`, and a non-positive threshold disables that half. The `pre-auto-gc`
-/// veto that closes the same function is [`pre_auto_gc_allows`].
-pub(super) fn gc_needed(repo: &gix::Repository) -> bool {
+/// `odb_source_files_optimize_required()` for `ODB_OPTIMIZE_INCREMENTAL`
+/// (odb/source-files.c:529-547): true when either the loose-object or the
+/// pack-count heuristic trips. Both halves compare with `>`, and a non-positive
+/// threshold disables that half. The `pre-auto-gc` veto `cmd_gc()` and the
+/// maintenance `gc` task apply after it is [`pre_auto_gc_allows`].
+///
+/// ```c
+/// repo_config_get_int(repo, "gc.auto", &gc_auto_threshold);
+/// repo_config_get_int(repo, "gc.autopacklimit", &gc_auto_pack_limit);
+/// if (gc_auto_threshold <= 0)
+///         return false;
+/// ```
+///
+/// Both keys are read before either is consulted, so a bad `gc.autoPackLimit`
+/// dies even under `gc.auto=0`. `Err` is the `fatal:` message: an unreadable
+/// key, or a repository settings value the pack walk cannot get past —
+/// `too_many_packs()` is the first thing an automatic `gc` does that needs the
+/// pack store, and opening it runs `prepare_repo_settings()`, so `gc --auto`
+/// dies on `feature.manyFiles=bogus` while `gc.auto=0` leaves before it.
+pub(super) fn gc_needed(repo: &gix::Repository) -> Result<bool, String> {
+    let auto_threshold = crate::config::config_int(repo, "gc.auto")?.unwrap_or(6700);
+    let auto_pack_limit = crate::config::config_int(repo, "gc.autopacklimit")?.unwrap_or(50);
     // `gc.auto` at zero or below disables automatic gc outright — git returns
     // before it ever counts packs, so a repository over `gc.autoPackLimit` is
     // still left alone.
-    let auto_threshold = repo.config_snapshot().integer("gc.auto").unwrap_or(6700);
     if auto_threshold <= 0 {
-        return false;
+        return Ok(false);
     }
-    too_many_packs(repo) || too_many_loose_objects(repo, auto_threshold)
+    crate::repo_settings::RepoSettings::load(repo)?;
+    Ok(too_many_packs(repo, auto_pack_limit) || too_many_loose_objects(repo, auto_threshold))
 }
 
 /// git's `too_many_loose_objects()`: the *approximate* loose-object count — the
@@ -1390,10 +1518,10 @@ pub(super) fn too_many_loose_objects(repo: &gix::Repository, limit: i64) -> bool
     false
 }
 
-/// git's `too_many_packs()`: more local, non-`.keep` packs than
-/// `gc.autoPackLimit` (default 50). A non-positive limit disables the check.
-pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
-    let limit = repo.config_snapshot().integer("gc.autoPackLimit").unwrap_or(50);
+/// `too_many_packs()` (odb/source-files.c:350-368): more local, non-`.keep`
+/// packs than `limit`, which is `gc.autoPackLimit` (default 50). A non-positive
+/// limit disables the check.
+pub(super) fn too_many_packs(repo: &gix::Repository, limit: i64) -> bool {
     if limit <= 0 {
         return false;
     }

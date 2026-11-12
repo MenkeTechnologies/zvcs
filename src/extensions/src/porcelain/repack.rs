@@ -188,10 +188,8 @@
 //!     `--cruft-expiration` either, so an object it would have called recent is
 //!     dated by its own mtime. `--combine-cruft-below-size` and
 //!     `--max-cruft-size` do not size or split the result: one cruft pack is
-//!     always written, and `--expire-to` writes no second one — with no
-//!     `--cruft-expiration` beside it the pack it would hold is empty and
-//!     `--non-empty` suppresses it anyway (`cmd_repack()`,
-//!     builtin/repack.c:510-544).
+//!     always written. `-d --expire-to=<prefix>` writes the second, limbo
+//!     cruft pack at that prefix (`cmd_repack()`, builtin/repack.c:654-689).
 //!   * **`--max-pack-size`** does not split the output; one pack is always
 //!     written. Its diagnostics *are* reproduced: a value below 1 MiB warns
 //!     `warning: minimum pack size limit is 1 MiB`, and `pack.packSizeLimit`
@@ -541,8 +539,9 @@ struct State {
     /// (builtin/repack.c:181) and so steers the *cruft* child alone.
     max_cruft_size: Option<u64>,
     /// `--expire-to=<dir>`: with `-d` it makes `cmd_repack()` run
-    /// `write_cruft_pack()` a second time (builtin/repack.c:510-544).
-    expire_to: bool,
+    /// `write_cruft_pack()` a second time, into that prefix
+    /// (builtin/repack.c:654-689).
+    expire_to: Option<String>,
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -754,7 +753,8 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let pack_dir = objdir.join("pack");
 
-    // `git_pack_config()`'s two remaining keys. git reaches them in the
+    // `git_pack_config()`: its two non-numeric keys and the delta search's
+    // numeric ones (builtin/pack-objects.c:3691-3801). git reaches them in the
     // `pack-objects` child this port packs inline instead, so an unreadable
     // value is fatal for a real run and *not* for `repack -h` — which is what
     // git 2.55.0 does: `-c pack.allowPackReuse=bogus repack -h` prints the usage
@@ -762,6 +762,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // [`super::pack_objects::PackConfig`] for what each would have steered.
     match crate::repo_settings::RepoSettings::load(&repo)
         .and_then(|settings| super::pack_objects::PackConfig::load(&repo, &settings))
+        .and_then(|_| super::pack_objects::delta_config_refusal(&repo).map_or(Ok(()), Err))
     {
         Ok(_) => {}
         Err(message) => {
@@ -1348,9 +1349,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // `write_cruft_pack()` spawns a `pack-objects` of its own whether or not
         // anything is left over, so its floor warning is unconditional here too.
         // With `-d --expire-to=<dir>` `cmd_repack()` runs it a second time
-        // (builtin/repack.c:510-544) and the child warns again; this port writes
-        // no second cruft pack — see the module docs — but the child's
-        // diagnostics are still the run's.
+        // (builtin/repack.c:654-689) and the child warns again.
         warn_min_pack_size(cruft_pack_size_limit(st, pack_size_limit_cfg));
         let mut stamps: HashMap<ObjectId, u32> = HashMap::new();
         for (id, stamp) in cruft_candidates {
@@ -1412,6 +1411,12 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // `load_gc_recent_objects()`'s `gc.recentObjectsHook` (reachable.c:189-191)
         // has no reader here, so an object it would have rescued is dated by its
         // own mtime like any other.
+        // The limbo pack below enumerates without an expiration, so it starts
+        // from every candidate.
+        let unexpired = match st.delete_redundant && st.expire_to.is_some() {
+            true => stamps.clone(),
+            false => HashMap::new(),
+        };
         if let Some(spec) = st.cruft_expiration.as_deref() {
             let expire = crate::date::approxidate(spec);
             let expire = expire.clamp(0, i64::from(u32::MAX)) as u32;
@@ -1449,12 +1454,57 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
             new_packs.push((hash, cruft.len()));
         }
 
-        // `if (delete_redundant && expire_to)` (builtin/repack.c:510-544): a
-        // second `write_cruft_pack()`, and so a second child with the same
-        // limit. This port writes no pack there — see the module docs — but the
-        // child's floor warning is still part of the run's output.
-        if st.delete_redundant && st.expire_to {
+        // ```c
+        // if (delete_redundant && expire_to) {
+        //         [...]
+        //         opts.destination = expire_to;
+        //         ret = write_cruft_pack(&opts, NULL, 0ul, &names,
+        //                                &existing);
+        // ```
+        //
+        // (builtin/repack.c:654-689.) `-d` is about to delete every pack the
+        // objects not kept above came from, so they are written once more, to
+        // the `--expire-to` prefix: a second cruft pack with no expiration —
+        // `enumerate_cruft_objects()`, every candidate dated by its own mtime —
+        // and with the cruft pack just written among `names`, whose objects it
+        // therefore leaves out. Its child warns on the same limit. The pack is
+        // `<expire-to>-<hash>.{pack,idx,rev,mtimes}`, written by `pack-objects`
+        // at that prefix, and `finish_pack_objects_cmd()` puts it in `names`
+        // only when the prefix begins with `packdir` (repack.c:91-122).
+        if let Some(expire_to) = st.expire_to.as_deref().filter(|_| st.delete_redundant) {
             warn_min_pack_size(cruft_pack_size_limit(st, pack_size_limit_cfg));
+            let limbo: HashMap<ObjectId, u32> =
+                unexpired.into_iter().filter(|(id, _)| !cruft_written.contains(id)).collect();
+            let mut ids: Vec<ObjectId> = limbo.keys().copied().collect();
+            ids.sort();
+            // `--non-empty`, as for the first.
+            if !ids.is_empty() {
+                let prefix = PathBuf::from(expire_to);
+                let path = match write_pack_with(&repo, st, &ids, &prefix, write_rev, progress, false, false, true) {
+                    Ok(path) => path,
+                    // `pack-objects` cannot move its temporary pack into a
+                    // directory that is not there; it dies, and `cmd_repack()`
+                    // with it (`goto cleanup`), before anything was installed.
+                    Err(e) => match e.downcast_ref::<UnplaceablePack>() {
+                        Some(UnplaceablePack(path)) => {
+                            let shown = path.display();
+                            eprintln!("error: unable to write file {shown}: No such file or directory");
+                            eprintln!("fatal: unable to rename temporary file to '{shown}'");
+                            return Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)));
+                        }
+                        None => return Err(e),
+                    },
+                };
+                let hash = pack_hash(&pack_base_name(&path));
+                write_mtimes(&repo, &path, &suffixed(&prefix, &format!("-{hash}.mtimes")), &limbo)?;
+                // A local prefix is in `names`, but `generated_pack_populate()`
+                // looked for it under `packtmp`, so `generated_pack_install()`
+                // dies as it does for a local `--filter-to`.
+                if is_local_destination(expire_to, &packdir) {
+                    eprintln!("fatal: pack-objects did not write a '.pack' file for pack {packtmp_shown}-{hash}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         }
     }
 
@@ -3569,7 +3619,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
                 .and_then(scaled)
                 .and_then(|n| u64::try_from(n).ok())
         }
-        "expire-to" => st.expire_to = on && value.is_some(),
+        "expire-to" => st.expire_to = value.filter(|_| on).map(str::to_string),
         "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = Some(on),

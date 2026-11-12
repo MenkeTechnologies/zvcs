@@ -1178,36 +1178,37 @@ fn repack_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejecti
 // gc
 // ---------------------------------------------------------------------------
 
-/// `gc_config()` (builtin/gc.c:176-233) — the one reader in this module that is
+/// `gc_config()` (builtin/gc.c:154-192) — the one reader in this module that is
 /// **not** a callback.
 ///
 /// It is a fixed sequence of targeted `repo_config_get_*` lookups followed by a
 /// single `repo_config(the_repository, git_default_config, NULL)` at the end
-/// (builtin/gc.c:232). Two consequences, both measured against git 2.55.0:
+/// (builtin/gc.c:191). Two consequences:
 ///
 /// * a `gc.*` key beats a `core.*` one no matter which comes first in the config,
 ///   because the whole `gc.*` block runs before the default walk starts:
 ///
 ///   ```text
-///   $ git -c core.ignorecase=bogus -c gc.auto=bogus gc --auto
-///   fatal: bad numeric config value 'bogus' for 'gc.auto': invalid unit
+///   $ git -c core.ignorecase=bogus -c gc.aggressiveWindow=bogus gc
+///   fatal: bad numeric config value 'bogus' for 'gc.aggressivewindow': invalid unit
 ///   ```
 ///
-/// * within the block the *source order* decides, not the config order:
-///
-///   ```text
-///   $ git -c gc.auto=bogus -c gc.packRefs=bogus gc --auto
-///   fatal: bad boolean config value 'bogus' for 'gc.packrefs'
-///   $ git -c gc.autoPackLimit=bogus -c gc.auto=bogus gc --auto
-///   fatal: bad numeric config value 'bogus' for 'gc.auto': invalid unit
-///   ```
+/// * within the block the *source order* decides, not the config order.
 ///
 /// so the lookups below are written in the C's order and must stay that way.
 ///
 /// Each lookup is last-value-wins ([`crate::config::config_int`] and friends),
 /// which is the opposite of the callback readers in the rest of this module.
 ///
-/// `gc.maxCruftSize`, `gc.logExpiry` and `gc.repackFilter*` are read again by
+/// git 2.56 moved `gc.auto`, `gc.autoPackLimit`, `gc.bigPackThreshold`,
+/// `pack.deltaCacheSize`, `core.deltaBaseCacheLimit` and `gc.repackFilter*` out
+/// of this function and into the object store's optimisation
+/// (odb/source-files.c:430-432, :484-485, :533-534, :616-618), which reads them
+/// only when it gets that far, so they are not validated here: `gc -c
+/// gc.auto=abc` packs the refs and expires the reflogs before it dies.
+/// [`crate::porcelain::gc`] reads them where stock does.
+///
+/// `gc.maxCruftSize` and `gc.logExpiry` are read again by
 /// [`crate::porcelain::gc`], which needs their values; validating them here as
 /// well changes nothing observable because the gate dies first with the identical
 /// message and status, and it is what puts them in the right order relative to
@@ -1221,65 +1222,44 @@ pub fn validate_gc(repo: &gix::Repository) -> Result<(), Rejection> {
         all.iter().filter(|v| v.key == key).next_back().cloned()
     };
 
-    // builtin/gc.c:182-187 — `notbare` or a boolean.
+    // builtin/gc.c:159-164 — `notbare` or a boolean.
     if let Some(v) = last("gc.packrefs") {
         if v.value.as_deref() != Some("notbare") {
             bool_value(&v, "gc.packrefs")?;
         }
     }
 
-    // builtin/gc.c:189-191. The `&&` short-circuits, so the second key is only
+    // builtin/gc.c:166-168. The `&&` short-circuits, so the second key is only
     // read when the first resolved to "never" — which is why
     // `gc.reflogExpireUnreachable=bogus` alone runs clean under stock git.
     if expiry_is_never(last("gc.reflogexpire"), "gc.reflogexpire")? {
         expiry_is_never(last("gc.reflogexpireunreachable"), "gc.reflogexpireunreachable")?;
     }
 
-    // builtin/gc.c:193-197.
-    for key in [
-        "gc.aggressivewindow",
-        "gc.aggressivedepth",
-        "gc.auto",
-        "gc.autopacklimit",
-    ] {
+    // builtin/gc.c:170-171.
+    for key in ["gc.aggressivewindow", "gc.aggressivedepth"] {
         if let Some(v) = last(key) {
             int_value(&v, key)?;
         }
     }
+    // builtin/gc.c:172-173.
     for key in ["gc.autodetach", "gc.cruftpacks"] {
         if let Some(v) = last(key) {
             bool_value(&v, key)?;
         }
     }
 
-    // builtin/gc.c:199 and :216-220 — the byte-sized values.
+    // builtin/gc.c:174.
     if let Some(v) = last("gc.maxcruftsize") {
         ulong_value(&v, "gc.maxcruftsize")?;
     }
 
-    // builtin/gc.c:201-214 — three `repo_config_get_expiry` reads in a row.
+    // builtin/gc.c:176-189 — three `repo_config_get_expiry` reads in a row.
     for key in ["gc.pruneexpire", "gc.worktreepruneexpire", "gc.logexpiry"] {
         check_expiry(last(key), key)?;
     }
 
-    for key in [
-        "gc.bigpackthreshold",
-        "pack.deltacachesize",
-        "core.deltabasecachelimit",
-    ] {
-        if let Some(v) = last(key) {
-            ulong_value(&v, key)?;
-        }
-    }
-
-    // builtin/gc.c:222-230 — `repo_config_get_string`, so only the valueless form.
-    for key in ["gc.repackfilter", "gc.repackfilterto"] {
-        if let Some(v) = last(key) {
-            string_value(&v)?;
-        }
-    }
-
-    // builtin/gc.c:232.
+    // builtin/gc.c:191.
     let mut out = defaults();
     for v in &all {
         git_default_config(v, &mut out)?;

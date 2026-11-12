@@ -1652,6 +1652,15 @@ impl Default for DeltaConfig {
     }
 }
 
+/// [`DeltaConfig::from_repo`]'s refusal, for a caller that packs in-process
+/// where git's `pack-objects` child would have read `pack.window`, `pack.depth`,
+/// `pack.windowMemory`, `pack.deltaCacheSize`, `pack.deltaCacheLimit` and
+/// `pack.threads` (builtin/pack-objects.c:3694-3758) and died on one it cannot
+/// parse: `repack -a -d` and `gc` under `-c pack.deltaCacheSize=abc`.
+pub(crate) fn delta_config_refusal(repo: &gix::Repository) -> Option<String> {
+    DeltaConfig::from_repo(repo).err()
+}
+
 impl DeltaConfig {
     /// The `pack.*` half, as `git_pack_config()` reads it. `Err` carries the
     /// `fatal:` line git dies with for a value it cannot read.

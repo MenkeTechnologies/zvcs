@@ -63,10 +63,8 @@
 //! a criss-cross history goes through the same chain; `--aggressive` files every
 //! tree before the head under stage 1 (unpack-trees.c:1211-1226).
 //!
-//! ### Floors (bail rather than approximate)
-//!
-//! * An unborn `HEAD`, which the `diff-index` pre-flight would have to diagnose
-//!   in git's own words.
+//! An unborn `HEAD` is the pre-flight's own refusal: both `diff-index` children
+//! die on `HEAD` in their own words, and the script reads that as a dirty index.
 //!
 //! An already-unmerged index is not a floor: the pre-flight is the ported
 //! `diff-index --cached` queue ([`super::diff_index::cached_name_only`]), whose
@@ -174,6 +172,18 @@ fn resolve(args: &[String], check_toplevel: bool) -> Result<ExitCode> {
             report_child_fatal(rejection);
         }
         return Ok(ExitCode::from(2));
+    }
+    // An unborn `HEAD`: `diff-index` dies on the operand (`fatal: bad revision 'HEAD'`, as
+    // the `--` makes it a revision), which `if !` takes for local changes; the `--name-only`
+    // child dies the same way, so `sed` indents nothing and the script exits 2
+    // (git-merge-resolve.sh:10-15).
+    if repo.head_commit().is_err() {
+        let argv = |args: &[&str]| -> Vec<String> { args.iter().map(|s| s.to_string()).collect() };
+        if child_status(super::diff_index::diff_index(&argv(&["--quiet", "--cached", "HEAD", "--"])))? != 0 {
+            println!("Error: Your local changes to the following files would be overwritten by merge");
+            child_status(super::diff_index::diff_index(&argv(&["--cached", "--name-only", "HEAD", "--"])))?;
+            return Ok(ExitCode::from(2));
+        }
     }
     let dirty = dirty_paths(&repo)?;
     if !dirty.is_empty() {
@@ -335,8 +345,7 @@ fn dirty_paths(repo: &Repository) -> Result<Vec<BString>> {
     let head_tree = match repo.head_commit().ok().and_then(|c| c.tree_id().ok()) {
         Some(id) => id.detach(),
         None => anyhow::bail!(
-            "unsupported: merge-resolve against an unborn HEAD (git lets diff-index's \
-             `fatal: ambiguous argument 'HEAD'` through, which is not reproduced)"
+            "unsupported: merge-resolve where diff-index accepts HEAD but HEAD names no commit"
         ),
     };
 

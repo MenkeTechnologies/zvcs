@@ -148,13 +148,20 @@ pub fn render<'r, 's>(
 /// Whether merge-ort ran `ll_merge()` for any of `conflicts`: a blob both sides changed, which is
 /// where `Auto-merging <path>` comes from (see [`render_one`]).
 pub fn runs_content_merge(conflicts: &[Conflict]) -> bool {
-    conflicts.iter().any(|c| {
-        matches!(
-            &c.resolution,
-            Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { .. })
-                | Ok(Resolution::OursModifiedTheirsRenamedAndChangedThenRename { merged_blob: Some(_), .. })
-        ) && Stages::of(c).is_some_and(|s| s.needs_content_merge())
-    })
+    conflicts.iter().any(content_merged)
+}
+
+/// The paths of `conflicts` merge-ort hands `ll_merge()`, in their order.
+pub fn content_merged_paths(conflicts: &[Conflict]) -> Vec<BString> {
+    conflicts.iter().filter(|c| content_merged(c)).map(conflict_location).collect()
+}
+
+fn content_merged(c: &Conflict) -> bool {
+    matches!(
+        &c.resolution,
+        Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { .. })
+            | Ok(Resolution::OursModifiedTheirsRenamedAndChangedThenRename { merged_blob: Some(_), .. })
+    ) && Stages::of(c).is_some_and(|s| s.needs_content_merge())
 }
 
 /// The messages for one conflict, or `None` when the class is not ported.

@@ -1020,7 +1020,76 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         head_id,
         unborn,
     };
+    read_and_refresh_cache(&repo, &mut state.index)?;
     run_todo(&env, &mut state, &todo, 0, sequence)
+}
+
+/// `read_and_refresh_cache()` (sequencer.c:2612-2639), which `sequencer_pick_revisions()` runs
+/// first (sequencer.c:5677): `refresh_index(r->index, REFRESH_QUIET|REFRESH_UNMERGED, ...)` and
+/// the index written back under `COMMIT_LOCK | SKIP_IF_UNCHANGED`. An entry the refresh hashes
+/// reads its attributes, and with them the index's sparse patterns (attr.c:821). The refresh
+/// `pick_commits()` repeats (sequencer.c:5134) finds the index it just wrote and moves nothing.
+fn read_and_refresh_cache(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+    if repo.workdir().is_none() {
+        return Ok(());
+    }
+    // A refresh that dies on its first hashed entry dies before anything is refreshed.
+    super::read_tree::StatCtx::refresh_or_die(repo, index)?;
+    let flags = super::update_index::RefreshFlags { quiet: true, allow_unmerged: true, ..Default::default() };
+    let before: Vec<Stat> = index.entries().iter().map(|e| e.stat).collect();
+    super::update_index::refresh_index(repo, index, flags, None, None)?;
+    // `SKIP_IF_UNCHANGED` writes only what `refresh_cache_ent()` replaced: an entry whose stat
+    // data it renewed. A racily clean entry it verified is marked `CE_UPTODATE` in core only
+    // (read-cache.c:1406-1420), and unlike `update-index` (builtin/update-index.c:740-750) the
+    // sequencer does not rewrite an index over a racy timestamp.
+    let changed = index.entries().len() != before.len()
+        || index.entries().iter().zip(&before).any(|(e, stat)| e.stat != *stat);
+    if changed {
+        crate::index_racy::write(repo, index)?;
+    }
+    Ok(())
+}
+
+/// `verify_uptodate()` of each entry `twoway_merge()` hands `merged_entry()` or
+/// `deleted_entry()` — the index at `old_tree`'s entry, which `new_tree` changes or drops
+/// (unpack-trees.c:2944-2993, :2224-2286) — in the `unpack_trees()` merge-ort's `checkout()`
+/// and `checkout_fast_forward()` run: `ie_match_stat()` of a racily clean regular file hashes
+/// it with its attributes read from `o->src_index` (attr.c:821, dir.c:1557-1574).
+fn twoway_uptodate_attr_reads(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+) -> Result<()> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    let flat = |tree: ObjectId| -> Result<HashMap<BString, (ObjectId, Mode)>> {
+        let state = repo.index_from_tree(&tree)?;
+        let backing = state.path_backing();
+        Ok(state.entries().iter().map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode))).collect())
+    };
+    let (old, new) = (flat(old_tree)?, flat(new_tree)?);
+    let backing = index.path_backing();
+    for e in index.entries() {
+        let path = e.path_in(backing);
+        if e.stage_raw() != 0 || e.flags.intersects(gix::index::entry::Flags::UPTODATE | gix::index::entry::Flags::SKIP_WORKTREE) {
+            continue;
+        }
+        let at_old = old.get(path).filter(|o| **o == (e.id, e.mode));
+        if at_old.is_none() || new.get(path) == at_old {
+            continue;
+        }
+        if crate::index_racy::ie_match_stat_compares_data(repo, index, e, &workdir.join(gix::path::from_bstr(path))) {
+            crate::unpack_sparse::convert_attrs(
+                repo,
+                path,
+                crate::unpack_sparse::Istate::Source,
+                crate::unpack_sparse::Direction::Checkin,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `walk_revs_populate_todo`: one `pick <abbrev> <subject>` instruction per
@@ -1231,6 +1300,11 @@ fn pick_one(
         }
         head_tree
     };
+    // `discard_index(r->index)` (sequencer.c:2331): `do_recursive_merge()` and
+    // `fast_forward_to()` read the index again (sequencer.c:763, :657), an `index_state` with
+    // the timestamp of the file, no `CE_UPTODATE` marks and no sparse patterns loaded.
+    state.index = repo.index_or_load_from_head()?.into_owned();
+    crate::unpack_sparse::fresh_index();
 
     // --- pick the base (mainline) parent ------------------------------
     let parents: Vec<ObjectId> = pick.parent_ids().map(|id| id.detach()).collect();
@@ -1278,7 +1352,18 @@ fn pick_one(
         // transaction that fails is `error("%s", err.buf)` and `return -1` — which
         // `do_pick_commit()` hands on as `PICK_RESULT_ERROR`, so the command ends on
         // `die(_("cherry-pick failed"))` with the index and work tree already moved.
-        state.index = update_clean_worktree(&repo, &state.index, pick_tree, &should_interrupt)?;
+        let unpack = crate::unpack_sparse::SparseCheckout::begin(repo, true, crate::merge_apply::unpack_opts());
+        twoway_uptodate_attr_reads(repo, &state.index, head_tree, pick_tree)?;
+        // `twoway_merge()` refuses per path as merge-ort's `checkout()` does, under the same
+        // "merge" porcelain messages (merge.c:101), and `checkout_fast_forward()` returning -1
+        // ends the pick on `PICK_RESULT_ERROR` (sequencer.c:657-659).
+        let clobber = crate::merge_guard::verify_two_way(repo, head_tree, pick_tree, &state.index)?;
+        if !clobber.is_empty() {
+            clobber.report("merge");
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
+        state.index =
+            update_clean_worktree(&repo, &state.index, pick_tree, unpack.as_ref(), &[], &should_interrupt)?;
         if let Some(message) =
             held_ref_lock(advance_head(&repo, (!state.unborn).then_some(head_id), pick_id, "cherry-pick: fast-forward".into()))?
         {
@@ -1370,6 +1455,10 @@ fn pick_one(
     // with `git: 'merge-nonexistent-strategy' is not a git command`.
     let unresolved = gix::merge::tree::TreatAsUnresolved::git();
     let mut conflicted: Vec<BString> = Vec::new();
+    // The `unpack_trees()` merge-ort's `checkout()` runs onto the merged tree, with the pattern
+    // list it loaded before looking at any entry (unpack-trees.c:1931-1936); a `merge-<strategy>`
+    // child moves the worktree itself.
+    let mut unpack: Option<crate::unpack_sparse::SparseCheckout> = None;
     let (tree_id, mut merge) = match opts.strategy {
         None | Some("recursive") | Some("ort") => {
             // git hands every `-X` to `parse_merge_opt()` here and *discards*
@@ -1399,6 +1488,7 @@ fn pick_one(
                 },
                 strategy.apply(repo.tree_merge_options()?)?,
             )?;
+            crate::unpack_sparse::ll_merge_attrs(repo, &crate::merge_msg::content_merged_paths(&merge.conflicts));
             let tree_id = merge.tree.write()?.detach();
 
             // `merge_switch_to_result()` opens with `checkout(opt, head,
@@ -1417,6 +1507,8 @@ fn pick_one(
             // `if (res < 0) goto leave` skips the `MERGE_MSG` write. The merged
             // tree itself is already in the object database — git writes it
             // before the checkout too.
+            unpack = crate::unpack_sparse::SparseCheckout::begin(repo, true, crate::merge_apply::unpack_opts());
+            twoway_uptodate_attr_reads(repo, &state.index, head_tree, tree_id)?;
             let clobber =
                 crate::merge_guard::verify_two_way(repo, head_tree, tree_id, &state.index)?;
             if !clobber.is_empty() {
@@ -1553,7 +1645,7 @@ fn pick_one(
     // never reaches the point where emptiness would be decided.
     if let Some(merge) = merge.as_mut().filter(|_| !conflicted.is_empty()) {
         let mut new_index =
-            update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+            update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &conflicted, &should_interrupt)?;
         // The two steps below are `merge_switch_to_result()`'s, in its order
         // (merge-ort.c), and the order is the whole of what the extension ends up
         // looking like:
@@ -1661,7 +1753,7 @@ fn pick_one(
     // git leaves the result in the index and worktree and never moves HEAD;
     // `pending_tree` carries it forward so a following pick squashes onto it.
     if opts.no_commit {
-        state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        state.index = update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &[], &should_interrupt)?;
         state.pending_tree = Some(tree_id);
         return Ok(PickOutcome::Done);
     }
@@ -1744,7 +1836,7 @@ fn pick_one(
     //
     // (sequencer.c:2474-2479); a landing pick has it removed again by the commit.
     if super::replay_commit::should_edit(opts.edit_given, super::replay_commit::Action::Pick) {
-        state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        state.index = update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &[], &should_interrupt)?;
         let code = super::replay_commit::run_git_commit(
             super::replay_commit::Action::Pick,
             opts.gpg_sign,
@@ -1816,13 +1908,13 @@ fn pick_one(
     // sequencer.c:2506-2511 wrote `CHERRY_PICK_HEAD`, all of which stay behind with
     // `MERGE_MSG` and `AUTO_MERGE`.
     if let Some(refusal) = crate::commit_tree_refusal(true) {
-        state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        state.index = update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &[], &should_interrupt)?;
         return Ok(PickOutcome::Stopped(refusal.die()));
     }
     // `do_recursive_merge()` has written the merged index and work tree before
     // `do_commit()` runs, so they are in place ahead of the commit object, the
     // `HEAD` update and the `post-commit` hook, which reads that index.
-    state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+    state.index = update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &[], &should_interrupt)?;
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
     // A signature gpg refused is `res = error(_("failed to write commit object"))`
     // (sequencer.c:1687-1690), which `do_pick_commit()` folds to `res = !!res`
@@ -1889,7 +1981,7 @@ fn pick_one(
     }
     // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
     print!("{}", crate::summary_committer_block(&repo, &committer_ident));
-    print_diffstat(head_tree, tree_id)?;
+    print_diffstat(&repo, head_tree, tree_id)?;
 
     state.head_id = new_id;
     state.unborn = false;
@@ -2613,7 +2705,26 @@ fn advance_head(
 ///
 /// `-r` is `log_tree_diff()`'s recursion; the operands are the two trees rather
 /// than the two commits so that `diff-tree` prints no commit-id header of its own.
-fn print_diffstat(old_tree: ObjectId, new_tree: ObjectId) -> Result<()> {
+fn print_diffstat(repo: &gix::Repository, old_tree: ObjectId, new_tree: ObjectId) -> Result<()> {
+    // `builtin_diffstat()` asks `diff_filespec_is_binary()` of each side of each pair, and
+    // `diff_populate_filespec()` of a blob goes through `reuse_worktree_file()`, which asks the
+    // index whether the path is in the sparse checkout (diff.c:3698-3707, :4409-4417); a gitlink
+    // is filled without it (`diff_populate_gitlink()`).
+    {
+        let flat = |tree: ObjectId| -> Result<HashMap<BString, (ObjectId, Mode)>> {
+            let state = repo.index_from_tree(&tree)?;
+            let backing = state.path_backing();
+            Ok(state.entries().iter().map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode))).collect())
+        };
+        let (old, new) = (flat(old_tree)?, flat(new_tree)?);
+        let blob_pair = old.keys().chain(new.keys()).any(|p| {
+            let (o, n) = (old.get(p), new.get(p));
+            o != n && [o, n].into_iter().flatten().any(|(_, mode)| *mode != Mode::COMMIT)
+        });
+        if blob_pair {
+            crate::unpack_sparse::path_in_sparse_checkout(repo);
+        }
+    }
     super::diff_tree::diff_tree(&[
         "-r".to_string(),
         "-M".to_string(),
@@ -2631,11 +2742,18 @@ fn print_diffstat(old_tree: ObjectId, new_tree: ObjectId) -> Result<()> {
 ///
 /// Verbatim port of `porcelain::merge`'s helper: added/modified files are
 /// checked out via `gix-worktree-state`, removed files are deleted, and the new
-/// index reuses prior stats for unchanged entries.
+/// index reuses prior stats for unchanged entries. Each caller stands for an
+/// `unpack_trees()` with the porcelain messages installed — merge-ort's `checkout()`
+/// (merge-ort.c:4611-4645) or `checkout_fast_forward()` (merge.c:52-113) — so in a
+/// sparse checkout its sparse loops settle the result first
+/// ([`crate::merge_apply::sparse_checkout_update`]) with the pattern list `sparse` it loaded;
+/// `conflicts` are the paths `record_conflicted_index_entries()` turns into stages afterwards.
 fn update_clean_worktree(
     repo: &gix::Repository,
     old: &gix::index::File,
     new_tree_id: ObjectId,
+    sparse: Option<&crate::unpack_sparse::SparseCheckout>,
+    conflicts: &[BString],
     should_interrupt: &AtomicBool,
 ) -> Result<gix::index::File> {
     let workdir = repo
@@ -2658,10 +2776,39 @@ fn update_clean_worktree(
         Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
         None => false,
     });
-    // A path the sparse checkout left out of the work tree stays out of it, and keeps the bit that
-    // says so (`unpack_trees()` seeds its result from the source index).
-    super::reset::carry_skip_worktree(old, &mut new_index);
-    super::reset::carry_skip_worktree(old, &mut subset);
+    let mut removals: Vec<BString> = {
+        let new_paths: HashSet<BString> = {
+            let backing = new_index.path_backing();
+            new_index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+        };
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_owned())
+            .filter(|p| !new_paths.contains(p))
+            .collect()
+    };
+    let sparse_result = crate::merge_apply::sparse_checkout_update(
+        repo,
+        sparse,
+        old,
+        &new_index,
+        new_tree_id,
+        conflicts,
+        &old_map,
+        &mut subset,
+        &mut removals,
+    )?;
+    match &sparse_result {
+        // In a sparse checkout every entry's bit is the sparse loops' verdict.
+        Some(result) => crate::unpack_sparse::carry_skip_worktree_bits(result, &mut new_index),
+        // A path the sparse checkout left out of the work tree stays out of it, and keeps the bit
+        // that says so (`unpack_trees()` seeds its result from the source index).
+        None => {
+            super::reset::carry_skip_worktree(old, &mut new_index);
+            super::reset::carry_skip_worktree(old, &mut subset);
+        }
+    }
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
@@ -2680,29 +2827,10 @@ fn update_clean_worktree(
         opts,
     )?;
 
-    let new_paths: HashSet<BString> = {
-        let backing = new_index.path_backing();
-        new_index
-            .entries()
-            .iter()
-            .map(|e| e.path_in(backing).to_owned())
-            .collect()
-    };
-    {
-        let backing = old.path_backing();
-        for e in old.entries() {
-            let path = e.path_in(backing);
-            if !new_paths.contains(&path.to_owned()) {
-                if let Some(full) = repo.workdir_path(path) {
-                    let _ = std::fs::remove_file(&full);
-                    // `unlink_entry()`'s `schedule_dir_for_removal()`: the directory
-                    // whose last file just went goes with it.
-                    if let Some(workdir) = repo.workdir() {
-                        crate::worktree::prune_empty_dirs(workdir, &full);
-                    }
-                }
-            }
-        }
+    // `unlink_entry()`, whose `schedule_dir_for_removal()` takes the directory whose last file
+    // just went with it.
+    for path in &removals {
+        crate::merge_apply::remove_worktree_entry(repo, path.as_ref());
     }
 
     // Unchanged entries reuse the old stat; the ones the checkout wrote then take the fresh

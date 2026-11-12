@@ -864,11 +864,23 @@ pub(crate) fn load_sparsity_if_enabled(repo: &gix::Repository) -> Result<Option<
 /// `core.sparseCheckout` worktree whose `info/sparse-checkout` is not there has no definition to
 /// consult: `init_sparse_checkout_patterns()` fails to load it and every path counts as inside,
 /// where an *empty* file is a definition that includes nothing.
+///
+/// The load is `init_sparse_checkout_patterns()` of the command's index, which prints the
+/// warnings `add_pattern_to_hashsets()` gives a cone-mode file it cannot read once per
+/// `index_state` (dir.c:798-936, :1557-1574), and from that pattern on the list is matched as
+/// the non-cone list it is (`pl->use_cone_patterns = 0`).
 pub(crate) fn load_sparsity_for_path_checks(repo: &gix::Repository) -> Result<Option<Sparsity>> {
     if std::fs::metadata(pattern_path(repo)).is_err() {
         return Ok(None);
     }
-    load_sparsity(repo).map(Some)
+    crate::unpack_sparse::path_in_sparse_checkout(repo);
+    let cone = is_cone(repo)?;
+    if cone {
+        if let Some((fallback @ Sparsity::Patterns(..), _)) = load_pattern_file(repo, cone)? {
+            return Ok(Some(fallback));
+        }
+    }
+    load_sparsity_with(repo, cone).map(Some)
 }
 
 pub(crate) fn load_sparsity(repo: &gix::Repository) -> Result<Sparsity> {

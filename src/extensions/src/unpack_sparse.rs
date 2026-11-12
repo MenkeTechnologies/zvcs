@@ -233,8 +233,110 @@ pub(crate) fn convert_attrs(repo: &gix::Repository, path: &BStr, istate: Istate,
         s.direction = direction;
         s.stack = None;
     }
+    let reads = frames_to_read(&mut s.stack, path);
+    read_frames(&mut s, repo, &reads, istate, direction);
+}
+
+/// `path_in_sparse_checkout()` of the command's index (dir.c:1576-1622), which loads its sparse
+/// patterns (dir.c:1557-1574) whatever the worktree's `.gitattributes` answer: `add` and `mv`
+/// testing a path against the definition, and the diffstat of a commit summary over a pair
+/// with a blob to read, whose `diff_populate_filespec()` asks it in `reuse_worktree_file()`
+/// (diff.c:3698-3707, :4409-4417).
+pub(crate) fn path_in_sparse_checkout(repo: &gix::Repository) {
+    let mut s = attr_patterns();
+    index_patterns(&mut s, repo, Istate::Current);
+}
+
+/// `read_attr()` of each of `reads` on `istate` (attr.c:841-874): `true` once that index's
+/// sparse patterns are loaded, by this read or before.
+fn read_frames(s: &mut AttrPatterns, repo: &gix::Repository, reads: &[BString], istate: Istate, direction: Direction) -> bool {
+    for file in reads {
+        // `read_attr()` (attr.c:841-874): under `GIT_ATTR_CHECKIN` a file in the worktree
+        // answers and the index is not asked; `read_attr_from_file()` opens it with
+        // `O_NOFOLLOW` (attr.c:693-726), so a symlink there does not.
+        if direction == Direction::Checkin && in_worktree(repo, file.as_bstr()) {
+            continue;
+        }
+        if index_patterns(s, repo, istate) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `init_sparse_checkout_patterns()` of `istate` (dir.c:1557-1574), as `read_attr_from_index()`
+/// and `path_in_sparse_checkout()` ask it: `true` once that index's patterns are loaded, by this
+/// call or before.
+fn index_patterns(s: &mut AttrPatterns, repo: &gix::Repository, istate: Istate) -> bool {
+    if istate == Istate::Current {
+        if let Some(result) = s.result.as_mut() {
+            // The file `populate_from_existing_patterns()` read for this unpack.
+            if let Some(warnings) = result.take() {
+                eprint!("{warnings}");
+            }
+            return true;
+        }
+    }
+    if s.read_loaded {
+        return true;
+    }
+    if load_index_patterns(repo) {
+        s.read_loaded = true;
+        return true;
+    }
+    false
+}
+
+/// `ll_merge()`'s `git_check_attr()` of each path merge-ort content-merges (merge-ll.c:429),
+/// handed `&opt->priv->attr_index` (merge-ort.c:2161-2163): `initialize_attr_index()` makes it a
+/// fresh `index_state` for every merge, holding nothing but, under `merge.renormalize`, a
+/// merged `.gitattributes` (merge-ort.c:2049-2081), so its sparse patterns load at the first
+/// `.gitattributes` the check reads from it (attr.c:821). The check is
+/// `load_merge_attributes()`' own `attr_check`, whose stack (attr.c:1186) starts empty here:
+/// every `unpack_trees()` that updates the worktree drops it when `check_updates()` flips the
+/// direction (unpack-trees.c:456, :509, attr.c:682-691).
+pub(crate) fn ll_merge_attrs(repo: &gix::Repository, paths: &[BString]) {
+    let mut stack = None;
+    for path in paths {
+        for file in frames_to_read(&mut stack, path.as_bstr()) {
+            if !in_worktree(repo, file.as_bstr()) && load_index_patterns(repo) {
+                return;
+            }
+        }
+    }
+}
+
+/// `read_attr_from_file()` finds `file` in the worktree: a regular file, as `O_NOFOLLOW`
+/// opens it (attr.c:693-726).
+fn in_worktree(repo: &gix::Repository, file: &BStr) -> bool {
+    repo.workdir()
+        .and_then(|wd| std::fs::symlink_metadata(wd.join(gix::path::from_bstr(file))).ok())
+        .is_some_and(|md| !md.file_type().is_symlink())
+}
+
+/// `init_sparse_checkout_patterns()` (dir.c:1557-1574) of an `index_state` nothing has loaded,
+/// with the warnings the load prints. Nothing loads without `core.sparseCheckout`, and a
+/// pattern file that cannot be read is freed again, to be tried at the next read: `false` for
+/// both.
+fn load_index_patterns(repo: &gix::Repository) -> bool {
+    let config = repo.config_snapshot();
+    if !config.boolean("core.sparseCheckout").unwrap_or(false) {
+        return false;
+    }
+    let cone = config.boolean("core.sparseCheckoutCone").unwrap_or(false);
+    let Some((_, warnings)) = UnpackPatterns::load_with_warnings(repo, cone) else {
+        return false;
+    };
+    eprint!("{warnings}");
+    true
+}
+
+/// The `.gitattributes` files `prepare_attr_stack()` (attr.c:950-1043) reads for `path` with
+/// `stack` the directory frames above the root one, outermost first (`None` before
+/// `bootstrap_attr_stack()` has run), which it leaves as the frames of `path`'s directory.
+fn frames_to_read(stack: &mut Option<Vec<BString>>, path: &BStr) -> Vec<BString> {
     let mut reads: Vec<BString> = Vec::new();
-    let stack = s.stack.get_or_insert_with(|| {
+    let stack = stack.get_or_insert_with(|| {
         // `bootstrap_attr_stack()`'s root frame.
         reads.push(".gitattributes".into());
         Vec::new()
@@ -259,44 +361,7 @@ pub(crate) fn convert_attrs(repo: &gix::Repository, path: &BStr, istate: Istate,
         stack.push(dir);
         len = end;
     }
-    for file in reads {
-        // `read_attr()` (attr.c:841-874): under `GIT_ATTR_CHECKIN` a file in the worktree
-        // answers and the index is not asked; `read_attr_from_file()` opens it with
-        // `O_NOFOLLOW` (attr.c:693-726), so a symlink there does not.
-        if direction == Direction::Checkin {
-            let on_disk = repo
-                .workdir()
-                .and_then(|wd| std::fs::symlink_metadata(wd.join(gix::path::from_bstr(file.as_bstr()))).ok());
-            if on_disk.is_some_and(|md| !md.file_type().is_symlink()) {
-                continue;
-            }
-        }
-        if istate == Istate::Current {
-            if let Some(result) = s.result.as_mut() {
-                // The file `populate_from_existing_patterns()` read for this unpack.
-                if let Some(warnings) = result.take() {
-                    eprint!("{warnings}");
-                }
-                break;
-            }
-        }
-        if s.read_loaded {
-            break;
-        }
-        // `init_sparse_checkout_patterns()`: nothing to load without `core.sparseCheckout`, and
-        // a pattern file that cannot be read is freed again, to be tried at the next read.
-        let config = repo.config_snapshot();
-        if !config.boolean("core.sparseCheckout").unwrap_or(false) {
-            break;
-        }
-        let cone = config.boolean("core.sparseCheckoutCone").unwrap_or(false);
-        let Some((_, warnings)) = UnpackPatterns::load_with_warnings(repo, cone) else {
-            continue;
-        };
-        s.read_loaded = true;
-        eprint!("{warnings}");
-        break;
-    }
+    reads
 }
 
 /// `checkout_entry_ca()`'s `convert_attrs()` of the first regular file `check_updates()`

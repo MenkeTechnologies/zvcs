@@ -888,19 +888,41 @@ fn finish(o: Opts) -> Result<ExitCode> {
         old_paths.difference(&new_paths).cloned().collect()
     };
 
+    // ---- Sparse checkout (unpack-trees.c:1974-1976, :2035-2075). ----
+    //
+    // `CE_UPDATE` on what the merge writes and `CE_WT_REMOVE` on what it drops go into the
+    // sparse loops, which settle every entry of the result; `read-tree` installs no porcelain
+    // messages, so a warning is an `error()` as it is met. `--reset` is
+    // `UNPACK_RESET_OVERWRITE_UNTRACKED` (builtin/read-tree.c:171-172), and `-u` clears
+    // `preserve_ignored` (:228-229). `unpack_trees()` loads the pattern list before its merge
+    // function looks at a single entry (unpack-trees.c:1931-1936), so its warnings come ahead
+    // of a refusal from the checks below.
+    let sparse = super::super::unpack_sparse::SparseCheckout::with_patterns(
+        sparse_patterns(&repo, &o)?,
+        super::super::unpack_sparse::Opts {
+            quiet: o.quiet,
+            overwrite_untracked: o.reset,
+            show_progress: o.verbose_update,
+            ..Default::default()
+        },
+    );
+
     // ---- Merge safety checks, before touching anything. ----
     // Needed for the checks, and for `--reset -u` to know which files to restore.
     // Both are decided from `stat` data against the OLD index, which is what
     // `verify_uptodate_1`/`oneway_merge` compare against (`o->src_index`).
+    // The entries whose file `unpack_trees()` compares against `o->src_index`:
+    // `verify_uptodate()` of one `merged_entry()` replaces or `deleted_entry()` drops,
+    // which `o->reset` waves through unless it is `CE_VALID` (unpack-trees.c:2233-2245),
+    // and `oneway_merge()`'s `ie_match_stat()` of one `--reset -u` keeps (:3036-3042).
+    // A racily clean regular file is hashed there with its attributes, and with them
+    // the sparse patterns, read from that index (attr.c:821, dir.c:1557-1574). The merge
+    // function meets them in traversal order and the first refusal stops the walk, so the
+    // checks below read them path by path (`racy_read`).
+    let mut racy_reads: HashSet<BString> = HashSet::new();
     let (dirty, absent) = if o.checked() || o.reset {
         let stat_ctx = StatCtx::new(&repo, &old)?;
         let dirty = worktree_dirty(&repo, &old, &stat_ctx);
-        // The entries whose file `unpack_trees()` compares against `o->src_index`:
-        // `verify_uptodate()` of one `merged_entry()` replaces or `deleted_entry()` drops,
-        // which `o->reset` waves through unless it is `CE_VALID` (unpack-trees.c:2233-2245),
-        // and `oneway_merge()`'s `ie_match_stat()` of one `--reset -u` keeps (:3036-3042).
-        // A racily clean regular file is hashed there with its attributes, and with them
-        // the sparse patterns, read from that index (attr.c:821, dir.c:1557-1574).
         if !o.index_only {
             let backing = old.path_backing();
             for e in old.entries().iter().filter(|e| e.stage_raw() == 0) {
@@ -915,12 +937,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
                 };
                 let full = repo.workdir_path(path);
                 if compared && full.is_some_and(|full| crate::index_racy::ie_match_stat_compares_data(&repo, &old, e, &full)) {
-                    crate::unpack_sparse::convert_attrs(
-                        &repo,
-                        path,
-                        crate::unpack_sparse::Istate::Source,
-                        crate::unpack_sparse::Direction::Checkin,
-                    );
+                    racy_reads.insert(path.to_owned());
                 }
             }
         }
@@ -970,8 +987,19 @@ fn finish(o: Opts) -> Result<ExitCode> {
     let is_submodule_link = |entry: Option<&(ObjectId, Mode, Stat, Flags)>, path: &BString| {
         entry.is_some_and(|(_, mode, _, _)| *mode == Mode::COMMIT) && subs.as_ref().is_some_and(|s| s.is_submodule(path.as_bstr()))
     };
+    let racy_read = |path: &BString| {
+        if racy_reads.contains(path) {
+            crate::unpack_sparse::convert_attrs(
+                &repo,
+                path.as_bstr(),
+                crate::unpack_sparse::Istate::Source,
+                crate::unpack_sparse::Direction::Checkin,
+            );
+        }
+    };
     if o.reset && !o.index_only {
         for path in old_paths.union(&new_paths) {
+            racy_read(path);
             let loses_content = removed.contains(path) || changed.contains(path);
             if loses_content && old_map.contains_key(path) && not_uptodate(path) {
                 return rejected(format!("Entry '{}' not uptodate. Cannot merge.", shown(path.as_bstr())));
@@ -985,8 +1013,9 @@ fn finish(o: Opts) -> Result<ExitCode> {
         // `merged_entry()` gives a new entry `CE_NEW_SKIP_WORKTREE` before its `verify_absent()`,
         // which returns at once for it unless `o->skip_sparse_checkout` (unpack-trees.c:2540-2541,
         // :2582-2588): in a sparse checkout the check waits for the sparse loops.
-        let sparse = sparse_patterns(&repo, &o)?.is_some();
+        let sparse = sparse.is_some();
         for path in old_paths.union(&new_paths) {
+            racy_read(path);
             let loses_content = removed.contains(path)
                 || (changed.contains(path) && old_map.contains_key(path));
             // A submodule's gitlink is up to date by the dry-run move, not by its stat
@@ -1022,25 +1051,14 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
     }
 
-    // ---- Sparse checkout (unpack-trees.c:1974-1976, :2035-2075). ----
-    //
-    // `CE_UPDATE` on what the merge writes and `CE_WT_REMOVE` on what it drops go into the
-    // sparse loops, which settle every entry of the result; `read-tree` installs no porcelain
-    // messages, so a warning is an `error()` as it is met. `--reset` is
-    // `UNPACK_RESET_OVERWRITE_UNTRACKED` (builtin/read-tree.c:171-172), and `-u` clears
-    // `preserve_ignored` (:228-229).
-    let sparse = super::super::unpack_sparse::SparseCheckout::with_patterns(
-        sparse_patterns(&repo, &o)?,
-        super::super::unpack_sparse::Opts {
-            quiet: o.quiet,
-            overwrite_untracked: o.reset,
-            show_progress: o.verbose_update,
-            ..Default::default()
-        },
-    );
-
     if o.dry_run && sparse.is_none() {
         return Ok(ExitCode::SUCCESS);
+    }
+    if sparse.is_none() {
+        // `o->internal.result` replaced the index: an `index_state` nothing has loaded
+        // (unpack-trees.c:2097-2098), whose `do_write_index()` smudges a racily clean entry
+        // with its attributes read from it (read-cache.c:2902).
+        super::super::unpack_sparse::fresh_index();
     }
 
     // ---- Worktree update. ----
@@ -1392,6 +1410,17 @@ fn multi_tree_read(
         })
         .collect();
 
+    // `unpack_trees()` loads the pattern list before its merge function looks at a single entry
+    // (unpack-trees.c:1931-1936), so its warnings come ahead of a refusal from the traversal.
+    let sparse_unpack = super::super::unpack_sparse::SparseCheckout::with_patterns(
+        sparse_patterns(repo, o)?,
+        super::super::unpack_sparse::Opts {
+            quiet: o.quiet,
+            overwrite_untracked: o.reset,
+            show_progress: o.verbose_update,
+            ..Default::default()
+        },
+    );
     let stat_ctx = StatCtx::new(repo, old)?;
     let patterns = sparse_patterns(repo, o)?;
     let sparse = patterns.is_some();
@@ -1525,16 +1554,11 @@ fn multi_tree_read(
     // single-tree read: they settle every entry of the result, and `apply_sparse_checkout()`
     // turns each crossing into a worktree write or a worktree removal.
     let mut removed = removed;
-    if let Some(sparse) = super::super::unpack_sparse::SparseCheckout::with_patterns(
-        sparse_patterns(repo, o)?,
-        super::super::unpack_sparse::Opts {
-            quiet: o.quiet,
-            overwrite_untracked: o.reset,
-            show_progress: o.verbose_update,
-            ..Default::default()
-        },
-    ) {
-        sparse.apply(repo, old, &mut new_index, &mut wanted, &mut removed)?;
+    match &sparse_unpack {
+        Some(sparse) => sparse.apply(repo, old, &mut new_index, &mut wanted, &mut removed)?,
+        // `o->internal.result` replaced the index: an `index_state` nothing has loaded
+        // (unpack-trees.c:2097-2098).
+        None => super::super::unpack_sparse::fresh_index(),
     }
     // `-n` stops at `check_updates()`, which returns before touching the worktree
     // (unpack-trees.c:442-446), and `cmd_read_tree()` writes no index (builtin/read-tree.c:
@@ -1670,6 +1694,22 @@ impl MergeCtx<'_> {
         }
         if let Some(verdict) = self.submodule_uptodate(entry.id, entry.mode, path) {
             return verdict;
+        }
+        // `ie_match_stat()` of a racily clean regular file hashes it with its attributes, and
+        // with them the sparse patterns, read from `o->src_index` (attr.c:821,
+        // dir.c:1557-1574); git returns before it for a `ce_uptodate()` one
+        // (unpack-trees.c:2240-2241).
+        if !entry.flags.contains(Flags::UPTODATE)
+            && self.repo.workdir_path(path).is_some_and(|full| {
+                crate::index_racy::ie_match_stat_compares_data(self.repo, self.old, entry, &full)
+            })
+        {
+            crate::unpack_sparse::convert_attrs(
+                self.repo,
+                path,
+                crate::unpack_sparse::Istate::Source,
+                crate::unpack_sparse::Direction::Checkin,
+            );
         }
         match self.stat.probe(self.repo, entry, path) {
             // `errno == ENOENT` is up to date: there is nothing to lose.

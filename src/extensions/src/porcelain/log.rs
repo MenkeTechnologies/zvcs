@@ -704,6 +704,12 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // looked at a repository. Answering it only after `discover()` made
     // `git log -h` outside one die `fatal: not a git repository` at 128, where
     // stock prints the usage block on stdout at exit 0.
+    //
+    // `cmd_log()` still reads the configuration before `cmd_log_init()` parses
+    // anything (builtin/log.c:837, :847), so a bad `log.diffMerges` dies even then.
+    if matches!(args, [a] if a == "-h" || a == "--help-all") {
+        diff_merges_config_gently();
+    }
     if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
         return Ok(code);
     }
@@ -745,6 +751,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         Box::new(gix::odb::pack::cache::lru::MemoryCappedHashmap::new(96 * 1024 * 1024))
     });
 
+    // `log.diffMerges` is refused inside the `git_log_config()` callback itself,
+    // ahead of everything the configuration then decides.
+    let merges_default = diff_merges_default(&repo);
     // Config supplies the defaults; the flags below override them. git reads
     // these in `git_log_config` before parsing args, and validates `log.date`
     // there — an invalid value is fatal even when `--date` later overrides it.
@@ -2412,110 +2421,54 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         } else if a == "--no-follow" {
             follow = false;
             default_follow = false;
-        } else if a == "-m" {
+        } else if a == "-m"
+            || matches!(
+                a.as_str(),
+                "-c" | "--cc" | "--dd" | "--remerge-diff" | "--no-diff-merges"
+            )
+            || a.starts_with("--diff-merges=")
+        {
             // `diff_merges_parse_opts()` (diff-merges.c:119-151): each spelling
-            // selects a mode, and the last one wins. `-m` is the odd one out — it
-            // runs `set_to_default()` and then clears `merges_need_diff` again, so
-            // it selects the mode without asking for a patch format.
-            diff_merges = DiffMerges::Separate;
-            merges_need_diff = false;
-            remerge = false;
-            explicit_diff_merges = true;
+            // runs one of `func_by_opt()`'s setters, and the last one wins.
+            let (setup, imply_patch) = match a.as_str() {
+                // `-m` runs `set_to_default()` — `set_separate` unless
+                // `log.diffMerges` moved it — and then clears `merges_need_diff`
+                // again, so it selects the mode without asking for a patch format.
+                "-m" => (merges_default, false),
+                "-c" => (MergesSetup::Combined, true),
+                "--cc" => (MergesSetup::DenseCombined, true),
+                "--dd" => (MergesSetup::FirstParent, true),
+                "--remerge-diff" => (MergesSetup::Remerge, true),
+                "--no-diff-merges" => (MergesSetup::None, false),
+                // `set_diff_merges()` (diff-merges.c:89-97).
+                _ => {
+                    let v = &a["--diff-merges=".len()..];
+                    match MergesSetup::by_opt(v, merges_default) {
+                        Some(setup) => (setup, false),
+                        None => {
+                            eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                }
+            };
+            // `suppress()` (diff-merges.c:13-23) clears every flag, and
+            // `common_setup()` raises `merges_need_diff` for every setter but
+            // `set_none()` (diff-merges.c:25-34).
+            (diff_merges, remerge) = setup.mode();
+            merges_need_diff = setup != MergesSetup::None && a != "-m";
+            merges_imply_patch = imply_patch;
             combined_all_paths = false;
-            // `suppress()` (diff-merges.c:13-23) clears `merges_imply_patch` too, so
-            // `-c -m` asks for no patch on a non-merge.
-            merges_imply_patch = false;
-            // `set_separate()`'s second statement, which is not about the diff at
-            // all: `revs->simplify_history = 0` (diff-merges.c:38). It is why
-            // `git log -m -- <path>` shows a merge that `git log -- <path>`
-            // collapses onto the side it took.
-            full_history = true;
-        } else if a == "-c" {
-            diff_merges = DiffMerges::Combined;
-            merges_need_diff = true;
-            merges_imply_patch = true;
-            remerge = false;
             explicit_diff_merges = true;
-            combined_all_paths = false;
-        } else if a == "--cc" {
-            diff_merges = DiffMerges::DenseCombined;
-            merges_need_diff = true;
-            merges_imply_patch = true;
-            remerge = false;
-            explicit_diff_merges = true;
-            combined_all_paths = false;
-        } else if a == "--dd" {
-            // `set_first_parent()` (diff-merges.c:43-47) is `set_separate()` plus
-            // `first_parent_merges`, so it clears `simplify_history` the way
-            // `--diff-merges=separate` does — and, unlike `--first-parent`, it says
-            // nothing about which parents the *walk* follows.
-            diff_merges = DiffMerges::FirstParent;
-            merges_need_diff = true;
-            merges_imply_patch = true;
-            remerge = false;
-            explicit_diff_merges = true;
-            combined_all_paths = false;
-            full_history = true;
-        } else if a == "--remerge-diff" {
-            // `set_remerge_diff()` plus `merges_imply_patch = 1`
-            // (diff-merges.c:137-139); refused where the remerge would run.
-            diff_merges = DiffMerges::Separate;
-            remerge = true;
-            merges_need_diff = true;
-            merges_imply_patch = true;
-            explicit_diff_merges = true;
-            combined_all_paths = false;
-            full_history = true;
-        } else if a == "--no-diff-merges" {
-            diff_merges = DiffMerges::Off;
-            merges_need_diff = false;
-            remerge = false;
-            explicit_diff_merges = true;
-            combined_all_paths = false;
-            merges_imply_patch = false;
+            // `revs->simplify_history = 0`, which is not about the diff at all.
+            // It is why `git log -m -- <path>` shows a merge that
+            // `git log -- <path>` collapses onto the side it took.
+            if setup.clears_simplify_history() {
+                full_history = true;
+            }
         } else if a == "--combined-all-paths" {
             combined_all_paths = true;
             explicit_diff_merges = true;
-        } else if let Some(v) = a.strip_prefix("--diff-merges=") {
-            match DiffMerges::parse(v) {
-                Some(m) => {
-                    diff_merges = m;
-                    remerge = false;
-                    // `set_none()` is the only `func_by_opt` arm that does not run
-                    // `common_setup()`, so it is the only one that leaves
-                    // `merges_need_diff` at zero.
-                    merges_need_diff = m != DiffMerges::Off;
-                    explicit_diff_merges = true;
-                    combined_all_paths = false;
-                    merges_imply_patch = false;
-                    // `set_separate()` and `set_first_parent()` (which calls it)
-                    // also clear `revs->simplify_history`; `set_combined()`,
-                    // `set_dense_combined()` and `set_none()` do not.
-                    if matches!(m, DiffMerges::Separate | DiffMerges::FirstParent) {
-                        full_history = true;
-                    }
-                }
-                // `func_by_opt()` (diff-merges.c:82-83) maps `r`/`remerge` onto
-                // `set_remerge_diff()`, which is `common_setup()` plus
-                // `remerge_diff = 1` and `simplify_history = 0`. This port has no
-                // merge engine to re-run, so the request is refused where
-                // `do_remerge_diff()` would run (log-tree.c:1134-1142) rather than
-                // at parse time — a walk that reaches no merge behaves exactly as
-                // git's does, which is what the parse-time refusal got wrong.
-                None if matches!(v, "r" | "remerge") => {
-                    diff_merges = DiffMerges::Separate;
-                    remerge = true;
-                    merges_need_diff = true;
-                    explicit_diff_merges = true;
-                    combined_all_paths = false;
-                    merges_imply_patch = false;
-                    full_history = true;
-                }
-                None => {
-                    eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
-                    return Ok(ExitCode::from(128));
-                }
-            }
         } else if let Some(v) = a.strip_prefix("-G") {
             pickaxe_g = Some(v.to_string());
         // The patch-shaping options `setup_revisions()` takes from `diff_opt_parse()`.
@@ -7775,19 +7728,17 @@ pub(super) fn bad_revision_message_in_gated(
     {
         return format!("fatal: {message}\n");
     }
-    // `die_verify_filename()` resolves the operand a *second* time before it dies
-    // (`maybe_die_on_misspelt_object_name()` → `get_oid_with_context_1()`), so a
-    // reflog operand that reached back past its log and then failed for some other
-    // reason — `HEAD@{<old date>}^` on a root commit — carries the warning twice:
-    // once from the resolution that failed, once from the diagnosis. Verified
-    // against stock 2.55.0, which prints two for every `~`/`^<n>` suffix and one
-    // for `^{…}`, `:<path>` and the bare name.
-    let mut message = String::new();
-    if let Some(warning) =
-        crate::objname::reflog_reach_warning(repo, spec.strip_prefix('^').unwrap_or(spec))
-    {
-        message.push_str(&warning);
-    }
+    // `peel_onion()` reports an unreachable `^{<type>}` through `error()` while
+    // the resolution is still running, and the frame then falls back to
+    // `get_oid_basic()` on its whole name (object-name.c:1127-1133), which warns
+    // about a reflog it reads back past — all ahead of whatever the caller then
+    // dies with. [`warn_operand`] gave the innermost name's warning already.
+    // `handle_revision_arg_1()` strips the exclusion mark before resolving, so
+    // `^main^{blob}` is measured as `main^{blob}`.
+    let mut message =
+        crate::objname::peel_fallback_text(repo, spec.strip_prefix('^').unwrap_or(spec), false);
+    let generic =
+        bad_revision_message_gated(spec, repo.object_hash().len_in_hex(), seen_dashdash);
     // `die_verify_filename()` gives the operand one more pass, with
     // `GET_OID_ONLY_TO_DIE`, and `<rev>:<path>` / `:<n>:<path>` have their own
     // messages there — far more specific than the fallback below. The two shapes
@@ -7795,18 +7746,17 @@ pub(super) fn bad_revision_message_in_gated(
     // the pair `bad_revision_message_gated` answers with `bad revision`/`bad
     // object`, so the diagnosis is asked for only when the fallback would be the
     // three-line `ambiguous argument` text.
-    // `peel_onion()` reports an unreachable `^{<type>}` through `error()` while
-    // the resolution is still running, so the line precedes whatever the caller
-    // then dies with. `handle_revision_arg_1()` strips the exclusion mark before
-    // resolving, so `^main^{blob}` is measured as `main^{blob}`.
-    if let Some(peel) =
-        crate::objname::peel_type_error(repo, spec.strip_prefix('^').unwrap_or(spec))
-    {
-        message.push_str(&format!("error: {peel}\n"));
-    }
-    let generic =
-        bad_revision_message_gated(spec, repo.object_hash().len_in_hex(), seen_dashdash);
     if generic.starts_with("fatal: ambiguous argument") {
+        // `maybe_die_on_misspelt_object_name()` resolves with
+        // `GET_OID_ONLY_TO_DIE | GET_OID_QUIETLY` (object-name.c:1887), so
+        // `get_oid_basic()` warns about a reflog read back past only below a
+        // `~<n>`/`^<n>`, whose recursion drops the flag: `HEAD@{<old date>}^`
+        // warns twice in all, `HEAD@{<old date>}:<path>` once.
+        if crate::objname::quiet_lost_in_navigation(spec) {
+            if let Some(warning) = crate::objname::reflog_reach_warning(repo, spec) {
+                message.push_str(&warning);
+            }
+        }
         // `die_verify_filename()` resolves the operand once more, so its
         // `error()` comes out a second time — but only on this branch: the
         // `bad revision`/`bad object` shapes die inside `handle_revision_arg()`
@@ -7814,9 +7764,7 @@ pub(super) fn bad_revision_message_in_gated(
         // that pass's `GET_OID_QUIETLY`, so its ambiguity block comes out again
         // too (object-name.c:1880-1889).
         message.push_str(&crate::objname::misspelt_short_oid_report(repo, spec));
-        if let Some(peel) = crate::objname::peel_type_error(repo, spec) {
-            message.push_str(&format!("error: {peel}\n"));
-        }
+        message.push_str(&crate::objname::peel_fallback_text(repo, spec, true));
         if let Some(diagnosis) = crate::objpath::verify_filename_diagnosis(repo, spec) {
             message.push_str(&format!("fatal: {diagnosis}\n"));
             return message;
@@ -8486,22 +8434,101 @@ pub(crate) enum DiffMerges {
     FirstParent,
 }
 
-impl DiffMerges {
-    pub(crate) fn parse(v: &str) -> Option<Self> {
+/// `diff_merges_setup_func_t` (diff-merges.c:7): which of the setters
+/// `func_by_opt()` hands back runs — `set_none`, `set_first_parent`,
+/// `set_separate`, `set_combined`, `set_dense_combined` or `set_remerge_diff`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum MergesSetup {
+    None,
+    FirstParent,
+    Separate,
+    Combined,
+    DenseCombined,
+    Remerge,
+}
+
+impl MergesSetup {
+    /// `func_by_opt()` (diff-merges.c:70-87). `m` and `on` return
+    /// `set_to_default`, which starts as `set_separate` (diff-merges.c:10) and
+    /// which `log.diffMerges` moves ([`diff_merges_default`]); `default` is its
+    /// value.
+    pub(crate) fn by_opt(v: &str, default: MergesSetup) -> Option<Self> {
         Some(match v {
-            "off" | "none" => DiffMerges::Off,
-            "m" | "separate" => DiffMerges::Separate,
-            "c" | "combined" => DiffMerges::Combined,
-            "cc" | "dense-combined" => DiffMerges::DenseCombined,
-            "1" | "first-parent" => DiffMerges::FirstParent,
-            // `func_by_opt()`'s `"m"`/`"on"` arm returns `set_to_default`, whose
-            // initial value is `set_separate` (diff-merges.c:10). Only the
-            // `diff.mergesDefault`/`log.diffMerges` config can move it, and that is
-            // not read here, so `on` is `separate`.
-            "on" => DiffMerges::Separate,
+            "off" | "none" => MergesSetup::None,
+            "1" | "first-parent" => MergesSetup::FirstParent,
+            "separate" => MergesSetup::Separate,
+            "c" | "combined" => MergesSetup::Combined,
+            "cc" | "dense-combined" => MergesSetup::DenseCombined,
+            "r" | "remerge" => MergesSetup::Remerge,
+            "m" | "on" => default,
             _ => return None,
         })
     }
+
+    /// The `separate_merges`/`first_parent_merges`/`combine_merges`/
+    /// `dense_combined_merges` mode the setter leaves, as [`DiffMerges`] spells it,
+    /// and whether it raised `remerge_diff`. `set_remerge_diff()` is carried as
+    /// `separate` beside the flag, which `log_tree_diff()` tests first
+    /// (log-tree.c:1134).
+    pub(crate) fn mode(self) -> (DiffMerges, bool) {
+        match self {
+            MergesSetup::None => (DiffMerges::Off, false),
+            MergesSetup::FirstParent => (DiffMerges::FirstParent, false),
+            MergesSetup::Separate => (DiffMerges::Separate, false),
+            MergesSetup::Combined => (DiffMerges::Combined, false),
+            MergesSetup::DenseCombined => (DiffMerges::DenseCombined, false),
+            MergesSetup::Remerge => (DiffMerges::Separate, true),
+        }
+    }
+
+    /// `simplify_history = 0`, which `set_separate()` (and `set_first_parent()`
+    /// through it) and `set_remerge_diff()` do (diff-merges.c:40, :67).
+    pub(crate) fn clears_simplify_history(self) -> bool {
+        matches!(self, MergesSetup::FirstParent | MergesSetup::Separate | MergesSetup::Remerge)
+    }
+}
+
+/// [`diff_merges_default`] for a command that parses its options before this
+/// port opens the repository — a lone `-h`, which `parse_options()` answers,
+/// and `git show` — where `git_log_config()` has already run (builtin/log.c:674,
+/// :792, :837). Outside a repository the setter stays `set_separate`, and
+/// opening it is left to the caller, which reports the failure.
+pub(crate) fn diff_merges_config_gently() -> MergesSetup {
+    match crate::setup::discover() {
+        Ok(repo) => diff_merges_default(&repo),
+        Err(_) => MergesSetup::Separate,
+    }
+}
+
+/// `set_to_default` after `git_log_config()` has run (builtin/log.c:498-502):
+///
+/// ```c
+/// if (!strcmp(var, "log.diffmerges")) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         return diff_merges_config(value);
+/// }
+/// ```
+///
+/// The callback sees every occurrence in configuration order, so the first one
+/// that `diff_merges_config()` refuses (diff-merges.c:103-112) ends the command
+/// with `configset_iter()`'s `git_die_config_linenr()` (config.c:1654-1673),
+/// even when a later line would have set a valid value; a valueless one prints
+/// `config_error_nonbool()`'s `error()` first. `m`/`on` assign `set_to_default`
+/// to itself, so they leave whatever an earlier line chose.
+pub(crate) fn diff_merges_default(repo: &gix::Repository) -> MergesSetup {
+    let mut default = MergesSetup::Separate;
+    for v in crate::config::walk_config(repo).into_iter().filter(|v| v.key == "log.diffmerges") {
+        let Some(value) = v.value.as_deref() else {
+            eprintln!("error: missing value for '{}'", v.key);
+            crate::config::die_128(&v.origin.die_linenr(&v.key));
+        };
+        match MergesSetup::by_opt(value, default) {
+            Some(setup) => default = setup,
+            None => crate::config::die_128(&v.origin.die_linenr(&v.key)),
+        }
+    }
+    default
 }
 
 #[derive(Clone)]
@@ -9091,7 +9118,9 @@ fn reflog_excluded_spec(
         if let Some((lhs, rhs)) = spec.split_once("...") {
             let l = if lhs.is_empty() { "HEAD" } else { lhs };
             let r = if rhs.is_empty() { "HEAD" } else { rhs };
-            let (l, r) = (repo.rev_parse_single(l).ok()?, repo.rev_parse_single(r).ok()?);
+            // Each side through [`resolve_rev`], whose reflog reader takes the
+            // frame fallback a failed peel leaves (object-name.c:1127-1133).
+            let (l, r) = (resolve_rev(repo, l).ok()?, resolve_rev(repo, r).ok()?);
             return repo.merge_base(l, r).ok().map(|b| b.detach().to_string());
         }
         if let Some((lhs, rhs)) = spec.split_once("..") {
@@ -9420,6 +9449,17 @@ pub(super) fn warn_operand(repo: &gix::Repository, spec: &str, ambiguity: bool) 
         if let Some(warning) = crate::objname::reflog_reach_warning(repo, endpoint) {
             eprint!("{warning}");
         }
+        // `peel_onion()`'s `error()` and the `get_oid_basic()` fallback after it
+        // (`object-name.c:897-903`, :1127-1133) come out of the same
+        // resolution, for an operand that then resolves anyway:
+        // `HEAD@{1}^{blob}` is answered by reading `1}^{blob` as a date on
+        // HEAD's log. A plain operand that fails reports them in its fatal
+        // instead (see [`bad_revision_message_in_gated`]); a range endpoint
+        // has no fatal of its own, since what dies is the whole token, whose
+        // name `peel_onion()` cannot cut.
+        if range || crate::objname::resolve_quiet(repo, endpoint).is_some() {
+            crate::objname::report_peel_fallbacks(repo, endpoint);
+        }
         if range {
             // Already warned about above, so this is the same resolution rather
             // than a second operand — `resolve_quiet` and not
@@ -9446,6 +9486,13 @@ pub(super) fn revision_endpoints(spec: &str) -> Vec<&str> {
 }
 
 fn resolve_rev(repo: &gix::Repository, spec: &str) -> Result<ObjectId, ()> {
+    // `get_oid_basic()` answers a reflog operand, and a frame whose peel failed
+    // falls back to it whole (`object-name.c:1127-1133`), so `^HEAD@{1}^{blob}`
+    // excludes what `HEAD@{1}^{blob}` would walk — see
+    // [`crate::objname::reflog_spec_oid`].
+    if crate::objname::resolves_through_reflog(spec) {
+        return crate::objname::reflog_spec_oid(repo, spec).map(|id| peel_to_commit(repo, id)).ok_or(());
+    }
     // `get_short_oid()` under `GET_OID_COMMITTISH` decides a hex prefix in it
     // (revision.c:2074, :2227-2228); see [`crate::objname::hinted_spec`].
     let spec = crate::objname::hinted_spec(repo, spec, Some("committish")).ok_or(())?;

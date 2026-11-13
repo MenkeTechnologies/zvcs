@@ -659,6 +659,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // `get_short_oid()` reports whatever `--quiet` said
                     // (builtin/rev-parse.c:302).
                     eprint!("{}", crate::objname::short_oid_report(&repo, range.a, Some("committish"), false));
+                    // `peel_onion()`'s `error()` and its fallback, from the same
+                    // `repo_get_oid_committish()` call and without
+                    // `GET_OID_QUIETLY` for the same reason.
+                    if let ControlFlow::Break(code) = warn_peel_type(&mut out, &repo, range.a, false)? {
+                        return Ok(code);
+                    }
                     // The endpoint has already been warned about on the line
                     // above; this is the same resolution, not a second operand.
                     let a_resolved = crate::objname::resolves_committish_quietly(&repo, range.a);
@@ -670,6 +676,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                             return Ok(code);
                         }
                         eprint!("{}", crate::objname::short_oid_report(&repo, range.b, Some("committish"), false));
+                        if let ControlFlow::Break(code) = warn_peel_type(&mut out, &repo, range.b, false)? {
+                            return Ok(code);
+                        }
                     }
                 }
                 None => {
@@ -1000,9 +1009,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // The pass's `get_short_oid()` reports, below a `~<n>`/`^<n>` that
                     // dropped its `GET_OID_QUIETLY` (object-name.c:1880-1889).
                     eprint!("{}", crate::objname::misspelt_short_oid_report(&repo, arg));
-                    if let Some(message) = crate::objname::peel_type_error(&repo, arg) {
-                        eprintln!("error: {message}");
-                    }
+                    // `peel_onion()`'s `error()` for each frame that fails,
+                    // and the warning of a fallback below a `~<n>`/`^<n>`.
+                    eprint!("{}", crate::objname::peel_fallback_text(&repo, arg, true));
                     match crate::objpath::verify_filename_message(&repo, arg) {
                         Some(diagnosis) => eprintln!("fatal: {diagnosis}"),
                         None => eprintln!(
@@ -1276,34 +1285,48 @@ fn warn_reflog_reach(
 /// `error()` itself has no `flags` gate; the second reflog diagnosis carries the
 /// same gates as the first, and `peel_onion()` passes `lookup_flags` down
 /// untouched apart from `GET_OID_DISAMBIGUATORS`, so `--quiet` still reaches it.
+///
+/// The fallback is per frame, so a reflog operand can report more than once:
+/// `HEAD@{1}^{blob}^{blob}` prints the inner frame's `error()`, whose fallback
+/// answers with a commit, and then the outer frame's (see
+/// [`crate::objname::peel_fallback_events`]).
 fn warn_peel_type(
     out: &mut impl Write,
     repo: &gix::Repository,
     name: &str,
     quiet: bool,
 ) -> std::io::Result<ControlFlow<ExitCode>> {
-    let Some(message) = crate::objname::peel_type_error(repo, name) else {
+    let events = crate::objname::peel_fallback_events(repo, name, quiet);
+    if events.is_empty() {
         return Ok(ControlFlow::Continue(()));
-    };
-    out.flush()?;
-    eprintln!("error: {message}");
-    // `get_oid_basic()` a second time, on the **whole** name — so the reduction
-    // that produced the reflog diagnosis above does not apply here.
-    if let Some(message) = crate::objname::read_ref_at_warning_of(repo, name) {
-        eprintln!("warning: {message}");
     }
-    let quiet = quiet && !crate::objname::quiet_lost_in_navigation(name);
-    match crate::objname::reflog_reach_of(repo, name) {
-        Some(crate::objname::ReflogReach::Warning(message)) if !quiet => {
+    out.flush()?;
+    for event in events {
+        let (name, quiet) = match event {
+            crate::objname::PeelEvent::Error(message) => {
+                eprintln!("error: {message}");
+                continue;
+            }
+            crate::objname::PeelEvent::Basic(name, quiet) => (name, quiet),
+        };
+        // `get_oid_basic()` a second time, on the frame's **whole** name — so
+        // the reduction that produced the reflog diagnosis above does not apply
+        // here.
+        if let Some(message) = crate::objname::read_ref_at_warning_of(repo, &name) {
             eprintln!("warning: {message}");
         }
-        Some(crate::objname::ReflogReach::Fatal(message)) => {
-            if !quiet {
-                eprintln!("fatal: {message}");
+        match crate::objname::reflog_reach_of(repo, &name) {
+            Some(crate::objname::ReflogReach::Warning(message)) if !quiet => {
+                eprintln!("warning: {message}");
             }
-            return Ok(ControlFlow::Break(ExitCode::from(128)));
+            Some(crate::objname::ReflogReach::Fatal(message)) => {
+                if !quiet {
+                    eprintln!("fatal: {message}");
+                }
+                return Ok(ControlFlow::Break(ExitCode::from(128)));
+            }
+            _ => {}
         }
-        _ => {}
     }
     Ok(ControlFlow::Continue(()))
 }

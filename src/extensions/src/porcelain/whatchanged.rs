@@ -629,6 +629,13 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // repository too, where this used to die `fatal: not a git repository`.
     // The block is `log`'s own: git.c:659 registers `whatchanged` as `cmd_log`'s
     // sibling over `builtin_log_usage`.
+    //
+    // `cmd_whatchanged()` reads the configuration first (builtin/log.c:538), so
+    // a bad `log.diffMerges` dies ahead of the usage block and of the
+    // deprecation check alike.
+    if matches!(args, [a] if a == "-h" || a == "--help-all") {
+        super::log::diff_merges_config_gently();
+    }
     if let Some(code) =
         super::show_usage_if_asked_full(args, super::log::USAGE, super::log::USAGE_ALL)
     {
@@ -638,6 +645,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
     let repo = crate::setup::discover()?;
+    super::log::diff_merges_default(&repo);
     super::diff_files::init_quote_path(&repo);
 
     // git reads `log.*` display config in `git_log_config`, before `setup_revisions` and

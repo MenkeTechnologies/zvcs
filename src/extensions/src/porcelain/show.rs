@@ -450,6 +450,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         crate::parseopt::expand_short_owned_words(args, super::diff::DIFF_SHORT_OPTS);
     let args = &expanded[..];
 
+    // `cmd_show()` runs `git_log_config()` before it parses an option
+    // (builtin/log.c:674, :693), and `log.diffMerges` moves the setter `-m` and
+    // `--diff-merges=on|m` run.
+    let merges_default = super::log::diff_merges_config_gently();
     for (idx, a) in args.iter().enumerate() {
         if std::mem::take(&mut consumed_next) {
             continue;
@@ -759,14 +763,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // the `cmd_show` tweak below stops supplying a default.
             //
             // `-m` runs `set_to_default()` — `set_separate` unless
-            // `diff.mergesDefault`/`log.diffMerges` moved it, which this port does
-            // not read — and then clears `merges_need_diff`. That clearing cannot
-            // matter here: `cmd_show` sets `rev.diff = 1` unconditionally
-            // (builtin/log.c:686), so `log_tree_diff()`'s `all_need_diff` is
-            // already true and the merge is diffed either way.
+            // `log.diffMerges` moved it — and then clears `merges_need_diff`. That
+            // clearing cannot matter here: `cmd_show` sets `rev.diff = 1`
+            // unconditionally (builtin/log.c:686), so `log_tree_diff()`'s
+            // `all_need_diff` is already true and the merge is diffed either way.
             "-m" => {
-                diff_merges = Some(super::log::DiffMerges::Separate);
-                remerge = false;
+                let (mode, re) = merges_default.mode();
+                diff_merges = Some(mode);
+                remerge = re;
                 combined_all_paths = false;
             }
             "-c" => {
@@ -1198,18 +1202,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(v) = s.strip_prefix("--line-prefix=") {
                     line_prefix = v.as_bytes().to_vec();
                 } else if let Some(v) = s.strip_prefix("--diff-merges=") {
-                    match super::log::DiffMerges::parse(v) {
-                        Some(m) => {
-                            diff_merges = Some(m);
-                            remerge = false;
-                            combined_all_paths = false;
-                        }
-                        // `func_by_opt()` (diff-merges.c:82-83) does map
-                        // `r`/`remerge` onto `set_remerge_diff()`, so calling it
-                        // invalid would claim git rejects a value it accepts.
-                        None if matches!(v, "r" | "remerge") => {
-                            diff_merges = Some(super::log::DiffMerges::Separate);
-                            remerge = true;
+                    match super::log::MergesSetup::by_opt(v, merges_default) {
+                        Some(setup) => {
+                            let (mode, re) = setup.mode();
+                            diff_merges = Some(mode);
+                            remerge = re;
                             combined_all_paths = false;
                         }
                         None => {
@@ -1832,10 +1829,34 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // The test is on the *reduced* name: `HEAD@{<n>}^{commit}` reaches
         // `get_oid_basic()` as `HEAD@{<n>}`, and the peel then works on the object
         // the reader answered with. See [`crate::objname::reflog_spec_oid`].
-        let reflog = crate::objname::resolves_through_reflog(spec)
-            .then(|| crate::objname::reflog_spec_oid(&repo, spec))
-            .flatten()
-            .map(RevSpec::Include);
+        //
+        // `handle_revision_arg_1()` strips the exclusion mark, and
+        // `handle_dotdot()` cuts a range, before either side reaches
+        // `get_oid_basic()` (revision.c:2105-2150), so `^HEAD@{1}^{blob}` and
+        // `HEAD@{1}^{blob}..HEAD` are read the same way, frame fallback included.
+        let reflog_side = |side: &str| {
+            crate::objname::resolves_through_reflog(side)
+                .then(|| crate::objname::reflog_spec_oid(&repo, side))
+                .flatten()
+        };
+        let resolve_side = |side: &str| match reflog_side(side) {
+            Some(id) => Some(id),
+            None => crate::objname::resolve_quiet(&repo, side),
+        };
+        let reflog = match (spec.strip_prefix('^'), crate::objname::split_range(spec)) {
+            (Some(bare), _) => reflog_side(bare).map(RevSpec::Exclude),
+            (None, Some(range))
+                if crate::objname::resolves_through_reflog(range.a)
+                    || crate::objname::resolves_through_reflog(range.b) =>
+            {
+                match (resolve_side(range.a), resolve_side(range.b)) {
+                    (Some(theirs), Some(ours)) if range.symmetric => Some(RevSpec::Merge { theirs, ours }),
+                    (Some(from), Some(to)) => Some(RevSpec::Range { from, to }),
+                    _ => None,
+                }
+            }
+            (None, _) => reflog_side(spec).map(RevSpec::Include),
+        };
         // `get_oid_with_context_1()`'s `:/<text>` arm walks every ref in commit-date
         // order (`object-name.c:1763-1775`), which gitoxide's grammar answers
         // differently whenever more than one commit matches — so that spelling is

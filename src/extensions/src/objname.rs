@@ -467,7 +467,15 @@ fn peel_onion_error(repo: &gix::Repository, name: &str) -> Option<String> {
         "tree" => Some("treeish"),
         _ => disambiguate_filter(repo),
     };
-    let mut id = resolve_quiet_as(repo, base, hint)?;
+    let id = resolve_quiet_as(repo, base, hint)?;
+    let kind = peel_mismatch(repo, id, want)?;
+    Some(format!("{name}: expected {want} type, but the object dereferences to {kind} type"))
+}
+
+/// `repo_peel_to_type()` (object.c) refusing to take `id` to a `want` object:
+/// the type the dereference chain stopped at, or `None` when it got there (or
+/// the object cannot be read, which `peel_onion()` reports as nothing).
+fn peel_mismatch(repo: &gix::Repository, mut id: ObjectId, want: &str) -> Option<&'static str> {
     loop {
         let object = repo.find_object(id).ok()?;
         let kind = match object.kind {
@@ -482,11 +490,7 @@ fn peel_onion_error(repo: &gix::Repository, name: &str) -> Option<String> {
         match object.kind {
             gix::object::Kind::Tag => id = object.into_tag().decode().ok()?.target(),
             gix::object::Kind::Commit => id = object.into_commit().tree_id().ok()?.detach(),
-            _ => {
-                return Some(format!(
-                    "{name}: expected {want} type, but the object dereferences to {kind} type"
-                ))
-            }
+            _ => return Some(kind),
         }
     }
 }
@@ -912,18 +916,16 @@ fn resolve_as(
     reflog_diagnostics(repo, ambiguity_base(spec));
     // `peel_onion()`'s `error()` (`object-name.c:897-903`), raised from inside
     // `get_oid_1()` and therefore before `get_oid_basic()` ever answers.
-    if let Some(message) = peel_type_error(repo, spec) {
-        eprintln!("error: {message}");
-        // `peel_onion()` returned -1, so `get_oid_1()` hands `get_oid_basic()`
-        // the **whole** name (`object-name.c:1128-1132`) — a second, differently
-        // spelled trip through the reflog branch. `approxidate_careful()` does
-        // not reject `2005-01-01}^{blob` as a selector (it sets `*error_ret`
-        // only when nothing in the string was `isdigit()` or `isalpha()`,
-        // `date.c:1409-1410`), which is how stock 2.55.0 prints
-        // `log for 'HEAD' only goes back to …` twice for
-        // `HEAD@{<old date>}^{blob}` and answers with the oldest entry.
-        reflog_diagnostics(repo, spec);
-    }
+    //
+    // `peel_onion()` returned -1, so `get_oid_1()` hands `get_oid_basic()` the
+    // **whole** name of that frame (`object-name.c:1128-1132`) — a second,
+    // differently spelled trip through the reflog branch. `approxidate_careful()`
+    // does not reject `2005-01-01}^{blob` as a selector (it sets `*error_ret`
+    // only when nothing in the string was `isdigit()` or `isalpha()`,
+    // `date.c:1409-1410`), which is how stock prints
+    // `log for 'HEAD' only goes back to …` twice for
+    // `HEAD@{<old date>}^{blob}` and answers with the oldest entry.
+    report_peel_fallbacks(repo, spec);
     let resolved = resolve_quiet_as(repo, spec, want);
     if resolved.is_none() {
         // `get_short_oid()` is the last thing `get_oid_1()` tries
@@ -1331,19 +1333,166 @@ pub fn resolves_through_reflog(spec: &str) -> bool {
 /// returned -1, which is how stock answers `HEAD@{<old date>}^{blob}` at all
 /// despite the peel being impossible.
 pub fn reflog_spec_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let base = ambiguity_base(spec);
-    if base.len() < spec.len() && is_reflog_operand(base) {
-        if let Some(id) = reflog_oid(repo, base) {
-            let rewritten = format!("{}{}", id.to_hex(), &spec[base.len()..]);
-            if let Some(id) = resolve_quiet(repo, &rewritten) {
-                return Some(id);
+    // `get_oid_with_context_1()` cuts the `<rev>:<path>` arm before `get_oid_1()`
+    // is entered (`object-name.c:1821-1841`), and looks the path up in what the
+    // left half resolved to.
+    let rev = object_part(spec);
+    let id = reflog_get_oid_1(repo, rev, false, &mut Vec::new());
+    if rev.len() == spec.len() {
+        return id;
+    }
+    let id = id?;
+    resolve_quiet(repo, &format!("{}{}", id.to_hex(), &spec[rev.len()..]))
+}
+
+/// What one `get_oid_1()` frame of a reflog operand's reduction says on stderr,
+/// in the order [`reflog_get_oid_1`] meets it.
+pub enum PeelEvent {
+    /// `get_oid_basic()` was handed this name, so `read_ref_at()` and its
+    /// caller report on it ([`reflog_diagnostics`]) — unless the frame still
+    /// carries `GET_OID_QUIETLY`, the second field.
+    Basic(String, bool),
+    /// `peel_onion()`'s `error()` for this frame (`object-name.c:897-903`).
+    Error(String),
+}
+
+/// `get_oid_1()` (`object-name.c:1083-1141`) over a name whose reduction reaches
+/// a reflog operand, frame by frame, recording what each frame reports.
+///
+/// The fallback at the bottom of the C is per *frame*, not per operand:
+///
+/// ```c
+/// ret = peel_onion(r, name, len, oid, lookup_flags);
+/// if (!ret)
+///         return FOUND;
+///
+/// ret = get_oid_basic(r, name, len, oid, lookup_flags);
+/// ```
+///
+/// so in `HEAD@{1}^{blob}^{tree}` the inner frame `HEAD@{1}^{blob}` fails its
+/// peel, prints its `error()`, and is answered by `get_oid_basic()` reading
+/// `1}^{blob` as a date selector on HEAD's log — and the outer frame then peels
+/// *that* commit to its tree. Answering only the whole operand that way
+/// resolved it to the commit. The `~<n>`/`^<n>` frames return what
+/// `get_nth_ancestor()`/`get_parent()` return, with no fallback.
+fn reflog_get_oid_1(
+    repo: &gix::Repository,
+    name: &str,
+    quiet: bool,
+    events: &mut Vec<PeelEvent>,
+) -> Option<ObjectId> {
+    let basic = |events: &mut Vec<PeelEvent>| {
+        events.push(PeelEvent::Basic(name.to_string(), quiet));
+        if is_reflog_operand(name) {
+            reflog_oid(repo, name)
+        } else if resolves_through_reflog(name) {
+            // Only a name this reduction has already taken apart gets here (a
+            // `@{-<n>}`/`@{u}` mark ends it), and handing it back to
+            // [`resolve_quiet`] would come straight back to this function.
+            None
+        } else {
+            resolve_quiet(repo, name)
+        }
+    };
+    let Some((inner, ancestry)) = navigation_step(name) else {
+        // A `~<n>`/`^<n>` count `get_oid_1()` refuses is `MISSING_OBJECT` before
+        // anything below it runs (`object-name.c:1108-1120`).
+        if stops_at_missing_count(name) {
+            return None;
+        }
+        return basic(events);
+    };
+    let suffix = &name[inner.len()..];
+    // `get_parent()` and `get_nth_ancestor()` recurse with a literal
+    // `GET_OID_COMMITTISH`, which drops `GET_OID_QUIETLY` (see [`navigation`]);
+    // `peel_onion()` keeps the caller's flags.
+    let outer = reflog_get_oid_1(repo, inner, quiet && !ancestry, events);
+    if ancestry {
+        return resolve_quiet(repo, &format!("{}{}", outer?.to_hex(), suffix));
+    }
+    if let Some(id) = outer {
+        // `repo_peel_to_type()`'s `error()`, only for the four typed peels:
+        // `^{}`, `^{object}` and `^{/<text>}` fail without a word
+        // (`object-name.c:963-1006`).
+        let want = ["commit", "tag", "tree", "blob"]
+            .into_iter()
+            .find(|kind| suffix[2..].strip_prefix(kind) == Some("}"));
+        match want.and_then(|want| Some((want, peel_mismatch(repo, id, want)?))) {
+            Some((want, have)) => events.push(PeelEvent::Error(format!(
+                "{name}: expected {want} type, but the object dereferences to {have} type"
+            ))),
+            None => {
+                if let Some(id) = resolve_quiet(repo, &format!("{}{}", id.to_hex(), suffix)) {
+                    return Some(id);
+                }
             }
         }
     }
-    if is_reflog_operand(spec) {
-        return reflog_oid(repo, spec);
+    basic(events)
+}
+
+/// What `peel_onion()`'s frames and their `get_oid_basic()` fallbacks print for
+/// `spec` beyond the innermost name, which [`resolve_as`] reports first.
+///
+/// A reflog operand goes through [`reflog_get_oid_1`], which knows every frame:
+/// `HEAD@{1}^{blob}^{blob}` prints the inner frame's `error()` and then the
+/// outer one's, because the inner fallback answered with a commit the outer peel
+/// cannot take to a blob either. Anything else keeps [`peel_type_error`]'s
+/// single frame — a failed peel on a plain name leaves no `get_oid_basic()`
+/// fallback that could answer, so no outer frame gets as far as peeling.
+pub fn report_peel_fallbacks(repo: &gix::Repository, spec: &str) {
+    for event in peel_fallback_events(repo, spec, false) {
+        match event {
+            PeelEvent::Error(message) => eprintln!("error: {message}"),
+            PeelEvent::Basic(name, _) => reflog_diagnostics(repo, &name),
+        }
     }
-    None
+}
+
+/// [`report_peel_fallbacks`] as text, for a caller that is assembling the
+/// report an operand that failed to resolve dies with. A fallback name never
+/// reaches `read_ref_at()`'s `die()`: its selector runs to the end of the name,
+/// so it is read as a date rather than as an entry count.
+///
+/// `quiet` is `GET_OID_QUIETLY`, which `maybe_die_on_misspelt_object_name()`
+/// passes for its second resolution (object-name.c:1887): `get_oid_basic()`'s
+/// warning is then given only by a frame below a `~<n>`/`^<n>`, while
+/// `peel_onion()`'s `error()` is not gated at all.
+pub fn peel_fallback_text(repo: &gix::Repository, spec: &str, quiet: bool) -> String {
+    let mut text = String::new();
+    for event in peel_fallback_events(repo, spec, quiet) {
+        match event {
+            PeelEvent::Error(message) => text.push_str(&format!("error: {message}\n")),
+            PeelEvent::Basic(_, true) => {}
+            PeelEvent::Basic(name, false) => {
+                if let Some(message) = read_ref_at_warning_of(repo, &name) {
+                    text.push_str(&format!("warning: {message}\n"));
+                }
+                if let Some(ReflogReach::Warning(message)) = reflog_reach_of(repo, &name) {
+                    text.push_str(&format!("warning: {message}\n"));
+                }
+            }
+        }
+    }
+    text
+}
+
+/// The events behind [`report_peel_fallbacks`], innermost `get_oid_basic()` left out.
+pub fn peel_fallback_events(repo: &gix::Repository, spec: &str, quiet: bool) -> Vec<PeelEvent> {
+    let rev = object_part(spec);
+    if resolves_through_reflog(rev) {
+        let mut events = Vec::new();
+        reflog_get_oid_1(repo, rev, quiet, &mut events);
+        // The innermost `get_oid_basic()` is the caller's to report.
+        if matches!(events.first(), Some(PeelEvent::Basic(..))) {
+            events.remove(0);
+        }
+        events
+    } else if let Some(message) = peel_type_error(repo, spec) {
+        vec![PeelEvent::Error(message), PeelEvent::Basic(spec.to_string(), quiet)]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The operand as gitoxide's revspec parser needs to see it: `@{u}`-family marks

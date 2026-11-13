@@ -1664,7 +1664,7 @@ fn log_expiry(repo: &gix::Repository) -> Result<String, LogExpiryRejection> {
     let Some((value, origin)) = last_value_with_source(repo, "gc.logExpiry") else {
         return Ok("1.day.ago".to_string());
     };
-    if value != "now" && crate::date::approxidate(&value) >= crate::date::now_seconds() {
+    if crate::date::config_expiry_rejected(&value) {
         return Err(LogExpiryRejection { value, origin });
     }
     Ok(value)

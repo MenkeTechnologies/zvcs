@@ -62,6 +62,29 @@ pub fn parse_expiry_date(value: &str) -> Option<i64> {
     gix::date::parse::parse_expiry_date(value, now_seconds())
 }
 
+/// The refusal in `repo_config_get_expiry()` (config.c:2486-2490): a configured expiry other
+/// than the literal `now` must resolve to a moment strictly before the present.
+///
+/// ```c
+/// if (strcmp(*output, "now")) {
+///         timestamp_t now = approxidate("now");
+///         if (approxidate(*output) >= now)
+///                 git_die_config(r, key, _("Invalid %s: '%s'"), key, *output);
+/// }
+/// ```
+///
+/// `now` is read first, in its own statement, and the value second. A value [`approxidate()`]
+/// cannot read resolves to the clock at its own call, so read in that order it is never earlier
+/// than `now` and is always refused. Reading the value first lets a second boundary fall between
+/// the two reads and accept `bogus`.
+pub fn config_expiry_rejected(value: &str) -> bool {
+    if value == "now" {
+        return false;
+    }
+    let now = approxidate("now");
+    approxidate(value) >= now
+}
+
 /// git's `date_string()` (date.c:835-844): `<seconds> <±hhmm>`, the form every
 /// stored ident date takes. `offset_minutes` is signed minutes east of UTC.
 pub fn date_string(seconds: i64, offset_minutes: i64) -> String {

@@ -1318,7 +1318,7 @@ fn check_expiry(value: Option<ConfigValue>, key: &str) -> Result<(), Rejection> 
         return Ok(());
     };
     let raw = string_value(&v)?;
-    if raw != "now" && crate::date::approxidate(&raw) >= crate::date::now_seconds() {
+    if crate::date::config_expiry_rejected(&raw) {
         return Err(reported(&v, vec![format!("Invalid {key}: '{raw}'")]));
     }
     Ok(())

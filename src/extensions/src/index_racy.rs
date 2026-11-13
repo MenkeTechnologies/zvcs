@@ -589,7 +589,7 @@ fn clean_shared_index_files(
             return Err(std::io::Error::other("splitindex.sharedindexexpire"));
         }
         Some(Some(value)) => {
-            if value != "now" && crate::date::approxidate(&value) >= crate::date::approxidate("now") {
+            if crate::date::config_expiry_rejected(&value) {
                 *bad_expiry = Some(Some(format!("Invalid splitindex.sharedindexexpire: '{value}'")));
                 return Err(std::io::Error::other("splitindex.sharedindexexpire"));
             }

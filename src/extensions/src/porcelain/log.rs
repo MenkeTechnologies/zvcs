@@ -7112,6 +7112,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                             &remerge_headers,
                             show_conflict_headers,
                             &patch_opts.colors,
+                            (&patch_opts.src_prefix, &patch_opts.dst_prefix),
                         );
                         &spliced
                     }

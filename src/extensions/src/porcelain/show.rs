@@ -3560,6 +3560,10 @@ pub(super) fn splice_remerge_headers(
     // queue prints anything.
     inject_missing: bool,
     colors: &super::diff_color::DiffColors,
+    // `o->a_prefix`/`o->b_prefix`, already swapped under `-R`: `builtin_diff()`
+    // writes the header-only pair's `diff --git` line with them (diff.c:3903-3912),
+    // as it writes every section's, so `--no-prefix` and `--src-prefix` reach it.
+    (src_prefix, dst_prefix): (&[u8], &[u8]),
 ) -> Vec<u8> {
     if headers.is_empty() {
         return body;
@@ -3576,22 +3580,25 @@ pub(super) fn splice_remerge_headers(
             }
         }
     };
-    // The `diff --git a/<old> b/<new>` line's paths, unquoted. A path git had to
-    // C-quote is left alone: the header map is keyed by the raw bytes, and a quoted
-    // header line would not match it — the notice is then simply not spliced rather
-    // than attached to the wrong section.
+    // The `diff --git <src-prefix><old> <dst-prefix><new>` line's paths, unquoted.
+    // A path git had to C-quote is left alone: the header map is keyed by the raw
+    // bytes, and a quoted header line would not match it — the notice is then
+    // simply not spliced rather than attached to the wrong section.
+    let mut head = b"diff --git ".to_vec();
+    head.extend_from_slice(src_prefix);
+    let mut sep_mark = b" ".to_vec();
+    sep_mark.extend_from_slice(dst_prefix);
     let section_path = |line: &[u8]| -> Option<Vec<u8>> {
         let plain = strip_sgr(line);
-        let rest = plain.strip_prefix(b"diff --git a/".as_slice())?.to_vec();
+        let rest = plain.strip_prefix(head.as_slice())?.to_vec();
         // A path that carries a notice is recognized by matching the key itself, so
-        // a name containing ` b/` cannot be split in the wrong place.
-        if let Some((p, _)) = headers
-            .iter()
-            .find(|(p, _)| rest.starts_with(p.as_slice()) && rest[p.len()..].starts_with(b" b/"))
-        {
+        // a name containing the separator cannot be split in the wrong place.
+        if let Some((p, _)) = headers.iter().find(|(p, _)| {
+            rest.starts_with(p.as_slice()) && rest[p.len()..].starts_with(sep_mark.as_slice())
+        }) {
             return Some(p.clone());
         }
-        let sep = find_sub(&rest, b" b/")?;
+        let sep = find_sub(&rest, &sep_mark)?;
         Some(rest[..sep].to_vec())
     };
     // `fill_metainfo()`'s own repertoire (diff.c:4860-4906): everything it can write
@@ -3631,7 +3638,7 @@ pub(super) fn splice_remerge_headers(
             // among the real ones.
             while let Some(pos) = pending.iter().position(|(p, _)| *p < path) {
                 let (p, lines) = pending.remove(pos);
-                emit_git_header_painted(&mut out, p, p, meta, reset);
+                emit_git_header_painted(&mut out, (src_prefix, p), (dst_prefix, p), meta, reset);
                 render(&mut out, lines);
             }
             out.extend_from_slice(line);
@@ -3653,7 +3660,7 @@ pub(super) fn splice_remerge_headers(
         out.extend_from_slice(line);
     }
     for (p, lines) in pending {
-        emit_git_header_painted(&mut out, p, p, meta, reset);
+        emit_git_header_painted(&mut out, (src_prefix, p), (dst_prefix, p), meta, reset);
         render(&mut out, lines);
     }
     out
@@ -3661,11 +3668,19 @@ pub(super) fn splice_remerge_headers(
 
 /// The `diff --git` line of a header-only section, in the `meta` color the rest of
 /// the metainfo block carries (diff.c:3912).
-fn emit_git_header_painted(out: &mut Vec<u8>, old: &[u8], new: &[u8], meta: &str, reset: &str) {
+fn emit_git_header_painted(
+    out: &mut Vec<u8>,
+    (src_prefix, old): (&[u8], &[u8]),
+    (dst_prefix, new): (&[u8], &[u8]),
+    meta: &str,
+    reset: &str,
+) {
     out.extend_from_slice(meta.as_bytes());
-    out.extend_from_slice(b"diff --git a/");
+    out.extend_from_slice(b"diff --git ");
+    out.extend_from_slice(src_prefix);
     out.extend_from_slice(old);
-    out.extend_from_slice(b" b/");
+    out.push(b' ');
+    out.extend_from_slice(dst_prefix);
     out.extend_from_slice(new);
     out.extend_from_slice(reset.as_bytes());
     out.push(b'\n');
@@ -4719,6 +4734,7 @@ fn show_commit_record(
                     &remerge_headers,
                     show_conflict_headers,
                     &disp.patch.colors,
+                    (&disp.patch.src_prefix, &disp.patch.dst_prefix),
                 ));
                 if painted && out.len() != start {
                     disp.no_prefix.borrow_mut().push((start, out.len()));

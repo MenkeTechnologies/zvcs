@@ -140,6 +140,12 @@
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
 //!   the full id, `--abbrev=<n>` clamps `<n>` to `[4, 40]`, and a non-numeric
 //!   `<n>` is the 129 `error: option 'abbrev' expects a numerical value`).
+//! * Every `--diff-merges` spelling (`--diff-merges=<fmt>`, `--remerge-diff`,
+//!   `--no-diff-merges`, and the `--no-remerge-diff` the inner log refuses)
+//!   sets `include_merges` (builtin/range-diff.c:93-97). Such a run reads both
+//!   ranges the way `read_patches()` does: from a `git log` child, its output
+//!   folded into patches (see [`read_patches_log`]), so a merge is rendered in
+//!   whatever form its style gives it.
 //! * The diff options that upstream forwards but that touch only patch bytes
 //!   this port already discards, or that address machinery the diff-of-diffs
 //!   does not have, so accepting them changes nothing. Each was verified
@@ -148,10 +154,6 @@
 //!   * `--full-index` (the abbreviated/full `index` line is dropped) and
 //!     `--binary` (text files gain no binary hunk; the `Binary files … differ`
 //!     label is unchanged).
-//!   * Every `--diff-merges` variant (`--no-diff-merges`, `--remerge-diff`,
-//!     `--diff-merges=<fmt>`) *when neither range contains a merge*, which is
-//!     the patch-series shape range-diff exists for. See the known deviation
-//!     below for what happens when one does.
 //!   * `--textconv` / `--no-textconv`: `get_textconv()` (diff.c:3762) asks
 //!     `diff_filespec_load_driver()`, which returns immediately because a driver
 //!     is already set (diff.c:2312-2313) — the hardcoded `section_headers`
@@ -300,12 +302,12 @@
 //!
 //! ### Not covered — these stop rather than emit output that would diverge
 //!
-//! * `--stat=<width>` and the `--stat-*-width` / `--stat-count` spellings, and
-//!   `--compact-summary`: they carry a geometry (and, for the last, a per-row
-//!   annotation) this port does not thread into [`diffstat::show_stats`]. Plain
-//!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
-//!   widths give it — `builtin/range-diff.c` never calls
-//!   `init_diffstat_widths()`.
+//! * `--compact-summary`. `--stat`, `--stat=<w>[,<n>[,<c>]]` and the
+//!   `--stat-*` spellings are rendered: what they set reaches
+//!   [`diffstat::show_stats`], and what they leave is the zeroes
+//!   `repo_diff_setup()` gives it — `builtin/range-diff.c` never calls
+//!   `init_diffstat_widths()`, so there is no `$COLUMNS` and no
+//!   `diff.stat*Width`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -340,16 +342,6 @@
 //!   then `could not parse log`, 255), while one it claims — `-p`, `--stat`, a
 //!   `git log` option — stops the run as an unsupported flag instead of drawing
 //!   output the claimed option would have changed.
-//! * Any `--diff-merges` spelling — `--remerge-diff` and `--no-diff-merges`
-//!   included, since both push onto `diff_merges_arg` — makes upstream set
-//!   `range_diff_opts.include_merges` (builtin/range-diff.c:94-97), so a merge
-//!   inside either range then gets its own pair-header line. This port always
-//!   walks with merges excluded, so on such a range it prints one line fewer.
-//!   Confirmed against git 2.55.0: on a range holding one merge,
-//!   `range-diff -s --remerge-diff <r1> <r2>` lists the merge and the flagless
-//!   run does not. These options are still accepted rather than deferred,
-//!   because on a merge-free range — the patch series range-diff is for — they
-//!   are byte-identical.
 //! * `is_range_diff_range()` counts the *objects* `setup_revisions()` left
 //!   pending and demands at least one positive and one negative. When both ends
 //!   of `<a>..<b>` name the same commit, upstream sees one object carrying
@@ -1041,6 +1033,11 @@ struct Opts {
     /// With it up, `run_diff_cmd()` hands the `a`/`b` filepair to the program
     /// `external_diff()` or path `a`'s `diff.<driver>.command` names.
     allow_external: bool,
+    /// `stat_width`, `stat_name_width`, `stat_graph_width` and `stat_count`,
+    /// which `--stat=<w>[,<n>[,<c>]]` and the `--stat-*` options set
+    /// (`diff_opt_stat()`, diff.c:5381-5427) on top of the zeroes
+    /// `repo_diff_setup()` leaves.
+    stat_widths: diffstat::StatWidths,
 }
 
 impl Opts {
@@ -1088,6 +1085,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
         allow_external: false,
+        stat_widths: diffstat::StatWidths::plumbing(),
     };
     // `--ws-error-highlight=<kind>`, held until the config default can be read.
     let mut ws_error_highlight: Option<u32> = None;
@@ -1134,9 +1132,14 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // `diffopt.anchors`, the `--anchored=<text>` list of the outer diff.
     let mut anchors: Vec<String> = Vec::new();
 
-    // The first `--diff-merges` style the inner `git log` would reject, held
-    // back until that log runs so the ordering matches upstream.
-    let mut bad_diff_merges: Option<String> = None;
+    // `log_arg` and `diff_merges_arg` (builtin/range-diff.c:41-42): the
+    // `OPT_PASSTHRU_ARGV` spellings `recreate_opt()` rebuilds as
+    // `--[no-]<long-name>[=<arg>]` (parse-options-cb.c:271-293), in command-line
+    // order. Any `--diff-merges` spelling makes the inner logs include merges
+    // (builtin/range-diff.c:93-97), and those patches are then read from a real
+    // `git log` child exactly as `read_patches()` does (see [`read_patches_log`]).
+    let mut notes_arg: Vec<String> = Vec::new();
+    let mut diff_merges_arg: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -1270,6 +1273,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             "--no-notes" => {
                 opts.notes.disable();
                 opts.notes.given = true;
+                notes_arg.push("--no-notes".into());
             }
             "--notes" => {
                 match inline {
@@ -1277,6 +1281,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     None => opts.notes.enable_default(),
                 }
                 opts.notes.given = true;
+                notes_arg.push(match inline {
+                    Some(v) => format!("--notes={v}"),
+                    None => "--notes".into(),
+                });
             }
             // `--abbrev`/`--no-abbrev`/`--abbrev=<n>` rewrite the abbreviated id
             // printed in every pair header. Upstream's `parse_opt_abbrev_cb`:
@@ -1303,14 +1311,19 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // port already discards: `--full-index` only lengthens the `index`
             // line (dropped with the rest of the diff header), `--binary` adds a
             // binary hunk to text files that have none and leaves the `Binary
-            // files … differ` label untouched, and every `--diff-merges` variant
-            // acts on merges that range-diff excludes (`--no-merges`). So they
-            // are genuine no-ops here, not deferrals — accept them silently.
+            // files … differ` label untouched. So they are genuine no-ops here,
+            // not deferrals — accept them silently.
             //
             // `--binary` carries `PARSE_OPT_NONEG` (diff.c:6089), so `--no-binary` is
             // not a spelling parse-options resolves at all; it falls through to the
             // `unknown option` refusal below, exactly as stock rejects it.
-            "--full-index" | "--binary" | "--no-diff-merges" | "--remerge-diff" => {}
+            "--full-index" | "--binary" => {}
+            // `OPT_PASSTHRU_ARGV` into `diff_merges_arg` (builtin/range-diff.c:
+            // 59-60, 65-66), negations included: the inner log is the one that
+            // refuses `--no-remerge-diff`.
+            "--no-diff-merges" | "--remerge-diff" | "--no-remerge-diff" => {
+                diff_merges_arg.push(name.into())
+            }
             // The rest of the provable no-ops, each one a diff option
             // `add_diff_options()` wires to the *outer* diff-of-diffs
             // (builtin/range-diff.c:83) whose effect that diff cannot have:
@@ -1702,9 +1715,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             // `--diff-merges` is an `OPT_PASSTHRU_ARGV`, so its value is not
             // checked here — it is handed to the inner `git log`, which dies on
-            // a style it does not know. Record the first bad one and report it
-            // where that log would have run (see below); reporting it now would
-            // put it ahead of the range resolution git does first.
+            // a style it does not know.
             "--diff-merges" => {
                 let value = match inline {
                     Some(v) => Some(v.to_string()),
@@ -1714,9 +1725,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     }
                 };
                 if let Some(v) = value {
-                    if !crate::diffopt::diff_merges_is_valid(&v) && bad_diff_merges.is_none() {
-                        bad_diff_merges = Some(v);
-                    }
+                    diff_merges_arg.push(format!("--diff-merges={v}"));
                 }
             }
             // `-s`/`--no-patch` assigns `DIFF_FORMAT_NO_OUTPUT`, clearing the
@@ -1874,13 +1883,32 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     format_bits(name, inline),
                     Some((FMT_SUMMARY, _)) | Some((FMT_DIRSTAT, false))
                 );
+                // `diff_opt_stat()` (diff.c:5381-5427) folds each `--stat`
+                // spelling into the geometry `show_stats()` reads: `--stat=<w>`
+                // always sets the width and a comma-introduced field the name
+                // width and count, leaving the rest as they were.
+                let geometry = match name {
+                    "--stat" => {
+                        if let Some(spec) = inline {
+                            diffstat::parse_stat_geometry(&mut opts.stat_widths, spec);
+                        }
+                        true
+                    }
+                    flag if diff::is_stat_width_flag(flag) => {
+                        if let (Some(slot), Some(v)) =
+                            (diff::stat_width_slot_of(&mut opts.stat_widths, flag), shared_value)
+                        {
+                            *slot = v.trim().parse().unwrap_or(0);
+                        }
+                        true
+                    }
+                    _ => false,
+                };
                 // The formats [`flush_pair`] renders itself. Their bytes are
                 // fixed by the filepair's shape (`--raw`, `--name-only`,
                 // `--name-status`) or derived from the same outer diff the patch
                 // body is (`--check` and the stat group), so nothing is left for
-                // a later flag to change. `--stat=<width>` and the
-                // `--stat-*-width` spellings are excluded: they carry a geometry
-                // this port does not thread into `show_stats()`.
+                // a later flag to change.
                 let rendered = matches!(
                     name,
                     "--raw"
@@ -1891,7 +1919,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                         | "--patch-with-stat"
                         | "--numstat"
                         | "--shortstat"
-                ) || (name == "--stat" && inline.is_none());
+                ) || geometry;
                 if !writes_nothing && !rendered {
                     opts.defer(unsupported_flag(a));
                 }
@@ -2067,6 +2095,12 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Ok(c) => c,
         Err(code) => return Ok(code),
     };
+    // `strvec_pushv(&log_arg, argv + …)` (builtin/range-diff.c:128/148/179): the
+    // operands the form did not consume, `--` included, follow the passthrough
+    // `--notes` spellings and the `--diff-merges` ones (builtin/range-diff.c:93-97).
+    let include_merges = !diff_merges_arg.is_empty();
+    let log_arg: Vec<String> =
+        notes_arg.into_iter().chain(diff_merges_arg).chain(extra.iter().cloned()).collect();
 
     if opts.left_only && opts.right_only {
         // Upstream's `error()`, whose -1 return becomes git's exit status 255.
@@ -2074,90 +2108,107 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    // The inner `git log` opens with `repo_config(git_log_config)` and
-    // `repo_init_revisions()`'s `grep_config` pass, so a value they refuse is the log's
-    // `fatal:` followed by `could not parse log`, ahead of resolving the range. The
-    // parent runs neither, which is why a usage error (`need two commit ranges`)
-    // above is never pre-empted by one.
-    if let Some(code) = inner_log_config_refusal(&repo, &range1) {
-        return Ok(code);
-    }
+    // A run that includes merges hands both ranges to the `git log` children
+    // upstream starts (range-diff.c:54-81, see [`read_patches_log`]), oldest
+    // range first: each check the branch below emulates is one those logs make
+    // themselves, in their own words and order.
+    let (mut a, mut b) = if include_merges {
+        let a = match read_patches_log(&repo, &range1, &log_arg, &opts.abbrev)? {
+            Ok(p) => p,
+            Err(code) => return Ok(code),
+        };
+        let b = match read_patches_log(&repo, &range2, &log_arg, &opts.abbrev)? {
+            Ok(p) => p,
+            Err(code) => return Ok(code),
+        };
+        (a, b)
+    } else {
+        // The inner `git log` opens with `repo_config(git_log_config)` and
+        // `repo_init_revisions()`'s `grep_config` pass, so a value they refuse is the log's
+        // `fatal:` followed by `could not parse log`, ahead of resolving the range. The
+        // parent runs neither, which is why a usage error (`need two commit ranges`)
+        // above is never pre-empted by one.
+        if let Some(code) = inner_log_config_refusal(&repo, &range1) {
+            return Ok(code);
+        }
 
-    // Upstream resolves each range by running `git log` over it, oldest range
-    // first; a range naming an unknown revision is fatal before any patch is
-    // read, and `git log`'s -1 return becomes exit status 255.
-    if let Some(code) = inner_log_options(&repo, &range1, &extra, true)? {
-        return Ok(code);
-    }
-    let mut ends1 = match endpoints(&repo, &range1) {
-        Ok(e) => walkable(&repo, e),
-        Err(_) => return Ok(could_not_parse_log(&repo, &range1)),
-    };
-    // The inner `git log` takes the range first and the forwarded `log_arg`
-    // after it (`range-diff.c` `read_patches()`), so a range it cannot resolve
-    // is reported ahead of a `--diff-merges` style it cannot parse — but a
-    // resolvable range1 lets the style error out, before range2 is ever tried.
-    if let Some(v) = &bad_diff_merges {
-        eprintln!("fatal: invalid value for '--diff-merges': '{v}'");
-        return Ok(log_parse_failed(&range1));
-    }
-    // Everything from the form's consumed count onward — the `--` included — is
-    // what upstream hands that same `git log` after its range
-    // (`strvec_pushv(&log_arg, argv + …)`, builtin/range-diff.c:128/148/179,
-    // spliced in at range-diff.c:71-73). It is resolved here, between the two
-    // ranges, because range1's log is the one that meets it first: an operand it
-    // rejects is reported against range1, and range2's log never runs.
-    let operands = match extra_operands(&repo, &range1, &extra) {
-        Ok(e) => e,
-        Err(code) => return Ok(code),
-    };
-    if let Some(code) = inner_log_options(&repo, &range2, &extra, false)? {
-        return Ok(code);
-    }
-    let mut ends2 = match endpoints(&repo, &range2) {
-        Ok(e) => walkable(&repo, e),
-        Err(_) => return Ok(could_not_parse_log(&repo, &range2)),
-    };
-    // range2's log is a *second* process handed the same `log_arg` list, so it
-    // resolves every one of those operands over again. That is observable: an
-    // operand that is a full-length hex and also a ref name earns
-    // `get_oid_basic()`'s `warning: refname … is ambiguous.` once per log, and
-    // stock 2.55.0 prints it twice for `range-diff <r1> <r2> <40-hex>`. Resolving
-    // once and reusing the ids under-warns by exactly one. The result is
-    // discarded — it can only equal the first pass's — for the same reason
-    // `notes1` and `notes2` are loaded separately below: what is being reproduced
-    // is the second log's side effects, not a second answer.
-    if let Err(code) = extra_operands(&repo, &range2, &extra) {
-        return Ok(code);
-    }
-    let extra = operands;
+        // Upstream resolves each range by running `git log` over it, oldest range
+        // first; a range naming an unknown revision is fatal before any patch is
+        // read, and `git log`'s -1 return becomes exit status 255.
+        if let Some(code) = inner_log_options(&repo, &range1, &extra, true)? {
+            return Ok(code);
+        }
+        let mut ends1 = match endpoints(&repo, &range1) {
+            Ok(e) => walkable(&repo, e),
+            Err(_) => return Ok(could_not_parse_log(&repo, &range1)),
+        };
+        // Everything from the form's consumed count onward — the `--` included — is
+        // what upstream hands that same `git log` after its range
+        // (`strvec_pushv(&log_arg, argv + …)`, builtin/range-diff.c:128/148/179,
+        // spliced in at range-diff.c:71-73). It is resolved here, between the two
+        // ranges, because range1's log is the one that meets it first: an operand it
+        // rejects is reported against range1, and range2's log never runs.
+        let operands = match extra_operands(&repo, &range1, &extra) {
+            Ok(e) => e,
+            Err(code) => return Ok(code),
+        };
+        // A pathspec limits both which commits appear and which file sections each
+        // rendered patch carries. `setup_revisions()` parses it in range1's log, so
+        // one it refuses is that log's `die()`, and range2's never runs.
+        let matcher = match build_matcher(&repo, &operands.pathspec) {
+            Ok(m) => m,
+            Err(e) => match e.downcast::<crate::fatal::Fatal>() {
+                Ok(fatal) => {
+                    eprintln!("fatal: {fatal}");
+                    return Ok(log_parse_failed(&range1));
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        if let Some(code) = inner_log_options(&repo, &range2, &extra, false)? {
+            return Ok(code);
+        }
+        let mut ends2 = match endpoints(&repo, &range2) {
+            Ok(e) => walkable(&repo, e),
+            Err(_) => return Ok(could_not_parse_log(&repo, &range2)),
+        };
+        // range2's log is a *second* process handed the same `log_arg` list, so it
+        // resolves every one of those operands over again. That is observable: an
+        // operand that is a full-length hex and also a ref name earns
+        // `get_oid_basic()`'s `warning: refname … is ambiguous.` once per log, and
+        // stock 2.55.0 prints it twice for `range-diff <r1> <r2> <40-hex>`. Resolving
+        // once and reusing the ids under-warns by exactly one. The result is
+        // discarded — it can only equal the first pass's — for the same reason
+        // `notes1` and `notes2` are loaded separately below: what is being reproduced
+        // is the second log's side effects, not a second answer.
+        if let Err(code) = extra_operands(&repo, &range2, &extra) {
+            return Ok(code);
+        }
+        let extra = operands;
 
-    // The one `log_arg` list is appended to *both* logs, so a revision operand
-    // widens each walk alike.
-    for (tips, hidden) in [&mut ends1, &mut ends2] {
-        tips.extend(extra.tips.iter().copied());
-        hidden.extend(extra.hidden.iter().copied());
-    }
+        // The one `log_arg` list is appended to *both* logs, so a revision operand
+        // widens each walk alike.
+        for (tips, hidden) in [&mut ends1, &mut ends2] {
+            tips.extend(extra.tips.iter().copied());
+            hidden.extend(extra.hidden.iter().copied());
+        }
 
-    // A pathspec limits both which commits appear and which file sections each
-    // rendered patch carries.
-    let matcher = build_matcher(&repo, &extra.pathspec)?;
-
-
-    let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
-    // `--notes[=<ref>]`/`--no-notes` are passed straight to the `git log`
-    // upstream runs, so the display refs are the ones that log would have used.
-    // Loaded once per range because upstream runs one log per range: a ref that
-    // does not resolve warns once for each of them.
-    let notes1 = super::notes::load_display(&repo, &opts.notes)?;
-    let mut a = match read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes1, &range1)? {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
-    let notes2 = super::notes::load_display(&repo, &opts.notes)?;
-    let mut b = match read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes2, &range2)? {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
+        let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
+        // `--notes[=<ref>]`/`--no-notes` are passed straight to the `git log`
+        // upstream runs, so the display refs are the ones that log would have used.
+        // Loaded once per range because upstream runs one log per range: a ref that
+        // does not resolve warns once for each of them.
+        let notes1 = super::notes::load_display(&repo, &opts.notes)?;
+        let a = match read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes1, &range1)? {
+            Ok(p) => p,
+            Err(code) => return Ok(code),
+        };
+        let notes2 = super::notes::load_display(&repo, &opts.notes)?;
+        let b = match read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes2, &range2)? {
+            Ok(p) => p,
+            Err(code) => return Ok(code),
+        };
+        (a, b)
     };
 
     find_exact_matches(&mut a, &mut b);
@@ -2318,6 +2369,7 @@ pub(super) fn show_range_diff(
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
         allow_external: false,
+        stat_widths: diffstat::StatWidths::plumbing(),
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -3140,6 +3192,22 @@ fn build_matcher(repo: &gix::Repository, pathspec: &[String]) -> Result<Option<P
     if pathspec.is_empty() || pathspec.iter().any(String::is_empty) {
         return Ok(None);
     }
+    // The inner `git log` starts where `setup_git_directory()` left range-diff:
+    // discovery walks up to the top of the work tree and stays there
+    // (setup.c:1268-1272), so `-- <path>` names a path from the top, not from
+    // the directory the command was run in. The matcher is built there, from a
+    // handle opened there.
+    if let (Some(top), Ok(Some(prefix))) = (repo.workdir(), repo.prefix()) {
+        if !prefix.as_os_str().is_empty() {
+            let cwd = std::env::current_dir()?;
+            std::env::set_current_dir(top)?;
+            let matcher = crate::setup::discover()
+                .map_err(anyhow::Error::from)
+                .and_then(|at_top| PathMatcher::new(&at_top, pathspec));
+            std::env::set_current_dir(cwd)?;
+            return Ok(Some(matcher?));
+        }
+    }
     Ok(Some(PathMatcher::new(repo, pathspec)?))
 }
 
@@ -3341,6 +3409,659 @@ fn read_patches(
         }
     }
     Ok(Ok(out))
+}
+
+/// `read_patches()` (range-diff.c:41-237) as upstream runs it for a range-diff
+/// that includes merges: a `git log` child over `range` and `log_arg`, its
+/// output folded into one patch text per `commit` line.
+///
+/// Every `--diff-merges` spelling sets `include_merges` (builtin/range-diff.c:
+/// 93-97), so a merge reaches the patch list in whatever form the log renders
+/// it: `separate` gives one `commit <id> (from <parent>)` record per parent,
+/// each its own patch; a combined diff has no `diff --git` line, so its lines
+/// stay in the header and only a four-space-indented one survives; a remerge
+/// diff's `remerge CONFLICT` line ends `parse_git_diff_header()`'s table and
+/// becomes context along with the header lines after it. Reading the child's
+/// output rather than re-deriving each style keeps all of that exact.
+fn read_patches_log(
+    repo: &gix::Repository,
+    range: &str,
+    log_arg: &[String],
+    abbrev: &Abbrev,
+) -> Result<std::result::Result<Vec<Patch>, ExitCode>> {
+    // range-diff.c:54-75; `--no-merges` is pushed only without `include_merges`.
+    let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+    cmd.args([
+        "log",
+        "--no-color",
+        "-p",
+        "--reverse",
+        "--date-order",
+        "--decorate=no",
+        "--no-prefix",
+        "--submodule=short",
+        "--output-indicator-new=>",
+        "--output-indicator-old=<",
+        "--output-indicator-context=#",
+        "--no-abbrev-commit",
+        "--pretty=medium",
+        "--show-notes-by-default",
+    ])
+    .arg(range)
+    .args(log_arg)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::inherit());
+    // `setup_git_directory()` has moved the parent to the top of the work tree,
+    // and the child inherits that directory.
+    if let Some(dir) = repo.workdir() {
+        cmd.current_dir(dir);
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: could not start `log`: {}", io_reason(&e));
+            return Ok(Err(log_parse_failed(range)));
+        }
+    };
+    // `if (finish_command(&cp)) goto cleanup;` — the child has said why.
+    if !output.status.success() {
+        return Ok(Err(log_parse_failed(range)));
+    }
+    let contents = output.stdout;
+
+    // `util->oid`, `util->diff_offset` and `util->diffsize` of the record being
+    // read; its text accumulates in `buf`.
+    struct Util {
+        id: ObjectId,
+        diff_offset: usize,
+        diffsize: i64,
+    }
+    let mut records: Vec<(Vec<u8>, Util)> = Vec::new();
+    let mut util: Option<Util> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut in_header = true;
+    let mut current_filename: Option<Vec<u8>> = None;
+    let hexsz = repo.object_hash().len_in_hex();
+
+    let mut at = 0usize;
+    while at < contents.len() {
+        let rest = &contents[at..];
+        // `eol = memchr(line, '\n', size)`; the line is then read as a C string.
+        let (raw, mut len) = match rest.iter().position(|&b| b == b'\n') {
+            Some(eol) => (&rest[..eol], eol + 1),
+            None => (rest, rest.len()),
+        };
+        let line = c_str(raw);
+
+        if let Some(p) = line.strip_prefix(b"commit ") {
+            if let Some(u) = util.take() {
+                records.push((std::mem::take(&mut buf), u));
+            }
+            // `include_merges` is always set on this path.
+            let p = match find_bytes(p, b" (from ") {
+                Some(q) => &p[..q],
+                None => p,
+            };
+            let id = std::str::from_utf8(p)
+                .ok()
+                .and_then(|s| repo.rev_parse_single(s).ok())
+                .map(|id| id.detach());
+            let Some(id) = id else {
+                eprintln!("error: could not parse commit '{}'", String::from_utf8_lossy(p));
+                return Ok(Err(log_parse_failed(range)));
+            };
+            util = Some(Util {
+                id,
+                diff_offset: 0,
+                diffsize: 0,
+            });
+            in_header = true;
+            at += len;
+            continue;
+        }
+
+        let Some(u) = util.as_mut() else {
+            eprintln!(
+                "error: could not parse first line of `log` output: did not start with 'commit ': '{}'",
+                String::from_utf8_lossy(line)
+            );
+            return Ok(Err(log_parse_failed(range)));
+        };
+
+        if line.starts_with(b"diff --git") {
+            in_header = false;
+            buf.push(b'\n');
+            if u.diff_offset == 0 {
+                u.diff_offset = buf.len();
+            }
+            let Some((patch, consumed)) = parse_git_diff_header(rest, len, hexsz) else {
+                eprintln!("error: could not parse git header '{}'", String::from_utf8_lossy(&rest[..len]));
+                return Ok(Err(log_parse_failed(range)));
+            };
+            len = consumed;
+            buf.extend_from_slice(b" ## ");
+            if patch.is_new {
+                buf.extend_from_slice(patch.new_name.as_deref().unwrap_or_default());
+                buf.extend_from_slice(b" (new)");
+            } else if patch.is_delete {
+                buf.extend_from_slice(patch.old_name.as_deref().unwrap_or_default());
+                buf.extend_from_slice(b" (deleted)");
+            } else if patch.is_rename {
+                buf.extend_from_slice(patch.old_name.as_deref().unwrap_or_default());
+                buf.extend_from_slice(b" => ");
+                buf.extend_from_slice(patch.new_name.as_deref().unwrap_or_default());
+            } else {
+                buf.extend_from_slice(patch.new_name.as_deref().unwrap_or_default());
+            }
+            current_filename = match patch.is_delete {
+                true => patch.old_name.clone(),
+                false => patch.new_name.clone(),
+            };
+            if patch.new_mode != 0 && patch.old_mode != 0 && patch.old_mode != patch.new_mode {
+                buf.extend_from_slice(
+                    format!(" (mode change {:06o} => {:06o})", patch.old_mode, patch.new_mode).as_bytes(),
+                );
+            }
+            buf.extend_from_slice(b" ##");
+        } else if in_header {
+            if line.starts_with(b"Author: ") {
+                buf.extend_from_slice(b" ## Metadata ##\n");
+                buf.extend_from_slice(line);
+                buf.extend_from_slice(b"\n\n ## Commit message ##\n");
+            } else if line.starts_with(b"Notes") && line.last() == Some(&b':') {
+                // "strip the trailing colon"
+                buf.extend_from_slice(b"\n\n ## ");
+                buf.extend_from_slice(&line[..line.len() - 1]);
+                buf.extend_from_slice(b" ##\n");
+            } else if line.starts_with(b"    ") {
+                // `p = line + len - 2; while (isspace(*p) && p >= line) p--;`:
+                // `len` counts the newline, so the scan starts on the last byte
+                // of the line — or, on a final line with none, one before it.
+                let mut p = len as isize - 2;
+                while p >= 0 && matches!(raw[p as usize], b' ' | b'\t' | b'\n' | b'\r') {
+                    p -= 1;
+                }
+                buf.extend_from_slice(&raw[..(p + 1) as usize]);
+                buf.push(b'\n');
+            }
+            at += len;
+            continue;
+        } else if let Some(p) = line.strip_prefix(b"@@ ") {
+            let hunk = find_bytes(p, b"@@").map(|i| &p[i + 2..]);
+            buf.extend_from_slice(b"@@");
+            if let (Some(name), Some(tail)) = (&current_filename, hunk) {
+                if !tail.is_empty() {
+                    buf.push(b' ');
+                    buf.extend_from_slice(name);
+                    buf.push(b':');
+                }
+            }
+            if let Some(tail) = hunk {
+                buf.extend_from_slice(tail);
+            }
+        } else if line.is_empty() {
+            // "A completely blank (not ' \n', which is context) line is not
+            // valid in a diff. We skip it silently, because this neatly handles
+            // the blank separator line between commits in git-log output."
+            at += len;
+            continue;
+        } else if let Some(body) = line.strip_prefix(b">") {
+            buf.push(b'+');
+            buf.extend_from_slice(body);
+        } else if let Some(body) = line.strip_prefix(b"<") {
+            buf.push(b'-');
+            buf.extend_from_slice(body);
+        } else if let Some(body) = line.strip_prefix(b"#") {
+            buf.push(b' ');
+            buf.extend_from_slice(body);
+        } else {
+            buf.push(b' ');
+            buf.extend_from_slice(line);
+        }
+
+        buf.push(b'\n');
+        u.diffsize += 1;
+        at += len;
+    }
+    if let Some(u) = util {
+        records.push((buf, u));
+    }
+
+    let mut patches = Vec::with_capacity(records.len());
+    for (index, (text, u)) in records.into_iter().enumerate() {
+        patches.push(Patch {
+            id: u.id,
+            index,
+            abbrev: abbrev_id(repo, u.id, abbrev)?,
+            subject: commit_subject(repo, u.id)?,
+            text,
+            diff_offset: u.diff_offset,
+            diffsize: u.diffsize,
+            matching: -1,
+            shown: false,
+        });
+    }
+    Ok(Ok(patches))
+}
+
+/// The pair header's `pp_commit_easy(CMIT_FMT_ONELINE)` subject, from the same
+/// re-coded buffer [`build_patch`] reads.
+fn commit_subject(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
+    let commit = repo.find_object(id)?.try_into_commit()?;
+    let output_encoding = crate::revfilter::log_output_encoding(repo, None);
+    let mut buffer = commit.data.clone();
+    super::log::logmsg_reencode(&mut buffer, &output_encoding);
+    super::log::logmsg_c_string(&mut buffer);
+    let (_, raw) = super::log::pp_header_lines(&buffer);
+    Ok(subject_of(raw.into()))
+}
+
+/// A byte string read as C reads it: up to its first NUL.
+fn c_str(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&b| b == 0) {
+        Some(nul) => &s[..nul],
+        None => s,
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The fields of `struct patch` that `read_patches()` reads back from
+/// `parse_git_diff_header()`.
+#[derive(Default)]
+struct DiffHeader {
+    old_name: Option<Vec<u8>>,
+    new_name: Option<Vec<u8>>,
+    old_mode: u32,
+    new_mode: u32,
+    is_new: bool,
+    is_delete: bool,
+    is_rename: bool,
+    is_copy: bool,
+    /// `patch->extension_linenr`, for `check_header_line()`.
+    extension_linenr: usize,
+}
+
+/// git's `isspace()`: the four `GIT_SPACE` bytes of `sane_ctype[]` (ctype.c).
+fn git_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// `parse_git_diff_header()` (apply.c:1354-1446) as `read_patches()` calls it:
+/// no root, no input file name, `p_value` 0. `input` runs from the `diff
+/// --git` line to the end of the log output and `len` is that line's length
+/// with its newline. The answer is the header and the bytes it consumed; `None`
+/// is the negative return, after the handler's `error()` has been printed.
+fn parse_git_diff_header(input: &[u8], len: usize, hexsz: usize) -> Option<(DiffHeader, usize)> {
+    // Reads past the end of `input` see the NUL that ends git's strbuf.
+    let byte = |i: usize| input.get(i).copied().unwrap_or(0);
+    let mut patch = DiffHeader::default();
+    let def_name = git_header_name(input, len);
+
+    let mut linenr = 1usize;
+    let mut offset = len;
+    while offset < input.len() {
+        let rest = &input[offset..];
+        // `linelen()`: through the newline, or to the end of the buffer.
+        let len = rest.iter().position(|&b| b == b'\n').map_or(rest.len(), |i| i + 1);
+        if len == 0 || rest[len - 1] != b'\n' {
+            break;
+        }
+        // The handler's argument is the rest of the buffer, not just this line:
+        // `find_name()` and `gitdiff_index()` scan it as a C string.
+        let arg = |oplen: usize| offset + oplen;
+        const OPTABLE: [&[u8]; 17] = [
+            b"@@ -",
+            b"--- ",
+            b"+++ ",
+            b"old mode ",
+            b"new mode ",
+            b"deleted file mode ",
+            b"new file mode ",
+            b"copy from ",
+            b"copy to ",
+            b"rename old ",
+            b"rename new ",
+            b"rename from ",
+            b"rename to ",
+            b"similarity index ",
+            b"dissimilarity index ",
+            b"index ",
+            b"",
+        ];
+        let Some(op) = OPTABLE.iter().position(|p| rest[..len].starts_with(p)) else {
+            unreachable!("the empty prefix matches every line")
+        };
+        let at = arg(OPTABLE[op].len());
+        // `res`: negative is an error, positive ends the header.
+        let res: i32 = match OPTABLE[op] {
+            b"@@ -" | b"" => 1,
+            b"--- " => verify_name(input, at, patch.is_new, &mut patch.old_name, false, linenr),
+            b"+++ " => verify_name(input, at, patch.is_delete, &mut patch.new_name, true, linenr),
+            b"old mode " => parse_mode_line(input, at, linenr, &mut patch.old_mode),
+            b"new mode " => parse_mode_line(input, at, linenr, &mut patch.new_mode),
+            b"deleted file mode " => {
+                patch.is_delete = true;
+                patch.old_name = def_name.clone();
+                parse_mode_line(input, at, linenr, &mut patch.old_mode)
+            }
+            b"new file mode " => {
+                patch.is_new = true;
+                patch.new_name = def_name.clone();
+                parse_mode_line(input, at, linenr, &mut patch.new_mode)
+            }
+            b"copy from " => {
+                patch.is_copy = true;
+                patch.old_name = find_name(input, at, 0);
+                0
+            }
+            b"copy to " => {
+                patch.is_copy = true;
+                patch.new_name = find_name(input, at, 0);
+                0
+            }
+            b"rename old " | b"rename from " => {
+                patch.is_rename = true;
+                patch.old_name = find_name(input, at, 0);
+                0
+            }
+            b"rename new " | b"rename to " => {
+                patch.is_rename = true;
+                patch.new_name = find_name(input, at, 0);
+                0
+            }
+            // `gitdiff_similarity()`/`gitdiff_dissimilarity()` set only the
+            // score, which `read_patches()` never reads.
+            b"similarity index " | b"dissimilarity index " => 0,
+            // `gitdiff_index()` (apply.c:1112-1145): only its optional mode
+            // reaches `struct patch` fields read here. Its `strchr()` calls
+            // scan the C string, past this line if need be.
+            _ => {
+                let dot = (at..input.len()).take_while(|&i| input[i] != 0).find(|&i| input[i] == b'.');
+                match dot {
+                    Some(dot) if byte(dot + 1) == b'.' && dot - at <= hexsz => {
+                        let new = dot + 2;
+                        let space = (new..input.len()).take_while(|&i| input[i] != 0).find(|&i| input[i] == b' ');
+                        let eol = (new..input.len())
+                            .find(|&i| input[i] == b'\n' || input[i] == 0)
+                            .unwrap_or(input.len());
+                        let end = match space {
+                            Some(sp) if sp <= eol => sp,
+                            _ => eol,
+                        };
+                        if end - new > hexsz {
+                            0
+                        } else if byte(end) == b' ' {
+                            parse_mode_line(input, end + 1, linenr, &mut patch.old_mode)
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                }
+            }
+        };
+        if res < 0 {
+            return None;
+        }
+        // `check_header_line()` (apply.c:1340-1352).
+        let extensions = [patch.is_delete, patch.is_new, patch.is_rename, patch.is_copy]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+        if extensions > 1 {
+            eprintln!("error: inconsistent header lines {} and {}", patch.extension_linenr, linenr);
+            return None;
+        }
+        if extensions > 0 && patch.extension_linenr == 0 {
+            patch.extension_linenr = linenr;
+        }
+        if res > 0 {
+            break;
+        }
+        offset += len;
+        linenr += 1;
+    }
+
+    if patch.old_name.is_none() && patch.new_name.is_none() {
+        let Some(def) = def_name else {
+            eprintln!(
+                "error: git diff header lacks filename information when removing \
+                 0 leading pathname components (line {linenr})"
+            );
+            return None;
+        };
+        patch.old_name = Some(def.clone());
+        patch.new_name = Some(def);
+    }
+    if (patch.new_name.is_none() && !patch.is_delete) || (patch.old_name.is_none() && !patch.is_new) {
+        eprintln!("error: git diff header lacks filename information (line {linenr})");
+        return None;
+    }
+    Some((patch, offset))
+}
+
+/// `gitdiff_verify_name()` (apply.c:941-983) with no input file name.
+fn verify_name(
+    input: &[u8],
+    at: usize,
+    isnull: bool,
+    name: &mut Option<Vec<u8>>,
+    new_side: bool,
+    linenr: usize,
+) -> i32 {
+    match name {
+        None if !isnull => {
+            *name = find_name(input, at, TERM_TAB);
+            0
+        }
+        Some(existing) => {
+            if isnull {
+                eprintln!(
+                    "error: git apply: bad git-diff - expected /dev/null, got {} on line {linenr}",
+                    String::from_utf8_lossy(existing)
+                );
+                return -1;
+            }
+            if find_name(input, at, TERM_TAB).as_deref() != Some(existing.as_slice()) {
+                let side = if new_side { "new" } else { "old" };
+                eprintln!("error: git apply: bad git-diff - inconsistent {side} filename on line {linenr}");
+                return -1;
+            }
+            0
+        }
+        None => {
+            // `is_dev_null()`: `/dev/null` followed by an `isspace()` byte.
+            let rest = &input[at..];
+            if !(rest.starts_with(b"/dev/null") && rest.get(9).is_some_and(|&b| git_space(b))) {
+                eprintln!("error: git apply: bad git-diff - expected /dev/null on line {linenr}");
+                return -1;
+            }
+            0
+        }
+    }
+}
+
+/// `parse_mode_line()` (apply.c:996-1011): `strtoul(line, &end, 8)`, which must
+/// stop on an `isspace()` byte, then `canon_mode()` (object.h:145-154).
+fn parse_mode_line(input: &[u8], at: usize, linenr: usize, mode: &mut u32) -> i32 {
+    let byte = |i: usize| input.get(i).copied().unwrap_or(0);
+    let mut i = at;
+    // `strtoul()` skips the C locale's white space and takes one sign.
+    while matches!(byte(i), b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        i += 1;
+    }
+    let negative = byte(i) == b'-';
+    if matches!(byte(i), b'+' | b'-') {
+        i += 1;
+    }
+    let digits = i;
+    let mut value: u64 = 0;
+    while (b'0'..=b'7').contains(&byte(i)) {
+        value = value.saturating_mul(8).saturating_add(u64::from(byte(i) - b'0'));
+        i += 1;
+    }
+    if i == digits || !git_space(byte(i)) {
+        eprintln!(
+            "error: invalid mode on line {linenr}: {}",
+            String::from_utf8_lossy(c_str(&input[at..]))
+        );
+        return -1;
+    }
+    let raw = match negative {
+        true => (value as u32).wrapping_neg(),
+        false => value as u32,
+    };
+    *mode = match raw & 0o170000 {
+        0o100000 => 0o100000 | if raw & 0o100 != 0 { 0o755 } else { 0o644 },
+        0o120000 => 0o120000,
+        0o040000 => 0o040000,
+        _ => 0o160000,
+    };
+    0
+}
+
+/// `TERM_TAB` (apply.c:440): a tab ends a name; without it only a newline or
+/// another non-blank `isspace()` byte does.
+const TERM_TAB: u8 = 2;
+
+/// `find_name()` (apply.c:765-777) with no root, no default and `p_value` 0:
+/// a C-quoted name is `find_name_gnu()`, otherwise `find_name_common()`.
+fn find_name(input: &[u8], at: usize, terminate: u8) -> Option<Vec<u8>> {
+    if input.get(at) == Some(&b'"') {
+        if let Some((name, _)) = crate::setup::unquote_c_style_step(input, at) {
+            return Some(squash_slash(name));
+        }
+    }
+    // `find_name_common()` (apply.c:687-737): with `p_value` 0 the name starts
+    // at the line and runs to the first `isspace()` byte `name_terminate()`
+    // accepts — a space never, a tab only under `TERM_TAB`.
+    let mut end = at;
+    while let Some(&c) = input.get(end) {
+        if c == 0 {
+            break;
+        }
+        if git_space(c) {
+            let terminates = match c {
+                b'\n' => true,
+                b' ' => false,
+                b'\t' => terminate & TERM_TAB != 0,
+                _ => true,
+            };
+            if terminates {
+                break;
+            }
+        }
+        end += 1;
+    }
+    if end == at {
+        return None;
+    }
+    Some(squash_slash(input[at..end].to_vec()))
+}
+
+/// `squash_slash()` (apply.c:458-472).
+fn squash_slash(name: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    for b in name {
+        if b == b'/' && out.last() == Some(&b'/') {
+            continue;
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// `git_header_name()` (apply.c:1170-1300) with `p_value` 0, over the `diff
+/// --git` line (`llen` bytes, newline included) and the buffer after it.
+fn git_header_name(input: &[u8], llen: usize) -> Option<Vec<u8>> {
+    let byte = |i: usize| input.get(i).copied().unwrap_or(0);
+    let prefix = b"diff --git ".len();
+    let line = prefix;
+    let llen = llen.checked_sub(prefix)?;
+    let end = line + llen;
+    // `skip_tree_prefix()` with `p_value` 0: an absolute path has no prefix
+    // to skip, so it is refused.
+    let skip_tree_prefix = |s: &[u8]| -> bool { s.first() != Some(&b'/') };
+
+    if byte(line) == b'"' {
+        let (first, second) = crate::setup::unquote_c_style_step(input, line)?;
+        if !skip_tree_prefix(&first) {
+            return None;
+        }
+        let mut second = second;
+        while second < end && git_space(byte(second)) {
+            second += 1;
+        }
+        if end <= second {
+            return None;
+        }
+        if byte(second) == b'"' {
+            let (sp, _) = crate::setup::unquote_c_style_step(input, second)?;
+            if !skip_tree_prefix(&sp) || sp != first {
+                return None;
+            }
+            return Some(first);
+        }
+        // An unquoted second name runs to `line + llen`, the newline included,
+        // so it can never be the same length as the first.
+        let cp = &input[second..end];
+        if !skip_tree_prefix(cp) || cp != first.as_slice() {
+            return None;
+        }
+        return Some(first);
+    }
+
+    // Unquoted first name.
+    if llen > 0 && byte(line) == b'/' {
+        return None;
+    }
+    let name = line;
+    if let Some(second) = (name..end).find(|&i| byte(i) == b'"') {
+        let (sp, _) = crate::setup::unquote_c_style_step(input, second)?;
+        if !skip_tree_prefix(&sp) {
+            return None;
+        }
+        let len = sp.len();
+        if len < second - name && input[name..name + len] == sp[..] && git_space(byte(name + len)) {
+            return Some(sp);
+        }
+        return None;
+    }
+
+    // "Accept a name only if it shows up twice, exactly the same form."
+    let nl = (name..input.len()).take_while(|&i| input[i] != 0).find(|&i| input[i] == b'\n')?;
+    let line_len = nl - name;
+    let mut len = 0usize;
+    loop {
+        match byte(name + len) {
+            b'\n' => return None,
+            b'\t' | b' ' => {
+                if byte(name + len + 1) == 0 {
+                    return None;
+                }
+                let second = name + len + 1;
+                // "If we are at the SP at the end of a directory,
+                // skip_tree_prefix() may return NULL as that makes it appears
+                // as if we have an absolute path. Keep going to find another SP."
+                if line_len - (len + 1) > 0 && byte(second) == b'/' {
+                    len += 1;
+                    continue;
+                }
+                if byte(second + len) == b'\n'
+                    && (0..len).all(|k| byte(name + k) == byte(second + k))
+                {
+                    return Some(input[name..name + len].to_vec());
+                }
+            }
+            0 => return None,
+            _ => {}
+        }
+        len += 1;
+    }
 }
 
 /// `diff.orderFile` for the inner log: the configured name, and its patterns once
@@ -4789,15 +5510,10 @@ fn flush_pair(
             if fmt & FMT_DIFFSTAT != 0 {
                 let mut rendered = Vec::new();
                 // `builtin/range-diff.c` never calls `init_diffstat_widths()`, so
-                // the geometry reaches `show_stats()` as the zeroes
-                // `repo_diff_setup()` left: a flat 80 columns, no `$COLUMNS` and
-                // no `diff.stat*Width`.
-                diffstat::show_stats(
-                    &mut rendered,
-                    &files,
-                    &diffstat::StatWidths::plumbing(),
-                    &opts.colors,
-                );
+                // what the options did not set reaches `show_stats()` as the
+                // zeroes `repo_diff_setup()` left: a flat 80 columns, no
+                // `$COLUMNS` and no `diff.stat*Width`.
+                diffstat::show_stats(&mut rendered, &files, &opts.stat_widths, &opts.colors);
                 indented(out, &rendered);
             }
             if fmt & FMT_SHORTSTAT != 0 {

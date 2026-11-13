@@ -74,10 +74,16 @@ impl delegate::Navigate for Delegate<'_> {
                     // the chain revisit a commit (`refs/replace/<c1>` naming a
                     // commit whose parent is `<c1>`) still yields an ancestor,
                     // where a deduplicating revision walk ran dry.
+                    //
+                    // The C returns `MISSING_OBJECT` at the first commit without
+                    // parents (object-name.c:873-875), so the walk ends there
+                    // instead of running out the remaining count.
                     let mut cur = Some(commit);
                     for _ in 0..num {
-                        cur = cur
-                            .and_then(|c| c.parent_ids().next())
+                        let Some(c) = cur else { break };
+                        cur = c
+                            .parent_ids()
+                            .next()
                             .and_then(|p| repo.find_object(p).ok())
                             .and_then(|o| o.try_into_commit().ok());
                     }

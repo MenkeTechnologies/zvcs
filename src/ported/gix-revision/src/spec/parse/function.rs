@@ -614,6 +614,7 @@ where
                     .and_then(|past_sep| try_parse_usize(past_sep.as_bstr()).transpose())
                     .transpose()?
                     .unwrap_or((1, 0));
+                check_count(number as u64, input)?;
                 if number == 0 {
                     // `<rev>~0` is not a no-op in git: `get_nth_ancestor()` runs
                     // `lookup_commit_reference()` before its (zero-iteration)
@@ -638,6 +639,9 @@ where
                     .and_then(|past_sep| try_parse_isize(past_sep.as_bstr()).transpose())
                     .transpose()?
                 {
+                    if !negative {
+                        check_count(number as u64, input)?;
+                    }
                     if negative {
                         let traversal = delegate::Traversal::NthParent(
                             number
@@ -786,6 +790,17 @@ fn parse_regex_prefix(regex: &BStr) -> Result<(&BStr, bool), Error> {
         Some(_regex) => return Err(Error::new_with_input("need one character after /!, typically -", regex)),
         None => (regex, false),
     })
+}
+
+/// `get_oid_1()` refuses a `~<n>`/`^<n>` count above `INT_MAX` with `MISSING_OBJECT`
+/// before it recurses (object-name.c:1105-1120): the overflow checks on the
+/// `unsigned int` accumulator and the `num > INT_MAX` test both return before
+/// `get_parent()`/`get_nth_ancestor()` walk anything.
+fn check_count(number: u64, input: &BStr) -> Result<(), Exn<Error>> {
+    if number > i32::MAX as u64 {
+        return Err(Error::new_with_input("count above INT_MAX", input).raise());
+    }
+    Ok(())
 }
 
 fn try_parse_usize(input: &BStr) -> Result<Option<(usize, usize)>, Error> {

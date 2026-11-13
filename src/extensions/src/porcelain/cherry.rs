@@ -156,9 +156,11 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--abbrev=") => {
                 match parse_abbrev(&a["--abbrev=".len()..], hexsz) {
                     Some(v) => abbrev = v,
+                    // `parse_opt_abbrev_cb()` returns `error()`, which
+                    // `parse_options()` ends on at 129 without the usage block
+                    // (parse-options.c `PARSE_OPT_ERROR`).
                     None => {
                         eprintln!("error: option `abbrev' expects a numerical value");
-                        eprint!("{USAGE}");
                         return Ok(ExitCode::from(129));
                     }
                 }
@@ -320,9 +322,21 @@ fn tracked_upstream(repo: &gix::Repository) -> Result<Option<String>> {
 /// `cmd_cherry()` calls `repo_get_oid()` once per operand — head, then upstream,
 /// then the optional limit — so [`crate::objname::resolve`] carries
 /// `get_oid_basic()`'s ambiguity warning here and each operand earns at most one.
+///
+/// `add_pending_commit()` (builtin/log.c:2574-2587) uses the loud
+/// `lookup_commit_reference()`, so an operand naming a tree or a blob reports
+/// `error: object <id> is a tree, not a commit` ahead of the caller's
+/// `fatal: unknown commit`.
 fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     let id = crate::objname::resolve(repo, spec)?;
-    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+    let found = crate::objname::lookup_commit_reference(repo, id);
+    if let Some(err) = found.type_error() {
+        eprintln!("error: {err}");
+    }
+    match found {
+        crate::objname::CommitRef::Commit(id) => Some(id),
+        _ => None,
+    }
 }
 
 /// A revision walk over `tips` excluding everything reachable from `hidden`,

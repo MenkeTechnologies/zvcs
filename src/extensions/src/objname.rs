@@ -3220,20 +3220,20 @@ fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, u6
 
 /// `read_ref_at()` (`refs.c:1173-1218`) as a value rather than the pile of
 /// out-parameters the C fills in.
-struct ReadRefAt {
+pub(crate) struct ReadRefAt {
     /// `*oid` as the function leaves it. Note that it is an *in*-parameter too:
     /// the caller pre-seeds it with the ref's current value, and three of
     /// `read_ref_at_ent()`'s four paths never overwrite it.
-    oid: ObjectId,
+    pub(crate) oid: ObjectId,
     /// The `return` value inverted — `return 0` (an entry matched) is `true`,
     /// `return 1` (the walk fell off the end) is `false`.
-    found: bool,
+    pub(crate) found: bool,
     /// `*cutoff_cnt`, i.e. `cb.reccnt`: how many entries were consumed. The
     /// out-of-range test in `get_oid_basic()` compares `nth` against it.
-    reccnt: usize,
+    pub(crate) reccnt: usize,
     /// The one `warning()` `read_ref_at_ent()` can raise. Held rather than printed
     /// so the walk stays a pure function; `reflog_oid` prints it where the C does.
-    warning: Option<String>,
+    pub(crate) warning: Option<String>,
 }
 
 /// `read_ref_at()` (`refs.c:1173-1218`) over an already-collected, newest-first
@@ -3285,7 +3285,7 @@ struct ReadRefAt {
 ///
 /// `None` is the `!cb.reccnt` arm with `cnt != 0`: an empty log, which is
 /// `die(_("log for %s is empty"))` and belongs to [`reflog_reach`].
-fn read_ref_at(
+pub(crate) fn read_ref_at(
     refname: &str,
     entries: &[(ObjectId, ObjectId, gix::date::Time)],
     at_time: u64,

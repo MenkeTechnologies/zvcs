@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::process::ExitCode;
 
-use gix::bstr::{BString, ByteSlice};
+use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 
@@ -59,19 +59,12 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     // (builtin/show-branch.c:718) runs *before* `parse_options()`, so a
     // `color.showbranch` that `git_config_colorbool()` cannot read is fatal
     // ahead of any command-line refusal.
-    let color_config = read_color_config(&repo)?;
+    let (color_config, default_args) = read_show_branch_config(&repo)?;
 
-    // `cmd_show_branch`: with no argument at all, `showbranch.default` supplies argv.
+    // "If nothing is specified, try the default first" (builtin/show-branch.c:720-724).
     let mut argv: Vec<String> = args.to_vec();
-    if argv.is_empty() {
-        let snapshot = repo.config_snapshot();
-        let values: Vec<BString> = snapshot
-            .plumbing()
-            .values::<BString>("showbranch.default")
-            .unwrap_or_default();
-        if !values.is_empty() {
-            argv = values.iter().map(ToString::to_string).collect();
-        }
+    if argv.is_empty() && !default_args.is_empty() {
+        argv = default_args;
     }
 
     let mut opts = Opts::new();
@@ -587,7 +580,9 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
-        if a == "--" {
+        // `--` and `--end-of-options` both end the options and are consumed
+        // (parse-options.c:1113-1124).
+        if a == "--" || a == "--end-of-options" {
             i += 1;
             break;
         }
@@ -1265,35 +1260,64 @@ fn color_reset(on: bool) -> &'static str {
     }
 }
 
-/// `git_show_branch_config()`'s `color.showbranch` arm (builtin/show-branch.c:588-591),
-/// run at config time and therefore ahead of every command-line diagnostic:
+/// `git_show_branch_config()` (builtin/show-branch.c:563-596), run by
+/// `repo_config()` at config time and therefore ahead of every command-line
+/// diagnostic. It is a callback, so the two keys it owns are taken in the
+/// order the configuration lists them and the first bad value ends the walk:
 ///
 /// ```c
+/// if (!strcmp(var, "showbranch.default")) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         …
+///         strvec_push(&default_args, value);
+///         return 0;
+/// }
+///
 /// if (!strcmp(var, "color.showbranch")) {
 ///         showbranch_use_color = git_config_colorbool(var, value);
 ///         return 0;
 /// }
 /// ```
 ///
+/// Every occurrence of `showbranch.default` is read once — through
+/// [`crate::config::walk_config`], which does not see a `-c` value twice the way
+/// the plain snapshot reader does — so `-c showbranch.default='b*'` is one glob,
+/// not a second copy whose matches are all duplicates and end in `error: no
+/// matching refs`. A valueless one is `config_error_nonbool()`, which the walk
+/// turns into `git_die_config_linenr()`.
+///
 /// `git_config_colorbool()` (color.c:383-403) takes `never`/`always`/`auto` as
 /// words and hands everything else to `git_config_bool()`, which `die()`s on a
-/// value that is not a boolean. That death happens whatever the command line
-/// goes on to say, so the read is separated from the decision below.
-fn read_color_config(repo: &gix::Repository) -> Result<Option<String>> {
-    let Some(raw) = repo
-        .config_snapshot()
-        .string("color.showbranch")
-        .map(|v| v.to_string())
-    else {
-        return Ok(None);
-    };
-    let is_word = ["never", "always", "auto"]
-        .iter()
-        .any(|w| raw.eq_ignore_ascii_case(w));
-    if !is_word && crate::optint::maybe_bool(&raw).is_none() {
-        crate::git_fatal!("bad boolean config value '{raw}' for 'color.showbranch'");
+/// value that is not a boolean; a valueless key is `git_config_bool()`'s true.
+/// The color value is returned raw, the last one winning, for the decision
+/// below.
+fn read_show_branch_config(repo: &gix::Repository) -> Result<(Option<String>, Vec<String>)> {
+    let mut color = None;
+    let mut defaults = Vec::new();
+    for v in crate::config::walk_config(repo) {
+        match v.key.as_str() {
+            "showbranch.default" => match v.value {
+                Some(value) => defaults.push(value),
+                None => {
+                    eprintln!("error: missing value for '{}'", v.key);
+                    crate::config::die_128(&v.origin.die_linenr(&v.key));
+                }
+            },
+            "color.showbranch" => {
+                let raw = v.value.unwrap_or_else(|| "true".to_string());
+                let is_word = ["never", "always", "auto"]
+                    .iter()
+                    .any(|w| raw.eq_ignore_ascii_case(w));
+                if !is_word && crate::optint::maybe_bool(&raw).is_none() {
+                    crate::git_fatal!("bad boolean config value '{raw}' for 'color.showbranch'");
+                }
+                color = Some(raw);
+            }
+            _ => {}
+        }
     }
-    Ok(Some(raw))
+    Ok((color, defaults))
 }
 
 /// `want_color(showbranch_use_color)` — the command line wins, then
@@ -1584,31 +1608,52 @@ fn reflog_entries(repo: &gix::Repository, full: &str) -> Vec<gix::refs::log::Lin
     lines
 }
 
-/// The `<base>` of `--reflog=<n>,<base>`: an index outright, or — as git does
-/// with `approxidate` plus `read_ref_at(at_time, -1)` — the position of the
-/// newest entry no younger than the given date.
-fn reflog_base_index(base: Option<&str>, entries: &[gix::refs::log::Line]) -> i32 {
-    let Some(base) = base else { return 0 };
-    // `base = strtoul(reflog_base, &ep, 10); if (*ep) { ...approxidate... }`
-    // (builtin/show-branch.c:791-800) — the same wide grammar [`strtoul`] models,
-    // so `2,+1` and `2, 1` are the index 1 and `2,-1` is the index -1 that
-    // `read_ref_at()` then refuses.
-    let (n, end) = strtoul(base);
-    if end == base.len() {
-        return n;
-    }
-    let at = crate::date::approxidate(base);
-    entries
+/// One `read_ref_at()` call (refs.c:1173-1218) of the show-branch reflog loop,
+/// with the `warning()` it raises printed where the C prints it. `None` is the
+/// `!cb.reccnt` arm with `cnt != 0`, `die(_("log for %s is empty"))`.
+fn read_ref_at(
+    full: &str,
+    entries: &[gix::refs::log::Line],
+    at_time: i64,
+    cnt: i64,
+    oid: ObjectId,
+) -> Option<crate::objname::ReadRefAt> {
+    let walk: Vec<(ObjectId, ObjectId, gix::date::Time)> = entries
         .iter()
-        .position(|e| e.signature.time.seconds <= at)
-        .map_or(0, |i| i as i32)
+        .map(|e| (e.previous_oid, e.new_oid, e.signature.time))
+        .collect();
+    let read = crate::objname::read_ref_at(full, &walk, at_time as u64, cnt, oid)?;
+    if let Some(warning) = &read.warning {
+        eprintln!("warning: {warning}");
+    }
+    Some(read)
 }
 
-/// The reflog half of `cmd_show_branch`: turn `<ref>` into a run of
-/// `<ref>@{n}` pseudo-ref names with their `(<date>) <msg>` captions. The ids
-/// `read_ref_at()` hands back never leave this function — they only decide
-/// whether `append_ref()` keeps an entry; the caller resolves each name afresh.
-/// `Err` carries the text of git's `die()`.
+/// The reflog half of `cmd_show_branch` (builtin/show-branch.c:752-826): turn
+/// `<ref>` into a run of `<ref>@{n}` pseudo-ref names with their
+/// `(<date>) <msg>` captions. The ids `read_ref_at()` hands back never leave
+/// this function — they only decide whether `append_ref()` keeps an entry; the
+/// caller resolves each name afresh. `Err` carries the text of git's `die()`.
+///
+/// ```c
+/// for (i = 0; i < reflog; i++) {
+///         …
+///         if (read_ref_at(get_main_ref_store(the_repository),
+///                         ref, flags, 0, base + i, &oid, &logmsg,
+///                         &timestamp, &tz, NULL)) {
+///                 free(logmsg);
+///                 reflog = i;
+///                 break;
+///         }
+///         …
+///         nth_desc = xstrfmt("%s@{%d}", *av, base+i);
+///         append_ref(nth_desc, &oid, 1);
+/// ```
+///
+/// Every call is handed the same `oid`, which `read_ref_at()` reads as well as
+/// writes: an entry whose newer neighbour is a creation leaves it at the id the
+/// previous call produced and warns `unexpectedly ended`, so each call walks
+/// the log afresh and may warn again.
 fn collect_reflog(
     repo: &gix::Repository,
     revs: &[String],
@@ -1635,41 +1680,48 @@ fn collect_reflog(
     if opts.reflog > MAX_REVS as i32 {
         return Err(format!("only {MAX_REVS} entries can be shown at one time."));
     }
-    let Some((full, dwim_oid)) = dwim_ref(repo, &av[0]) else {
+    let Some((full, mut oid)) = dwim_ref(repo, &av[0]) else {
         return Err(format!("no such ref {}", av[0]));
     };
-
     let entries = reflog_entries(repo, &full);
-    let base = reflog_base_index(opts.reflog_base.as_deref(), &entries);
+    let empty = || format!("log for {full} is empty");
 
-    for i in 0..opts.reflog {
-        let nth = base + i;
-        // `read_ref_at` only tolerates an empty log for `@{0}`, where the ref's
-        // own value is the documented fallback; past that it is fatal.
-        if entries.is_empty() {
-            if nth == 0 {
-                break;
-            }
-            return Err(format!("log for {full} is empty"));
+    // Has the base been specified? (builtin/show-branch.c:784-796)
+    //
+    // ```c
+    // base = strtoul(reflog_base, &ep, 10);
+    // if (*ep) {
+    //         /* Ah, that is a date spec... */
+    //         timestamp_t at;
+    //         at = approxidate(reflog_base);
+    //         read_ref_at(get_main_ref_store(the_repository),
+    //                     ref, flags, at, -1, &oid, NULL,
+    //                     NULL, NULL, &base);
+    // }
+    // ```
+    //
+    // `cutoff_cnt` is `cb->reccnt` as `set_read_ref_cutoffs()` sees it: the
+    // matched entry's position, or — through `read_ref_at_ent_oldest()` when no
+    // entry is old enough — the length of the log, which leaves nothing to show.
+    let mut base: i64 = 0;
+    if let Some(spec) = opts.reflog_base.as_deref() {
+        let (n, end) = strtoul(spec);
+        base = i64::from(n);
+        if end != spec.len() {
+            let at = crate::date::approxidate(spec);
+            let read = read_ref_at(&full, &entries, at, -1, oid).ok_or_else(empty)?;
+            oid = read.oid;
+            base = read.reccnt as i64 - i64::from(read.found);
         }
-        let Some(entry) = usize::try_from(nth).ok().and_then(|n| entries.get(n)) else {
+    }
+
+    for i in 0..i64::from(opts.reflog) {
+        let read = read_ref_at(&full, &entries, 0, base + i, oid).ok_or_else(empty)?;
+        oid = read.oid;
+        if !read.found {
             break;
-        };
-        // At `@{0}` git keeps the id `dwim_ref` produced rather than the one the
-        // log records; the two only diverge on a corrupt log.
-        let oid = if nth == 0 { dwim_oid } else { entry.new_oid };
-        // `append_ref()` drops anything that does not peel to a commit. It is
-        // given the id, not a name, so nothing is resolved and nothing warns.
-        if resolve_commit_quiet(repo, &oid.to_string()).is_none() {
-            continue;
         }
-        if names.len() >= MAX_REVS {
-            eprintln!(
-                "warning: ignoring {}@{{{nth}}}; cannot handle more than {MAX_REVS} refs",
-                av[0]
-            );
-            break;
-        }
+        let entry = &entries[read.reccnt - 1];
         // git truncates the log message at the first newline and substitutes
         // "(none)" for an empty one.
         let raw = entry.message.to_str_lossy();
@@ -1679,6 +1731,20 @@ fn collect_reflog(
             "({}) {msg}",
             show_date_relative(entry.signature.time.seconds)
         ));
+        // `append_ref(nth_desc, &oid, 1)` drops anything that does not peel to a
+        // commit. It is given the id, not a name, so nothing is resolved and
+        // nothing warns; the caption above stays at its loop index regardless.
+        if resolve_commit_quiet(repo, &oid.to_string()).is_none() {
+            continue;
+        }
+        let nth = base + i;
+        if names.len() >= MAX_REVS {
+            eprintln!(
+                "warning: ignoring {}@{{{nth}}}; cannot handle more than {MAX_REVS} refs",
+                av[0]
+            );
+            continue;
+        }
         names.push(format!("{}@{{{nth}}}", av[0]));
     }
     Ok(())

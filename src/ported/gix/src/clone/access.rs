@@ -20,6 +20,29 @@ impl PrepareFetch {
         self
     }
 
+    /// Use `f` to change the remote once [`configure_remote()`](Self::configure_remote()) ran and its section
+    /// was written to the configuration, so that _no change done in `f()` is persisted_; the fetch uses them all.
+    ///
+    /// This is where refspecs belong that the configuration already holds, which git's `remote_get()` read
+    /// before `cmd_clone()` appended the clone's own (builtin/clone.c:1316-1321).
+    pub fn configure_remote_unsaved(
+        mut self,
+        f: impl FnMut(crate::Remote<'_>) -> Result<crate::Remote<'_>, Box<dyn std::error::Error + Send + Sync>> + 'static,
+    ) -> Self {
+        self.configure_remote_unsaved = Some(Box::new(f));
+        self
+    }
+
+    /// Open the contained repository again, for files of it that were changed on disk after it was created:
+    /// `init_db()` copies a template's `config` before anything reads the configuration (setup.c:2253-2297), so
+    /// what it sets, like `core.logAllRefUpdates`, is in effect for the whole clone.
+    pub fn reload_repository(&mut self) -> Result<(), crate::clone::Error> {
+        let repo = self.repo.as_mut().expect("present until consumed");
+        repo.reload()?;
+        repo.committer_or_set_generic_fallback()?;
+        Ok(())
+    }
+
     /// Set the remote's name to the given value after it was configured using the function provided via
     /// [`configure_remote()`](Self::configure_remote()).
     ///

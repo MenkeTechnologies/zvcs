@@ -279,7 +279,7 @@ impl PrepareFetch {
         // ```
         //
         // (builtin/clone.c:1319-1321, 1405-1412, 1590-1592.) The revision is the only refspec
-        // the fetch uses and none reaches the configuration.
+        // of the clone's own, and none reaches the configuration.
         if self.revision.is_some() {
             remote.fetch_specs.clear();
         }
@@ -292,6 +292,9 @@ impl PrepareFetch {
         )?);
         if let Some(spec) = &self.revision {
             remote.fetch_specs = vec![spec.clone()];
+        }
+        if let Some(f) = self.configure_remote_unsaved.as_mut() {
+            remote = f(remote).map_err(Error::RemoteConfiguration)?;
         }
         #[cfg(feature = "sha256")]
         let mut config = config;
@@ -522,13 +525,17 @@ impl PrepareFetch {
 /// `lookup_commit_or_die()` (the full ref name, or the hex id the refspec spelled out) and the
 /// object it advertised, before any peeling.
 ///
-/// The revision is the only fetch refspec such a clone has, so its mapping is the one produced
-/// by refspec 0 (`wanted_peer_refs()` → `get_fetch_map()`, builtin/clone.c:465-466).
+/// `our_head_points_at = mapped_refs` (builtin/clone.c:1547-1548): the first ref `wanted_peer_refs()`
+/// mapped, going through the fetch refspecs in order (:465-466). The revision's refspec follows those the
+/// configuration already held for the remote (:1316, :1405-1411), so it is the first only when they map nothing.
 pub fn revision_mapping(ref_map: &crate::remote::fetch::RefMap) -> Option<(BString, gix_hash::ObjectId)> {
-    ref_map
-        .mappings
-        .iter()
-        .find(|m| m.spec_index == crate::remote::fetch::refmap::SpecIndex::ExplicitInRemote(0))
+    (0..ref_map.refspecs.len())
+        .find_map(|index| {
+            ref_map
+                .mappings
+                .iter()
+                .find(|m| m.spec_index == crate::remote::fetch::refmap::SpecIndex::ExplicitInRemote(index))
+        })
         .and_then(|m| {
             let id = m.remote.as_id()?.to_owned();
             let name = m.remote.as_name().map_or_else(|| id.to_string().into(), ToOwned::to_owned);

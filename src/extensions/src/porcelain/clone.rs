@@ -1537,6 +1537,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
     super::init::drop_defaults_set_elsewhere(&git_dir, template.as_deref())?;
+    // `init_db()` copies the template before the clone reads any of the configuration, so what the template's
+    // `config` sets is in force for every ref the clone writes: `core.logAllRefUpdates = false` writes no reflog
+    // (refs/files-backend.c `files_log_ref_write()`). gitoxide opened the repository before it was there.
+    prepare.reload_repository()?;
 
     // `run_transaction_hook()` (refs.c:2663-2678) runs for every ref transaction of the new
     // repository, the template's `reference-transaction` hook included. Commands that find their
@@ -1934,6 +1938,51 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         });
     }
 
+    // ```c
+    // remote = remote_get_early(remote_name);
+    //
+    // if (!option_rev)
+    //         refspec_appendf(&remote->fetch, "+%s*:%s*", src_ref_prefix,
+    //                         branch_top.buf);
+    // ```
+    //
+    // (builtin/clone.c:1316-1321.) The configuration's `remote.<name>.fetch` refspecs come first, and
+    // `wanted_peer_refs()` maps the refs through each of them in turn (:465-466), so a `-c`, template, global
+    // or `git -c` refspec writes the refs it maps, and one that maps a ref the clone's own refspec maps too
+    // makes `write_remote_refs()` queue it twice. `write_refspec_config()` records only the clone's own
+    // refspec (:801-835), so these never reach the remote section gitoxide writes.
+    {
+        let explicit_origin = origin.clone();
+        let single = matches!(plan, Some(Refspecs::Single { .. }));
+        let single_outcome = single_outcome.clone();
+        prepare = prepare.configure_remote_unsaved(move |mut remote| {
+            let remote_name = resolve_remote_name(remote.repo, explicit_origin.as_deref());
+            let mut specs = configured_fetch_refspecs(remote.repo, &remote_name)?;
+            if single {
+                let fetched = single_outcome
+                    .lock()
+                    .expect("clone is single-threaded here")
+                    .as_ref()
+                    .and_then(|probe| probe.fetched.clone());
+                let mut restricted = Vec::new();
+                for spec in &specs {
+                    restricted.extend(restrict_to_single_ref(spec, fetched.as_deref())?);
+                }
+                specs = restricted;
+            }
+            if specs.is_empty() {
+                return Ok(remote);
+            }
+            let all: Vec<gix::bstr::BString> = specs
+                .iter()
+                .chain(remote.refspecs(gix::remote::Direction::Fetch))
+                .map(|spec| spec.to_ref().to_bstring())
+                .collect();
+            remote.replace_refspecs(all.iter().map(|spec| spec.as_bstr()), gix::remote::Direction::Fetch)?;
+            Ok(remote)
+        });
+    }
+
     // Before fetching from the remote, download and install bundle data from the
     // `--bundle-uri` option. git does this after `create_reference_database()`
     // and before the first fetch (`builtin/clone.c`), so the bundled objects and
@@ -2231,6 +2280,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             let fetched = prepare.fetch_only(meters.clone(), &should_interrupt);
             let (mut repo, outcome) = match fetched {
                 Ok((repo, outcome)) => {
+                    check_exact_refspecs_mapped(&outcome.ref_map)?;
                     check_pack(&repo, &outcome)?;
                     (repo, outcome)
                 }
@@ -2255,6 +2305,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 Err(gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::PackStream(stream))) => {
                     return Err(pack_stream_died(&git_dir, url_str, filter.is_some(), &stream));
                 }
+                Err(e) if conflicting_destination(&e).is_some() => {
+                    say_done();
+                    let name = conflicting_destination(&e).expect("checked");
+                    return Err(crate::fatal::die(format!("multiple updates for ref '{name}' not allowed")));
+                }
                 Err(e) => {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
                 }
@@ -2276,6 +2331,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             let fetched = prepare.fetch_then_checkout(meters.clone(), &should_interrupt);
             let (mut checkout, outcome) = match fetched {
                 Ok((checkout, outcome)) => {
+                    check_exact_refspecs_mapped(&outcome.ref_map)?;
                     check_pack(checkout.repo(), &outcome)?;
                     (checkout, outcome)
                 }
@@ -2295,6 +2351,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 }
                 Err(gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::PackStream(stream))) => {
                     return Err(pack_stream_died(&git_dir, url_str, filter.is_some(), &stream));
+                }
+                Err(e) if conflicting_destination(&e).is_some() => {
+                    say_done();
+                    let name = conflicting_destination(&e).expect("checked");
+                    return Err(crate::fatal::die(format!("multiple updates for ref '{name}' not allowed")));
                 }
                 Err(e) => {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
@@ -2922,6 +2983,141 @@ fn single_branch_refspec(full_ref_name: &str, remote_name: &str, bare: bool) -> 
     format!("+{full_ref_name}:{destination}")
 }
 
+/// `remote.<remote_name>.fetch` as `remote_get_early()` reads it, in git's configuration order: the system and
+/// global files, then the new repository's own, which starts as the template's `config` and has every
+/// `-c <key>=<value>` appended by `write_config()` before the remote is read (builtin/clone.c:764-791, :1189),
+/// then `git -c`. This clone holds its `-c` pairs in memory instead (`Source::Api`), so they are put back between
+/// the two. `refspec_append()` dies on a value it cannot parse (refspec.c `refspec_item_init_or_die()`), and
+/// `get_fetch_map()` skips a negative refspec (remote.c:2141-2142), which no other step of a clone consults.
+fn configured_fetch_refspecs(
+    repo: &gix::Repository,
+    remote_name: &str,
+) -> Result<Vec<gix::refspec::RefSpec>, Box<dyn std::error::Error + Send + Sync>> {
+    use gix::config::Source;
+    let config = repo.config_snapshot();
+    let key = format!("remote.{remote_name}.fetch");
+    let values = |wanted: &dyn Fn(Source) -> bool| {
+        config
+            .plumbing()
+            .strings_filter(key.as_str(), &mut |meta: &gix::config::file::Metadata| wanted(meta.source))
+            .unwrap_or_default()
+    };
+    let command_line = |source: Source| matches!(source, Source::Env | Source::Cli | Source::EnvOverride);
+    let mut specs = Vec::new();
+    for value in values(&|s| s != Source::Api && !command_line(s))
+        .into_iter()
+        .chain(values(&|s| s == Source::Api))
+        .chain(values(&command_line))
+    {
+        let spec = gix::refspec::parse(value.as_ref(), gix::refspec::parse::Operation::Fetch)
+            .map_err(|_| crate::fatal::Fatal(format!("invalid refspec '{value}'")))?;
+        if let Some(spec) = with_local_destination(spec.to_owned()) {
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
+}
+
+/// `get_fetch_map()`'s `ref_map->peer_ref = get_local_ref(refspec->dst)` (remote.c:2118-2132, :2159) for an
+/// exact refspec: a destination outside `refs/` is a branch, unless it starts `heads/`, `tags/` or `remotes/`,
+/// which only lack the `refs/`. A pattern's expansion is taken as it is (`get_expanded_map()`), and a negative
+/// refspec is dropped (remote.c:2141-2142).
+fn with_local_destination(spec: gix::refspec::RefSpec) -> Option<gix::refspec::RefSpec> {
+    use gix::refspec::instruction::Fetch;
+    let gix::refspec::Instruction::Fetch(instruction) = spec.to_ref().instruction() else {
+        return Some(spec);
+    };
+    let (src, dst, force) = match instruction {
+        Fetch::Exclude { .. } => return None,
+        Fetch::AndUpdate { src, dst, allow_non_fast_forward } if !src.contains(&b'*') => (src, dst, allow_non_fast_forward),
+        Fetch::Only { .. } | Fetch::AndUpdate { .. } => return Some(spec),
+    };
+    let local = if dst.starts_with(b"refs/") {
+        return Some(spec);
+    } else if dst.starts_with(b"heads/") || dst.starts_with(b"tags/") || dst.starts_with(b"remotes/") {
+        format!("refs/{dst}")
+    } else {
+        format!("refs/heads/{dst}")
+    };
+    let text = format!("{}{src}:{local}", if force { "+" } else { "" });
+    Some(
+        gix::refspec::parse(text.as_str().into(), gix::refspec::parse::Operation::Fetch)
+            .map_or(spec, |parsed| parsed.to_owned()),
+    )
+}
+
+/// `get_fetch_map(refs, refspec, &tail, 0)` for a single-branch clone, whose `refs` is the one ref
+/// `wanted_peer_refs()` kept (builtin/clone.c:451-466): `fetched`, or nothing when the remote's `HEAD` named no
+/// branch. A pattern maps that ref or nothing; an exact refspec that does not name it dies
+/// `couldn't find remote ref` (remote.c:2144-2157), and one spelling out an object id maps that id whatever the
+/// refs are. The result names `fetched` exactly, so the fetch asks for nothing else.
+fn restrict_to_single_ref(
+    spec: &gix::refspec::RefSpec,
+    fetched: Option<&str>,
+) -> Result<Option<gix::refspec::RefSpec>, Box<dyn std::error::Error + Send + Sync>> {
+    use gix::refspec::instruction::Fetch;
+    let gix::refspec::Instruction::Fetch(instruction) = spec.to_ref().instruction() else {
+        return Ok(Some(spec.clone()));
+    };
+    let (src, dst, force) = match instruction {
+        Fetch::Exclude { .. } => return Ok(None),
+        Fetch::Only { src } => (src, None, false),
+        Fetch::AndUpdate { src, dst, allow_non_fast_forward } => (src, Some(dst), allow_non_fast_forward),
+    };
+    let local = if src.contains(&b'*') {
+        let Some(fetched) = fetched else { return Ok(None) };
+        let null = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        let group = gix::refspec::MatchGroup::from_fetch_specs([spec.to_ref()]);
+        let outcome = group.match_lhs(std::iter::once(gix::refspec::match_group::Item {
+            full_ref_name: fetched.into(),
+            target: &null,
+            object: None,
+        }));
+        let Some(mapping) = outcome.mappings.into_iter().next() else {
+            return Ok(None);
+        };
+        mapping.rhs.map(|rhs| rhs.to_string())
+    } else if gix::ObjectId::from_hex(src).is_ok() {
+        return Ok(Some(spec.clone()));
+    } else {
+        let name = if src.is_empty() { "HEAD".into() } else { src.to_str_lossy() };
+        match fetched {
+            Some(fetched) if crate::refname::refname_match(&name, fetched) > 0 => dst.map(|dst| dst.to_string()),
+            _ => return Err(Box::new(crate::fatal::Fatal(format!("couldn't find remote ref {name}")))),
+        }
+    };
+    let fetched = fetched.expect("a mapping implies the ref");
+    let text = match local {
+        Some(local) => format!("{}{fetched}:{local}", if force { "+" } else { "" }),
+        None => fetched.to_string(),
+    };
+    Ok(Some(gix::refspec::parse(text.as_str().into(), gix::refspec::parse::Operation::Fetch)?.to_owned()))
+}
+
+/// `get_fetch_map()`'s death for an exact refspec of `remote->fetch` that names no advertised ref
+/// (remote.c:2144-2157), which `wanted_peer_refs()` reaches before anything is transferred
+/// (builtin/clone.c:465-466). A clone that got this far mapped something, so `refs` was not NULL and
+/// `wanted_peer_refs()` ran (:1512-1513); a `--revision` that matched nothing in a NULL `refs` is
+/// `Remote revision ... not found` instead.
+fn check_exact_refspecs_mapped(ref_map: &gix::remote::fetch::RefMap) -> Result<()> {
+    use gix::refspec::instruction::Fetch;
+    let null = gix::ObjectId::null(ref_map.object_hash);
+    for spec in &ref_map.refspecs {
+        let gix::refspec::Instruction::Fetch(Fetch::Only { src } | Fetch::AndUpdate { src, .. }) = spec.to_ref().instruction()
+        else {
+            continue;
+        };
+        if src.contains(&b'*') || gix::ObjectId::from_hex(src).is_ok() {
+            continue;
+        }
+        if fetch_map(ref_map, spec, &null).is_empty() {
+            let name = if src.is_empty() { "HEAD".into() } else { src.to_str_lossy() };
+            crate::git_fatal!("couldn't find remote ref {name}");
+        }
+    }
+    Ok(())
+}
+
 /// Ask the remote which ref a `--single-branch` clone should be restricted to:
 /// the `--branch` argument resolved against the advertisement (a branch first,
 /// then a tag, matching git's `--branch` lookup order), or the branch the remote's
@@ -3059,7 +3255,27 @@ struct ConfigFixups<'a> {
 /// fetch; the fetch and checkout observe them all the same, because they are
 /// also handed to gitoxide as in-memory overrides.
 fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
-    if !fixups.set_mirror
+    let path = git_dir.join("config");
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // gitoxide appended the remote section it wrote, so it is the last; a template's `config` can hold one of
+    // the same name ahead of it, where `repo_config_set()` would have put `url` and `fetch` (config.c
+    // `git_config_set_multivar_in_file_gently()` appends to the last section of that name).
+    let remote_name = file
+        .sections()
+        .filter(|s| s.header().name() == "remote")
+        .last()
+        .and_then(|s| s.header().subsection_name().map(ToString::to_string));
+    let remote_section_repeated = file
+        .sections()
+        .filter(|s| s.header().name() == "remote" && s.header().subsection_name().map(ToString::to_string) == remote_name)
+        .count()
+        > 1;
+
+    if !remote_section_repeated
+        && !fixups.set_mirror
         && !fixups.drop_fetch
         && !fixups.drop_tag_opt
         && !fixups.drop_branch_sections
@@ -3071,16 +3287,6 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     {
         return Ok(());
     }
-
-    let path = git_dir.join("config");
-    let mut file =
-        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let remote_name = file
-        .sections()
-        .find(|s| s.header().name() == "remote")
-        .and_then(|s| s.header().subsection_name().map(ToString::to_string));
 
     if let Some(name) = remote_name {
         if let Ok(mut section) = file.section_mut("remote", Some(name.as_str().into())) {
@@ -3103,6 +3309,28 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
             }
             if let Some(url) = &fixups.remote_url {
                 section.set("url", url.as_str())?;
+            }
+        }
+        // `repo_config_set(the_repository, "remote.<name>.url", repo)` (builtin/clone.c:1303-1304) replaces a
+        // `url` the template's section of that name already holds, where it stands.
+        if remote_section_repeated {
+            let sections: Vec<_> = file
+                .sections_and_ids()
+                .filter(|(s, _)| {
+                    s.header().name() == "remote"
+                        && s.header().subsection_name().map(ToString::to_string).as_ref() == Some(&name)
+                })
+                .map(|(s, id)| (id, s.value("url").is_some()))
+                .collect();
+            let ((written, _), earlier) = sections.split_last().expect("the section is repeated");
+            let holder = earlier.iter().rev().find(|(_, has_url)| *has_url).map(|(id, _)| *id);
+            if let Some(holder) = holder {
+                let url = file
+                    .section_mut_by_id(*written)
+                    .and_then(|mut s| s.remove("url"));
+                if let (Some(url), Some(mut section)) = (url, file.section_mut_by_id(holder)) {
+                    section.set("url", url.as_bstr())?;
+                }
             }
         }
     }
@@ -3180,7 +3408,7 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     let sections: Vec<_> = file.sections().collect();
     let split = sections
         .iter()
-        .position(|s| s.header().name() == "remote")
+        .rposition(|s| s.header().name() == "remote")
         .unwrap_or(sections.len());
     let mut out = gix::config::File::new(gix::config::file::Metadata::from(gix::config::Source::Local));
     let append = |out: &mut gix::config::File,
@@ -3330,12 +3558,41 @@ fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: 
         // `die(_("could not parse %s"), ref_name)` (builtin/clone.c:1550, commit.c:85).
         e @ (gix::clone::fetch::Error::RevisionMissing { .. }
         | gix::clone::fetch::Error::RevisionNotACommit { .. }) => crate::fatal::die(e.to_string()),
+        // A `die()` of the remote's own configuration, `refspec_append()`'s or `get_fetch_map()`'s, which
+        // `remote_get_early()` and `wanted_peer_refs()` reach before anything is fetched.
+        gix::clone::fetch::Error::RemoteConfiguration(e) if e.is::<crate::fatal::Fatal>() => {
+            anyhow::Error::new(*e.downcast::<crate::fatal::Fatal>().expect("checked"))
+        }
         gix::clone::fetch::Error::RefNameMissing { ref wanted } => {
             let wanted = branch.map_or_else(|| wanted.as_ref().as_bstr().to_string(), ToOwned::to_owned);
             crate::fatal::die(format!("Remote branch {wanted} not found in upstream {remote_name}"))
         }
         other => other.into(),
     }
+}
+
+/// The ref two refspecs of `remote->fetch` map different remote refs onto, which gitoxide refuses to map at all.
+/// git maps both and `write_remote_refs()` queues the ref twice, so the clone dies in
+/// `ref_update_reject_duplicates()` (builtin/clone.c:473-498, refs.c:2574-2593, :2708-2709) on the first such
+/// name in sorted order, once the objects are in.
+///
+/// Only the destinations gitoxide reports are known here: a ref two refspecs map from the *same* remote ref is
+/// no conflict to it, so such a ref sorting ahead of every reported one is not the name chosen.
+fn conflicting_destination(err: &gix::clone::fetch::Error) -> Option<String> {
+    use gix::protocol::fetch::refmap::init::Error as InitRefMap;
+    use gix::refspec::match_group::validate::Issue;
+    let gix::clone::fetch::Error::PrepareFetch(gix::remote::fetch::prepare::Error::RefMap(
+        gix::remote::ref_map::Error::InitRefMap(InitRefMap::MappingValidation(validation)),
+    )) = err
+    else {
+        return None;
+    };
+    validation
+        .issues
+        .iter()
+        .map(|Issue::Conflict { destination_full_ref_name, .. }| destination_full_ref_name)
+        .min()
+        .map(|name| name.to_string())
 }
 
 /// Split a `-c <key>=<value>` argument the way git's `git_config_parse_parameter`
@@ -4380,27 +4637,33 @@ struct RefWrites<'a> {
 /// refspec already names, tag or branch. A `--mirror --branch` clone maps every tag twice, once
 /// through `+refs/*:refs/*` and once through `TAG_REFSPEC`.
 fn wanted_peer_refs(ref_map: &gix::remote::fetch::RefMap, plan: &RefWrites<'_>) -> Vec<MappedRef> {
-    use gix::protocol::fetch::refmap::SpecIndex;
-    let mut explicit: Vec<(usize, &gix::remote::fetch::refmap::Mapping)> = ref_map
-        .mappings
-        .iter()
-        .filter_map(|m| match m.spec_index {
-            SpecIndex::ExplicitInRemote(idx) => Some((idx, m)),
-            SpecIndex::Implicit(_) => None,
-        })
-        .collect();
-    explicit.sort_by_key(|(idx, _)| *idx);
-    let mut mapped: Vec<MappedRef> = explicit
-        .into_iter()
-        .filter_map(|(_, m)| {
-            let id = m.remote.as_id()?.to_owned();
-            Some(MappedRef {
-                name: m.remote.as_name().map_or_else(|| id.to_string().into(), ToOwned::to_owned),
-                id,
-                peer: m.local.as_ref().and_then(|local| gix::refs::FullName::try_from(local.clone()).ok()),
-            })
-        })
-        .collect();
+    use gix::refspec::match_group::SourceRef;
+    // Each refspec maps the refs on its own, as `get_fetch_map()` does: the mappings of the fetch were folded
+    // across refspecs the way `ref_remove_duplicates()` folds a fetch's (remote.c:915-947), which a clone never
+    // calls, so a ref two refspecs map alike is listed twice and its creation queued twice.
+    let null = gix::ObjectId::null(ref_map.object_hash);
+    let mut mapped: Vec<MappedRef> = Vec::new();
+    for spec in &ref_map.refspecs {
+        for m in fetch_map(ref_map, spec, &null) {
+            let (name, id) = match (m.item_index, &m.lhs) {
+                (Some(index), _) => match ref_map.remote_refs[index].unpack() {
+                    (name, Some(id), _) => (name.to_owned(), id.to_owned()),
+                    (_, None, _) => continue,
+                },
+                (None, SourceRef::ObjectId(id)) => (id.to_string().into(), *id),
+                (None, _) => continue,
+            };
+            // `get_fetch_map()` lets no peer outside `refs/` through (remote.c:2165-2179).
+            let peer = match m.rhs {
+                Some(rhs) if rhs.starts_with(b"refs/") || rhs.as_ref() == "HEAD" => {
+                    gix::refs::FullName::try_from(rhs.into_owned()).ok()
+                }
+                Some(_) => continue,
+                None => None,
+            };
+            mapped.push(MappedRef { name, id, peer });
+        }
+    }
     if (plan.tags || plan.branch.is_some()) && !plan.revision && !plan.single_branch {
         for r in &ref_map.remote_refs {
             let (name, Some(id), _) = r.unpack() else { continue };
@@ -4422,6 +4685,24 @@ fn wanted_peer_refs(ref_map: &gix::remote::fetch::RefMap, plan: &RefWrites<'_>) 
         mapped.extend(tags);
     }
     mapped
+}
+
+/// The refs `spec` maps out of the advertisement on its own, as `get_fetch_map()` maps them for one refspec
+/// (remote.c:2134-2185); `null` stands in for the id of a ref advertised without one.
+fn fetch_map<'a>(
+    ref_map: &'a gix::remote::fetch::RefMap,
+    spec: &'a gix::refspec::RefSpec,
+    null: &'a gix::ObjectId,
+) -> Vec<gix::refspec::match_group::Mapping<'a, 'a>> {
+    let items = ref_map.remote_refs.iter().map(|r| {
+        let (full_ref_name, target, object) = r.unpack();
+        gix::refspec::match_group::Item {
+            full_ref_name,
+            target: target.unwrap_or(null),
+            object,
+        }
+    });
+    gix::refspec::MatchGroup::from_fetch_specs([spec.to_ref()]).match_lhs(items).mappings
 }
 
 /// `find_remote_branch()` (builtin/clone.c:422-441): `refs/heads/<branch>`, else `refs/tags/<branch>`.

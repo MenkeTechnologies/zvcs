@@ -27,6 +27,8 @@ pub struct PrepareFetch {
     config_overrides: Vec<BString>,
     /// A function to configure a remote prior to fetching a pack.
     configure_remote: Option<ConfigureRemoteFn>,
+    /// A function to configure the remote once its section was written, for the fetch alone.
+    configure_remote_unsaved: Option<ConfigureRemoteFn>,
     /// A function to configure a connection before using it.
     #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
     configure_connection: Option<ConfigureConnectionFn>,
@@ -78,6 +80,8 @@ pub enum Error {
     Init(#[from] crate::init::Error),
     #[error(transparent)]
     CommitterOrFallback(#[from] crate::config::commit_signature::Error),
+    #[error(transparent)]
+    Reopen(#[from] crate::open::Error),
     #[error(transparent)]
     UrlParse(#[from] gix_url::parse::Error),
     #[error("Failed to turn a the relative file url \"{}\" into an absolute one", url.to_bstring())]
@@ -205,6 +209,7 @@ impl PrepareFetch {
             config_overrides: Vec::new(),
             remote_name: None,
             configure_remote: None,
+            configure_remote_unsaved: None,
             #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]
             configure_connection: None,
             #[cfg(any(feature = "async-network-client", feature = "blocking-network-client"))]

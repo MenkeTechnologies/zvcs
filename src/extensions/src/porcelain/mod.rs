@@ -760,7 +760,7 @@ mod mv;
 mod name_rev;
 mod notes;
 mod p4;
-mod pack_objects;
+pub(crate) mod pack_objects;
 mod pack_redundant;
 mod pack_refs;
 mod patch_id;

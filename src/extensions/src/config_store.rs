@@ -58,7 +58,7 @@ enum Matcher {
     Any,
     Never,
     Fixed(Vec<u8>),
-    Regex { re: regex::bytes::Regex, do_not_match: bool },
+    Regex { re: crate::porcelain::pack_objects::PosixRegex, do_not_match: bool },
 }
 
 /// The outcomes `repo_config_set_multivar_in_file_gently()` reports, named after the
@@ -667,39 +667,6 @@ pub fn set_multivar_in_file(
     // contents are written into it (config.c:3063-3073).
     let target = resolve_symlink(path);
     let lock = ConfigLock::hold(&target).map_err(StoreError::Io)?;
-    let matcher = match pattern {
-        ValuePattern::Any => Matcher::Any,
-        ValuePattern::Never => Matcher::Never,
-        ValuePattern::Fixed(v) => Matcher::Fixed(v.as_bytes().to_vec()),
-        ValuePattern::Regex(p) => {
-            let (do_not_match, p) = match p.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, p),
-            };
-            match regex::bytes::Regex::new(p) {
-                Ok(re) => Matcher::Regex { re, do_not_match },
-                Err(_) => return Err(StoreError::InvalidPattern(p.to_string())),
-            }
-        }
-    };
-
-    let mut store = Store {
-        key: canonical_key.as_bytes().to_vec(),
-        baselen,
-        matcher,
-        multi_replace,
-        parsed: vec![Parsed { begin: 0, end: 0, ty: EventType::Eof, is_keys_section: false }],
-        parsed_nr: 0,
-        seen: Vec::new(),
-        seen_nr: 0,
-        seen_touched: false,
-        section_seen: false,
-        is_keys_section: false,
-        key_seen: false,
-        previous_type: EventType::Eof,
-        previous_offset: 0,
-    };
-
     let contents = match std::fs::read(&target) {
         Ok(bytes) => Some(bytes),
         // ENOENT takes the "write a minimal version" branch; every other errno is the
@@ -724,6 +691,43 @@ pub fn set_multivar_in_file(
         out.extend_from_slice(&write_pair(key.as_bytes(), baselen, value, comment));
         lock.commit(&out, None).map_err(StoreError::Io)?;
         return Ok(());
+    };
+
+    // The value-pattern is compiled only once the file is known to exist: a missing file
+    // takes the branch above without looking at it (config.c:3078-3124).
+    let matcher = match pattern {
+        ValuePattern::Any => Matcher::Any,
+        ValuePattern::Never => Matcher::Never,
+        ValuePattern::Fixed(v) => Matcher::Fixed(v.as_bytes().to_vec()),
+        ValuePattern::Regex(p) => {
+            let (do_not_match, p) = match p.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, p),
+            };
+            // `regcomp(store.value_pattern, value_pattern, REG_EXTENDED)` (config.c:3116-3117):
+            // the C library's POSIX ERE, not a Rust dialect.
+            match crate::porcelain::pack_objects::PosixRegex::extended(p) {
+                Some(re) => Matcher::Regex { re, do_not_match },
+                None => return Err(StoreError::InvalidPattern(p.to_string())),
+            }
+        }
+    };
+
+    let mut store = Store {
+        key: canonical_key.as_bytes().to_vec(),
+        baselen,
+        matcher,
+        multi_replace,
+        parsed: vec![Parsed { begin: 0, end: 0, ty: EventType::Eof, is_keys_section: false }],
+        parsed_nr: 0,
+        seen: Vec::new(),
+        seen_nr: 0,
+        seen_touched: false,
+        section_seen: false,
+        is_keys_section: false,
+        key_seen: false,
+        previous_type: EventType::Eof,
+        previous_offset: 0,
     };
 
     if parse_source(&contents, &mut store).is_err() {
@@ -799,6 +803,89 @@ pub fn set_multivar_in_file(
 
     lock.commit(&out, Some(&target)).map_err(StoreError::Io)?;
     Ok(())
+}
+
+/// `repo_config_set_multivar_in_file_gently()` (config.c:3028-3288) as the C callers
+/// reach it: the key goes through `git_config_parse_key()` first (:3054-3056), and every
+/// failure prints the `error()` the C function prints before it returns the `CONFIG_*`
+/// code. `CONFIG_NOTHING_SET` is the one silent failure. Returns 0 on success.
+pub fn set_multivar_in_file_gently(
+    path: &Path,
+    key: &str,
+    value: Option<&[u8]>,
+    pattern: ValuePattern<'_>,
+    multi_replace: bool,
+) -> i32 {
+    let canonical = match crate::config::parse_config_key(key) {
+        Ok(canonical) => canonical,
+        Err(message) => {
+            eprintln!("error: {message}");
+            // CONFIG_INVALID_KEY (config.h:27).
+            return 1;
+        }
+    };
+    // `store.baselen`: everything before the last dot (config.c:572).
+    let baselen = key.rfind('.').unwrap_or(0);
+    match set_multivar_in_file(path, key, &canonical, baselen, value, pattern, None, multi_replace) {
+        Ok(()) => 0,
+        Err(StoreError::NothingSet) => 5,
+        Err(StoreError::InvalidFile) => {
+            eprintln!("error: invalid config file {}", path.display());
+            3
+        }
+        Err(StoreError::InvalidPattern(pattern)) => {
+            eprintln!("error: invalid pattern: {pattern}");
+            6
+        }
+        Err(StoreError::Io(err)) => {
+            eprintln!("error: could not lock config file {}: {}", path.display(), strerror(&err));
+            -1
+        }
+    }
+}
+
+/// `repo_config_set_multivar_in_file()` (config.c:3290-3302): the gently form, dying
+/// `could not set '<key>' to '<value>'` or `could not unset '<key>'` on any failure.
+pub fn set_multivar_in_file_or_die(
+    path: &Path,
+    key: &str,
+    value: Option<&[u8]>,
+    pattern: ValuePattern<'_>,
+    multi_replace: bool,
+) -> anyhow::Result<()> {
+    if set_multivar_in_file_gently(path, key, value, pattern, multi_replace) == 0 {
+        return Ok(());
+    }
+    Err(crate::fatal::die(match value {
+        Some(value) => format!("could not set '{key}' to '{}'", String::from_utf8_lossy(value)),
+        None => format!("could not unset '{key}'"),
+    }))
+}
+
+/// `repo_config_rename_section_in_file()` (config.c:3507-3512) as its callers see it:
+/// the number of headers renamed (or removed, when `new_name` is `None`), or -1 after
+/// the `error()` the C function prints (config.c:3405-3445).
+pub fn rename_section_in_file_gently(path: &Path, old_name: &str, new_name: Option<&str>) -> isize {
+    match copy_or_rename_section_in_file(path, old_name, new_name, false) {
+        Ok(count) => count as isize,
+        Err(RenameError::LongLine(line)) => {
+            eprintln!(
+                "error: refusing to work with overly long line in '{}' on line {line}",
+                path.display()
+            );
+            -1
+        }
+        Err(RenameError::NoLock) => {
+            eprintln!("error: could not lock config file {}", path.display());
+            -1
+        }
+        // The lock is held by then: what fails is reading the file or committing the
+        // lock (`error_errno(_("could not write config file %s"))`, config.c:3540-3542).
+        Err(RenameError::Io(err)) => {
+            eprintln!("error: could not write config file {}: {}", path.display(), strerror(&err));
+            -1
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

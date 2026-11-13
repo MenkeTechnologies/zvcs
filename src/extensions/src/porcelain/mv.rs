@@ -645,7 +645,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                 gitmodules_modified = true;
             }
             if let Some(git_dir) = gitfile {
-                connect_work_tree_and_git_dir(&plan.dst_abs, git_dir)?;
+                super::submodule_move::connect_work_tree_and_git_dir(&plan.dst_abs, git_dir, true)?;
             }
         }
         // `if (mode & (WORKING_DIRECTORY | SKIP_WORKTREE_DIR)) continue;`
@@ -1389,7 +1389,7 @@ fn update_path_in_gitmodules(workdir: &Path, old: &str, new: &str) -> Result<boo
     if !file.exists() {
         return Ok(false);
     }
-    let mut config = gix::config::File::from_path_no_includes(
+    let config = gix::config::File::from_path_no_includes(
         file.clone(),
         gix::config::Source::Worktree,
     )?;
@@ -1403,57 +1403,20 @@ fn update_path_in_gitmodules(workdir: &Path, old: &str, new: &str) -> Result<boo
         eprintln!("warning: Could not find section in .gitmodules where path={old}");
         return Ok(false);
     };
-    config.set_raw_value_by("submodule", Some(name.as_ref()), "path", new)?;
-    std::fs::write(&file, config.to_string())?;
-    Ok(true)
-}
-
-/// `connect_work_tree_and_git_dir()`: rewrite `<work_tree>/.git` to point at
-/// `git_dir` and `git_dir`'s `core.worktree` back at `work_tree`, both as paths
-/// relative to each other, which is what makes a moved submodule keep working.
-fn connect_work_tree_and_git_dir(work_tree: &Path, git_dir: &Path) -> Result<()> {
-    let work_tree = work_tree.canonicalize().unwrap_or_else(|_| work_tree.to_path_buf());
-    let git_dir = git_dir.canonicalize().unwrap_or_else(|_| git_dir.to_path_buf());
-
-    std::fs::write(
-        work_tree.join(".git"),
-        format!("gitdir: {}\n", relative_path(&git_dir, &work_tree).display()),
-    )?;
-
-    let config_path = git_dir.join("config");
-    let mut config = gix::config::File::from_path_no_includes(
-        config_path.clone(),
-        gix::config::Source::Local,
-    )?;
-    config.set_raw_value_by(
-        "core",
-        None::<&BStr>,
-        "worktree",
-        relative_path(&work_tree, &git_dir).to_string_lossy().as_ref(),
-    )?;
-    std::fs::write(&config_path, config.to_string())?;
-    Ok(())
-}
-
-/// `relative_path(target, base)`: how to reach `target` starting from directory
-/// `base`, using `..` for each level `base` sits below their common ancestor.
-/// Both must already be absolute and normalized.
-fn relative_path(target: &Path, base: &Path) -> PathBuf {
-    let mut t = target.components().peekable();
-    let mut b = base.components().peekable();
-    while t.peek().is_some() && t.peek() == b.peek() {
-        t.next();
-        b.next();
+    // `config_set_in_gitmodules_file_gently()` (submodule-config.c:985-996): the config.c
+    // store splices the one line into the file, every other byte left as it was.
+    let key = format!("submodule.{name}.path");
+    let ret = crate::config_store::set_multivar_in_file_gently(
+        &file,
+        &key,
+        Some(new.as_bytes()),
+        crate::config_store::ValuePattern::Any,
+        false,
+    );
+    if ret < 0 {
+        eprintln!("warning: Could not update .gitmodules entry {key}");
     }
-    let mut out = PathBuf::new();
-    for _ in b {
-        out.push("..");
-    }
-    out.extend(t);
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    out
+    Ok(ret == 0)
 }
 
 /// `stage_updated_gitmodules()`: hash the rewritten worktree file back into the

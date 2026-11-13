@@ -2421,10 +2421,10 @@ fn record_upstreams(
             }
             continue;
         }
-        let _ = super::config::set_branch_upstream(repo, branch, remote_name, remote_ref);
-        if !quiet {
-            println!("branch '{branch}' set up to track '{remote_name}/{short}'.");
-        }
+        // `install_branch_config(flag, localname + 11, transport->remote->name, remotename)`
+        // (transport.c:121-123), whose result is ignored.
+        let upstream = (remote_name.to_owned(), remote_ref.to_owned(), format!("{remote_name}/{short}"));
+        let _ = super::branch::install_tracking(repo, branch, &upstream, quiet);
     }
 }
 

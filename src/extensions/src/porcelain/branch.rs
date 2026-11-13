@@ -3,7 +3,6 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
-use gix::config::{File as ConfigFile, Source};
 use gix::hash::ObjectId;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
@@ -2865,22 +2864,10 @@ fn install_branch_config_multiple_remotes(
         }
     }
 
-    let (path, mut file) = local_config(repo)?;
-    {
-        let sub = BStr::new(local.as_bytes());
-        let mut section = file.section_mut_or_create_new("branch", Some(sub))?;
-        while section.remove("remote").is_some() {}
-        section.push("remote", remote)?;
-        while section.remove("merge").is_some() {}
-        for item in remotes {
-            section.push("merge", item.as_str())?;
-        }
-        if rebasing {
-            while section.remove("rebase").is_some() {}
-            section.push("rebase", "true")?;
-        }
+    if !write_branch_config(repo, local, origin, remotes, rebasing) {
+        // `if (install_branch_config_multiple_remotes(...) < 0) exit(1);` (branch.c:344-346).
+        return Ok(Some(ExitCode::from(1)));
     }
-    write_config(&path, &file)?;
 
     if !quiet {
         // ```c
@@ -3242,16 +3229,15 @@ fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let (cfg_path, mut file) = local_config(repo)?;
-    let sub = BStr::new(branch_name.as_bytes());
-    if stripped.is_empty() {
-        if let Ok(mut section) = file.section_mut("branch", Some(sub)) {
-            while section.remove("description").is_some() {}
-        }
-    } else {
-        file.set_raw_value_by("branch", Some(sub), "description", stripped.as_slice())?;
-    }
-    write_config(&cfg_path, &file)?;
+    // `repo_config_set(the_repository, name.buf, buf.len ? buf.buf : NULL)`
+    // (builtin/branch.c:939), which dies on any failure.
+    crate::config_store::set_multivar_in_file_or_die(
+        &repo.common_dir().join("config"),
+        &format!("branch.{branch_name}.description"),
+        (!stripped.is_empty()).then_some(stripped.as_slice()),
+        crate::config_store::ValuePattern::Any,
+        false,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3325,17 +3311,13 @@ pub(super) fn install_tracking(
     quiet: bool,
 ) -> Result<()> {
     let (remote, merge_ref, short) = upstream;
-    let (path, mut file) = local_config(repo)?;
-    let sub = BStr::new(branch.as_bytes());
-    file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
-    file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
-
     let want_rebase = autosetup_rebase(repo, remote);
-    if want_rebase {
-        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
+    // The callers (clone.c:584, :611, fetch.c:2152) ignore the -1 of a failed write, so the
+    // `out_err` report is all that comes of it, and the notice is not printed.
+    let origin = (remote != ".").then_some(remote.as_str());
+    if !write_branch_config(repo, branch, origin, std::slice::from_ref(merge_ref), want_rebase) {
+        return Ok(());
     }
-
-    write_config(&path, &file)?;
 
     if !quiet {
         // `printf_ln(rebasing ? _("branch '%s' set up to track '%s' by rebasing.") :
@@ -3345,6 +3327,47 @@ pub(super) fn install_tracking(
         println!("{}", tracking_line(branch, short, want_rebase));
     }
     Ok(())
+}
+
+/// The configuration half of `install_branch_config_multiple_remotes()` (branch.c:118-141):
+/// `branch.<local>.remote` set to `origin` or `.`, every `branch.<local>.merge` unset and
+/// then one added per remote with `CONFIG_REGEX_NONE` so none replaces the last, and
+/// `branch.<local>.rebase` set when rebasing. Each is its own store write, so the rest of
+/// the file keeps its bytes. Only a negative return — the lock or the write failing —
+/// is fatal to the sequence (`goto out_err`); a `CONFIG_NOTHING_SET` or a
+/// `has multiple values` refusal is not. `false` once `out_err` (:182-201) has reported it.
+pub(super) fn write_branch_config(
+    repo: &gix::Repository,
+    local: &str,
+    origin: Option<&str>,
+    remotes: &[String],
+    rebasing: bool,
+) -> bool {
+    use crate::config_store::{set_multivar_in_file_gently as set, ValuePattern};
+    let path = repo.common_dir().join("config");
+    let remote_key = format!("branch.{local}.remote");
+    let merge_key = format!("branch.{local}.merge");
+    let written = set(&path, &remote_key, Some(origin.unwrap_or(".").as_bytes()), ValuePattern::Any, false) >= 0
+        && set(&path, &merge_key, None, ValuePattern::Any, false) >= 0
+        && remotes
+            .iter()
+            .all(|item| set(&path, &merge_key, Some(item.as_bytes()), ValuePattern::Never, false) >= 0)
+        && (!rebasing || set(&path, &format!("branch.{local}.rebase"), Some(b"true"), ValuePattern::Any, false) >= 0);
+    if written {
+        return true;
+    }
+    eprintln!("error: unable to write upstream branch configuration");
+    crate::advice::print_hint("\nAfter fixing the error cause you may try to fix up\nthe remote tracking information by invoking:");
+    if let [only] = remotes {
+        let prefix = origin.map(|o| format!("{o}/")).unwrap_or_default();
+        crate::advice::print_hint(&format!("  git branch --set-upstream-to={prefix}{only}"));
+    } else {
+        crate::advice::print_hint(&format!("  git config --add branch.\"{local}\".remote {}", origin.unwrap_or(".")));
+        for item in remotes {
+            crate::advice::print_hint(&format!("  git config --add branch.\"{local}\".merge {item}"));
+        }
+    }
+    false
 }
 
 /// `branch.autoSetupRebase` for one upstream: whether `install_branch_config()` records
@@ -3825,28 +3848,6 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The repository's own `config`, opened for rewriting — with an absent file
-/// read as an empty one.
-///
-/// git's `git_config_set_multivar_in_file_gently()` (`config.c`) holds a lock on
-/// the path and writes through it whether or not anything was there to read, so
-/// a repository whose `.git/config` has been moved aside still takes a
-/// `git branch -m`, a `--set-upstream-to` and an `--edit-description`; this port
-/// refused all three with the `from_path_no_includes()` I/O error.
-fn local_config(repo: &gix::Repository) -> Result<(std::path::PathBuf, ConfigFile)> {
-    let path = repo.common_dir().join("config");
-    let file = match ConfigFile::from_path_no_includes(path.clone(), Source::Local) {
-        Ok(f) => f,
-        Err(gix::config::file::init::from_paths::Error::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            ConfigFile::new(gix::config::file::Metadata::from(Source::Local).at(path.clone()))
-        }
-        Err(e) => return Err(e.into()),
-    };
-    Ok((path, file))
-}
-
 /// `refs_verify_refname_available()` (refs.c) reduced to the question
 /// `refs_rename_ref_available()` (refs/files-backend.c:1616-1633) asks: is some
 /// *other* reference in the way of creating `refname`?
@@ -4290,20 +4291,6 @@ fn report_rename_error(path: &std::path::Path, err: &crate::config_store::Rename
             super::config::errno_text(io)
         ),
     }
-}
-
-/// Serialize `file` to `path` atomically: write a sibling temp file, then rename
-/// over the target so a crash never leaves a half-written config.
-fn write_config(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
-    let bytes = file.to_bstring();
-    let tmp = path.with_extension("zvcs-tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// `enum delete_branch_flags` (builtin/branch.c:198-204).
@@ -4890,24 +4877,21 @@ fn delete_merged_branches(
         }
         if !cleared.is_empty() {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            let (path, mut file) = local_config(repo)?;
+            let path = repo.common_dir().join("config");
             for name in &cleared {
-                // `repo_config_set_gently(key, NULL)` for `merge`, then `remote`;
-                // a section left with nothing in it goes with them.
-                let sub = BStr::new(name.as_bytes());
-                let empty = match file.section_mut("branch", Some(sub)) {
-                    Ok(mut section) => {
-                        while section.remove("merge").is_some() {}
-                        while section.remove("remote").is_some() {}
-                        section.num_values() == 0
-                    }
-                    Err(_) => false,
-                };
-                if empty {
-                    file.remove_section("branch", Some(sub));
+                // `repo_config_set_gently(the_repository, key.buf, NULL)` for `merge`, then
+                // `remote`, results ignored (builtin/branch.c:792-797); the store drops a
+                // section left with nothing in it (`maybe_remove_section()`, config.c:2811).
+                for key in ["merge", "remote"] {
+                    crate::config_store::set_multivar_in_file_gently(
+                        &path,
+                        &format!("branch.{name}.{key}"),
+                        None,
+                        crate::config_store::ValuePattern::Any,
+                        false,
+                    );
                 }
             }
-            write_config(&path, &file)?;
         }
     }
     Ok(ret)

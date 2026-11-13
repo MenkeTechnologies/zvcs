@@ -601,8 +601,6 @@ fn init_repo(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let config_path = repo.common_dir().join("config");
-    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
-    let mut dirty = false;
 
     for entry in &entries {
         // `get_submodule_displaypath()` (builtin/submodule--helper.c:116-133): a
@@ -618,19 +616,16 @@ fn init_repo(
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
             // git writes each key through `repo_config_set_gently()` as it goes,
             // so everything registered before this `die()` is already on disk.
-            if dirty {
-                persist(&config_path, &config)?;
-            }
             eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
             return Ok(128);
         };
         let sub_name = sub.name().to_owned();
         let sub_name = sub_name.as_bstr();
 
-        // Mark it active first — that is the order git writes the two keys in.
+        // Mark it active first — that is the order git writes the two keys in, the
+        // result ignored (builtin/submodule--helper.c:601-605).
         if !is_submodule_active(repo, &index, sub, &entry.path)? {
-            config.set_raw_value_by("submodule", Some(sub_name), "active", "true")?;
-            dirty = true;
+            config_set(&config_path, &format!("submodule.{sub_name}.active"), "true");
         }
 
         // Reads go against the merged snapshot, matching git's `git_config_get_string`.
@@ -643,9 +638,6 @@ fn init_repo(
             let Some(url) = url else {
                 // `submodule.<name>.active` was set a few lines up and git had
                 // already written it by the time it reached this `die()`.
-                if dirty {
-                    persist(&config_path, &config)?;
-                }
                 eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
                 return Ok(128);
             };
@@ -664,8 +656,11 @@ fn init_repo(
                 true => resolve_relative_url(&repo, url.as_ref(), None, false)?,
                 false => url,
             };
-            config.set_raw_value_by("submodule", Some(sub_name), "url", url.as_bstr())?;
-            dirty = true;
+            // `if (repo_config_set_gently(the_repository, sb.buf, url)) die(...)`
+            // (builtin/submodule--helper.c:629-631).
+            if config_set(&config_path, &format!("submodule.{sub_name}.url"), &url.to_str_lossy()) != 0 {
+                crate::git_fatal!("Failed to register url for submodule path '{display}'");
+            }
             // git prints this line to stderr (verified against git 2.55.0:
             // `git submodule init 1>out 2>err` leaves `out` empty) from inside
             // `init_submodule()`, one submodule at a time. It has to go out here
@@ -690,13 +685,10 @@ fn init_repo(
                 let upd = upd.to_str_lossy().into_owned();
                 match upd.as_str() {
                     "checkout" | "rebase" | "merge" | "none" => {
-                        config.set_raw_value_by(
-                            "submodule",
-                            Some(sub_name),
-                            "update",
-                            upd.as_str(),
-                        )?;
-                        dirty = true;
+                        // (builtin/submodule--helper.c:651-652.)
+                        if config_set(&config_path, &format!("submodule.{sub_name}.update"), &upd) != 0 {
+                            crate::git_fatal!("Failed to register update mode for submodule path '{display}'");
+                        }
                     }
                     _ if upd.starts_with('!') => bail!(
                         "submodule '{sub_name}' configures `update = {upd}`; git's !command downgrade path is not ported"
@@ -707,9 +699,6 @@ fn init_repo(
         }
     }
 
-    if dirty {
-        persist(&config_path, &config)?;
-    }
     Ok(0)
 }
 
@@ -1874,8 +1863,6 @@ fn sync_repo(
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let config_path = repo.common_dir().join("config");
-    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
-    let mut dirty = false;
 
     for entry in &entries {
         let Some(sub) = find_submodule(&submodules, &entry.path) else {
@@ -1894,32 +1881,22 @@ fn sync_repo(
             quiet,
             recursive,
             modules.as_ref(),
-            &mut config,
+            &config_path,
         )?;
-        match outcome {
-            SyncOne::Skipped => continue,
-            SyncOne::Synced => dirty = true,
-            SyncOne::Failed(code) => {
-                persist(&config_path, &config)?;
-                return Ok(code);
-            }
+        if let SyncOne::Failed(code) = outcome {
+            return Ok(code);
         }
-    }
-
-    if dirty {
-        persist(&config_path, &config)?;
     }
     Ok(0)
 }
 
-/// What [`sync_one`] did, so its caller knows whether the superproject config
-/// still needs writing out.
+/// What [`sync_one`] did, so its caller knows whether to go on.
 enum SyncOne {
     /// Inactive: git's `sync_submodule` returns before touching anything.
     Skipped,
-    /// `submodule.<name>.url` was set in the caller's config file.
+    /// `submodule.<name>.url` was set in the superproject's config file.
     Synced,
-    /// A recursive descent failed with this exit code; the config was written.
+    /// A recursive descent failed with this exit code.
     Failed(u8),
 }
 
@@ -1927,9 +1904,6 @@ enum SyncOne {
 /// `.gitmodules` url into the superproject's `submodule.<name>.url`, and — when
 /// the submodule is populated — into `remote.<default-remote>.url` inside the
 /// submodule's own config, descending afterwards under `--recursive`.
-///
-/// The superproject config is written by the caller: git rewrites `.git/config`
-/// once per submodule, and batching the writes is the only difference.
 #[allow(clippy::too_many_arguments)]
 fn sync_one(
     repo: &gix::Repository,
@@ -1940,7 +1914,7 @@ fn sync_one(
     quiet: bool,
     recursive: bool,
     modules: Option<&ConfigFile>,
-    config: &mut ConfigFile,
+    config_path: &std::path::Path,
 ) -> Result<SyncOne> {
     // `sync_submodule` returns immediately for an inactive submodule.
     if !is_submodule_active(repo, index, sub, path)? {
@@ -1996,8 +1970,11 @@ fn sync_one(
         std::io::stdout().flush()?;
     }
 
-    // Superproject `submodule.<name>.url` — git's `git_config_set_gently`.
-    config.set_raw_value_by("submodule", Some(sub_name), "url", url_bytes.as_bstr())?;
+    // Superproject `submodule.<name>.url`: `repo_config_set_gently()`, which dies
+    // on failure (builtin/submodule--helper.c:1475-1479).
+    if config_set(config_path, &format!("submodule.{sub_name}.url"), &url_bytes.to_str_lossy()) != 0 {
+        crate::git_fatal!("failed to register url for submodule path '{display}'");
+    }
 
     if let Some(msg) = repo.workdir().and_then(|wd| broken_gitfile_fatal(wd, path.as_bstr())) {
         std::io::stdout().flush()?;
@@ -2018,19 +1995,13 @@ fn sync_one(
     let sub_config_path = sub_repo.common_dir().join("config");
     {
         let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
-        let mut sub_config =
-            ConfigFile::from_path_no_includes(sub_config_path.clone(), Source::Local)?;
         // `repo_config_set_in_file_gently(..., remote_key, NULL, sub_origin_url)`
-        // (builtin/submodule--helper.c:1490): the submodule's own remote gets the
+        // (builtin/submodule--helper.c:1494-1496): the submodule's own remote gets the
         // `up_path`-prefixed spelling, which differs from the superproject's only when the
         // superproject's default remote is itself a relative url.
-        sub_config.set_raw_value_by(
-            "remote",
-            Some(remote.as_bstr()),
-            "url",
-            sub_origin_url.as_bstr(),
-        )?;
-        persist(&sub_config_path, &sub_config)?;
+        if config_set(&sub_config_path, &format!("remote.{remote}.url"), &sub_origin_url.to_str_lossy()) != 0 {
+            crate::git_fatal!("failed to update remote for submodule '{path}'");
+        }
     }
 
     if recursive {
@@ -2437,18 +2408,13 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     };
     let sub_name = sub.name().to_owned();
 
-    // `config_set_in_gitmodules_file_gently`; a failure here returns 1 and the
-    // sync below never runs.
+    // `config_set_in_gitmodules_file_gently()`; a failure here returns 1 and the
+    // sync below never runs (builtin/submodule--helper.c:3262-3270).
     {
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-        let (modules_path, mut modules) = gitmodules_for_write(&repo)?;
-        modules.set_raw_value_by(
-            "submodule",
-            Some(sub_name.as_bstr()),
-            "url",
-            newurl.as_str(),
-        )?;
-        persist(&modules_path, &modules)?;
+        if gitmodules_set(&repo, &format!("submodule.{sub_name}.url"), Some(&newurl)) != 0 {
+            return Ok(ExitCode::from(1));
+        }
     }
 
     // `repo_read_gitmodules(the_repository, 0)` then `sync_submodule(sub->path,
@@ -2458,7 +2424,6 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     let modules = read_gitmodules(&repo);
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let config_path = repo.common_dir().join("config");
-    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
     let outcome = sync_one(
         &repo,
         &index,
@@ -2468,18 +2433,11 @@ fn set_url(args: &[String], mut quiet: bool) -> Result<ExitCode> {
         quiet,
         false,
         modules.as_ref(),
-        &mut config,
+        &config_path,
     )?;
     Ok(match outcome {
-        SyncOne::Skipped => ExitCode::SUCCESS,
-        SyncOne::Synced => {
-            persist(&config_path, &config)?;
-            ExitCode::SUCCESS
-        }
-        SyncOne::Failed(code) => {
-            persist(&config_path, &config)?;
-            ExitCode::from(code)
-        }
+        SyncOne::Skipped | SyncOne::Synced => ExitCode::SUCCESS,
+        SyncOne::Failed(code) => ExitCode::from(code),
     })
 }
 
@@ -2640,21 +2598,14 @@ fn deinit_one(
         std::io::stdout().flush()?;
     }
 
-    // `git config --get-regexp "submodule.<name>\."` decides whether there is
-    // anything registered; only then is the section removed and the line
-    // printed. git drops the *whole* section so a later `init` starts clean.
+    // `git config --get-regexp "submodule.<name>\."` over every configuration the
+    // child would read decides whether there is anything registered; only then is the
+    // section removed from the repository's file and the line printed. git drops the
+    // *whole* section so a later `init` starts clean (builtin/submodule--helper.c:1650-1668).
     let config_path = repo.common_dir().join("config");
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let mut config = ConfigFile::from_path_no_includes(config_path.clone(), Source::Local)?;
-    let mut removed_any = false;
-    while config
-        .remove_section("submodule", Some(sub_name.as_bstr()))
-        .is_some()
-    {
-        removed_any = true;
-    }
-    if removed_any {
-        persist(&config_path, &config)?;
+    if any_config_key_matches(repo, &format!("submodule.{sub_name}\\.")) {
+        crate::config_store::rename_section_in_file_gently(&config_path, &format!("submodule.{sub_name}"), None);
         if !quiet {
             let url = modules
                 .and_then(|m| m.string_by("submodule", Some(sub_name.as_bstr()), "url"))
@@ -2668,6 +2619,29 @@ fn deinit_one(
         }
     }
     Ok(())
+}
+
+/// Whether `git config --get-regexp <pattern>` would print anything: some key of the
+/// merged configuration, spelled as `section.subsection.name` with the section and
+/// name lower-cased, matches the POSIX ERE `pattern` anywhere (builtin/config.c's
+/// `collect_config()` through `regexec()`).
+fn any_config_key_matches(repo: &gix::Repository, pattern: &str) -> bool {
+    let Some(re) = super::pack_objects::PosixRegex::extended(pattern) else {
+        return false;
+    };
+    let snapshot = repo.config_snapshot();
+    let found = snapshot.plumbing().sections().any(|section| {
+        let header = section.header();
+        let mut base = header.name().to_str_lossy().to_ascii_lowercase();
+        if let Some(sub) = header.subsection_name() {
+            base.push('.');
+            base.push_str(&sub.to_str_lossy());
+        }
+        section
+            .value_names()
+            .any(|name| re.is_match(format!("{base}.{}", name.to_ascii_lowercase()).as_bytes()))
+    });
+    found
 }
 
 /// git's `submodule_unset_core_worktree` (submodule.c:2059): drop
@@ -3974,16 +3948,16 @@ fn connect_work_tree_and_git_dir(work_tree: &std::path::Path, git_dir: &std::pat
     )
 }
 
-/// `repo_config_set_in_file()` for one `<section>.<key>` in a specific config file.
+/// `repo_config_set_in_file()` (config.c:2901-2905) for one key in a specific config
+/// file: the store splices the line in, and any failure dies `could not set`.
 fn set_config_value(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
-    let mut file = match gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local) {
-        Ok(file) => file,
-        Err(_) => gix::config::File::new(gix::config::file::Metadata::from(gix::config::Source::Local)),
-    };
-    let (section, name) = key.split_once('.').expect("every key here is `<section>.<name>`");
-    file.set_raw_value_by(section, None, name, value)?;
-    std::fs::write(path, file.to_bstring())?;
-    Ok(())
+    crate::config_store::set_multivar_in_file_or_die(
+        path,
+        key,
+        Some(value.as_bytes()),
+        crate::config_store::ValuePattern::Any,
+        false,
+    )
 }
 
 /// The two `submodule.alternate*` keys plus the superproject's own alternate object
@@ -4529,47 +4503,48 @@ fn set_branch_apply(branch: Option<String>, path: String) -> Result<ExitCode> {
     let sub_name = sub.name().to_owned();
     let sub_name = sub_name.as_bstr();
 
+    // `ret = config_set_in_gitmodules_file_gently(the_repository, config_name, opt_branch);
+    // return !!ret;` (builtin/submodule--helper.c:3317-3321): `--default` is the unset,
+    // which answers CONFIG_NOTHING_SET, so exit 1, when there was no key to drop.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let (modules_path, mut modules) = gitmodules_for_write(&repo)?;
-
-    match branch {
-        // `set-branch --branch <b>`: write the key, keyed by submodule name.
-        Some(value) => {
-            modules.set_raw_value_by("submodule", Some(sub_name), "branch", value.as_str())?;
-            persist(&modules_path, &modules)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        // `set-branch --default`: drop the key; exit 1 when there was none to drop.
-        None => {
-            let removed = modules
-                .section_mut("submodule", Some(sub_name))
-                .ok()
-                .and_then(|mut s| s.remove("branch"))
-                .is_some();
-            if removed {
-                persist(&modules_path, &modules)?;
-                Ok(ExitCode::SUCCESS)
-            } else {
-                Ok(ExitCode::from(1))
-            }
-        }
+    match gitmodules_set(&repo, &format!("submodule.{sub_name}.branch"), branch.as_deref()) {
+        0 => Ok(ExitCode::SUCCESS),
+        _ => Ok(ExitCode::from(1)),
     }
 }
 
-/// The worktree `.gitmodules` opened for writing, as
-/// `config_set_in_gitmodules_file_gently()` opens it: through
-/// `git_config_set_in_file_gently(GITMODULES_FILE, …)`, which *creates* the file
-/// when it is not there. It is reachable with no worktree copy — `set-branch`
-/// and `set-url` resolve the submodule's name through the index or `HEAD` copy
-/// (see [`read_gitmodules`]) and never consult `is_writing_gitmodules_ok()`.
-fn gitmodules_for_write(repo: &gix::Repository) -> Result<(std::path::PathBuf, ConfigFile)> {
-    let path = gitmodules_path(repo);
-    let file = if path.exists() {
-        ConfigFile::from_path_no_includes(path.clone(), Source::Local)?
-    } else {
-        ConfigFile::new(gix::config::file::Metadata::from(Source::Local).at(&path))
-    };
-    Ok((path, file))
+/// `repo_config_set_gently()`-style single-key write into the config file at `path`
+/// (config.c:3028-3288): the store splices the one line in, every other byte stays.
+/// Returns the `CONFIG_*` code, 0 on success.
+fn config_set(path: &std::path::Path, key: &str, value: &str) -> i32 {
+    crate::config_store::set_multivar_in_file_gently(
+        path,
+        key,
+        Some(value.as_bytes()),
+        crate::config_store::ValuePattern::Any,
+        false,
+    )
+}
+
+/// `config_set_in_gitmodules_file_gently()` (submodule-config.c:985-996): set, or unset
+/// when `value` is `None`, one key in the worktree's `.gitmodules`, warning
+/// `Could not update .gitmodules entry <key>` when the store fails outright. A missing
+/// file is created, as `repo_config_set_in_file_gently(GITMODULES_FILE, …)` creates it;
+/// `set-branch` and `set-url` reach it with no worktree copy, resolving the submodule's
+/// name through the index or `HEAD` copy (see [`read_gitmodules`]), and never consult
+/// `is_writing_gitmodules_ok()`.
+fn gitmodules_set(repo: &gix::Repository, key: &str, value: Option<&str>) -> i32 {
+    let ret = crate::config_store::set_multivar_in_file_gently(
+        &gitmodules_path(repo),
+        key,
+        value.map(str::as_bytes),
+        crate::config_store::ValuePattern::Any,
+        false,
+    );
+    if ret < 0 {
+        eprintln!("warning: Could not update .gitmodules entry {key}");
+    }
+    ret
 }
 
 /// A `submodule.<name>.<field>` config key, built structurally so submodule
@@ -4580,20 +4555,6 @@ fn key<'a>(name: &'a BStr, field: &'a str) -> KeyRef<'a> {
         subsection_name: Some(name),
         value_name: field,
     }
-}
-
-/// Serialize `file` next to `path` and rename it into place, so a crash never
-/// leaves a half-written config. Mirrors `porcelain::config`'s writer.
-fn persist(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
-    let bytes = file.to_bstring();
-    let tmp = path.with_extension("zvcs-tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 // ---------------------------------------------------------- .gitmodules -----
@@ -5492,17 +5453,11 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     }
 
     // ---- configure_added_submodule (submodule--helper.c:3518) ---------------
+    // Every key is its own store write, which splices one line into the file and
+    // leaves the rest of its bytes alone; `repo_config_set_gently()`'s result is
+    // ignored (:3531-3533).
     let local_config = repo.common_dir().join("config");
-    let mut cfg = ConfigFile::from_path_no_includes(local_config.clone(), Source::Local)?;
-    cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "url", realrepo.as_str())?;
-    // `if (repo_config_get(the_repository, "submodule.active")) { … set
-    // submodule.<name>.active = true; }` — an explicit `submodule.active` pathspec
-    // list owns the decision, so the per-submodule flag is only written when there
-    // is none.
-    if repo.config_snapshot().string("submodule.active").is_none() {
-        cfg.set_raw_value_by("submodule", Some(name.as_str().into()), "active", "true")?;
-    }
-    std::fs::write(&local_config, cfg.to_bstring())?;
+    config_set(&local_config, &format!("submodule.{name}.url"), realrepo.as_str());
 
     // git stages the gitlink with an `add --no-warn-embedded-repo [--force] -- <path>`
     // child before it writes `.gitmodules` (submodule--helper.c:3535-3543), so a path
@@ -5519,25 +5474,44 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     // `config_submodule_in_gitmodules(name, "url", add_data->repo)`: the *argument*,
     // not `realrepo` — `.gitmodules` is shared with every other clone of the
     // superproject, so a relative url has to stay relative there.
-    let gitmodules = workdir.join(".gitmodules");
-    let mut file = if gitmodules.exists() {
-        ConfigFile::from_path_no_includes(gitmodules.clone(), Source::Worktree)?
-    } else {
-        ConfigFile::new(gix::config::file::Metadata::from(Source::Worktree).at(&gitmodules))
-    };
-    {
-        let mut section = file.section_mut_or_create_new("submodule", Some(name.as_str().into()))?;
-        section.push("path", Some(BStr::new(path.as_bytes())))?;
-        section.push("url", Some(BStr::new(url.as_bytes())))?;
-        if let Some(b) = &branch {
-            section.push("branch", Some(BStr::new(b.as_bytes())))?;
+    // `config_submodule_in_gitmodules()` for `path`, `url` and the branch, each a
+    // `config_set_in_gitmodules_file_gently()` (:3545-3553).
+    let mut fields = vec![("path", path.as_str()), ("url", url.as_str())];
+    if let Some(b) = &branch {
+        fields.push(("branch", b.as_str()));
+    }
+    for (var, value) in fields {
+        if gitmodules_set(&repo, &format!("submodule.{name}.{var}"), Some(value)) != 0 {
+            crate::git_fatal!("Failed to register submodule '{path}'");
         }
     }
-    std::fs::write(&gitmodules, file.to_bstring())?;
 
-    let staged = run_at_toplevel(&workdir, &["add", "--force", "--", ".gitmodules"])?;
-    if staged != 0 {
-        return Ok(ExitCode::from(staged));
+    if run_at_toplevel(&workdir, &["add", "--force", "--", ".gitmodules"])? != 0 {
+        crate::git_fatal!("Failed to register submodule '{path}'");
+    }
+
+    // ```c
+    // if (repo_config_get(the_repository, "submodule.active") || /* key absent */
+    //     repo_config_get_string_multi(the_repository, "submodule.active", &values)) {
+    //         [... submodule.<name>.active = true ...]
+    // } else {
+    //         for (size_t i = 0; i < values->nr; i++)
+    //                 if (!wildmatch(pat, add_data->sm_path, 0)) { matched = 1; break; }
+    //         if (!matched)
+    //                 [... submodule.<name>.active = true ...]
+    // }
+    // ```
+    //
+    // (:3572-3594.) A configured `submodule.active` pathspec list owns the decision
+    // only for a path one of its patterns covers.
+    let snapshot = repo.config_snapshot();
+    let covered = snapshot.plumbing().strings("submodule.active").is_some_and(|values| {
+        values
+            .iter()
+            .any(|pat| super::log::wildmatch(pat.as_slice(), path.as_bytes()))
+    });
+    if !covered {
+        config_set(&local_config, &format!("submodule.{name}.active"), "true");
     }
     Ok(ExitCode::SUCCESS)
 }

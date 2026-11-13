@@ -15,7 +15,7 @@
 //! orders them too, but the two are derived independently.
 
 use anyhow::{bail, Result};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -256,50 +256,10 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
     }
 
     // Paths, exactly as the user wrote them — the output echoes these, not the
-    // worktree-relative form they are looked up by.
-    let given: Vec<BString> = if stdin_paths {
-        let mut buf = Vec::new();
-        std::io::stdin().read_to_end(&mut buf)?;
-        let sep = if nul { b'\0' } else { b'\n' };
-        let mut records: Vec<&[u8]> = if buf.is_empty() {
-            Vec::new()
-        } else {
-            buf.split(|b| *b == sep).collect()
-        };
-        // A trailing separator terminates the last record, it does not start one.
-        if buf.last() == Some(&sep) {
-            records.pop();
-        }
-        let mut paths = Vec::with_capacity(records.len());
-        for r in records {
-            // git only unquotes in the line-oriented mode; `-z` records are literal.
-            // `check_attr()` takes the strbuf as a `const char *`, so a NUL
-            // inside a line ends the name there: a NUL-separated stream fed to a
-            // `--stdin` without `-z` is one line, and only the first name in it
-            // is looked up and echoed.
-            let truncate = |b: &[u8]| -> BString {
-                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                BString::from(&b[..end])
-            };
-            if !nul && r.first() == Some(&b'"') {
-                let Some(unquoted) = unquote_c_style(r) else {
-                    eprintln!("fatal: line is badly quoted");
-                    return Ok(ExitCode::from(128));
-                };
-                paths.push(truncate(&unquoted));
-            } else if nul {
-                paths.push(BString::from(r));
-            } else {
-                paths.push(truncate(r));
-            }
-        }
-        paths
-    } else {
-        rest[filei as usize..]
-            .iter()
-            .map(|s| BString::from(s.as_bytes()))
-            .collect()
-    };
+    // worktree-relative form they are looked up by. `--stdin` records are read
+    // one at a time inside the lookup loop below, as `check_attr_stdin_paths()`
+    // does (builtin/check-attr.c:82-102).
+    let mut cli_paths = rest[filei as usize..].iter().map(|s| BString::from(s.as_bytes()));
 
     let repo = crate::setup::discover()?;
 
@@ -397,7 +357,49 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
     let mut outcome = gix::attrs::search::Outcome::default();
     let mut out: Vec<u8> = Vec::new();
 
-    for path in &given {
+    // `check_attr_stdin_paths()` (builtin/check-attr.c:82-102) reads one
+    // record, answers it and flushes before reading the next, so a process
+    // driving `--stdin` through a pipe gets each answer as it asks, and a badly
+    // quoted line dies after the answers to every line before it.
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let sep = if nul { b'\0' } else { b'\n' };
+    loop {
+        let path: BString = if stdin_paths {
+            // `strbuf_getline_lf()` / `strbuf_getline_nul()`: EOF ends the loop,
+            // and the terminator, when present, is not part of the record.
+            let mut record = Vec::new();
+            if std::io::BufRead::read_until(&mut reader, sep, &mut record)? == 0 {
+                break;
+            }
+            if record.last() == Some(&sep) {
+                record.pop();
+            }
+            // git only unquotes in the line-oriented mode; `-z` records are
+            // literal. `check_attr()` takes the strbuf as a `const char *`, so a
+            // NUL inside a line ends the name there: a NUL-separated stream fed
+            // to a `--stdin` without `-z` is one line, and only the first name
+            // in it is looked up and echoed.
+            let truncate = |b: &[u8]| -> BString {
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                BString::from(&b[..end])
+            };
+            if !nul && record.first() == Some(&b'"') {
+                let Some(unquoted) = unquote_c_style(&record) else {
+                    eprintln!("fatal: line is badly quoted");
+                    return Ok(ExitCode::from(128));
+                };
+                truncate(&unquoted)
+            } else {
+                truncate(&record)
+            }
+        } else {
+            match cli_paths.next() {
+                Some(path) => path,
+                None => break,
+            }
+        };
+        let path = &path;
         let rel = match worktree_relative(workdir.as_deref(), prefix.as_bstr(), path.as_bstr()) {
             Ok(Some(rel)) => rel,
             Ok(None) => {
@@ -430,14 +432,25 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         // then does the metadata collection know every attribute name — so the
         // outcome has to be sized against it afterwards. The second descent is
         // a cache hit on the same stack.
-        let _ = stack.at_entry(rel.as_bstr(), mode)?;
+        //
+        // The empty path (`''`, `.`, `sub/..`) is the work-tree root, which
+        // `prepare_attr_stack()` answers from the root frames alone (attr.c).
+        // The stack cannot point at it once it has descended, so it is moved to
+        // a top-level leaf instead — a leaf loads no `.gitattributes`, leaving
+        // exactly the root frames — and the empty path is matched against those.
+        let at = if rel.is_empty() { b".git".as_bstr() } else { rel.as_bstr() };
+        let _ = stack.at_entry(at, mode)?;
         if all {
             outcome.initialize(stack.attributes_collection());
         } else {
             outcome.initialize_with_selection(stack.attributes_collection(), names.iter().copied());
         }
-        let platform = stack.at_entry(rel.as_bstr(), mode)?;
-        platform.matching_attributes(&mut outcome);
+        if rel.is_empty() {
+            stack.matching_attributes_at_current(rel.as_bstr(), Some(false), &mut outcome);
+        } else {
+            let platform = stack.at_entry(rel.as_bstr(), mode)?;
+            platform.matching_attributes(&mut outcome);
+        }
 
         if all {
             // `--all` reports only attributes that actually have a state.
@@ -452,6 +465,13 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             for m in outcome.iter_selected() {
                 emit(&mut out, path.as_bstr(), m.assignment, nul);
             }
+        }
+        if stdin_paths {
+            // `maybe_flush_or_die(stdout, "attribute to stdout")`.
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&out)?;
+            stdout.flush()?;
+            out.clear();
         }
     }
 

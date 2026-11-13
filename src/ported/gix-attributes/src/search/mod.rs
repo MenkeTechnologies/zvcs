@@ -43,7 +43,11 @@ pub struct TrackedAssignment {
 
 /// An implementation of the [`Pattern`][gix_glob::search::Pattern] trait for attributes.
 #[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Default)]
-pub struct Attributes;
+pub struct Attributes {
+    /// Parse without git's `READ_ATTR_MACRO_OK` (attr.c:266): `[attr]` lines are
+    /// reported and dropped, as for every `.gitattributes` below the work-tree root.
+    pub(crate) macros_not_allowed: bool,
+}
 
 /// Describes a matching pattern with
 #[derive(Clone, PartialEq, Eq, Debug, Hash, Ord, PartialOrd)]

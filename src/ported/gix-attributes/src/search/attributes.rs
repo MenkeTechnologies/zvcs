@@ -59,7 +59,7 @@ impl Search {
         // TODO: should `Pattern` trait use an instance as first argument to carry this information
         //       (so no `retain` later, it's slower than skipping)
         let was_added =
-            gix_glob::search::add_patterns_file(&mut self.patterns, source, follow_symlinks, root, buf, Attributes)?;
+            gix_glob::search::add_patterns_file(&mut self.patterns, source, follow_symlinks, root, buf, Attributes { macros_not_allowed: !allow_macros })?;
         if was_added {
             let last = self.patterns.last_mut().expect("just added");
             if !allow_macros {
@@ -82,7 +82,7 @@ impl Search {
         allow_macros: bool,
     ) {
         self.patterns
-            .push(pattern::List::from_bytes(bytes, source, root, Attributes));
+            .push(pattern::List::from_bytes(bytes, source, root, Attributes { macros_not_allowed: !allow_macros }));
         let last = self.patterns.last_mut().expect("just added");
         if !allow_macros {
             last.patterns
@@ -163,7 +163,9 @@ impl Pattern for Attributes {
             }
         };
 
-        crate::parse(bytes)
+        let lines = crate::parse(bytes);
+        let lines = if self.macros_not_allowed { lines.macros_not_allowed() } else { lines };
+        lines
             .filter_map(|res| match res {
                 Ok(pattern) => Some(pattern),
                 // `parse_attr_line()` (attr.c:398-402) is the one parse failure git
@@ -178,6 +180,18 @@ impl Pattern for Attributes {
                         "warning: Negative patterns are ignored in git attributes\n\
                          Use '\\!' for literal leading exclamation."
                     );
+                    None
+                }
+                // `parse_attr_line()` without `READ_ATTR_MACRO_OK` (attr.c:350-353):
+                //
+                // ```c
+                // fprintf_ln(stderr, _("%s not allowed: %s:%d"), name, src, lineno);
+                // goto fail_return;
+                // ```
+                Err(crate::parse::Error::MacroNotAllowed { line_number, ref name }) => {
+                    let mut msg = name.to_vec();
+                    msg.extend_from_slice(format!(" not allowed: {}:{line_number}\n", _source.display()).as_bytes());
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &msg);
                     None
                 }
                 // `parse_attr_line()`'s macro arm validates the name with the

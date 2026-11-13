@@ -15,7 +15,7 @@
 //! usage error and for `-h`.
 
 use anyhow::Result;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 
 use crate::mailmap::Mailmap;
@@ -185,15 +185,25 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
     for contact in &opts.contacts {
         emit(&mut out, &map, contact.as_bytes())?;
     }
+    // `maybe_flush_or_die(stdout, "stdout")` (builtin/check-mailmap.c:74).
+    out.flush()?;
 
     if opts.stdin {
-        let mut buf = Vec::new();
-        std::io::stdin().lock().read_to_end(&mut buf)?;
-        for line in buf.split_inclusive(|&b| b == b'\n') {
-            // `strbuf_getline`: strip the trailing LF, then a trailing CR.
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            emit(&mut out, &map, line)?;
+        // `while (strbuf_getline_lf(&buf, stdin) != EOF)` (builtin/check-mailmap.c:78-81):
+        // one contact at a time, each answer flushed before the next line is
+        // read, so a process driving `--stdin` through a pipe gets it at once.
+        // The LF alone is stripped, so a CR before it stays part of the contact.
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if std::io::BufRead::read_until(&mut reader, b'\n', &mut line)? == 0 {
+                break;
+            }
+            let contact = line.strip_suffix(b"\n").unwrap_or(&line);
+            emit(&mut out, &map, contact)?;
+            out.flush()?;
         }
     }
 
@@ -274,7 +284,9 @@ fn split_ident(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..name_end], &line[mail_begin..gt]))
 }
 
-/// `isspace` in the C locale, which is what git's ident parser sees.
+/// git's own `isspace()` — `sane_ctype[]`'s `GIT_SPACE` class (ctype.c:20-23),
+/// which is SP, TAB, LF and CR only: unlike the C library's, it leaves VT and FF
+/// in the name.
 fn is_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }

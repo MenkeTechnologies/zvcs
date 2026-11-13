@@ -3695,7 +3695,29 @@ pub fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let brace = name.iter().position(|&c| c == b'}')?;
-    let nth: i64 = std::str::from_utf8(name.get(3..brace)?).ok()?.parse().ok()?;
+    // `strtol(name + 3, &num_end, 10)`: leading C-locale whitespace and one
+    // sign are skipped, the digits are read, and an out-of-range value
+    // saturates rather than failing, so `@{- 1}` is `@{-1}` and a huge `N`
+    // is merely more switches than the reflog holds.
+    let text = name.get(3..brace)?;
+    let mut i = text
+        .iter()
+        .position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .unwrap_or(text.len());
+    let negative = text.get(i) == Some(&b'-');
+    if matches!(text.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let digits = &text[i..];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        // No digits leave `num_end` at `name + 3`, which is the brace only for
+        // `@{-}` — whose `nth` of 0 is refused just below anyway.
+        return None;
+    }
+    let magnitude = digits
+        .iter()
+        .fold(0i64, |n, &d| n.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    let nth = if negative { -magnitude } else { magnitude };
     if nth <= 0 {
         return None;
     }

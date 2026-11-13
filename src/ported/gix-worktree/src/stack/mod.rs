@@ -191,6 +191,26 @@ impl Stack {
         &self.state
     }
 
+    /// Match `relative_path` against the attribute pattern lists the stack holds
+    /// right now, without moving the stack to it — for the empty path, which
+    /// the stack cannot be made to point at once it has descended, but which
+    /// git's `prepare_attr_stack()` resolves against the root frames (attr.c).
+    ///
+    /// # Panics
+    ///
+    /// If the cache was configured without attributes.
+    #[cfg(feature = "attributes")]
+    pub fn matching_attributes_at_current(
+        &self,
+        relative_path: &BStr,
+        is_dir: Option<bool>,
+        out: &mut gix_attributes::search::Outcome,
+    ) -> bool {
+        self.state
+            .attributes_or_panic()
+            .matching_attributes(relative_path, self.case, is_dir, out)
+    }
+
     /// Return the base path against which all entries or paths should be relative to when querying.
     ///
     /// Note that this path _may_ not be canonicalized.

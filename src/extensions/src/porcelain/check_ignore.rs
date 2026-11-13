@@ -37,7 +37,7 @@
 //! internal candidate ordering.
 
 use anyhow::Result;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -235,15 +235,6 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("--non-matching is only valid with --verbose"));
     }
 
-    let originals = if o.stdin {
-        match read_stdin_paths(o.nul)? {
-            Some(paths) => paths,
-            None => return Ok(fatal("line is badly quoted")),
-        }
-    } else {
-        cli_paths
-    };
-
     let repo = crate::setup::discover()?;
     let Some(workdir) = repo.workdir().map(Path::to_path_buf) else {
         return Ok(fatal("this operation must be run in a work tree"));
@@ -281,13 +272,25 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
     // refusal and the parse-time dies are measured against, and each `--stdin`
     // batch is flushed before the next line is read (`maybe_flush_or_die()`,
     // builtin/check-ignore.c:148), so a die mid-stream keeps what came before it.
-    let batches: Vec<&[BString]> = if o.stdin {
-        originals.chunks(1).collect()
+    // The records are read one at a time, after the repository is set up, as
+    // `check_ignore_stdin_paths()` does (builtin/check-ignore.c:128-153).
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut cli_batch = (!o.stdin).then_some(cli_paths);
+    loop {
+    let owned_batch: Vec<BString> = if o.stdin {
+        match read_stdin_record(&mut reader, o.nul)? {
+            StdinRecord::Eof => break,
+            StdinRecord::Path(path) => vec![path],
+            StdinRecord::BadlyQuoted => return Ok(flush_then_fatal(&out, "line is badly quoted")),
+        }
     } else {
-        vec![originals.as_slice()]
+        match cli_batch.take() {
+            Some(paths) => paths,
+            None => break,
+        }
     };
-
-    for batch in batches {
+    let batch = owned_batch.as_slice();
     // `parse_pathspec()` walks the whole argument vector for an empty element
     // before it parses any of them (pathspec.c:637-643), so an empty string
     // anywhere in the batch is reported ahead of every other diagnostic.
@@ -301,7 +304,7 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
     // then its leading path is checked for symlinks. Every item is parsed before
     // any of them is matched, so a die on the last argument suppresses the
     // output the earlier ones would have produced.
-    let mut items: Vec<(&BStr, bool, BString, BString)> = Vec::with_capacity(batch.len());
+    let mut items: Vec<(&BStr, bool, BString, BString, bool)> = Vec::with_capacity(batch.len());
     for orig in batch {
         // `cmd_check_ignore` calls `parse_pathspec()` with a magic mask of
         // `PATHSPEC_ALL_MAGIC & ~PATHSPEC_FROMTOP`, so `:(top)`/`:/` is the one
@@ -384,17 +387,29 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         // ```
         //
         // `entry` is the argument as written, not the prefixed match.
-        if has_symlink_leading_path(&root_abs, rel.as_bstr()) {
+        //
+        // `item->match` is `prefix_path_gently()`'s `normalize_path_copy_len()`
+        // output, which keeps a trailing `/` — written, or left behind by a
+        // final `.` or `..` component (path.c:1106-1109, :1121-1204) — so `link/`,
+        // `link/.` and `link/x/..` all have `link` as a leading path and die.
+        // `rel` drops that slash, so it is restored for this check alone.
+        let mut match_path = rel.clone();
+        let last_component = path.rsplit(|&b| b == b'/').next().unwrap_or_default();
+        if !fromtop && !match_path.is_empty() && matches!(last_component, b"" | b"." | b"..") {
+            match_path.push(b'/');
+        }
+        if has_symlink_leading_path(&root_abs, match_path.as_bstr()) {
             return Ok(flush_then_fatal(
                 &out,
                 &format!("pathspec '{orig}' is beyond a symbolic link"),
             ));
         }
 
-        items.push((orig.as_bstr(), fromtop, path, rel));
+        let match_has_slash = match_path.ends_with(b"/");
+        items.push((orig.as_bstr(), fromtop, path, rel, match_has_slash));
     }
 
-    for (orig, fromtop, path, rel) in &items {
+    for (orig, fromtop, path, rel, match_has_slash) in &items {
         let (orig, fromtop) = (*orig, *fromtop);
 
         // git skips tracked paths entirely unless --no-index: they are not
@@ -406,7 +421,10 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         let mut hit = if tracked || rel.is_empty() {
             None
         } else {
-            // Trailing `/` forces directory semantics; otherwise git lstat()s the
+            // A trailing `/` on `item->match` — written, or left by a final `.`
+            // or `..` — forces directory semantics: `last_matching_pattern()`
+            // then hands the whole path to `prep_exclude()` as a leading
+            // directory (dir.c:1813-1828). Otherwise git lstat()s the
             // path — so a symlink-to-directory is *not* a directory here. git
             // lstat()s it from the top of the work tree, which is where
             // `setup_git_directory()` left it, so a `:(top)` path is resolved
@@ -417,6 +435,7 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
                 root_abs.join(gix::path::from_bstr(rel.as_bstr()))
             };
             let is_dir = path.ends_with(b"/")
+                || *match_has_slash
                 || std::fs::symlink_metadata(&on_disk)
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
@@ -621,48 +640,39 @@ fn usage_error(msg: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// Read the path list from standard input: NUL-separated with `-z`, otherwise
-/// one per line with `"…"`-quoted lines decoded, matching git's `--stdin`.
-///
-/// `None` signals a line that opens a quote it never closes — git's
-/// `fatal: line is badly quoted`.
-fn read_stdin_paths(nul: bool) -> Result<Option<Vec<BString>>> {
-    let mut buf = Vec::new();
-    std::io::stdin().lock().read_to_end(&mut buf)?;
+/// One `--stdin` record, as `check_ignore_stdin_paths()`'s loop sees it.
+enum StdinRecord {
+    /// `strbuf_getline_*()` returned EOF.
+    Eof,
+    /// A path, unquoted when it was `"…"`-quoted.
+    Path(BString),
+    /// A line that opens a quote it never closes — git's
+    /// `fatal: line is badly quoted`.
+    BadlyQuoted,
+}
+
+/// Read the next `--stdin` record: NUL-terminated with `-z`, otherwise one line
+/// with a `"…"`-quoted line decoded (builtin/check-ignore.c:137-147). Reading
+/// one record at a time lets each answer be flushed before the next question
+/// is read, which a process driving the command through a pipe relies on.
+fn read_stdin_record(reader: &mut impl std::io::BufRead, nul: bool) -> Result<StdinRecord> {
     let sep = if nul { b'\0' } else { b'\n' };
-
-    // git's read loop is `while (strbuf_getline(&buf, stdin) != EOF)`, which
-    // yields no iterations at all on empty input. `[u8]::split` instead yields a
-    // single empty chunk for an empty slice, which produced a phantom record
-    // (`::\t\n` under `-n -v --stdin`, four NULs under `-z`) where stock git
-    // writes nothing.
-    if buf.is_empty() {
-        return Ok(Some(Vec::new()));
+    let mut line = Vec::new();
+    // `strbuf_getline_*()` yields no record at all at EOF, and strips the
+    // terminator when there is one.
+    if reader.read_until(sep, &mut line)? == 0 {
+        return Ok(StdinRecord::Eof);
     }
-
-    let mut chunks: Vec<&[u8]> = buf.split(|&b| b == sep).collect();
-    // A trailing separator yields one empty tail chunk that is not a record.
-    if buf.last() == Some(&sep) {
-        chunks.pop();
+    if line.last() == Some(&sep) {
+        line.pop();
     }
-
-    let mut paths = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let line: &[u8] = chunk;
-        if !nul {
-            if line.starts_with(b"\"") {
-                match unquote_c_style(line) {
-                    Some(p) => {
-                        paths.push(as_c_string(&p));
-                        continue;
-                    }
-                    None => return Ok(None),
-                }
-            }
-        }
-        paths.push(as_c_string(line));
+    if !nul && line.starts_with(b"\"") {
+        return Ok(match unquote_c_style(&line) {
+            Some(p) => StdinRecord::Path(as_c_string(&p)),
+            None => StdinRecord::BadlyQuoted,
+        });
     }
-    Ok(Some(paths))
+    Ok(StdinRecord::Path(as_c_string(&line)))
 }
 
 /// The record as the C code that consumes it sees it.

@@ -26,6 +26,8 @@ mod error {
         AttributeName { line_number: usize, attribute: BString },
         #[error("Macro in line {line_number} has non-ascii characters or starts with '-': {macro_name}")]
         MacroName { line_number: usize, macro_name: BString },
+        #[error("Macro in line {line_number} is not allowed outside the top-level attributes files: {name}")]
+        MacroNotAllowed { line_number: usize, name: BString },
         #[error("Could not unquote attributes line")]
         Unquote(#[from] gix_quote::ansi_c::undo::Error),
     }
@@ -36,6 +38,7 @@ pub use error::Error;
 pub struct Lines<'a> {
     lines: bstr::Lines<'a>,
     line_no: usize,
+    macros_ok: bool,
 }
 
 /// An iterator over attribute assignments in a single line.
@@ -96,7 +99,16 @@ impl<'a> Lines<'a> {
         Lines {
             lines: bytes[bom.len()..].lines(),
             line_no: 0,
+            macros_ok: true,
         }
+    }
+
+    /// Parse without `READ_ATTR_MACRO_OK` (attr.c:266), as git reads every
+    /// `.gitattributes` below the top of the work tree: a `[attr]` line is then
+    /// [`Error::MacroNotAllowed`] rather than a macro definition.
+    pub fn macros_not_allowed(mut self) -> Self {
+        self.macros_ok = false;
+        self
     }
 }
 
@@ -113,7 +125,7 @@ impl<'a> Iterator for Lines<'a> {
             if line.first() == Some(&b'#') {
                 continue;
             }
-            match parse_line(line, self.line_no) {
+            match parse_line(line, self.line_no, self.macros_ok) {
                 None => continue,
                 Some(res) => return Some(res),
             }
@@ -122,12 +134,14 @@ impl<'a> Iterator for Lines<'a> {
     }
 }
 
-fn parse_line(line: &BStr, line_number: usize) -> Option<Result<(Kind, Iter<'_>, usize), Error>> {
+fn parse_line(line: &BStr, line_number: usize, macros_ok: bool) -> Option<Result<(Kind, Iter<'_>, usize), Error>> {
     if line.is_empty() {
         return None;
     }
 
-    let (line, attrs): (Cow<'_, _>, _) = if line.starts_with(b"\"") {
+    let raw_line = line;
+    let quoted = line.starts_with(b"\"");
+    let (line, attrs): (Cow<'_, _>, _) = if quoted {
         let (unquoted, consumed) = match gix_quote::ansi_c::undo(line) {
             Ok(res) => res,
             Err(err) => return Some(Err(err.into())),
@@ -139,7 +153,20 @@ fn parse_line(line: &BStr, line_number: usize) -> Option<Result<(Kind, Iter<'_>,
             .unwrap_or((line.into(), [].as_bstr()))
     };
 
-    let kind_res = match line.strip_prefix(b"[attr]") {
+    // `parse_attr_line()` (attr.c:348-354): a name is a macro only when it is
+    // longer than the `[attr]` prefix, so a bare `[attr]` stays a pattern; and
+    // without `READ_ATTR_MACRO_OK` it is refused before its name is checked,
+    // reported as `name` — a C string, so for an unquoted line the rest of the
+    // line from the name on, states included.
+    let macro_name = line.strip_prefix(b"[attr]").filter(|name| !name.is_empty());
+    if macro_name.is_some() && !macros_ok {
+        let name: &BStr = if quoted { &line } else { raw_line };
+        return Some(Err(Error::MacroNotAllowed {
+            line_number,
+            name: name.to_owned(),
+        }));
+    }
+    let kind_res = match macro_name {
         Some(macro_name) => check_attr(macro_name.into())
             .map_err(|err| Error::MacroName {
                 line_number,

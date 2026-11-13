@@ -53,11 +53,6 @@
 //!   `a^{}@{u}`, where the ladder is reached through `ambiguity_base()` and that
 //!   strips the `^{}` peel before the `@` scan, so the mark is never seen. (Stock
 //!   dies with `no such branch: 'a^{}'`; `git rev-parse` here has the same gap.)
-//! * The `N` in `@{-N}` is parsed with Rust's integer parser rather than
-//!   `strtol`, which additionally skips leading whitespace. Whitespace is an
-//!   invalid refname byte regardless, so the only effect is that such input
-//!   stays unexpanded and is then rejected — the same exit code, via a
-//!   different path.
 
 use anyhow::Result;
 use std::io::Write;

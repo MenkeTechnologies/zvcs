@@ -97,7 +97,10 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
             return Ok(super::show_usage(USAGE));
         }
         if let Some(long) = arg.strip_prefix("--") {
-            if long.is_empty() {
+            // `--` and `--end-of-options` both end the options
+            // (parse-options.c:1112-1124); what follows them is positional,
+            // and mktree ignores positionals.
+            if long.is_empty() || long == "end-of-options" {
                 no_more_opts = true;
                 continue;
             }
@@ -521,13 +524,24 @@ fn fatal_format(line: &[u8]) -> Option<Entry> {
     None
 }
 
-/// Report a git `fatal:` on stderr with the message bytes verbatim, so paths
-/// that are not valid UTF-8 come out exactly as git prints them.
+/// Report a git `fatal:` on stderr as `vfreportf()` writes it (usage.c:12-38):
+/// the line, prefix included, is clipped to 4095 bytes, every control byte but
+/// tab and newline becomes `?`, and it goes out in one write. The bytes are not
+/// otherwise touched, so a path that is not valid UTF-8 comes out as git prints
+/// it.
 fn fatal(msg: &[u8]) {
+    const MSG: usize = 4096;
+    let mut line = b"fatal: ".to_vec();
+    line.extend_from_slice(msg);
+    line.truncate(MSG - 1);
+    for byte in &mut line {
+        if byte.is_ascii_control() && *byte != b'\t' && *byte != b'\n' {
+            *byte = b'?';
+        }
+    }
+    line.push(b'\n');
     let mut err = std::io::stderr().lock();
-    let _ = err.write_all(b"fatal: ");
-    let _ = err.write_all(msg);
-    let _ = err.write_all(b"\n");
+    let _ = err.write_all(&line);
     let _ = err.flush();
 }
 

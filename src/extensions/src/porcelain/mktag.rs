@@ -10,8 +10,9 @@
 //! `fsck.c`, including git's short-circuiting: the first message whose severity
 //! resolves to an error stops validation, so only that one line is printed.
 //! Message severities follow git's table, then `fsck.<msgId>` config
-//! (`ignore`/`warn`/`error`/`info`), and finally `mktag`'s own rule that a
-//! warning is reported as an error while `--strict` is in effect (the default).
+//! (`ignore`/`warn`/`error`, read in config order by `git_fsck_config()`),
+//! and finally `mktag`'s own rule that a warning is reported as an error while
+//! `--strict` is in effect (the default).
 //! That reproduces `fsck.badTagName=warn` still failing under `--strict`, and
 //! `--no-strict` demoting `missingTaggerEntry`/`badTagName`/`extraHeaderEntry`
 //! to warnings that still write the tag.
@@ -87,7 +88,9 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
             eprint!("{USAGE}");
             return Ok(ExitCode::from(129));
         };
-        if long.is_empty() {
+        // `--` and `--end-of-options` both end the options
+        // (parse-options.c:1112-1124); mktag ignores what follows.
+        if long.is_empty() || long == "end-of-options" {
             no_more_opts = true;
             continue;
         }
@@ -160,9 +163,12 @@ pub fn mktag(args: &[String]) -> Result<ExitCode> {
     let Ok(header) = repo.find_header(tagged_oid) else {
         return fatal(&format!("could not read tagged object '{tagged_oid}'"));
     };
-    if header.kind() != tagged_kind {
+    if Some(header.kind()) != tagged_kind {
+        // `type_name(OBJ_BAD)` is NULL, which `die()`'s printf renders as
+        // `(null)` (builtin/mktag.c:62-65).
+        let expected = tagged_kind.map_or("(null)".to_string(), |kind| kind.to_string());
         return fatal(&format!(
-            "object '{tagged_oid}' tagged as '{tagged_kind}', but is a '{}' type",
+            "object '{tagged_oid}' tagged as '{expected}', but is a '{}' type",
             header.kind()
         ));
     }
@@ -227,35 +233,66 @@ struct Reporter {
 }
 
 impl Reporter {
-    /// Read the `fsck.<msgId>` overrides that apply to the tag messages.
+    /// `repo_config(the_repository, git_fsck_config, &fsck_options)`
+    /// (builtin/mktag.c:102), keeping the overrides of the rows a tag can report.
     ///
-    /// Config keys are matched case-insensitively by `gix-config`, as git
-    /// matches them. `info` is folded into `warn`, which is what `report()`
-    /// does before handing the message to the error callback, and a
-    /// `FSCK_FATAL` row refuses to be demoted at all —
-    /// `fsck_set_msg_type_from_ids()` dies rather than accept it.
-    /// The `Err` is git's `die()` text, without its `fatal: ` prefix.
+    /// `git_fsck_config()` (fsck.c:1440-1469) is handed every variable in config
+    /// order, so the first bad `fsck.*` value is the one that dies:
+    ///
+    /// * `fsck.skiplist` goes through `git_config_pathname()` and then
+    ///   `fsck_set_msg_types("skiplist=<path>")`, whose `oidset_parse_file()`
+    ///   dies on a file it cannot open or a line that is not an object id. The
+    ///   list is never consulted afterwards: `fsck_tag_standalone()` is given a
+    ///   NULL oid, which `object_on_skiplist()` never finds.
+    /// * every other `fsck.<id>` is `fsck_set_msg_type()` (fsck.c:154-181): the
+    ///   id is looked up among *all* of fsck's ids, not only the tag's —
+    ///   `Unhandled message id: <id>` when none matches; the value is
+    ///   `parse_msg_type()`, which knows `error`, `warn` and `ignore` and nothing
+    ///   else; and a `FSCK_FATAL` row refuses to be demoted.
+    ///
+    /// A valueless `fsck.*` is `config_error_nonbool()`: its `error:` line is
+    /// printed here and the `Err` is `configset_iter()`'s follow-up. Every other
+    /// `Err` is git's `die()` text, without its `fatal: ` prefix.
     fn new(strict: bool, repo: &gix::Repository) -> Result<Self, String> {
-        let snapshot = repo.config_snapshot();
-        let mut overrides = Vec::new();
-        for msg in ALL {
-            let Some(value) = snapshot.string(msg.fsck_key) else {
+        let mut overrides: Vec<(&'static str, Severity)> = Vec::new();
+        for entry in crate::config::walk_config(repo) {
+            let Some(msg_id) = entry.key.strip_prefix("fsck.") else {
                 continue;
             };
-            let text = String::from_utf8_lossy(value.as_ref()).into_owned();
-            let severity = match value.as_slice() {
-                b"ignore" => Severity::Ignore,
-                b"warn" | b"info" => Severity::Warn,
-                b"error" => Severity::Error,
-                _ => return Err(format!("Unknown fsck message type: '{text}'")),
+            let Some(value) = entry.value.as_deref() else {
+                eprintln!("error: missing value for '{}'", entry.key);
+                return Err(entry.origin.die_linenr(&entry.key));
             };
-            // `fsck_set_msg_type_from_ids()` refuses to soften a `FSCK_FATAL`
-            // row, so `fsck.nulInHeader=warn` kills the command outright rather
-            // than letting a NUL-bearing header through.
-            if msg.default == Severity::Fatal && severity != Severity::Error {
-                return Err(format!("Cannot demote {} to {text}", msg.id.to_lowercase()));
+            if msg_id == "skiplist" {
+                let Some(path) = crate::setup::interpolate_path(value) else {
+                    return Err(format!("failed to expand user dir in: '{value}'"));
+                };
+                fsck::read_skip_list(&path.to_string_lossy())?;
+                continue;
             }
-            overrides.push((msg.id, severity));
+            // `parse_msg_id()` compares against each id's downcased spelling,
+            // and the config parser has already lower-cased the variable name.
+            let Some(msg) = fsck::MSGS.iter().find(|m| m.id.to_lowercase() == msg_id) else {
+                return Err(format!("Unhandled message id: {msg_id}"));
+            };
+            // `largePathname` carries its limit after a colon (fsck.c:164-173).
+            let mut type_str = value;
+            if msg.id == fsck::LARGE_PATHNAME.id {
+                if let Some((head, len)) = value.split_once(':') {
+                    type_str = head;
+                    if crate::optint::config_int64(len).is_err() {
+                        return Err(format!("unable to parse max tree entry len: {len}"));
+                    }
+                }
+            }
+            let severity = fsck::parse_severity(type_str)?;
+            if msg.default == Severity::Fatal && severity != Severity::Error {
+                return Err(format!("Cannot demote {msg_id} to {type_str}"));
+            }
+            overrides.retain(|(id, _)| *id != msg.id);
+            if ALL.iter().any(|m| m.id == msg.id) {
+                overrides.push((msg.id, severity));
+            }
         }
 
         Ok(Reporter {
@@ -321,7 +358,7 @@ fn fsck_tag(
     buf: &[u8],
     hash: gix::hash::Kind,
     reporter: &mut Reporter,
-) -> Option<(ObjectId, Kind)> {
+) -> Option<(ObjectId, Option<Kind>)> {
     if verify_headers(buf, reporter) {
         return None;
     }
@@ -360,10 +397,14 @@ fn fsck_tag(
         );
         return None;
     };
-    let Ok(tagged_kind) = Kind::from_bytes(&rest[..eol]) else {
-        reporter.report(&fsck::BAD_TYPE, b"invalid 'type' value");
+    // `*tagged_type = type_from_string_gently(…)` is left at `OBJ_BAD` for a word
+    // that is no type, and only a `report()` answering 1 stops the parse
+    // (fsck.c:1061-1065): with `fsck.badType` demoted the walk goes on, and
+    // `verify_object_in_tag()` meets the bad type. `None` stands for `OBJ_BAD`.
+    let tagged_kind = Kind::from_bytes(&rest[..eol]).ok();
+    if tagged_kind.is_none() && reporter.report(&fsck::BAD_TYPE, b"invalid 'type' value") {
         return None;
-    };
+    }
     let rest = &rest[eol + 1..];
 
     // From here on the tagged object is known, so later demotions can continue.
@@ -376,7 +417,8 @@ fn fsck_tag(
     let Some(eol) = rest.iter().position(|b| *b == b'\n') else {
         reporter.report(
             &fsck::MISSING_TAG,
-            b"invalid format - unexpected end after 'tag' line",
+            // git's text names the 'type' line here too (fsck.c:1074).
+            b"invalid format - unexpected end after 'type' line",
         );
         return found;
     };

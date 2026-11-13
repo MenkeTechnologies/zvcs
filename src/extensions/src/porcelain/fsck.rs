@@ -7549,7 +7549,7 @@ fn value_names(
 }
 
 /// `fsck.c::parse_msg_type` — the three names, compared case-sensitively.
-fn parse_severity(value: &str) -> Result<Severity, String> {
+pub(super) fn parse_severity(value: &str) -> Result<Severity, String> {
     match value {
         "error" => Ok(Severity::Error),
         "warn" => Ok(Severity::Warn),
@@ -7569,7 +7569,7 @@ fn parse_severity(value: &str) -> Result<Severity, String> {
 ///
 /// Both failures are `die()`s, and the caller decides whether they surface here
 /// or inside a transfer's child; see [`MsgConfig::deferred_fatal`].
-fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
+pub(super) fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|_| format!("could not open object name list: {path}"))?;
     let mut out = HashSet::new();

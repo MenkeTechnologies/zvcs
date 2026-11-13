@@ -6,7 +6,7 @@ use gix_revision::spec::parse::{
     delegate::{PeelTo, Traversal},
 };
 
-use crate::revision::spec::parse::delegate::peel;
+use crate::revision::spec::parse::delegate::{peel, read_grafts_if_peel_parses_commit};
 use crate::{
     Object,
     bstr::{BStr, ByteSlice},
@@ -118,6 +118,7 @@ impl delegate::Navigate for Delegate<'_> {
         match kind {
             PeelTo::ValidObject => {
                 for obj in objs.iter() {
+                    read_grafts_if_peel_parses_commit(repo, obj, Some(gix_object::Kind::Tag));
                     if let Err(err) = repo.find_object(*obj) {
                         errors.push((*obj, err.raise_erased()));
                     }
@@ -126,6 +127,7 @@ impl delegate::Navigate for Delegate<'_> {
             PeelTo::ObjectKind(kind) => {
                 let peel = |obj| peel(repo, obj, kind);
                 for obj in objs.iter() {
+                    read_grafts_if_peel_parses_commit(repo, obj, Some(kind));
                     match peel(obj) {
                         Ok(replace) => replacements.push((*obj, replace)),
                         Err(err) => errors.push((*obj, err)),
@@ -167,6 +169,7 @@ impl delegate::Navigate for Delegate<'_> {
             }
             PeelTo::RecursiveTagObject => {
                 for oid in objs.iter() {
+                    read_grafts_if_peel_parses_commit(repo, oid, None);
                     match oid.attach(repo).object().and_then(Object::peel_tags_to_end) {
                         Ok(obj) => replacements.push((*oid, obj.id)),
                         Err(err) => errors.push((*oid, err.raise_erased())),

@@ -121,9 +121,10 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
             "--missing-ok" => missing_ok = true,
             "--no-missing-ok" => missing_ok = false,
             "--no-prefix" => prefix = None,
-            // End-of-options: everything after `--` is a pathspec/positional,
-            // which write-tree ignores. Options seen before `--` still apply.
-            "--" => break,
+            // End-of-options: everything after `--` or `--end-of-options`
+            // (parse-options.c:1112-1124) is a positional, which write-tree
+            // ignores. Options seen before it still apply.
+            "--" | "--end-of-options" => break,
             "--prefix" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -157,6 +158,29 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
     // while reading the index, exactly like the tree-build phase of `commit`.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `hold_lock_file_for_update(&lock_file, index_path, LOCK_DIE_ON_ERROR)`
+    // comes before the index is read (cache-tree.c:816), so a lock git cannot
+    // create is `unable_to_lock_die()`'s message at 128 whatever the index
+    // holds. The lock is committed by the write below and rolled back on every
+    // other way out (cache-tree.c:832, :842).
+    let index_path = repo.index_path();
+    let held = match gix::lock::File::acquire_to_update_resource(&index_path, gix::lock::acquire::Fail::Immediately, None)
+    {
+        Ok(held) => held,
+        Err(err) => {
+            let errno = match err {
+                gix::lock::acquire::Error::Io(e) => {
+                    let mut lock_path = index_path.clone().into_os_string();
+                    lock_path.push(".lock");
+                    lock_errno(std::path::Path::new(&lock_path), &e)
+                }
+                gix::lock::acquire::Error::PermanentlyLocked { .. } => super::pack_refs::eexist(),
+            };
+            eprintln!("fatal: {}", gix::lock::pid::unable_to_lock_message(&index_path, &errno));
+            return Ok(ExitCode::from(128));
+        }
+    };
+
     // An absent index file is an empty index, and yields git's empty-tree id.
     let mut index = open_index_for_update(&repo)?;
     if ignore_cache_tree {
@@ -172,26 +196,23 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
         }
     };
 
-    // `--prefix` selects a sub-tree of what was just written; the trees are on
+    // `--prefix` is looked up in the cache-tree that was just brought up to
+    // date, not in the tree objects (cache-tree.c:772-776): a directory a sparse
+    // index keeps collapsed has no cache-tree node below it, so `out/deep/` is
+    // `not found` there even though the tree object holds it. The trees are on
     // disk either way, exactly as with stock git when the prefix does not exist.
     let out_id = match prefix.as_deref() {
         None => tree_id,
-        Some(p) if p.trim_end_matches('/').is_empty() => tree_id,
-        Some(p) => {
-            let root = repo.find_tree(tree_id)?;
-            // `Path::components` drops the documented trailing slash for us.
-            let entry = root.lookup_entry_by_path(std::path::Path::new(p))?;
-            match entry {
-                Some(e) if e.mode().is_tree() => e.object_id(),
-                _ => {
-                    eprintln!("fatal: git-write-tree: prefix {p} not found");
-                    return Ok(ExitCode::from(128));
-                }
+        Some(p) => match cache_tree_find(&index, p.as_bytes()) {
+            Some(subtree) => subtree.id,
+            None => {
+                eprintln!("fatal: git-write-tree: prefix {p} not found");
+                return Ok(ExitCode::from(128));
             }
-        }
+        },
     };
     if changed {
-        write_refreshed_cache_tree(&repo, &mut index)?;
+        write_refreshed_cache_tree_holding(&repo, &mut index, held)?;
     }
 
     println!("{out_id}");
@@ -377,6 +398,71 @@ pub(super) fn write_refreshed_cache_tree(repo: &gix::Repository, index: &mut gix
     prepare_offset_table(repo, index);
     crate::index_racy::write(repo, index)?;
     Ok(())
+}
+
+/// [`write_refreshed_cache_tree`] through `held`, the index lock `write-tree`
+/// took before it read the index, as `write_index_as_tree()` writes through its
+/// own `lock_file` (cache-tree.c:816, :832).
+fn write_refreshed_cache_tree_holding(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    held: gix::lock::File,
+) -> Result<()> {
+    prepare_offset_table(repo, index);
+    crate::index_racy::write_holding(repo, index, held)?;
+    Ok(())
+}
+
+/// The `errno` behind a lock gitoxide could not create, for
+/// `unable_to_lock_message()`'s `strerror()`.
+///
+/// gitoxide creates the file through the `tempfile` crate, which wraps the
+/// `open(2)` failure in a private error naming the path, and the raw code is not
+/// reachable through it; rendering the kind alone gives Rust's wording
+/// (`permission denied`) where git prints `Operation not permitted`. So the open
+/// git makes, `open(path, O_RDWR | O_CREAT | O_EXCL, 0666)` (tempfile.c:141-146),
+/// is made once more for its `errno`. Should it succeed this time, the file it
+/// made is removed and the kind is all there is to go on.
+fn lock_errno(lock_path: &std::path::Path, err: &std::io::Error) -> std::io::Error {
+    if let Some(code) = err.raw_os_error() {
+        return std::io::Error::from_raw_os_error(code);
+    }
+    match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(lock_path) {
+        Err(again) if again.raw_os_error().is_some() => again,
+        Ok(_) => {
+            let _ = std::fs::remove_file(lock_path);
+            std::io::Error::from(err.kind())
+        }
+        Err(_) => std::io::Error::from(err.kind()),
+    }
+}
+
+/// `cache_tree_find()` (cache-tree.c:733-756) over `index`'s cache-tree: walk
+/// `path` one `/`-separated component at a time through the children, skipping
+/// every run of slashes after a component. An empty component — a leading `/` —
+/// names no child, and an empty path is the root itself.
+///
+/// A sparse-directory entry is a leaf of git's cache-tree (cache-tree.c:326-340),
+/// so nothing below one can be found. This port expands such entries virtually on
+/// read, and its cache-tree grows nodes under them that git's does not have.
+fn cache_tree_find<'a>(index: &'a gix::index::File, mut path: &[u8]) -> Option<&'a gix::index::extension::Tree> {
+    let mut it = index.tree()?;
+    // The index name of `it`, with git's trailing `/`; empty at the root.
+    let mut dir: Vec<u8> = Vec::new();
+    while !path.is_empty() {
+        if index.virtual_sparse_dirs().iter().any(|d| d.path.as_slice() == dir.as_slice()) {
+            return None;
+        }
+        let end = path.iter().position(|&b| b == b'/').unwrap_or(path.len());
+        it = it.children.iter().find(|sub| sub.name.as_slice() == &path[..end])?;
+        dir.extend_from_slice(&path[..end]);
+        dir.push(b'/');
+        path = &path[end..];
+        while path.first() == Some(&b'/') {
+            path = &path[1..];
+        }
+    }
+    Some(it)
 }
 
 /// The as-is `prepare_index()` step (builtin/commit.c:486-491): update the

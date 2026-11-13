@@ -116,7 +116,6 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
     crate::settle_commit_identity(&mut repo);
 
     let mut message: Vec<u8> = Vec::new();
-    let mut have_message = false;
     let mut parents: Vec<ObjectId> = Vec::new();
     // Non-options, kept unresolved: `parse_options` only gathers them.
     let mut trees: Vec<&str> = Vec::new();
@@ -246,7 +245,6 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                 if !message.is_empty() && !message.ends_with(b"\n") {
                     message.push(b'\n');
                 }
-                have_message = true;
             }
             'F' => {
                 separate(&mut message);
@@ -256,19 +254,24 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                     std::io::stdin().lock().read_to_end(&mut buf)?;
                     message.extend_from_slice(&buf);
                 } else {
-                    match std::fs::read(crate::setup::path_below_work_tree_top(&repo, value)) {
-                        Ok(buf) => message.extend_from_slice(&buf),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            return fatal(&format!(
-                                "could not open '{value}' for reading: No such file or directory"
-                            ))
-                        }
+                    // `xopen(arg, O_RDONLY)` then `strbuf_read()`
+                    // (builtin/commit-tree.c:85-88): the open's failure is
+                    // xopen()'s die_errno() (wrapper.c), the read's is the
+                    // command's own — which is where a directory fails, since
+                    // open(2) accepts one for reading.
+                    let path = crate::setup::path_below_work_tree_top(&repo, value);
+                    let mut file = match std::fs::File::open(path) {
+                        Ok(file) => file,
                         Err(e) => {
-                            return fatal(&format!("could not open '{value}' for reading: {e}"))
+                            let errno = crate::external::strerror(&e);
+                            return fatal(&format!("could not open '{value}' for reading: {errno}"));
                         }
+                    };
+                    if let Err(e) = file.read_to_end(&mut message) {
+                        let errno = crate::external::strerror(&e);
+                        return fatal(&format!("git commit-tree: failed to read '{value}': {errno}"));
                     }
                 }
-                have_message = true;
             }
             _ => unreachable!("flag was validated above"),
         }
@@ -285,8 +288,10 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         Err(m) => return fatal(&m),
     };
 
-    // With no -m and no -F the whole message is stdin, verbatim.
-    if !have_message {
+    // `if (!buffer.len)` (builtin/commit-tree.c:142-145): the whole message is
+    // stdin, verbatim, whenever -m and -F left the buffer empty — with neither
+    // given, and also after `-m ""` or an empty `-F` file.
+    if message.is_empty() {
         std::io::stdin().lock().read_to_end(&mut message)?;
     }
     if message.contains(&0) {
@@ -519,5 +524,14 @@ fn identity(
              GIT_{upper}_NAME/GIT_{upper}_EMAIL); git's gecos fallback is not ported"
         );
     };
-    Ok(signature?.to_owned()?)
+    // `fmt_ident()` copies both fields through `strbuf_addstr_without_crud()`
+    // (ident.c:229-266, :525-528): crud is trimmed from each end and every `\n`,
+    // `<` and `>` left inside is dropped, so `GIT_AUTHOR_NAME='  a<b>c  '` records
+    // `abc` where the bytes as given could not be written at all.
+    let signature = signature?;
+    Ok(gix::actor::Signature {
+        name: super::refs_migrate::without_crud(signature.name).into(),
+        email: super::refs_migrate::without_crud(signature.email).into(),
+        time: signature.time()?,
+    })
 }

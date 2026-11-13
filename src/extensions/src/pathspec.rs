@@ -240,13 +240,26 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
     specs: &[S],
     defaults: gix::pathspec::Defaults,
 ) -> Option<String> {
+    // `prefix_path_gently()` is handed `revs->prefix`, the CWD as seen from the
+    // working tree. Outside one there is nothing to be outside *of*.
+    let prefix = repo.prefix().ok().flatten().unwrap_or_else(|| std::path::Path::new("")).to_owned();
+    first_outside_repository_fatal_from(repo, specs, defaults, &prefix)
+}
+
+/// [`first_outside_repository_fatal`] for a caller that hands `parse_pathspec()`
+/// a prefix other than the current directory's: `ls-tree --full-tree` passes
+/// `NULL` (builtin/ls-tree.c:387-388, :420-423), so its elements resolve from
+/// the top of the work tree and `../x` climbs out of it from any directory.
+pub fn first_outside_repository_fatal_from<S: AsRef<[u8]>>(
+    repo: &gix::Repository,
+    specs: &[S],
+    defaults: gix::pathspec::Defaults,
+    prefix: &std::path::Path,
+) -> Option<String> {
     let Some(workdir) = repo.workdir() else {
         return bare_outside_repository_fatal(repo, specs, defaults);
     };
     let root = gix::path::realpath(workdir).unwrap_or_else(|_| workdir.to_owned());
-    // `prefix_path_gently()` is handed `revs->prefix`, the CWD as seen from the
-    // working tree. Outside one there is nothing to be outside *of*.
-    let prefix = repo.prefix().ok().flatten().unwrap_or_else(|| std::path::Path::new("")).to_owned();
     specs.iter().find_map(|spec| {
         let elt: &BStr = spec.as_ref().as_bstr();
         let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
@@ -430,6 +443,19 @@ pub fn parse_pathspec_fatal_masked<S: AsRef<[u8]>>(
     specs: &[S],
     magic_mask: u32,
 ) -> Option<String> {
+    parse_pathspec_fatal_masked_from(repo, specs, magic_mask, None)
+}
+
+/// [`parse_pathspec_fatal_masked`] with the `prefix` `parse_pathspec()` is handed
+/// spelled out: `None` is the current directory's, `Some("")` git's `NULL`, which
+/// resolves every element from the top of the work tree (see
+/// [`first_outside_repository_fatal_from`]).
+pub fn parse_pathspec_fatal_masked_from<S: AsRef<[u8]>>(
+    repo: &gix::Repository,
+    specs: &[S],
+    magic_mask: u32,
+    prefix: Option<&std::path::Path>,
+) -> Option<String> {
     if specs.is_empty() {
         return None;
     }
@@ -451,9 +477,11 @@ pub fn parse_pathspec_fatal_masked<S: AsRef<[u8]>>(
         // `prefix_path_gently()` (pathspec.c:482-487), so neither can be "outside
         // repository": `git status -- ':(top)../x'` is a no-op match, not a fatal.
         if !element.rooted() {
-            if let Some(msg) =
-                first_outside_repository_fatal(repo, std::slice::from_ref(spec), defaults)
-            {
+            let outside = match prefix {
+                Some(prefix) => first_outside_repository_fatal_from(repo, std::slice::from_ref(spec), defaults, prefix),
+                None => first_outside_repository_fatal(repo, std::slice::from_ref(spec), defaults),
+            };
+            if let Some(msg) = outside {
                 return Some(msg);
             }
         }

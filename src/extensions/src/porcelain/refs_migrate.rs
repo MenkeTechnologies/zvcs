@@ -477,7 +477,7 @@ fn parse_reflog_line(repo: &gix::Repository, refname: &str, line: &[u8], index: 
 
 /// `strbuf_addstr_without_crud()` (ident.c:229-266): crud trimmed from both
 /// ends, and `\n`, `<` and `>` dropped from what is left.
-fn without_crud(s: &[u8]) -> Vec<u8> {
+pub(super) fn without_crud(s: &[u8]) -> Vec<u8> {
     let crud = |c: u8| c <= 32 || b",:;<>\"\\'".contains(&c);
     let start = s.iter().position(|&c| !crud(c)).unwrap_or(s.len());
     let end = s.iter().rposition(|&c| !crud(c)).map_or(start, |p| p + 1);

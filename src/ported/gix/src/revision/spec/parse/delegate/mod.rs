@@ -257,6 +257,35 @@ impl Delegate<'_> {
     }
 }
 
+/// The graft-file read a `^{…}` peel makes happen in git.
+///
+/// `peel_onion()` starts with `o = parse_object(r, &outer)` (object-name.c:961),
+/// and `repo_peel_to_type()` (object-name.c:882-905) and `deref_tag()`
+/// (tag.c:76-95) parse every object they step onto. Parsing a commit runs
+/// `parse_commit_buffer()`, whose `lookup_commit_graft()` (commit.c:554) reads
+/// `info/grafts` once and prints its deprecation advice (commit.c:287-300). So
+/// `HEAD^{tree}`, `v1^{}` over a tagged commit and `HEAD^{object}` read the
+/// graft file, while `v1^{tag}` stops at the tag and `HEAD:path` never parses
+/// the commit (`get_tree_entry()` reads it raw).
+///
+/// `target` is the type the peel stops at; `None` peels through every tag
+/// (`^{}`). `^{object}` stops at the outer object whatever it is, which for a
+/// tag is the same answer as stopping at `Tag`.
+fn read_grafts_if_peel_parses_commit(repo: &Repository, outer: &gix_hash::oid, target: Option<gix_object::Kind>) {
+    let Ok(object) = repo.find_object(outer) else {
+        return;
+    };
+    let reached = match object.kind {
+        gix_object::Kind::Tag if target != Some(gix_object::Kind::Tag) => {
+            object.peel_tags_to_end().ok().map(|object| object.kind)
+        }
+        kind => Some(kind),
+    };
+    if reached == Some(gix_object::Kind::Commit) {
+        repo.commit_grafts();
+    }
+}
+
 fn peel(repo: &Repository, obj: &gix_hash::oid, kind: gix_object::Kind) -> Result<ObjectId, Exn> {
     let mut obj = repo.find_object(obj).or_erased()?;
     obj = obj.peel_to_kind(kind).or_erased()?;

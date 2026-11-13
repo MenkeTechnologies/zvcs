@@ -5,7 +5,6 @@ use std::process::ExitCode;
 use gix::bstr::{BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::object::tree::{EntryKind, EntryMode};
-use gix::prelude::ObjectIdExt;
 
 use super::{Arg, LongOpt};
 
@@ -177,7 +176,9 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if !no_more_opts && a == "--" {
+        // `--` and `--end-of-options` both end the options
+        // (parse-options.c:1112-1124); what follows is the tree-ish and paths.
+        if !no_more_opts && (a == "--" || a == "--end-of-options") {
             no_more_opts = true;
             continue;
         }
@@ -356,6 +357,20 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     // alike. Resolving through the odb here would mis-report an absent but
     // well-formed id as an invalid name.
     let Some(id) = crate::objname::resolve(&repo, spec) else {
+        // A `./` or `../` path arm is rewritten by `resolve_relative_path()`
+        // inside the lookup, whose `prefix_path()` dies on one that climbs out
+        // of the work tree (object-name.c:1840-1845) — for `<rev>:<path>` only
+        // once `<rev>` has named a tree-ish.
+        let path_arm_reached = match crate::objpath::split(spec) {
+            crate::objpath::Split::Tree { rev, .. } => crate::objname::resolve(&repo, rev).is_some(),
+            crate::objpath::Split::Index { .. } => true,
+            crate::objpath::Split::Oneline | crate::objpath::Split::Rev => false,
+        };
+        if path_arm_reached {
+            if let Some(msg) = crate::objpath::relative_path_fatal(&repo, spec) {
+                return Ok(fatal(&msg));
+            }
+        }
         return Ok(fatal(&format!("Not a valid object name {spec}")));
     };
     // The settings block (`prepare_repo_settings()`) is not read up front: it
@@ -387,8 +402,13 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     // at exit 0.
     const MAGIC_MASK: u32 =
         crate::pathspec::MAGIC_ALL & !(crate::pathspec::MAGIC_TOP | crate::pathspec::MAGIC_LITERAL);
+    // `if (full_tree) prefix = NULL;` (builtin/ls-tree.c:387-388) comes before
+    // `parse_pathspec(…, prefix, argv + 1)`, so under `--full-tree` every element
+    // resolves from the top and `../a` is outside the repository from any
+    // directory.
+    let pathspec_prefix = full_tree.then_some(std::path::Path::new(""));
     if let Some(msg) =
-        crate::pathspec::parse_pathspec_fatal_masked(&repo, &positionals, MAGIC_MASK)
+        crate::pathspec::parse_pathspec_fatal_masked_from(&repo, &positionals, MAGIC_MASK, pathspec_prefix)
     {
         return Ok(fatal(&msg));
     }
@@ -481,10 +501,20 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     if let Err(bad) = walk(&repo, tree, b"", &opts, &mut out) {
         // `strbuf_expand_bad_format()` dies while rendering the first entry, so
         // nothing this run produced reaches stdout.
-        return Ok(match bad.downcast::<BadFormat>() {
-            Ok(BadFormat(msg)) => fatal(&msg),
-            Err(other) => return Err(other),
-        });
+        let bad = match bad.downcast::<BadFormat>() {
+            Ok(BadFormat(msg)) => return Ok(fatal(&msg)),
+            Err(other) => other,
+        };
+        // `expand_objectsize()`'s `die()` can come at any entry; the lines
+        // `fwrite()` already handed to stdio are flushed by the `exit()`.
+        return match bad.downcast::<ObjectInfoFatal>() {
+            Ok(ObjectInfoFatal(msg)) => {
+                let code = fatal(&msg);
+                std::io::stdout().lock().write_all(&out)?;
+                Ok(code)
+            }
+            Err(other) => Err(other),
+        };
     }
     let stdout = std::io::stdout();
     let mut sink = std::io::BufWriter::new(stdout.lock());
@@ -677,7 +707,14 @@ fn write_entry(
     let disp = display_name(name, opts);
 
     if let Some(fmt) = &opts.format {
-        expand_format(repo, fmt, out, mode, oid, &disp, opts)?;
+        // `show_tree_fmt()` builds the line in its own strbuf and writes it only
+        // once it is complete (builtin/ls-tree.c:108-140), so a `die()` partway
+        // through leaves none of it behind.
+        let start = out.len();
+        if let Err(err) = expand_format(repo, fmt, out, mode, oid, &disp, opts) {
+            out.truncate(start);
+            return Err(err);
+        }
         out.push(term);
         return Ok(());
     }
@@ -698,7 +735,7 @@ fn write_entry(
     let oid_str = object_id_str(repo, oid, opts)?;
 
     if opts.long {
-        let size = entry_size(repo, mode, oid)?;
+        let size = long_size_text(repo, mode, oid);
         out.extend_from_slice(format!("{mode_str} {type_str} {oid_str} {size:>7}\t").as_bytes());
     } else {
         out.extend_from_slice(format!("{mode_str} {type_str} {oid_str}\t").as_bytes());
@@ -849,9 +886,9 @@ fn expand_atom(
         "(objectmode)" => out.extend_from_slice(git_mode(mode).as_bytes()),
         "(objecttype)" => out.extend_from_slice(git_type(mode).as_bytes()),
         "(objectsize:padded)" => {
-            out.extend_from_slice(format!("{:>7}", entry_size(repo, mode, oid)?).as_bytes())
+            out.extend_from_slice(format!("{:>7}", format_object_size(repo, mode, oid)?).as_bytes())
         }
-        "(objectsize)" => out.extend_from_slice(entry_size(repo, mode, oid)?.as_bytes()),
+        "(objectsize)" => out.extend_from_slice(format_object_size(repo, mode, oid)?.as_bytes()),
         "(objectname)" => out.extend_from_slice(object_id_str(repo, oid, opts)?.as_bytes()),
         _ => out.extend_from_slice(&crate::quote::quoted_name_bytes(name)),
     }
@@ -878,15 +915,44 @@ fn bad_format(rest: &[u8]) -> BadFormat {
     }
 }
 
-/// The size column: blobs (including symlinks) report their byte count, trees
-/// and submodule commits report `-`, exactly as git does.
-fn entry_size(repo: &gix::Repository, mode: EntryMode, oid: &ObjectId) -> Result<String> {
-    Ok(if mode.is_blob_or_symlink() {
-        repo.find_header(*oid)?.size().to_string()
-    } else {
-        "-".to_string()
-    })
+/// `show_tree_long()`'s size column (builtin/ls-tree.c:222-231): a blob's
+/// (or symlink's) byte count, `BAD` for a blob the odb cannot answer for, and
+/// `-` for trees and submodule commits.
+fn long_size_text(repo: &gix::Repository, mode: EntryMode, oid: &ObjectId) -> String {
+    if !mode.is_blob_or_symlink() {
+        return "-".to_string();
+    }
+    match repo.find_header(*oid) {
+        Ok(header) => header.size().to_string(),
+        Err(_) => "BAD".to_string(),
+    }
 }
+
+/// `expand_objectsize()` without the padding (builtin/ls-tree.c:26-46), which
+/// `%(objectsize)` and `%(objectsize:padded)` share: a blob the odb cannot
+/// answer for is a `die()`, where `--long` prints `BAD`.
+fn format_object_size(repo: &gix::Repository, mode: EntryMode, oid: &ObjectId) -> Result<String> {
+    if !mode.is_blob_or_symlink() {
+        return Ok("-".to_string());
+    }
+    match repo.find_header(*oid) {
+        Ok(header) => Ok(header.size().to_string()),
+        Err(_) => Err(ObjectInfoFatal(format!("could not get object info about '{oid}'")).into()),
+    }
+}
+
+/// `expand_objectsize()`'s `die()`, carried out of the walk so the lines
+/// already written reach stdout before the `fatal:` ends the command.
+#[derive(Debug)]
+struct ObjectInfoFatal(String);
+
+impl std::fmt::Display for ObjectInfoFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObjectInfoFatal {}
 
 /// The 6-digit octal mode exactly as stock `git ls-tree` prints it.
 fn git_mode(mode: EntryMode) -> &'static str {
@@ -923,7 +989,10 @@ fn object_id_str(repo: &gix::Repository, oid: &ObjectId, opts: &Opts) -> Result<
             .ok()
             .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
             .map_or_else(|| oid.to_hex_with_len(n).to_string(), |p| p.to_string()),
-        Abbrev::Auto => oid.attach(repo).shorten_or_id().to_string(),
+        // A bare `--abbrev` is `DEFAULT_ABBREV` (parse-options-cb.c:23-24), and
+        // `repo_find_unique_abbrev()` keeps that length for an id the odb does
+        // not hold, which is how `--long` abbreviates a `BAD` blob's name.
+        Abbrev::Auto => crate::abbrev::default_unique_abbrev(repo, oid),
     })
 }
 

@@ -1985,7 +1985,22 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // `repo_get_commit_tree()`, the tree (commit-graph.c:858-874, 1091-1120);
                 // a buffer parse the tree first (commit.c:545-586).
                 let graph_order = from_graph.is_some();
-                let Ok(Ok(decoded)) = from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) else { continue };
+                // A commit or tag that will not parse prints what `parse_commit_buffer()` or
+                // `parse_tag_buffer()` prints, and stays unparsed, so the next walk of it
+                // parses and prints again (commit.c:527-544, tag.c:138-202, fsck.c:471-476).
+                let decoded = match from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) {
+                    Ok(Ok(decoded)) => decoded,
+                    Ok(Err(failed)) => {
+                        if !parsed_before {
+                            if let Some(line) = failed.diagnostic {
+                                eprintln!("{line}");
+                            }
+                            parsed_here.remove(&id);
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
                 let children: Vec<ObjectId> = decoded.children.iter().map(|(child, _)| *child).collect();
                 if !parsed_before {
                     let looked_up = match graph_order {
@@ -3258,8 +3273,10 @@ fn collect_index_heads(
         index_blobs.insert(entry.id);
         heads.push(entry.id);
     }
+    // `fsck_index()` hands its own `index_path` to `fsck_cache_tree()`
+    // (builtin/fsck.c:790-791).
     if let Some(tree) = index.tree() {
-        let path = index_path_label(repo);
+        let path = label.map_or_else(|| index_path_label(repo), str::to_owned);
         return collect_cache_tree(repo, tree, state, heads, names, &path, verbose);
     }
     Ok(0)

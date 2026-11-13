@@ -24,6 +24,10 @@
 //!      for its type.
 //!   6. **`--progress` draws around the scan's findings**: a subdirectory's lines
 //!      come out before `fsck_subdir()` draws it (odb/source-loose.c:1101-1106).
+//!   7. **A commit or tag that will not parse says why under
+//!      `--connectivity-only` too**, from `mark_unreachable_referents()`'s walk
+//!      (fsck.c:471-476, tag.c:168-179), and a linked worktree's cache tree is
+//!      checked under that worktree's index path (builtin/fsck.c:790-791).
 
 #[path = "support/stock_git.rs"]
 mod stock_git;
@@ -172,6 +176,12 @@ fn a_finding_report_answers_zero_for_does_not_end_the_check() {
             &format!("object {head}\ntype commit\ntag bad name\n\nm\n"),
         );
         git(stock, dir, &["update-ref", "refs/tags/n", &tag]);
+        literal(
+            stock,
+            dir,
+            "tag",
+            &format!("object {head}\ntype bogus\ntag bt\ntagger T <t@e> 1700000000 +0000\n\nm\n"),
+        );
     });
     // The ignored overflow lets `missingNameBeforeEmail` through; the bad
     // tagger is printed, yet the tag's ignored extra header is what
@@ -186,6 +196,10 @@ fn a_finding_report_answers_zero_for_does_not_end_the_check() {
     // A warning does not: both come out.
     let (_, _, err) = same(stock, &dirs, &["-c", "fsck.extraHeaderEntry=warn", "fsck"], &[]);
     assert!(err.contains("missingTaggerEntry") && err.contains("extraHeaderEntry"), "{err}");
+    // `--connectivity-only` parses the unreachable tag of no known type only in
+    // `mark_unreachable_referents()`, and `parse_tag_buffer()` says why it failed.
+    let (_, _, err) = same(stock, &dirs, &["fsck", "--connectivity-only"], &[]);
+    assert!(err.contains("error: unknown tag type 'bogus' in "), "{err}");
 }
 
 #[test]
@@ -202,6 +216,10 @@ fn broken_refs_and_a_linked_worktree_head_are_snapshot_errors() {
     assert!(err.contains("error: refs/heads/garb: invalid sha1 pointer 0000"), "{err}");
     assert!(err.contains("error: worktrees/wt/HEAD: invalid sha1 pointer 9999"), "{err}");
     same(stock, &dirs, &["fsck", "--name-objects", "--unreachable"], &[]);
+    // The linked worktree's index comes after the main one, under its own path
+    // for the cache tree as well (builtin/fsck.c:790-791, :958-980).
+    let (_, _, err) = same(stock, &dirs, &["fsck", "--verbose"], &[]);
+    assert!(err.contains("Checking cache tree of .git/worktrees/wt/index\n"), "{err}");
 }
 
 #[test]

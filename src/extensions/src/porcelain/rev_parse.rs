@@ -703,7 +703,17 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // the operand merely fails to resolve, and rev-parse ends on
                     // `die_no_single_rev(quiet)`'s silent exit 1 or, without
                     // `--verify`, on the ordinary `ambiguous argument` block.
-                    if !o.quiet {
+                    // Except behind a prefix rewrite: `reinterpret()` hands the
+                    // spliced name back to `repo_interpret_branch_name()` with
+                    // options holding `.allowed` alone (object-name.c:1376-1400),
+                    // so `nonfatal_dangling_mark` is gone and `@{-1}@{u}` or
+                    // `@@{u}` still dies under `--quiet`.
+                    let reinterpreted = crate::objname::prefix_rewrite(
+                        &repo,
+                        crate::objname::ambiguity_base_of(name),
+                    )
+                    .is_some();
+                    if !o.quiet || reinterpreted {
                         if let Some(message) = crate::objname::upstream_mark_fatal(&repo, name) {
                             out.flush()?;
                             eprintln!("fatal: {message}");
@@ -2885,6 +2895,43 @@ fn positional_option(
         return Ok(Positional::ConsumedValue);
     }
     // ```c
+    // if (!strcmp(arg,"-n")) {
+    //         if (++i >= argc)
+    //                 die(_("-n requires an argument"));
+    //         if ((filter & DO_FLAGS) && (filter & DO_REVS)) {
+    //                 show(arg);
+    //                 show(argv[i]);
+    //         }
+    //         continue;
+    // }
+    // if (starts_with(arg, "-n")) {
+    //         if ((filter & DO_FLAGS) && (filter & DO_REVS))
+    //                 show(arg);
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:799-811`.) The revision walk's `-n <count>`: echoed
+    // as a flag pair, never resolved, so the count is not a revision.
+    if arg.starts_with("-n") {
+        let shown = o.filter & DO_FLAGS != 0 && o.filter & DO_REVS != 0;
+        if arg != "-n" {
+            if shown {
+                show(out, o, arg)?;
+            }
+            return Ok(Positional::Consumed);
+        }
+        let Some(count) = next else {
+            out.flush()?;
+            eprintln!("fatal: -n requires an argument");
+            return Ok(Positional::Fatal);
+        };
+        if shown {
+            show(out, o, arg)?;
+            show(out, o, count)?;
+        }
+        return Ok(Positional::ConsumedValue);
+    }
+    // ```c
     // if (!strcmp(arg, "--prefix")) {
     //         prefix = argv[++i];
     //         if (!prefix)
@@ -3241,9 +3288,16 @@ impl PathCtx {
         // `setup_git_directory()` only climbs to the top of the work tree when the
         // cwd is *inside* it; standing in the git directory of a non-bare repository
         // leaves it there, which is why `--git-dir` answers `.` from inside `.git`.
+        // Below the git directory it does not stay there either: the GIT_DIR_BARE
+        // discovery chdir()s back to the cwd it started from and stores the git
+        // directory as an absolute path (`setup.c:1303-1308`, "cannot come back to
+        // cwd"), so `xgetcwd()` in `format_path()` (`path.c:1603-1604`) is the
+        // directory the command was typed in, and `--path-format=relative
+        // --git-dir` from `.git/refs` is `../`. At the git directory itself the two
+        // are the same directory.
         let root = match repo.workdir() {
             Some(wd) if !is_inside_git_dir(repo) => absolute(wd),
-            _ => absolute(repo.git_dir()),
+            _ => setup_cwd(),
         };
         // git's `prefix` is the path down from the top of the WORK TREE, and
         // nothing else: `setup_git_directory_gently_1()` sets the work tree to
@@ -3867,30 +3921,76 @@ fn is_common_path(path: &str) -> bool {
     best.is_some_and(|(_, is_common)| is_common)
 }
 
-/// `repo_for_each_abbrev()` (`object-name.c:548-567`): every object whose name
+/// `repo_for_each_abbrev()` (`object-name.c:547-568`): every object whose name
 /// starts with `prefix`, in ascending object-id order and without repeats.
 ///
-/// A prefix shorter than two hex characters selects nothing — the object database
-/// is enumerated through the two-character fanout of the loose object directories
-/// and of the pack index, so there is no bucket to open — and a prefix carrying a
-/// non-hex character is `parse_oid_prefix()`'s `-1`, which is also nothing. Both
-/// were verified against stock 2.55.0 on a loose and on a packed repository.
+/// ```c
+/// if (parse_oid_prefix(prefix, opts.prefix_hex_len, algo, NULL, &prefix_oid) < 0)
+///         return -1;
+/// if (odb_for_each_object_ext(r->objects, NULL, repo_collect_ambiguous, &collect, &opts) < 0)
+///         return -1;
+/// ret = oid_array_for_each_unique(&collect, fn, cb_data);
+/// ```
+///
+/// There is no minimum length: a prefix carrying a non-hex character is
+/// `parse_oid_prefix()`'s `-1` and selects nothing, any other is handed to
+/// every source with `prefix_oid` zero-padded. The two halves of a source read
+/// it differently:
+///
+///   * packs (`odb/source-packed.c:212-336`) `bsearch` the index for the
+///     zero-padded prefix and walk while `match_hash(len, …)` holds
+///     (`odb/source-packed.c:181-193`). That is the plain prefix test from two
+///     characters up, but its `do`/`while` compares the first byte whole before
+///     `len -= 2` wraps the unsigned length, so below two characters it goes on
+///     comparing the zero padding byte by byte and no real object matches: a
+///     short prefix lists no packed object at all.
+///   * the loose half (`odb/source-loose.c:480-483`) walks
+///     `odb_source_loose_cache(loose, opts->prefix)`, which loads the one
+///     fan-out directory named by `prefix->hash[0]`, and `oidtree_each()`
+///     (`oidtree.c:115-131`) filters it by the prefix. So for a prefix shorter
+///     than two characters only the directory the padding names is read: `a`
+///     reads `objects/a0/`, the empty prefix `objects/00/`, and a loose object
+///     elsewhere under `a` is not listed.
 fn for_each_abbrev(repo: &gix::Repository, prefix: &str) -> Vec<ObjectId> {
-    if prefix.len() < 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Vec::new();
     }
+    let prefix = prefix.to_ascii_lowercase();
     let hex_len = prefix.len().min(repo.object_hash().len_in_hex());
-    // `from_hex_nonempty()` rather than `from_hex()`: the latter refuses anything
-    // shorter than `MIN_HEX_LEN`, and git's own minimum here is the two-character
-    // fanout the guard above already applies.
-    let Ok(prefix) = gix::hash::Prefix::from_hex_nonempty(&prefix[..hex_len]) else {
-        return Vec::new();
-    };
+    let wanted = &prefix[..hex_len];
+    let matches = |id: &ObjectId| id.to_hex().to_string().starts_with(wanted);
+    // `prefix_oid.hash[0]`: the first two hex digits, zero-padded.
+    let bucket = format!("{:0<2}", &prefix[..prefix.len().min(2)]);
     let mut found: Vec<ObjectId> = Vec::new();
-    let Ok(iter) = repo.objects.iter() else { return found };
-    for id in iter.flatten() {
-        if prefix.cmp_oid(&id) == std::cmp::Ordering::Equal {
-            found.push(id);
+    // `repo->objects->sources`: the object directory, then each alternate in
+    // `prepare_alt_odb()`'s order.
+    let store = repo.objects.store_ref();
+    let sources = std::iter::once(store.path().to_owned())
+        .chain(store.alternate_db_paths().unwrap_or_default());
+    for source in sources {
+        if let Ok(entries) = std::fs::read_dir(source.join(&bucket)) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(rest) = name.to_str() else { continue };
+                if let Ok(id) = ObjectId::from_hex(format!("{bucket}{rest}").as_bytes()) {
+                    if matches(&id) {
+                        found.push(id);
+                    }
+                }
+            }
+        }
+        if hex_len < 2 {
+            continue;
+        }
+        let Ok(packs) = std::fs::read_dir(source.join("pack")) else { continue };
+        for entry in packs.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "idx") {
+                continue;
+            }
+            if let Ok(index) = gix::odb::pack::index::File::at(&path, repo.object_hash()) {
+                found.extend(index.iter().map(|e| e.oid).filter(|id| matches(id)));
+            }
         }
     }
     found.sort();
@@ -4428,6 +4528,13 @@ fn parse_options_step(
             }
             break;
         }
+        // `else if (!strcmp(arg + 2, "end-of-options"))` (parse-options.c:1119-1124):
+        // dropped unless `PARSE_OPT_KEEP_UNKNOWN_OPT`, which `cmd_parseopt()` never
+        // passes, and the rest is left unparsed — `--keep-dashdash` or not.
+        if arg == "--end-of-options" {
+            ctx.at += 1;
+            break;
+        }
         if arg == "--help-all" || arg == "--help" {
             return PoResult::Help;
         }
@@ -4473,7 +4580,7 @@ fn parse_short_opt(
         }
         let tail = &rest[c.len_utf8()..];
         ctx.opt = (!tail.is_empty()).then(|| tail.to_string());
-        return get_value(ctx, options, idx, false, hit);
+        return get_value(ctx, options, idx, false, true, hit);
     }
     ShortResult::Unknown
 }
@@ -4533,11 +4640,14 @@ fn parse_long_opt(
             return get_value_long(ctx, options, idx, sense, hit);
         }
 
+        // `register_abbrev()` (`parse-options.c:497-517`): any earlier candidate
+        // makes this one ambiguous unless `is_alias()` pairs them, and
+        // `cmd_parseopt()` has no `alias_groups`, so `is_alias()` is 0
+        // (:477-478) even for the *same* option registered twice — `--no-`
+        // matches every negatable option both ways and names the last one twice.
         let register = |cand: (usize, bool), abbrev: &mut Option<(usize, bool)>, ambiguous: &mut Option<(usize, bool)>| {
             if let Some(prev) = *abbrev {
-                if prev != cand {
-                    *ambiguous = Some(prev);
-                }
+                *ambiguous = Some(prev);
             }
             *abbrev = Some(cand);
         };
@@ -4580,7 +4690,7 @@ fn get_value_long(
     unset: bool,
     hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
 ) -> LongResult {
-    match get_value(ctx, options, idx, unset, hit) {
+    match get_value(ctx, options, idx, unset, false, hit) {
         ShortResult::Done => LongResult::Done,
         ShortResult::Error => LongResult::Error,
         ShortResult::Unknown => LongResult::Unknown,
@@ -4597,14 +4707,33 @@ fn get_value_long(
 /// else if (get_arg(p, opt, flags, &arg))            return -1;
 /// else { p_unset = 0; p_arg = arg; }
 /// ```
+///
+/// `do_get_value()` (`parse-options.c:130-143`) refuses before any of that: a
+/// value attached to a negated long option, a negated `!` option, and a value
+/// attached (`--opt=v`, abbreviation included) to a long option that takes none.
+/// `short` is `flags & OPT_SHORT`, under which the rest of `-abc` in `p->opt`
+/// is the next switch and not a value.
 fn get_value(
     ctx: &mut PoCtx,
     options: &[PoOption],
     idx: usize,
     unset: bool,
+    short: bool,
     hit: &mut dyn FnMut(usize, Option<&str>, bool) -> Result<()>,
 ) -> ShortResult {
     let o = &options[idx];
+    if unset && ctx.opt.is_some() {
+        eprintln!("error: {} takes no value", optname(o, short, unset));
+        return ShortResult::Error;
+    }
+    if unset && !o.allow_unset() {
+        eprintln!("error: {} isn't available", optname(o, short, unset));
+        return ShortResult::Error;
+    }
+    if !short && ctx.opt.is_some() && o.flags & PO_NOARG != 0 {
+        eprintln!("error: {} takes no value", optname(o, short, unset));
+        return ShortResult::Error;
+    }
     let (arg, p_unset) = if unset {
         (None, true)
     } else if o.flags & PO_NOARG != 0 {
@@ -4621,7 +4750,7 @@ fn get_value(
                     ctx.at += 1;
                     (Some(ctx.argv[ctx.at].clone()), false)
                 } else {
-                    eprintln!("error: {} requires a value", optname(o, unset));
+                    eprintln!("error: {} requires a value", optname(o, short, unset));
                     return ShortResult::Error;
                 }
             }
@@ -4633,13 +4762,14 @@ fn get_value(
     ShortResult::Done
 }
 
-/// `optname()` (`parse-options.c:30-45`).
-fn optname(o: &PoOption, unset: bool) -> String {
-    match (&o.long_name, o.short_name) {
-        (None, Some(c)) => format!("switch `{c}'"),
-        (Some(name), _) if unset => format!("option `no-{name}'"),
-        (Some(name), _) => format!("option `{name}'"),
-        (None, None) => String::new(),
+/// `optname()` (`parse-options.c:30-45`): named the way the option was *typed*,
+/// `OPT_SHORT` as the switch and `OPT_LONG` as the long option.
+fn optname(o: &PoOption, short: bool, unset: bool) -> String {
+    let long = o.long_name.as_deref().unwrap_or("");
+    match (short, unset) {
+        (true, _) => format!("switch `{}'", o.short_name.unwrap_or_default()),
+        (false, true) => format!("option `no-{long}'"),
+        (false, false) => format!("option `{long}'"),
     }
 }
 

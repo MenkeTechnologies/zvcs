@@ -2463,9 +2463,15 @@ fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
     let sel = &spec[at + 2..spec.len() - 1];
     // `upstream_mark()`/`push_mark()` compare with `strncasecmp`, so the marks
     // are claimed by `interpret_branch_name()` in any case and never reach the
-    // reflog reader.
+    // reflog reader. `at_mark()` compares only the mark's own length of
+    // `str + at` (`object-name.c:638-650`), so the mark need not end the name:
+    // `@{u}^{tree}` and `main@{push}^{commit}` are no reflog operands either,
+    // and reach `peel_onion()` with the mark as their base.
+    let rest = &spec[at..];
     if sel.starts_with('-')
-        || ["u", "upstream", "push"].iter().any(|m| sel.eq_ignore_ascii_case(m))
+        || ["@{u}", "@{upstream}", "@{push}"]
+            .iter()
+            .any(|m| rest.len() >= m.len() && rest.as_bytes()[..m.len()].eq_ignore_ascii_case(m.as_bytes()))
     {
         return None;
     }
@@ -2756,6 +2762,18 @@ pub fn upstream_mark_fatal_allowed(
     if let Some(rewritten) = prefix_rewrite_allowed(repo, base, allow_head) {
         return upstream_mark_fatal_allowed(repo, &rewritten, allow_head);
     }
+    // ```c
+    // len = interpret_nth_prior_checkout(r, name, namelen, buf);
+    // if (!len) {
+    //         return len; /* syntax Ok, not enough switches */
+    // ```
+    // (`object-name.c:1483-1486`.) A well-formed `@{-<n>}` the reflog does not
+    // reach ends `repo_interpret_branch_name()` before the `@` scan, so the
+    // mark after it is never interpreted: `@{-9}@{u}` is merely an unknown
+    // revision, not `no such branch: '@{-9}'`.
+    if matches!(nth_prior_checkout(repo, base), Some(None)) {
+        return None;
+    }
     let at = match (upstream_mark_at(base), push_mark_at(base)) {
         (Some(u), Some(p)) if p < u => return push_mark_fatal_allowed(repo, spec, allow_head),
         (None, Some(_)) => return push_mark_fatal_allowed(repo, spec, allow_head),
@@ -2889,6 +2907,10 @@ pub fn push_mark_fatal_allowed(
     // `reinterpret()`, as in [`upstream_mark_fatal`].
     if let Some(rewritten) = prefix_rewrite_allowed(repo, base, allow_head) {
         return push_mark_fatal_allowed(repo, &rewritten, allow_head);
+    }
+    // `interpret_nth_prior_checkout()`'s 0, as in [`upstream_mark_fatal`].
+    if matches!(nth_prior_checkout(repo, base), Some(None)) {
+        return None;
     }
     let at = push_mark_at(base)?;
     let named = &base[..at];

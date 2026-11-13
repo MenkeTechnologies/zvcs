@@ -517,9 +517,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         }
                     },
                 };
+                // `strcasecmp()` for the two ident groups, a case-sensitive
+                // `skip_prefix()` for `trailer:` and `format:`
+                // (`builtin/shortlog.c:335-344`).
                 match field.as_str() {
-                    "author" => group_author = true,
-                    "committer" => group_committer = true,
+                    f if f.eq_ignore_ascii_case("author") => group_author = true,
+                    f if f.eq_ignore_ascii_case("committer") => group_committer = true,
                     _ if field.starts_with("trailer:") => {
                         group_special.push(GroupBy::Trailer(field["trailer:".len()..].to_string()));
                     }
@@ -2421,25 +2424,52 @@ fn ancestry(commit: &gix::Commit<'_>, parents: Option<&[ObjectId]>) -> Vec<Objec
     }
 }
 
-/// Port of `parse_uint()` from `builtin/shortlog.c`: read a decimal run, require
-/// the terminator to be `comma` (or end of string), and fall back to `defval`
-/// when the field is empty. Returns `None` on a malformed field.
+/// Port of `parse_uint()` from `builtin/shortlog.c` (`builtin/shortlog.c:279-293`):
+///
+/// ```c
+/// ul = strtoul(*arg, &endp, 10);
+/// if (*endp && *endp != comma)
+///         return -1;
+/// if (ul > INT_MAX)
+///         return -1;
+/// ret = *arg == endp ? defval : (int)ul;
+/// *arg = *endp ? endp + 1 : endp;
+/// ```
+///
+/// `strtoul()` skips leading white space and takes a sign, so `-w+20` and
+/// `-w-0` are widths; a negated non-zero value wraps to a huge one and, like a
+/// value past `INT_MAX` (`-w2147483648`), fails the range check. An empty
+/// field falls back to `defval`. Returns `None` on a malformed field.
 fn parse_uint<'a>(arg: &mut &'a str, comma: Option<char>, defval: usize) -> Option<usize> {
     // Copy the slice out first so `rest` does not borrow through `arg`.
     let s: &'a str = arg;
-    let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let (num, rest) = s.split_at(digits);
+    let b = s.as_bytes();
+    let mut i = b.iter().take_while(|c| matches!(c, b' ' | b'\t'..=b'\r')).count();
+    let negative = b.get(i) == Some(&b'-');
+    if matches!(b.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+    // `endp` is `*arg` itself when no digit was converted.
+    let (endp, ul) = match digits {
+        0 => (0, 0u64),
+        _ => {
+            let ul = s[i..i + digits].parse::<u64>().unwrap_or(u64::MAX);
+            (i + digits, if negative { ul.wrapping_neg() } else { ul })
+        }
+    };
+    let rest = &s[endp..];
     if rest.chars().next().is_some_and(|c| Some(c) != comma) {
         return None;
     }
-    let value = if num.is_empty() {
-        defval
-    } else {
-        num.parse::<usize>().ok()?
-    };
+    if ul > i32::MAX as u64 {
+        return None;
+    }
+    let value = if endp == 0 { defval } else { ul as usize };
     *arg = if rest.is_empty() { rest } else { &rest[1..] };
     Some(value)
 }
+
 
 /// Port of `parse_wrap_args()`. Returns `false` when the argument is malformed,
 /// which git reports as `error: -w[<width>[,<indent1>[,<indent2>]]]`.

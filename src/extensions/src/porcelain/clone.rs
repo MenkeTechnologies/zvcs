@@ -266,6 +266,23 @@ fn usage_error(msg: &str) -> ExitCode {
 }
 
 pub fn clone(args: &[String]) -> Result<ExitCode> {
+    // `git_clone_config()` takes `clone.defaultRemoteName` from every scope on its
+    // first read, before the options are even parsed, a valueless one being
+    // `config_error_nonbool()` (builtin/clone.c:750-754, :1012).
+    let configured_remote_name = match crate::config::config_entries_in_order(None)
+        .into_iter()
+        .filter(|(key, _)| key == "clone.defaultremotename")
+        .last()
+    {
+        Some((_, Some(name))) => Some(name),
+        Some((_, None)) => crate::config::die_config(
+            None,
+            "clone.defaultremotename",
+            Some("missing value for 'clone.defaultremotename'"),
+        ),
+        None => None,
+    };
+
     // `-h` is answered by `parse-options` before anything else, on stdout.
     if args.iter().any(|a| a == "-h") {
         return Ok(super::show_usage(USAGE));
@@ -1088,6 +1105,18 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // Without `-o`, the name `git_clone_config()` left must pass
+    // `valid_remote_name()` (builtin/clone.c:1284-1292, remote.c) or the clone
+    // dies, an empty name included.
+    if origin.is_none() {
+        if let Some(name) = &configured_remote_name {
+            let refspec = format!("refs/heads/test:refs/remotes/{name}/test");
+            if gix::refspec::parse(refspec.as_str().into(), gix::refspec::parse::Operation::Fetch).is_err() {
+                return Err(crate::fatal::die(format!("'{name}' is not a valid remote name")));
+            }
+        }
+    }
+
     // ```c
     // if (option_recurse_submodules.nr > 0) {
     //         [...]
@@ -1491,13 +1520,23 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // The destination is the git directory rather than `repo_get_common_dir()`:
     // a clone always creates the repository it is filling in, so the two are the
     // same path here, unlike `git init` inside a linked worktree.
+    //
+    // `init_db()` resolves the template with `get_template_dir()`, so
+    // `GIT_TEMPLATE_DIR` and `init.templateDir` reach a clone as they reach `git
+    // init`, and a template's `config` is where the new repository's configuration
+    // starts.
+    let template = super::init::get_template_dir(template);
     match template.as_deref() {
-        Some(tpl) => super::init::apply_template(tpl, &git_dir)?,
+        Some(tpl) => {
+            super::init::apply_template(tpl, &git_dir)?;
+            super::init::adopt_template_config(tpl, &git_dir)?;
+        }
         None => {
             super::init::apply_template("", &git_dir)?;
             super::init::copy_default_template(&git_dir)?;
         }
     }
+    super::init::drop_defaults_set_elsewhere(&git_dir, template.as_deref())?;
 
     // `run_transaction_hook()` (refs.c:2663-2678) runs for every ref transaction of the new
     // repository, the template's `reference-transaction` hook included. Commands that find their
@@ -1559,8 +1598,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // file that says where, so git falls back to the transport, which
         // negotiates the boundary and writes `shallow` here.
         if shared && is_local {
-            if let Ok(objects) = objects_dir_of(&local_source) {
-                alternates.push(objects);
+            if let Some(src_repo) = get_repo_path(url_str) {
+                alternates.push(PathBuf::from(format!("{}/objects", get_common_dir(&src_repo))));
             }
         }
         if !alternates.is_empty() {
@@ -2499,23 +2538,30 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // clean-up for a source the negotiation could not skip after all — a pack the
         // transport wrote is not part of what `copy_or_link_directory()` leaves behind.
         remove_pack_files_other_than(&git_dir, &adopted);
-    } else if let Some(cloned) = gix::open(&git_dir)
-        .ok()
-        .filter(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex").unwrap_or(true))
-    {
-        // A clone that really fetched received its pack through gitoxide, which
-        // writes no reverse index; git's `index-pack` writes one for every pack
-        // it produces unless `pack.writeReverseIndex` says otherwise. The adopted
-        // local objects above are exempt: they are the source's own pack files,
-        // carried across with whatever sidecars the source already had.
-        //
-        // The hash comes from the cloned repository, which has already adopted
-        // the remote's `object-format` — a sha256 remote leaves a sha256 clone,
-        // and its `.rev` files have to be written in that algorithm.
-        super::index_pack::write_missing_rev_indexes(
-            &git_dir.join("objects").join("pack"),
-            cloned.object_hash(),
-        );
+    } else {
+        if let Some(cloned) = gix::open(&git_dir)
+            .ok()
+            .filter(|repo| repo.config_snapshot().boolean("pack.writeReverseIndex").unwrap_or(true))
+        {
+            // A clone that really fetched received its pack through gitoxide, which
+            // writes no reverse index; git's `index-pack` writes one for every pack
+            // it produces unless `pack.writeReverseIndex` says otherwise. The adopted
+            // local objects above are exempt: they are the source's own pack files,
+            // carried across with whatever sidecars the source already had.
+            //
+            // The hash comes from the cloned repository, which has already adopted
+            // the remote's `object-format` — a sha256 remote leaves a sha256 clone,
+            // and its `.rev` files have to be written in that algorithm.
+            super::index_pack::write_missing_rev_indexes(
+                &git_dir.join("objects").join("pack"),
+                cloned.object_hash(),
+            );
+        }
+        // The pack the transport received is index-pack's: `odb_mkstemp()` creates
+        // its pack, its index and its reverse index 0444 and lets the umask do the
+        // rest (builtin/index-pack.c:365-366, pack-write.c:87, :263, odb.c:72-84), where
+        // gitoxide wrote them 0600.
+        set_fetched_pack_modes(&git_dir.join("objects").join("pack"));
     }
 
     // ```c
@@ -3417,6 +3463,47 @@ fn absolute_pathdup(path: &Path) -> String {
     }
 }
 
+/// `get_repo_path()` (builtin/clone.c:144-155) for a source that is a
+/// repository: the first of `<repo>/.git`, `<repo>`, `<repo>.git/.git` and
+/// `<repo>.git` that is a git directory, through `absolute_pathdup()` and so
+/// spelled as given (`./src` stays `<cwd>/./src/.git`), or the real path a
+/// gitfile among them names. `clone_local()` borrows `<that>/objects` under `-s`.
+fn get_repo_path(repo_name: &str) -> Option<String> {
+    for suffix in ["/.git", "", ".git/.git", ".git"] {
+        let candidate = PathBuf::from(format!("{repo_name}{suffix}"));
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if meta.is_dir() && gix::discover::setup::is_git_directory(&candidate) {
+            return Some(absolute_pathdup(&candidate));
+        }
+        if meta.is_file() && meta.len() > 8 {
+            let is_gitfile = std::fs::read(&candidate).is_ok_and(|bytes| bytes.starts_with(b"gitdir: "));
+            if let (true, Ok(Some(dst))) =
+                (is_gitfile, gix::discover::setup::read_gitfile_gently(&candidate))
+            {
+                return Some(dst.display().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `get_common_dir_noenv()` (setup.c:321-348): the real path a `commondir` file
+/// names, else `gitdir` exactly as given.
+fn get_common_dir(gitdir: &str) -> String {
+    let file = Path::new(gitdir).join("commondir");
+    let Ok(data) = std::fs::read_to_string(&file) else {
+        return gitdir.to_string();
+    };
+    let data = data.trim_end_matches(['\n', '\r']);
+    let path = match Path::new(data).is_absolute() {
+        true => PathBuf::from(data),
+        false => PathBuf::from(format!("{gitdir}/{data}")),
+    };
+    std::fs::canonicalize(&path).unwrap_or(path).display().to_string()
+}
+
 /// A file git would read as a bundle really carrying a bundle header.
 ///
 /// `read_bundle_header_fd()` (`bundle.c`) accepts `# v2 git bundle` and `# v3 git bundle`; anything
@@ -3626,16 +3713,6 @@ fn local_source_objects(source: &Path) -> PathBuf {
         Err(_) if source.join(".git").is_dir() => source.join(".git").join("objects"),
         Err(_) => source.join("objects"),
     }
-}
-
-/// The object directory to borrow from for `--shared`/`--reference`: the
-/// `objects` directory of the repository at `path`, absolute and symlink-resolved,
-/// which is the form git records in `objects/info/alternates`.
-fn objects_dir_of(path: &Path) -> Result<PathBuf> {
-    let repo = gix::open(path)
-        .map_err(|_| anyhow::anyhow!("reference repository '{}' is not a local repository.", path.display()))?;
-    let objects = repo.git_dir().join("objects");
-    Ok(std::fs::canonicalize(&objects).unwrap_or(objects))
 }
 
 /// `compute_alternate_path()` (object-file.c), the whole of what
@@ -4172,6 +4249,24 @@ fn remove_pack_files_other_than(
     }
 }
 
+/// The modes `index-pack` leaves on the `.pack`, `.idx` and `.rev` a clone's fetch kept:
+/// `0444` under the umask.
+fn set_fetched_pack_modes(pack_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    // SAFETY: `umask()` cannot fail, and the mask is put straight back.
+    let umask = unsafe {
+        let mask = libc::umask(0);
+        libc::umask(mask);
+        mask as u32
+    };
+    let Ok(entries) = std::fs::read_dir(pack_dir) else { return };
+    for path in entries.flatten().map(|e| e.path()) {
+        if matches!(path.extension().and_then(|e| e.to_str()), Some("pack" | "idx" | "rev")) {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444 & !umask));
+        }
+    }
+}
+
 /// Copy (or hardlink) the source's object store into the clone: `copy_or_link_directory()`
 /// under `clone_local()`.
 ///
@@ -4223,7 +4318,14 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
             }
             let linked = hardlinks && std::fs::hard_link(&src_path, &dst_path).is_ok();
             if !linked {
-                std::fs::copy(&src_path, &dst_path)?;
+                // `copy_file_with_time(dest, src, 0666)` (builtin/clone.c:338, copy.c:67-74):
+                // a `0666` file under the umask, not the source's `0444`, carrying the
+                // source's access and modification times.
+                let copy = super::init::copy_file(&dst_path, &src_path, 0o666)?;
+                let meta = std::fs::metadata(&src_path)?;
+                copy.set_times(
+                    std::fs::FileTimes::new().set_accessed(meta.accessed()?).set_modified(meta.modified()?),
+                )?;
             }
         }
     }

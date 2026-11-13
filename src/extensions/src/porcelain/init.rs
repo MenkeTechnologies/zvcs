@@ -510,7 +510,31 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // On a fresh init there is nothing to move, and the relocation happens after
     // the skeleton has been laid down (below), which is where this port already
     // did it.
-    let migrated = separate_git_dir.is_some() && std::fs::symlink_metadata(&original_git_dir).is_ok();
+    //
+    // `init_db()` first hands the separate git directory to
+    // `apply_and_export_relative_gitdir()`, whose `repo_set_gitdir()` reads it with
+    // the dying `read_gitfile()` (repository.c:174-182, setup.c:927-950): a gitfile
+    // there names the real git directory, and any other regular file ends at
+    // `invalid gitfile format: <path>`.
+    let separate_git_dir = match separate_git_dir {
+        Some(real) => match crate::porcelain::rev_parse::read_gitfile_gently(Path::new(&real)) {
+            Ok(Some(target)) => Some(target.to_string_lossy().into_owned()),
+            Ok(None) => Some(real),
+            Err(err) => crate::git_fatal!(
+                "{}",
+                crate::porcelain::rev_parse::gitfile_error_message(Path::new(&real), err)
+            ),
+        },
+        None => None,
+    };
+    // A separate git directory that already exists is where `create_default_files()`
+    // fills in the repository, just as when `separate_git_dir()` moved one there:
+    // `safe_create_dir()` takes a directory it finds (path.c:791-801), so
+    // `--separate-git-dir=<non-empty dir>` initializes inside it, and over a git
+    // directory it reinitializes that repository.
+    let migrated = separate_git_dir.as_deref().is_some_and(|real| {
+        std::fs::symlink_metadata(&original_git_dir).is_ok() || Path::new(real).is_dir()
+    });
     let mut git_dir: PathBuf = match separate_git_dir.as_deref() {
         Some(real) if migrated => {
             let real_abs = PathBuf::from(real);
@@ -523,6 +547,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // reinitializes `<common>/worktrees/<name>` rather than the link file.
         None => read_gitfile(&original_git_dir).unwrap_or_else(|| original_git_dir.clone()),
     };
+
+    // What the git directory already holds: `--shared` leaves it alone below.
+    #[cfg(unix)]
+    let preexisting = existing_paths(&git_dir);
 
     // `is_reinit()` (`setup.c`) is exactly this: a readable (or symlinked)
     // `HEAD` inside the git directory, nothing else.
@@ -672,19 +700,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // `--initial-branch` warning. A fresh `--separate-git-dir` is still built in
     // `<target>/.git` here and moved below, which lands the payload in the same place.
     //
-    // Resolve the template directory with git's `copy_templates()` precedence
-    // (`builtin/init-db.c`): the `--template` command-line value wins, else the
-    // `GIT_TEMPLATE_DIR` environment variable, else the `init.templateDir`
-    // config (read as a pathname, so a leading `~` expands, matching git's
-    // `git_config_get_pathname("init.templatedir")`), else the compiled-in
-    // default template, which for this port is [`DEFAULT_TEMPLATE`] rather than
-    // a directory under `$(prefix)/share/git-core`. An explicit (even empty)
-    // `--template` or a set `GIT_TEMPLATE_DIR` short-circuits before the config
-    // is consulted, so the config is a DEFAULT the flag/env override — never the
-    // other way around.
-    let template = template
-        .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
-        .or_else(|| configured_template_dir(repo.as_ref(), &git_dir));
+    // Resolve the template directory with git's `get_template_dir()`; `None` is the
+    // compiled-in default, which for this port is [`DEFAULT_TEMPLATE`] rather than
+    // a directory under `$(prefix)/share/git-core`.
+    let template = get_template_dir(template);
 
     // Seed the git dir from the resolved template. git runs `copy_templates()`
     // on every init, reinitialization included, and it fills in only what is
@@ -722,6 +741,9 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         }
         None => copy_default_template(&template_dir)?,
     }
+    if !reinit {
+        drop_defaults_set_elsewhere(&git_dir, template.as_deref())?;
+    }
 
     // `create_default_files()`: the templates are in place, so `repo_config(git_default_config)`
     // now also sees a `config` they brought, and every key `git_default_config()` checks is
@@ -753,6 +775,18 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // own `main` fallback when that is unset), so recomputing here is what lets
         // the no-config case land on git's `master` rather than gix's `main`. When
         // the name gix already chose matches, the HEAD repoint below is a no-op.
+        let src_git_dir = repo.git_dir().to_path_buf();
+        // What a death in `create_reference_database()` leaves (see the invalid
+        // name below): no `HEAD` and no object store, which gix laid down with the
+        // skeleton.
+        let undo_unwritten_head = || {
+            if !reftable {
+                let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
+            }
+            for dir in ["objects/pack", "objects/info", "objects"] {
+                let _ = std::fs::remove_dir(src_git_dir.join(dir));
+            }
+        };
         let branch_name = match initial_branch.clone() {
             Some(name) => name,
             // `repo_default_branch_name()` (refs.c:696-700): the
@@ -763,7 +797,19 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             // Only the compiled-in fallback carries the hint; `quiet` is
             // `git init -q`, which is what `create_reference_database()` passes
             // through (setup.c:2521).
-            None => crate::refname::repo_default_branch_name(&repo, quiet),
+            // That death comes before `HEAD` is written as well, so it leaves the
+            // wreckage an invalid name leaves (below).
+            None => {
+                let valueless = crate::config::config_entries_in_order(Some(repo))
+                    .into_iter()
+                    .filter(|(key, _)| key == "init.defaultbranch")
+                    .last()
+                    .is_some_and(|(_, value)| value.is_none());
+                if valueless && crate::refname::default_branch_name_override().is_none() {
+                    undo_unwritten_head();
+                }
+                crate::refname::repo_default_branch_name(repo, quiet)
+            }
         };
 
         // Repoint the unborn HEAD symref to the resolved branch. This is a ref
@@ -779,7 +825,6 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // `check_refname_format(ref, 0)` rejects it — so the diagnostic is git's
         // `die()` (exit 128), and it lands only after the repository skeleton
         // already exists, exactly like here.
-        let src_git_dir = repo.git_dir().to_path_buf();
         let branch: FullName = match format!("refs/heads/{branch_name}").try_into() {
             Ok(b) => b,
             Err(_) => {
@@ -798,12 +843,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 // directory, so a pre-existing object store is never touched.
                 // A reftable store's `HEAD` is the `.invalid` stub `ref_store_create_on_disk()`
                 // wrote before the name was checked, and git leaves it there.
-                if !reftable {
-                    let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
-                }
-                for dir in ["objects/pack", "objects/info", "objects"] {
-                    let _ = std::fs::remove_dir(src_git_dir.join(dir));
-                }
+                undo_unwritten_head();
                 // A `-b` name fails `create_reference_database()`'s own check
                 // (setup.c); one `repo_default_branch_name()` supplied — the
                 // test override or `init.defaultBranch` — dies inside that
@@ -904,13 +944,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // names — never `<git-dir>/objects` as well.
     create_object_directory(&git_dir, &cwd)?;
 
-    // `--shared[=...]`: record the sharing config and widen permissions across the
-    // whole git dir, porting git's `create_default_files` config write and
-    // `adjust_shared_perm` (which git applies per-file during creation; a single
-    // recursive walk here produces the identical on-disk result). Absent the
-    // flag, `get_shared_repository()` still answers with whatever
-    // `core.sharedRepository` the repository's own config carries, which is what
-    // decides the wording of the message below.
+    // `--shared[=...]`: record the sharing config and widen the permissions of
+    // what this run created, porting git's `create_default_files` config write and
+    // `adjust_shared_perm` (which git applies per path as it creates it; see
+    // [`adjust_shared_perm_created`]). Absent the flag, `get_shared_repository()`
+    // still answers with whatever `core.sharedRepository` the configuration
+    // carries, which is what decides the wording of the message below.
     let shared = shared.or_else(|| configured_shared(&git_dir));
     if let Some(shared) = shared {
         write_shared_config(&git_dir, shared)?;
@@ -924,7 +963,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     }
     #[cfg(unix)]
     if let Some(shared) = shared {
-        adjust_shared_perm_recursive(&git_dir, shared)?;
+        let reftable = match &reinit_formats {
+            Some((_, refs)) => refs == "reftable",
+            None => reftable,
+        };
+        adjust_shared_perm_created(&git_dir, shared, reftable, &preexisting)?;
     }
 
     if !quiet {
@@ -1329,7 +1372,7 @@ pub(super) fn relocate_git_dir_to_link(src: &Path, link: &Path, real: &str) -> R
 /// Seed `git_dir` from the template at `template`. Ports git's `copy_templates`
 /// and `copy_templates_1`: entries whose name starts with `.` are skipped,
 /// directories are merged, existing files are left untouched, symlinks are
-/// recreated, and regular files are copied preserving their source mode.
+/// recreated, and regular files are copied with `copy_file()`'s modes.
 ///
 /// gix already populated its built-in default template (sample hooks,
 /// `info/exclude`, `description`) inside `git_dir`; git, given `--template`, uses
@@ -1405,7 +1448,7 @@ fn template_source(template: &str, warn: bool) -> Result<Option<PathBuf>> {
 /// template was copied, so its entries are replayed, in order, onto the
 /// template's file. Nothing happens on a reinitialization, where
 /// `copy_templates_1()` leaves the existing `config` alone.
-fn adopt_template_config(template: &str, git_dir: &Path) -> Result<()> {
+pub(super) fn adopt_template_config(template: &str, git_dir: &Path) -> Result<()> {
     use crate::config_store::ValuePattern;
     let Some(src) = template_source(template, false)? else {
         return Ok(());
@@ -1430,8 +1473,13 @@ fn adopt_template_config(template: &str, git_dir: &Path) -> Result<()> {
             }
         }
     }
-    std::fs::copy(&template_config, &path)?;
+    std::fs::remove_file(&path)?;
+    copy_file(&path, &template_config, st_mode(&std::fs::metadata(&template_config)?))?;
+    let spelled = template_keys(&template_config);
     for (key, value) in entries {
+        if CONDITIONAL_DEFAULTS.contains(&key.as_str()) && spelled.contains(&key) {
+            continue;
+        }
         crate::config_store::set_multivar_in_file(
             &path,
             &key,
@@ -1443,6 +1491,82 @@ fn adopt_template_config(template: &str, git_dir: &Path) -> Result<()> {
             false,
         )
         .map_err(|e| anyhow::anyhow!("could not set '{key}': {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// The two keys `create_default_files()` writes only when no configuration
+/// sets them: `core.logallrefupdates` when `repo_config_get_string_tmp()` finds
+/// no value (setup.c:2636-2637), and `core.precomposeunicode` when
+/// `probe_utf8_pathname_composition()` finds the key already read
+/// (compat/precompose_utf8.c:58-59). gix writes both into every new
+/// non-bare repository.
+const CONDITIONAL_DEFAULTS: [&str; 2] = ["core.logallrefupdates", "core.precomposeunicode"];
+
+/// The normalised keys a template's `config` spells.
+fn template_keys(config: &Path) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    let Ok(file) = gix::config::File::from_path_no_includes(config.to_path_buf(), gix::config::Source::Local) else {
+        return keys;
+    };
+    for section in file.sections() {
+        let header = section.header();
+        let base = match header.subsection_name() {
+            Some(sub) => format!("{}.{sub}", header.name().to_string().to_ascii_lowercase()),
+            None => header.name().to_string().to_ascii_lowercase(),
+        };
+        for name in section.value_names() {
+            keys.insert(format!("{base}.{}", name.to_string().to_ascii_lowercase()));
+        }
+    }
+    keys
+}
+
+/// The last value of `key` outside the repository's own `config` — system,
+/// global and command line, the scopes `repo_config()` reads around it — with
+/// `None` for a key no scope sets and `Some(None)` for a valueless one.
+fn configured_outside(key: &str) -> Option<Option<String>> {
+    crate::config::config_entries_in_order(None)
+        .into_iter()
+        .filter(|(k, _)| k == key)
+        .last()
+        .map(|(_, value)| value)
+}
+
+/// Take back the [`CONDITIONAL_DEFAULTS`] gix wrote into a fresh repository
+/// where git would not have written them: the template's `config` (`template`,
+/// as resolved) already spells the key, which [`adopt_template_config`] kept,
+/// or another scope sets it — any value for `core.precomposeunicode`, a
+/// non-valueless last one for `core.logallrefupdates`.
+pub(super) fn drop_defaults_set_elsewhere(git_dir: &Path, template: Option<&str>) -> Result<()> {
+    use crate::config_store::ValuePattern;
+    let spelled = template
+        .and_then(|t| template_source(t, false).ok().flatten())
+        .map(|src| template_keys(&src.join("config")))
+        .unwrap_or_default();
+    let path = config_path(git_dir);
+    for key in CONDITIONAL_DEFAULTS {
+        if spelled.contains(key) {
+            continue;
+        }
+        let elsewhere = match (key, configured_outside(key)) {
+            ("core.logallrefupdates", Some(value)) => value.is_some(),
+            (_, found) => found.is_some(),
+        };
+        let written = local_config(git_dir).is_some_and(|f| f.raw_value(key).is_ok());
+        if elsewhere && written {
+            crate::config_store::set_multivar_in_file(
+                &path,
+                key,
+                key,
+                key.rfind('.').expect("the key has a section"),
+                None,
+                ValuePattern::Any,
+                None,
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!("could not unset '{key}': {e:?}"))?;
+        }
     }
     Ok(())
 }
@@ -1516,6 +1640,40 @@ pub(super) fn copy_default_template(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `copy_file()` (copy.c:36-64): a new file opened `O_CREAT | O_EXCL` with
+/// `0777` when `mode` is executable by anyone and `0666` otherwise, so the
+/// umask decides the rest, and with the times of the copy, not the source's.
+/// Returns the copy, for `copy_file_with_time()` to stamp.
+pub(super) fn copy_file(dst: &Path, src: &Path, mode: u32) -> Result<std::fs::File> {
+    let mut input = std::fs::File::open(src)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(if mode & 0o111 != 0 { 0o777 } else { 0o666 });
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut output = opts.open(dst)?;
+    std::io::copy(&mut input, &mut output)?;
+    Ok(output)
+}
+
+/// The permission bits of `meta`, `st_mode` as `copy_file()` is handed it.
+fn st_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0o644
+    }
+}
+
 /// Recursively copy `src` into `dst` with git's `copy_templates_1` semantics.
 fn copy_template_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -1531,8 +1689,9 @@ fn copy_template_dir(src: &Path, dst: &Path) -> Result<()> {
         let ft = meta.file_type();
         if ft.is_dir() {
             copy_template_dir(&s, &d)?;
-        } else if d.exists() {
-            // git's copy_templates_1 never overwrites an existing file.
+        } else if std::fs::symlink_metadata(&d).is_ok() {
+            // copy_templates_1() never replaces what `lstat()` finds there
+            // (setup.c:2336-2341), a dangling symlink included.
             continue;
         } else if ft.is_symlink() {
             #[cfg(unix)]
@@ -1542,15 +1701,9 @@ fn copy_template_dir(src: &Path, dst: &Path) -> Result<()> {
                 std::fs::copy(&s, &d)?;
             }
         } else if ft.is_file() {
-            std::fs::copy(&s, &d)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &d,
-                    std::fs::Permissions::from_mode(meta.permissions().mode()),
-                )?;
-            }
+            copy_file(&d, &s, st_mode(&meta))?;
+        } else {
+            eprintln!("error: ignoring template {}", s.display());
         }
     }
     Ok(())
@@ -1647,13 +1800,23 @@ fn write_shared_config(git_dir: &Path, shared: i32) -> Result<()> {
         crate::git_fatal!("invalid value for shared repository");
     };
 
+    // `repo_config_set()` (setup.c:2916-2917) rewrites an assignment already
+    // there as a whole line, so a `sharedRepository = group` someone wrote reads
+    // `sharedrepository = 1` afterwards.
     let path = config_path(git_dir);
-    let mut file =
-        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    file.set_raw_value_by("core", None, "sharedrepository", value.as_str())?;
-    file.set_raw_value_by("receive", None, "denyNonFastforwards", "true")?;
-    std::fs::write(&path, file.to_bstring())?;
+    for (key, value) in [("core.sharedrepository", value.as_str()), ("receive.denyNonFastforwards", "true")] {
+        crate::config_store::set_multivar_in_file(
+            &path,
+            key,
+            &key.to_ascii_lowercase(),
+            key.rfind('.').expect("the key has a section"),
+            Some(value.as_bytes()),
+            crate::config_store::ValuePattern::Any,
+            None,
+            false,
+        )
+        .map_err(|e| anyhow::anyhow!("could not set '{key}': {e:?}"))?;
+    }
     Ok(())
 }
 
@@ -1697,13 +1860,26 @@ pub(crate) fn calc_shared_perm(shared: i32, mode: u32) -> u32 {
 /// untouched (git init creates none, and chmod through them is undesirable).
 #[cfg(unix)]
 pub(crate) fn adjust_shared_perm_recursive(path: &Path, shared: i32) -> Result<()> {
+    if adjust_shared_perm(path, shared)? {
+        for entry in std::fs::read_dir(path)? {
+            adjust_shared_perm_recursive(&entry?.path(), shared)?;
+        }
+    }
+    Ok(())
+}
+
+/// `adjust_shared_perm()` (path.c:762-789) on one path. Answers whether `path`
+/// is a directory, so a walk knows to descend; a symlink is left alone and is
+/// not one.
+#[cfg(unix)]
+fn adjust_shared_perm(path: &Path, shared: i32) -> Result<bool> {
     use std::os::unix::fs::PermissionsExt;
 
     const S_ISGID: u32 = 0o2000;
 
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
-        return Ok(());
+        return Ok(false);
     }
     let old = meta.permissions().mode();
     let is_dir = meta.is_dir();
@@ -1720,9 +1896,69 @@ pub(crate) fn adjust_shared_perm_recursive(path: &Path, shared: i32) -> Result<(
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(new & 0o7777))?;
     }
 
-    if is_dir {
-        for entry in std::fs::read_dir(path)? {
-            adjust_shared_perm_recursive(&entry?.path(), shared)?;
+    Ok(is_dir)
+}
+
+/// Every path under `git_dir`, relative to it, before `init` creates anything:
+/// what [`adjust_shared_perm_created`] must leave alone.
+fn existing_paths(git_dir: &Path) -> std::collections::HashSet<PathBuf> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::HashSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.insert(rel.to_path_buf());
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(git_dir, git_dir, &mut out);
+    out
+}
+
+/// The modes `init_db()` leaves under `--shared`. git adjusts each path as it
+/// creates it, never one it found: `safe_create_dir()` only after its own
+/// `mkdir()` succeeded (path.c:791-801), `copy_file()` on the file it just
+/// opened `O_EXCL` (copy.c:61), a lock file before it is renamed into place
+/// (tempfile.c:152) while `git_config_set()` gives a rewritten `config` its old
+/// mode back. Beyond those, `create_default_files()` adjusts the git directory
+/// itself (setup.c:2608-2610), the files backend its `refs/` (refs/files-backend.c:3679-3680)
+/// and the reftable stubs their `HEAD` and `refs/heads` (refs.c:2207-2219). So
+/// a reinitialization opens up `.git` and `.git/refs` and leaves `hooks/`,
+/// `objects/` and every file it already had as they were. `preexisting` is
+/// [`existing_paths`] taken before anything was written.
+#[cfg(unix)]
+fn adjust_shared_perm_created(
+    git_dir: &Path,
+    shared: i32,
+    reftable: bool,
+    preexisting: &std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    fn walk(root: &Path, dir: &Path, shared: i32, keep: &std::collections::HashSet<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let is_dir = if keep.contains(rel) {
+                std::fs::symlink_metadata(&path)?.is_dir()
+            } else {
+                adjust_shared_perm(&path, shared)?
+            };
+            if is_dir {
+                walk(root, &path, shared, keep)?;
+            }
+        }
+        Ok(())
+    }
+    adjust_shared_perm(git_dir, shared)?;
+    walk(git_dir, git_dir, shared, preexisting)?;
+    let explicit: &[&str] = if reftable { &["HEAD", "refs/heads"] } else { &["refs"] };
+    for rel in explicit {
+        let path = git_dir.join(rel);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            adjust_shared_perm(&path, shared)?;
         }
     }
     Ok(())
@@ -1886,11 +2122,24 @@ fn repository_object_format(git_dir: &Path) -> String {
 /// `core.sharedRepository` as `git_default_core_config` parses it into
 /// `get_shared_repository()`. `0`/`umask` reads as "not shared", which is the
 /// same falsy answer as an absent key, so it is reported as `None`.
+/// `create_default_files()` reads it with `repo_config(repo, git_default_config)`
+/// (setup.c:2588-2590), every scope: the global file and `-c` share a new
+/// repository as well as its own `config` does, the last value winning.
 fn configured_shared(git_dir: &Path) -> Option<i32> {
-    let value = local_config(git_dir)?
-        .string_by("core", None, "sharedRepository")
-        .map(|v| v.to_string())?;
-    parse_shared_value(&value).ok().filter(|&s| s != 0)
+    use gix::sec::trust::DefaultForLevel as _;
+    let open = gix::open::Options::default_for_level(gix::sec::Trust::Full).open_path_as_is(true);
+    let repo = gix::open_opts(git_dir, open).ok();
+    let value = crate::config::config_entries_in_order(repo.as_ref())
+        .into_iter()
+        .filter(|(key, _)| key == "core.sharedrepository")
+        .last()?
+        .1;
+    // `git_config_perm()`: a valueless key is `PERM_GROUP` (setup.c:2137-2138).
+    let shared = match value {
+        Some(value) => parse_shared_value(&value).ok()?,
+        None => 0o660,
+    };
+    Some(shared).filter(|&s| s != 0)
 }
 
 /// The repository's own `config` file, parsed without following `include`s —
@@ -1959,6 +2208,10 @@ fn set_config_default(git_dir: &Path, section: &str, key: &str, value: &str) -> 
     if file.string_by(section, None, key).is_some() {
         return Ok(());
     }
+    // `repo_config_get_string_tmp()` reads every scope, not only this file.
+    if configured_outside(&format!("{section}.{key}").to_ascii_lowercase()).is_some_and(|v| v.is_some()) {
+        return Ok(());
+    }
     file.set_raw_value_by(section, None, key, value)?;
     std::fs::write(&path, file.to_bstring())?;
     Ok(())
@@ -2017,28 +2270,49 @@ fn create_object_directory(git_dir: &Path, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `init.templateDir` read as a pathname out of whichever configuration is at
-/// hand: the repository just created, or — on a reinitialization, where there is
-/// no freshly-opened handle — the existing repository on disk.
-fn configured_template_dir(repo: Option<&gix::Repository>, git_dir: &Path) -> Option<String> {
-    fn read(repo: &gix::Repository) -> Option<String> {
-        repo.config_snapshot()
-            .trusted_path("init.templateDir")
-            .ok()
-            .flatten()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
-    match repo {
-        Some(repo) => read(repo),
-        None => {
-            let repo = gix::open_opts(
-                git_dir,
-                gix::open::Options::isolated().open_path_as_is(true),
-            )
-            .ok()?;
-            read(&repo)
+/// `get_template_dir()` (setup.c:2275-2297): the `--template` value, else
+/// `GIT_TEMPLATE_DIR`, else `init.templateDir` from the *protected*
+/// configuration (`git_protected_config()`: system, global and command line,
+/// never the repository's own `config`), else `None` for the compiled-in
+/// default. An explicit empty value is kept: `copy_templates()` then copies
+/// nothing and does not warn. Shared with `git clone`, whose `init_db()` call
+/// resolves its `--template` the same way.
+pub(super) fn get_template_dir(option_template: Option<String>) -> Option<String> {
+    option_template
+        .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
+        .or_else(protected_template_dir)
+}
+
+/// `template_dir_cb()` (setup.c:2253-2273) over the protected configuration, in
+/// order: a valueless `init.templateDir` forgets any earlier value, and a value
+/// is `git_config_pathname()`'s expansion of it, or the value as written when
+/// that yields no path (a missing `:(optional)` file).
+fn protected_template_dir() -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut path = None;
+    for (key, value) in crate::config::config_entries_in_order(None) {
+        if key != "init.templatedir" {
+            continue;
         }
+        path = value.map(|value| {
+            let (optional, raw) = match value.strip_prefix(":(optional)") {
+                Some(rest) => (true, rest),
+                None => (false, value.as_str()),
+            };
+            let Some(expanded) = crate::setup::interpolate_path(raw) else {
+                crate::config::die_128(&format!("failed to expand user dir in: '{raw}'"))
+            };
+            if optional
+                && std::fs::metadata(cwd.join(&expanded))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                value
+            } else {
+                expanded.to_string_lossy().into_owned()
+            }
+        });
     }
+    path
 }
 
 // ---------------------------------------------------------------------------

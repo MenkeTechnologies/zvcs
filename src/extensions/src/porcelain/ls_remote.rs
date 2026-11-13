@@ -371,6 +371,11 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             // child's stderr, then the fixed block. An `ls-refs` answer that
             // stopped short of its flush is `get_remote_refs()`'s `die()`.
             let err = anyhow::Error::from(e);
+            // `get_remote_refs()` writes its request with `packet_write_fmt()`, and a closed pipe
+            // there is `check_pipe()`'s death by `SIGPIPE` (pkt-line.c:171-174, run-command.c:1150-1161).
+            if crate::sigpipe::is_broken_pipe(err.as_ref()) {
+                crate::sigpipe::exit_broken_pipe();
+            }
             if let Some(code) = crate::transport_err::ssh_fatal(&url.to_string(), &err)
                 .or_else(|| crate::transport_err::hang_up_fatal(&err))
             {
@@ -1046,6 +1051,10 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
                 {
                     return code;
                 }
+            }
+            // A closed pipe under the `ls-refs` request: `check_pipe()` (pkt-line.c:171-174).
+            if crate::sigpipe::is_broken_pipe(err.as_ref()) {
+                crate::sigpipe::exit_broken_pipe();
             }
             if let Some(code) = crate::transport_err::ssh_fatal(&url.to_bstring().to_string(), &err)
                 .or_else(|| crate::transport_err::hang_up_fatal(&err))

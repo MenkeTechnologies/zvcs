@@ -6,7 +6,10 @@ mod error {
     #[derive(Debug, thiserror::Error)]
     #[expect(missing_docs)]
     pub enum Error {
-        #[error(transparent)]
+        /// `{0}` rather than `transparent` so that the `io::Error` of a request write stays
+        /// reachable through `source()`: a closed pipe there is `check_pipe()`'s death by
+        /// `SIGPIPE` (run-command.c:1150-1161), which the caller can only stage if it finds it.
+        #[error("{0}")]
         Io(#[from] std::io::Error),
         #[error(transparent)]
         Transport(#[from] gix_transport::client::Error),
@@ -44,7 +47,7 @@ pub(crate) mod function {
     #[cfg(feature = "async-client")]
     use crate::transport::client::async_io::{self, TransportV2Ext as _};
     #[cfg(feature = "blocking-client")]
-    use crate::transport::client::blocking_io::{self, TransportV2Ext as _};
+    use crate::transport::client::blocking_io;
     use crate::{
         Command,
         handshake::{Ref, refs::from_v2_refs},
@@ -238,16 +241,40 @@ pub(crate) mod function {
 
             progress.step();
             progress.set_name("list refs".into());
-            let mut remote_refs = transport.invoke(
-                Command::LsRefs.as_str(),
-                self.features.into_iter(),
-                if self.arguments.is_empty() {
-                    None
-                } else {
-                    Some(self.arguments.into_iter())
-                },
+            // `get_remote_refs()` does not build its request in a `req_buf`: every line is its own
+            // `packet_write_fmt()`, one `write_in_full()` each, as are the delimiter and the closing
+            // flush (connect.c:583-606, pkt-line.c:93-98, :164-180). A server that dies over the
+            // first of them can leave the rest to meet a closed pipe, which `SIGPIPE` or
+            // `check_pipe()` turns into git's silent death (run-command.c:1150-1161). Over http the
+            // request is the body of one `POST`, so it is still collected and sent whole there.
+            let line_by_line = transport.connection_persists_across_multiple_requests();
+            use std::io::Write as _;
+            let send = |writer: &mut blocking_io::RequestWriter<'_>, line: &[u8]| -> std::io::Result<()> {
+                writer.write_all(line)?;
+                if line_by_line { writer.flush() } else { Ok(()) }
+            };
+            let mut writer = transport.request(
+                gix_transport::client::WriteMode::OneLfTerminatedLinePerWriteCall,
+                gix_transport::client::MessageKind::Flush,
                 trace,
             )?;
+            send(&mut writer, format!("command={}", Command::LsRefs.as_str()).as_bytes())?;
+            for (name, value) in self.features {
+                match value {
+                    Some(value) => send(&mut writer, format!("{name}={value}").as_bytes())?,
+                    None => send(&mut writer, name.as_bytes())?,
+                }
+            }
+            if !self.arguments.is_empty() {
+                writer.write_message(gix_transport::client::MessageKind::Delimiter)?;
+                if line_by_line {
+                    writer.flush()?;
+                }
+                for argument in self.arguments {
+                    send(&mut writer, argument.as_ref())?;
+                }
+            }
+            let mut remote_refs = writer.into_read()?;
             Ok(from_v2_refs(&mut remote_refs)?)
         }
     }

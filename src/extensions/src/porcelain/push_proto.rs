@@ -1787,10 +1787,25 @@ pub fn send_pack(
         .transport_mut()
         .request(WriteMode::Binary, MessageKind::Flush, false)?
         .into_parts();
-    let wrote = writer
-        .write_all(&req_buf)
+    let broken_pipe = |e: &std::io::Error| e.kind() == std::io::ErrorKind::BrokenPipe;
+    // The commands go out through `write_or_die()`, and the flush that ends them (or the push
+    // options after them) through a `packet_flush()` of its own (send-pack.c:693-694).
+    // git runs with `SIGPIPE` at its default (common-init.c:27-35), so a receiving end already
+    // gone kills it in that `write()`, and `check_pipe()` stages the same death for an `EPIPE`
+    // that gets through (write-or-die.c:91-97, run-command.c:1150-1161): nothing on stderr.
+    let (commands, flush) = req_buf.split_at(req_buf.len() - 4);
+    let wrote = writer.write_all(commands).and_then(|()| writer.write_all(flush));
+    if wrote.as_ref().is_err_and(|e| !is_http && broken_pipe(e)) {
+        crate::sigpipe::exit_broken_pipe();
+    }
+    // The pack is `pack-objects` writing to the same descriptor (send-pack.c:81-84, :712), and a
+    // closed pipe kills that child by `SIGPIPE`, which `odb_pack_generator_files_finish()` passes
+    // over in silence as the consumer hanging up (odb/source-files.c:777-790). `send_pack()` goes
+    // on to read the status (send-pack.c:712-735), whose end of stream reports the hang-up.
+    let wrote = wrote
         .and_then(|()| if need_pack && !pack_failed { writer.write_all(&pack_bytes) } else { Ok(()) })
-        .and_then(|()| writer.flush());
+        .and_then(|()| writer.flush())
+        .or_else(|e| if !is_http && broken_pipe(&e) { Ok(()) } else { Err(e) });
     drop(writer);
     if let Some(close_write) = close_write {
         close_write();

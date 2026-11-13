@@ -7,12 +7,15 @@ use crate::{
 
 /// The `struct strbuf req_buf` a request is built in before it goes out whole.
 ///
-/// git never writes a request one pkt-line at a time: `find_common()` collects its
+/// git writes most requests whole rather than one pkt-line at a time: `find_common()` collects its
 /// wants, shallow lines and `deepen*` arguments in `req_buf` and hands the lot to
 /// `send_request()`, one `write_in_full()` (fetch-pack.c:254-264, :361-459),
 /// `send_fetch_request()` does the same for a v2 `fetch` (fetch-pack.c:1384-1445),
-/// `get_remote_refs()` for `ls-refs` (connect.c:690-711) and `send_pack()` for its
-/// commands (send-pack.c:486-694). A server that dies over the first line it reads
+/// `write_command_and_capabilities()` for every v2 command it opens (connect.c:712-750) and
+/// `send_pack()` for its commands, ahead of a `packet_flush()` of their own
+/// (send-pack.c:486-694). `get_remote_refs()` is the exception:
+/// it writes `ls-refs` one `packet_write_fmt()` per line (connect.c:583-606), which a caller
+/// gets by flushing after each line. A server that dies over the first line it reads
 /// (`deepen-not is not a ref`) has then been given the whole request already, so
 /// the client learns of the death from the read that follows,
 /// `the remote end hung up unexpectedly`, and never from a write into the closed

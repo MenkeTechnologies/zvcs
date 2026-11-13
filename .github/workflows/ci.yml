@@ -40,13 +40,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/stock-git
-          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}-curl-${{ env.STOCK_CURL_VERSION }}
+          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}-curl-${{ env.STOCK_CURL_VERSION }}-pcre2
       - name: Build stock git
         if: steps.stock-git.outputs.cache-hit != 'true'
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update
-            sudo apt-get install -y libexpat1-dev libssl-dev zlib1g-dev
+            sudo apt-get install -y libexpat1-dev libssl-dev zlib1g-dev libpcre2-dev
             # The parity tests compare libcurl's error text, and Ubuntu's libcurl
             # (8.5.0) predates 8.9.0's CURLE_PARTIAL_FILE wording "end of response
             # with N bytes missing", so libcurl is built into the stock-git prefix.
@@ -61,6 +61,7 @@ jobs:
             curl_config="$HOME/.local/stock-git/bin/curl-config"
             # CURLDIR also gives git-remote-http an rpath to that libcurl.
             curl_dir="$HOME/.local/stock-git"
+            pcre_dir=
           else
             # Link Homebrew libcurl, as Homebrew's git does, not the system one: the
             # parity tests compare libcurl's error text, and the system libcurl
@@ -69,7 +70,11 @@ jobs:
             curl_dir=
             brew list curl >/dev/null 2>&1 || brew install curl
             curl_config="$(brew --prefix curl)/bin/curl-config"
+            brew list pcre2 >/dev/null 2>&1 || brew install pcre2
+            pcre_dir="$(brew --prefix pcre2)"
           fi
+          # The grep parity tests compare -P against stock, so stock is built
+          # with PCRE2 as Homebrew's git is; without it every -P case is skipped.
           "$curl_config" --version
           tarball="git-$STOCK_GIT_VERSION.tar.xz"
           curl -sSfL -o "$RUNNER_TEMP/$tarball" \
@@ -80,6 +85,7 @@ jobs:
             prefix="$HOME/.local/stock-git" \
             CURL_CONFIG="$curl_config" \
             ${curl_dir:+CURLDIR="$curl_dir"} \
+            USE_LIBPCRE=YesPlease ${pcre_dir:+LIBPCREDIR="$pcre_dir"} \
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PYTHON=YesPlease \
             all install
       # First on PATH, and named explicitly for the parity harness
@@ -98,6 +104,9 @@ jobs:
               *) echo "expected git $STOCK_GIT_VERSION, got: $v" >&2; exit 1 ;;
             esac
           done
+          # 128 is "cannot use Perl-compatible regexes"; 1 is no match.
+          rc=0; "$ZVCS_STOCK_GIT" grep -q -P 'f.o' -- .github >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ge 128 ]; then echo "stock git has no PCRE2" >&2; exit 1; fi
       # Tests spawn the real `git` binary to build fixtures (a `git commit`
       # requires a committer identity) and the zdaemon autobumps commits; a
       # fresh runner has no git identity. Export the identity via git's

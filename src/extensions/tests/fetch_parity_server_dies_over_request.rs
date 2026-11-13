@@ -18,7 +18,12 @@
 //!
 //! The server is stock git's `upload-pack`/`receive-pack` behind an `--upload-pack`/
 //! `--receive-pack` proxy that forwards the advertisement and the client's first `$DIE_AFTER`
-//! packet lines, then kills the server and exits 128 with both pipes closed.
+//! packet lines, then kills the server, reads the rest of the client's request through its
+//! flush packet, or the `done` that ends a v0/v1 negotiation without one, and exits 128 with
+//! both pipes closed. Reading the request whole keeps every write of it off a closed pipe:
+//! stock git writes `ls-refs` one `packet_write_fmt()` per line
+//! (connect.c:583-606) and `send_pack()`'s closing flush on its own (send-pack.c:693-694), and
+//! one of those writes meeting a proxy already gone is death by `SIGPIPE`, not a hang-up.
 #![cfg(unix)]
 
 #[path = "support/stock_git.rs"]
@@ -34,7 +39,7 @@ use strict; use IPC::Open2; use IO::Select;
 my $pid = open2(my $sout, my $sin, $ENV{SERVER_GIT}, $ENV{SERVICE}, $ARGV[-1]);
 binmode $_ for $sout, $sin, \*STDIN, \*STDOUT;
 my $sel = IO::Select->new($sout, \*STDIN);
-my ($buf, $seen) = ('', 0);
+my ($buf, $seen, $dead) = ('', 0, 0);
 while (1) {
   for my $fh ($sel->can_read) {
     my $d; my $r = sysread($fh, $d, 65536);
@@ -42,11 +47,16 @@ while (1) {
     exit 128 unless $r;
     $buf .= $d;
     while (length($buf) >= 4) {
-      my $l = hex(substr($buf, 0, 4)); $l = 4 if $l < 4;
+      my $l = hex(substr($buf, 0, 4)); my $flush = $l == 0; $l = 4 if $l < 4;
       last if length($buf) < $l;
-      syswrite($sin, substr($buf, 0, $l)); $buf = substr($buf, $l);
-      if (++$seen >= $ENV{DIE_AFTER}) {
-        kill 'KILL', $pid; print STDERR "fatal: server died after $seen\n";
+      my $end = $flush || substr($buf, 4, $l - 4) eq "done\n";
+      syswrite($sin, substr($buf, 0, $l)) unless $dead;
+      $buf = substr($buf, $l);
+      if (!$dead && ++$seen >= $ENV{DIE_AFTER}) {
+        kill 'KILL', $pid; $sel->remove($sout); $dead = 1;
+      }
+      if ($dead && $end) {
+        print STDERR "fatal: server died after $seen\n";
         close STDIN; close STDOUT; exit 128;
       }
     }

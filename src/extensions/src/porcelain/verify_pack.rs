@@ -32,15 +32,15 @@
 //! under git, which sizes the index by the requested algorithm so the length
 //! check fails before any object is read.
 //!
-//! Not covered exactly: the per-object diagnostics git writes to stderr for a
-//! corrupt pack, which are replaced by a single terse `error:` line; stdout and
-//! the exit code still match.
+//! Each pack is checked by `index-pack --verify`'s code, as git runs it as a
+//! child: the pack is indexed afresh and the result compared with the index
+//! beside it, so a damaged pack or index fails with that command's
+//! diagnostics, `-s` included.
 //! Nothing is written to the repository, so post-command state is unchanged.
 
 use anyhow::Result;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use gix::hash::ObjectId;
 use gix::odb::pack;
@@ -72,7 +72,7 @@ const MAX_CHAIN: u32 = 15;
 /// Supported forms (matching stock git byte-for-byte, including exit codes):
 ///   * `git verify-pack <pack>.idx`          → verify silently, exit 0/1
 ///   * `-v` / `--verbose`                    → object table, histogram, `<pack>: ok`
-///   * `-s` / `--stat-only`                  → histogram only, no verification
+///   * `-s` / `--stat-only`                  → histogram only, still verified
 ///   * `-sv`, `--no-verbose`, `--no-stat-only`, `--`
 ///   * `--object-format[=]sha1`, `--no-object-format`
 ///   * `-h`                                  → usage on stdout, exit 0
@@ -256,7 +256,7 @@ enum HashChoice {
 /// Verify a single pack named by `path`, returning `false` when it is bad.
 ///
 /// Mirrors `verify_one_pack()` + `verify_pack()`: the argument is normalised to
-/// an `.idx` path, verification is skipped entirely under `--stat-only`, and the
+/// an `.idx` path, `index-pack --verify-stat-only` checks it under `--stat-only`, and the
 /// report — object table, histogram, trailing `ok`/`bad` line — is only produced
 /// when `-v` or `-s` was given.
 fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -> bool {
@@ -271,7 +271,6 @@ fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -
         let s = idx_path.to_string_lossy();
         format!("{}.pack", &s[..s.len() - 4])
     };
-    let pack_path = PathBuf::from(&pack_name);
 
     // A rejected `--object-format` fails this pack the same way an unopenable one
     // does: `bad` on stdout under `-v`/`-s`, diagnostic on stderr, `false` here.
@@ -286,61 +285,24 @@ fn verify_one(path: &str, verbose: bool, stat_only: bool, choice: &HashChoice) -
         }
     };
 
-    // `verify_one_pack()` is an `index-pack --verify <pack>` child
-    // (builtin/verify-pack.c:13-57), so the two `read_idx_option()` deaths — and the
-    // `error: wrong index v2 file size in …` that can precede the second — are
-    // `index-pack`'s, shared rather than written a second time.
-    let (idx, data, _) = match super::index_pack::open_idx_and_pack(&idx_path, hash) {
-        Ok(triple) => triple,
-        Err(message) => {
-            eprintln!("fatal: {message}");
-            if verbose || stat_only {
-                println!("{pack_name}: bad");
-            }
-            return false;
-        }
+    // `verify_one_pack()` is an `index-pack --verify-stat-only`, `--verify-stat`
+    // or `--verify` child (builtin/verify-pack.c:13-57): the pack is indexed
+    // afresh and checked against the index beside it, `-s` included, and every
+    // diagnostic is that child's.
+    let show_stat = match (stat_only, verbose) {
+        (true, _) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
     };
-
-    if !stat_only {
-        let opts = pack::index::verify::integrity::Options {
-            // Git checks each object's hash against the index and the two file
-            // checksums; it never re-encodes objects, so the stricter modes would
-            // reject packs git accepts.
-            verify_mode: pack::index::verify::Mode::HashCrc32,
-            ..Default::default()
-        };
-        let outcome = idx.verify_integrity(
-            Some(pack::index::verify::PackContext {
-                data: &data,
-                options: opts,
-            }),
-            &mut gix::progress::Discard,
-            &AtomicBool::new(false),
-        );
-        if let Err(e) = outcome {
-            eprintln!("error: {e}");
-            if verbose || stat_only {
-                println!("{pack_name}: bad");
-            }
-            return false;
-        }
-    }
-
+    let ok = super::index_pack::verify_for_verify_pack(&idx_path, hash, show_stat);
     if verbose || stat_only {
-        match show_pack_info(&idx, &data, !stat_only) {
-            Ok(()) => {
-                if !stat_only {
-                    println!("{pack_name}: ok");
-                }
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                println!("{pack_name}: bad");
-                return false;
-            }
+        if !ok {
+            println!("{pack_name}: bad");
+        } else if !stat_only {
+            println!("{pack_name}: ok");
         }
     }
-    true
+    ok
 }
 
 /// One row of the `-v` table, in pack-offset order.
@@ -361,7 +323,7 @@ struct Row {
 
 /// `show_pack_info()` — emit the object table (when `list` is set) followed by the
 /// delta-chain histogram.
-fn show_pack_info(
+pub(super) fn show_pack_info(
     idx: &pack::index::File,
     data: &pack::data::File,
     list: bool,

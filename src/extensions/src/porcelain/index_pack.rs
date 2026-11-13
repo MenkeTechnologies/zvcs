@@ -88,6 +88,10 @@
 //! already carries, even as a delta, is never stored twice, and the completed
 //! pack is the one stock git writes.
 //!
+//! `--index-version=<v>[,<off32-limit>]` selects the index layout and
+//! `--strict` refuses an object stored twice, both as `write_idx_file()` does:
+//! see [`write_idx_options`].
+//!
 //! `--strict`, `--fsck-objects` and `--check-self-contained-and-connected` are
 //! covered: see [`fsck_pack`]. git splits them across two flags
 //! (builtin/index-pack.c:1935-1944) — `do_fsck_object` runs `fsck_object()` over
@@ -105,7 +109,7 @@
 //! wrong answer: the `<msg-id>=<severity>` list form of `--strict=` /
 //! `--fsck-objects=` (its grammar is validated, but the severities it asks for
 //! are not applied — the checks run at git's defaults),
-//! `--pack_header`, `--index-version` other than a plain `2`,
+//! `--pack_header`,
 //! `--verify` combined with `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
 //! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
 //! resolves in-pack — since `gix_pack::index::write_data_iter_to_stream` refuses
@@ -143,8 +147,9 @@ use gix::odb::pack;
 /// trailing newline). Printed on `-h` (stdout) and for a usage error (stderr).
 const USAGE: &str = "usage: git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])\n";
 
-/// git's `pack_idx_option.off32_limit` default; any other `,<limit>` given to
-/// `--index-version` would change the index layout, which is not ported.
+/// git's `pack_idx_option.off32_limit` default (pack-write.c:17-23); any other
+/// `,<limit>` given to `--index-version` changes the index layout, see
+/// [`write_idx_options`].
 const DEFAULT_OFF32_LIMIT: u64 = 0x7fff_ffff;
 
 /// Parsed command line for a single `index-pack` invocation.
@@ -156,6 +161,9 @@ struct Opts {
     stdin: bool,                  // --stdin: read the pack from standard input
     fix_thin: bool,               // --fix-thin
     verify: bool,                 // --verify
+    /// `--verify-stat` (`Some(false)`) and `--verify-stat-only` (`Some(true)`):
+    /// git's `show_stat` and `stat_only`.
+    show_stat: Option<bool>,
     keep: Option<Option<String>>, // --keep / --keep=<msg>
     index_out: Option<PathBuf>,   // -o <index-file>
     rev_index: Option<bool>,      // --rev-index / --no-rev-index (None = config)
@@ -220,6 +228,7 @@ impl Opts {
             stdin: false,
             fix_thin: false,
             verify: false,
+            show_stat: None,
             keep: None,
             index_out: None,
             rev_index: None,
@@ -312,6 +321,15 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
             "--stdin" => opts.stdin = true,
             "--fix-thin" => opts.fix_thin = true,
             "--verify" => opts.verify = true,
+            // `show_stat`, and `stat_only` too (builtin/index-pack.c:1952-1958).
+            "--verify-stat" => {
+                opts.verify = true;
+                opts.show_stat = Some(false);
+            }
+            "--verify-stat-only" => {
+                opts.verify = true;
+                opts.show_stat = Some(true);
+            }
             "--keep" => opts.keep = Some(None),
             "--rev-index" => opts.rev_index = Some(true),
             "--no-rev-index" => opts.rev_index = Some(false),
@@ -445,7 +463,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
             // there are not reproduced, so refuse rather than guess.
             anyhow::bail!("unsupported: `--verify --stdin` (only verifying a pack already on disk is ported)");
         }
-        return verify_existing(&opts, &index_name);
+        return Ok(die_on_error(verify_existing(&opts, &index_name)));
     }
 
     if opts.stdin {
@@ -955,66 +973,215 @@ fn write_index_for_pack(
         }
     }
 
+    if let Err(e) = write_idx_options(opts, &tmp, hash) {
+        let _ = fs::remove_file(&tmp);
+        // `unlink(index_name); fd = xopen(index_name, O_CREAT|O_EXCL|O_WRONLY,
+        // 0600);` (pack-write.c:90-92) ran before the die, and nothing had been
+        // flushed to it yet.
+        let _ = fs::remove_file(index_path);
+        let _ = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(index_path);
+        return Err(e);
+    }
+
     fs::rename(&tmp, index_path)?;
     Ok(outcome.data_hash)
 }
 
-/// `--verify`: check an existing index against its pack, printing nothing and
-/// exiting 0 when they agree, exactly as git does.
+/// What `write_idx_file()` (pack-write.c:57-180) decides about an index on its
+/// own: under `WRITE_IDX_STRICT` — `--strict` and
+/// `--check-self-contained-and-connected` (builtin/index-pack.c:2058-2059) — an
+/// object id stored twice dies as it is written (pack-write.c:131-137), and
+/// `--index-version=<v>[,<off32-limit>]` (builtin/index-pack.c:1991-1999)
+/// picks the layout, [`super::pack_objects::index_file_with`]. `index_path`
+/// holds the plain version 2 index the vendored writer produced, and is
+/// rewritten in place when the options ask for another.
+fn write_idx_options(opts: &Opts, index_path: &Path, hash: Kind) -> Result<()> {
+    // `--verify` adds `WRITE_IDX_STRICT` and takes the layout from the index it
+    // checks (builtin/index-pack.c:2053-2057), see [`verify_existing`].
+    let strict = opts.strict() || opts.verify;
+    let wants_layout = !opts.verify
+        && opts
+            .index_version
+            .is_some_and(|(version, limit)| version != 2 || limit.is_some_and(|l| l != DEFAULT_OFF32_LIMIT));
+    if !strict && !wants_layout {
+        return Ok(());
+    }
+    let index = pack::index::File::at(index_path, hash)?;
+    if strict {
+        let mut previous: Option<ObjectId> = None;
+        for entry in index.iter() {
+            if previous == Some(entry.oid) {
+                bail!("The same object {} appears twice in the pack", entry.oid);
+            }
+            previous = Some(entry.oid);
+        }
+    }
+    if let (true, Some((version, limit))) = (wants_layout, opts.index_version) {
+        let entries: Vec<super::pack_objects::PackedEntry> = index
+            .iter()
+            .map(|e| super::pack_objects::PackedEntry {
+                id: e.oid,
+                offset: e.pack_offset,
+                crc32: e.crc32.unwrap_or(0),
+                // Neither is part of an index; only a `.bitmap` reads them.
+                kind: gix::object::Kind::Blob,
+                name_hash: 0,
+            })
+            .collect();
+        let pack_id = index.pack_checksum();
+        let limit = limit.map_or(super::pack_objects::DEFAULT_OFF32_LIMIT, |l| l as u32);
+        let bytes = super::pack_objects::index_file_with(hash, version, limit, &[], &pack_id, &entries)?;
+        drop(index);
+        fs::write(index_path, bytes)?;
+    }
+    Ok(())
+}
+
+/// The `index-pack --verify…` child `verify_one_pack()` runs for `verify-pack`
+/// (builtin/verify-pack.c:13-57), in process: its output and its diagnostics,
+/// and whether it succeeded.
+pub(super) fn verify_for_verify_pack(index_path: &Path, hash: Kind, show_stat: Option<bool>) -> bool {
+    let mut opts = Opts::new();
+    opts.verify = true;
+    opts.show_stat = show_stat;
+    opts.object_format = Some(match hash {
+        Kind::Sha1 => "sha1".to_string(),
+        _ => "sha256".to_string(),
+    });
+    die_on_error(verify_existing(&opts, index_path)) == ExitCode::SUCCESS
+}
+
+/// `--verify`, `--verify-stat` and `--verify-stat-only`: index the pack afresh
+/// and check the result against the index already beside it.
 ///
-/// git reaches this through `read_idx_option()` → `parse_pack_index()`, which
-/// requires the index to parse *and* the sibling `.pack` (the index name with
-/// `.idx` swapped for `.pack`, not the positional argument) to exist; when
-/// either fails it dies naming the index path.
+/// `read_idx_option()` (builtin/index-pack.c:1742-1767) opens the existing pair
+/// — its two deaths name the *index* path, see [`open_idx_and_pack`] — and
+/// takes its version and its anomalous large offsets. The pack is then parsed
+/// and its deltas resolved like any other (`parse_pack_objects()`,
+/// `resolve_deltas()`), so a damaged pack dies the way indexing it would, the
+/// `--strict` checks run, `show_pack_info()` prints the statistics (:2097-2098),
+/// and `write_idx_file()` writes the new index through `hashfd_check()`
+/// (:2053-2057, :2102-2105): see [`check_against`]. The `.rev` is checked the
+/// same way when there is one (`write_rev_file_order()`, pack-write.c:272-282).
 fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
-    let name = index_path.to_string_lossy().into_owned();
-    // `read_idx_option()`'s two deaths; see [`open_idx_and_pack`].
     let hash = opts.object_hash();
     let (index, data, pack_path) = match open_idx_and_pack(index_path, hash) {
         Ok(triple) => triple,
         Err(message) => return Ok(fatal(message)),
     };
-
     reject_unported(opts)?;
     // `final()` — and with it `write_special_file()` — is skipped under `--verify`
     // (`if (!verify) final(...); else close(input_fd);`, builtin/index-pack.c:2106-2113), so a
     // `--keep` alongside `--verify` leaves no file behind.
-
-    let options = pack::index::verify::integrity::Options {
-        // git checks each object's hash and CRC32 against the index plus the
-        // two file checksums; it never re-encodes objects, so the stricter
-        // modes would reject packs git accepts.
-        verify_mode: pack::index::verify::Mode::HashCrc32,
-        thread_limit: opts.threads,
-        ..Default::default()
+    let version = index.version() as u64;
+    drop((index, data));
+    let existing = fs::read(index_path)?;
+    let anomalies = match version {
+        2 => v2_anomalous_offsets(&existing, hash),
+        _ => Vec::new(),
     };
-    match index.verify_integrity(
-        Some(pack::index::verify::PackContext {
-            data: &data,
-            options,
-        }),
-        &mut gix::progress::Discard,
-        &AtomicBool::new(false),
-    ) {
-        Ok(_) => {}
-        // git's per-corruption diagnostics are not reproduced; report the real
-        // failure rather than inventing text that only looks like git's.
-        Err(e) => crate::git_fatal!("--verify failed for '{name}': {e}"),
-    }
-    // `do_fsck_object` is independent of `--verify`: the object checks still run
-    // over everything the pack holds.
+
+    // The fresh index goes to a private scratch directory: `--verify` writes
+    // nothing beside the pack.
+    let scratch = std::env::temp_dir().join(format!("zvcs-index-pack-verify-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)?;
+    let outcome = verify_in(opts, &pack_path, index_path, &scratch, version, &anomalies, &existing);
+    let _ = fs::remove_dir_all(&scratch);
+    outcome
+}
+
+fn verify_in(
+    opts: &Opts,
+    pack_path: &Path,
+    index_path: &Path,
+    scratch: &Path,
+    version: u64,
+    anomalies: &[u32],
+    existing: &[u8],
+) -> Result<ExitCode> {
+    let hash = opts.object_hash();
+    let fresh = scratch.join("fresh.idx");
     let mut foreign_nr = 1u32;
-    if opts.strict() || opts.do_fsck_object() {
-        fsck_pack(
-            &pack_path,
-            index_path,
-            opts.strict(),
-            opts.do_fsck_object(),
-            hash,
-            &mut foreign_nr,
-        )?;
+    let pack_hash = write_index_for_pack(opts, pack_path, &fresh, &mut foreign_nr)?;
+
+    let index = pack::index::File::at(&fresh, hash)?;
+    if let Some(stat_only) = opts.show_stat {
+        let data = pack::data::File::at(pack_path, hash)?;
+        super::verify_pack::show_pack_info(&index, &data, !stat_only)?;
+    }
+    let entries: Vec<super::pack_objects::PackedEntry> = index
+        .iter()
+        .map(|e| super::pack_objects::PackedEntry {
+            id: e.oid,
+            offset: e.pack_offset,
+            crc32: e.crc32.unwrap_or(0),
+            kind: gix::object::Kind::Blob,
+            name_hash: 0,
+        })
+        .collect();
+    drop(index);
+    let limit = super::pack_objects::DEFAULT_OFF32_LIMIT;
+    let rewritten = super::pack_objects::index_file_with(hash, version, limit, anomalies, &pack_hash, &entries)?;
+    check_against(&rewritten, existing, index_path)?;
+
+    let rev_path = index_path.with_extension("rev");
+    if want_rev_index(opts) && rev_path.exists() {
+        fs::write(&fresh, &rewritten)?;
+        write_rev_index(&fresh, &pack_hash, hash)?;
+        let fresh_rev = fs::read(fresh.with_extension("rev"))?;
+        check_against(&fresh_rev, &fs::read(&rev_path)?, &rev_path)?;
     }
     Ok(self_contained_exit(opts, foreign_nr))
+}
+
+/// `hashfd_check()` (csum-file.c:17-29, :85-98, :141-154): the file being
+/// verified is read back `DEFAULT_IO_BUFFER_SIZE` bytes at a time as the new
+/// one is written, so the first chunk it is short of is `sha1 file
+/// truncated`, the first that differs `validation error`, and anything left
+/// over `trailing garbage`.
+fn check_against(fresh: &[u8], existing: &[u8], path: &Path) -> Result<()> {
+    const DEFAULT_IO_BUFFER_SIZE: usize = 128 * 1024;
+    let name = path.to_string_lossy();
+    for (n, chunk) in fresh.chunks(DEFAULT_IO_BUFFER_SIZE).enumerate() {
+        let at = n * DEFAULT_IO_BUFFER_SIZE;
+        let Some(theirs) = existing.get(at..at + chunk.len()) else {
+            bail!("{name}: sha1 file truncated");
+        };
+        if theirs != chunk {
+            bail!("sha1 file '{name}' validation error");
+        }
+    }
+    if existing.len() > fresh.len() {
+        bail!("{name}: sha1 file has trailing garbage");
+    }
+    Ok(())
+}
+
+/// `read_v2_anomalous_offsets()` (builtin/index-pack.c:1708-1740): the entries
+/// of a v2 index whose offset sits in the 64-bit table although its high word
+/// is zero.
+fn v2_anomalous_offsets(idx: &[u8], hash: Kind) -> Vec<u32> {
+    let word = |at: usize| idx.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(nr) = word(8 + 255 * 4) else { return Vec::new() };
+    let nr = nr as usize;
+    let off32 = 8 + 256 * 4 + nr * (hash.len_in_bytes() + 4);
+    let off64 = off32 + nr * 4;
+    let mut out = Vec::new();
+    for i in 0..nr {
+        let Some(off) = word(off32 + i * 4) else { break };
+        if off & 0x8000_0000 == 0 {
+            continue;
+        }
+        let slot = off64 + (off & 0x7fff_ffff) as usize * 8;
+        if word(slot) == Some(0) {
+            if let Some(low) = word(slot + 4) {
+                out.push(low);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 /// `read_idx_option()` (builtin/index-pack.c:1742-1767): open the pack a `.idx`
@@ -1317,6 +1484,32 @@ fn index_from_stdin(
                 }
                 return Err(e);
             }
+        }
+        if let Err(e) = write_idx_options(opts, gix_index, opts.object_hash()) {
+            // git dies inside `write_idx_file()`: the streamed pack is still in
+            // its output file, and the index it had just opened is empty —
+            // `odb_mkstemp(…, "pack/tmp_idx_XXXXXX")` (0444) without a name,
+            // `xopen(index_name, …, 0600)` with one (pack-write.c:84-93).
+            for path in [gix_index].into_iter().chain(outcome.keep_path.as_ref()) {
+                let _ = fs::remove_file(path);
+            }
+            if let Some(output) = target_pack.or(temp_pack.as_deref()) {
+                fs::rename(gix_data, output)?;
+                if target_pack.is_none() {
+                    set_read_only(output)?;
+                }
+            }
+            match target_index {
+                Some(ti) => {
+                    let _ = fs::remove_file(ti);
+                    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(ti)?;
+                }
+                None => {
+                    let path = write_dir.join(format!("tmp_idx_{}", mkstemp_suffix()));
+                    fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&path)?;
+                }
+            }
+            return Err(e);
         }
 
         // Move gix's hash-named files onto git's chosen destinations, if any.
@@ -2123,11 +2316,6 @@ fn reject_unported(opts: &Opts) -> Result<()> {
     if let Some(fmt) = &opts.object_format {
         if fmt.parse::<Kind>().is_err() {
             anyhow::bail!("unsupported object format {fmt:?}");
-        }
-    }
-    if let Some((version, off32_limit)) = opts.index_version {
-        if version != 2 || off32_limit.is_some_and(|l| l != DEFAULT_OFF32_LIMIT) {
-            bail!("unsupported flag \"--index-version\" (only a plain version 2 index is written)");
         }
     }
     Ok(())

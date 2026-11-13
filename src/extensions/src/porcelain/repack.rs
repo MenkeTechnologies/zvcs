@@ -2274,7 +2274,7 @@ fn write_mtimes(
 /// `error()`: a missing, short, mis-signed, wrong-version, unknown-hash or
 /// wrong-length file. Only hash ids 1 (SHA-1) and 2 (SHA-256) are known, and
 /// their raw sizes are what the expected length is built from.
-fn read_mtimes(path: &Path, num_objects: u32) -> Option<Vec<u32>> {
+pub(super) fn read_mtimes(path: &Path, num_objects: u32) -> Option<Vec<u32>> {
     const HEADER: usize = 12;
     let bytes = fs::read(path).ok()?;
     if bytes.len() < HEADER || &bytes[..4] != b"MTME" {
@@ -3118,7 +3118,7 @@ fn loosen_unreachable(
 
 /// `force_object_loose()`: write `id` as a loose object unless one is there already, and date the
 /// file `mtime`.
-fn force_object_loose(repo: &gix::Repository, objdir: &Path, id: ObjectId, mtime: i64) -> Result<()> {
+pub(super) fn force_object_loose(repo: &gix::Repository, objdir: &Path, id: ObjectId, mtime: i64) -> Result<()> {
     let path = loose_path(objdir, &id);
     if path.exists() {
         return Ok(());

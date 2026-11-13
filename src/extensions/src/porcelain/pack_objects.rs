@@ -101,7 +101,12 @@
 //! * the object *set*: which objects end up in the pack, for `--all`,
 //!   `--reflog`, `--indexed-objects`, `--revs`, `--stdin-packs`, `--unpacked`,
 //!   `--cruft`, a bare object list on stdin, and every combination of those
-//!   (see [`collect_counts`]). A bare object list packs exactly the ids it
+//!   (see [`collect_counts`]), walked as `get_object_list()` walks it — an
+//!   exclusion marks only what git marks (see [`traverse_revs`]) — and put to
+//!   `want_object_in_pack()` for `--incremental`, `--local`,
+//!   `--honor-pack-keep` and `--keep-pack` (see [`PackInventory`]), then
+//!   `--keep-unreachable`, `--unpack-unreachable[=<time>]` and `--include-tag`
+//!   (see [`after_traversal`]). A bare object list packs exactly the ids it
 //!   names — `add_object_entry()` adds one object and no traversal follows — and
 //!   an id naming nothing is carried to the write and dies there, as git's does
 //! * the object *order*, both the enumeration order and the write order
@@ -158,15 +163,12 @@
 //!     `--max-pack-size` itself, does not split the output.
 //!   * `--missing=allow-promisor` does not additionally imply
 //!     `--exclude-promisor-objects` handling.
-//!   * `--include-tag` adds no tags beyond those the object set already names.
 //!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
 //!     cruft object is written with its current mtime.
-//!   * an *exclusion* among the revision arguments on stdin — `^<rev>`, anything
-//!     after `--not`, the left of `<a>..<b>`, the merge bases of `<a>...<b>` —
-//!     removes everything it reaches, as the push and bundle paths do; git only
-//!     marks the boundary commits' trees uninteresting, so an object reachable
-//!     from deep excluded history alone can differ. `<rev>^!` and `<rev>^@` are
+//!   * `<rev>^!` and `<rev>^@` among the revision arguments on stdin are
 //!     validated and then dropped, and `--shallow <oid>` registers no boundary.
+//!   * `--include-tag` only follows an enumeration from a revision walk or an
+//!     object list, not `--stdin-packs` or `--cruft`.
 //!
 //! # Configuration honoured
 //!
@@ -503,6 +505,17 @@ struct State {
     unpacked: bool,
     keep_unreachable: bool,
     unpack_unreachable: bool,
+    /// `--unpack-unreachable=<time>`, as typed: `option_parse_unpack_unreachable()`
+    /// (builtin/pack-objects.c:5061-5073) stores `approxidate(arg)` in
+    /// `unpack_unreachable_expiration`, and a bare or negated option clears it.
+    unpack_unreachable_expiration: Option<String>,
+    /// `--include-tag`: pack every annotated tag whose peeled target is packed.
+    include_tag: bool,
+    /// `--honor-pack-keep`, git's `ignore_packed_keep_on_disk`.
+    honor_pack_keep: bool,
+    /// `--keep-pack=<name>`, an `OPT_STRING_LIST`: each one marks the local
+    /// pack of that basename kept in core (`add_extra_kept_packs()`).
+    keep_packs: Vec<String>,
     non_empty: bool,
     /// The three options that name a source of objects all by themselves.
     all: bool,
@@ -528,6 +541,11 @@ struct State {
     /// `--index-version=<v>[,<offset>]`, just the `<v>`; `None` falls back to
     /// `pack.indexVersion` and then to 2.
     index_version: Option<u64>,
+    /// The `,<offset>` tail of the last `--index-version` that had one:
+    /// `popts->off32_limit`, which a later `--index-version` without a tail
+    /// leaves alone (builtin/pack-objects.c:5040-5059). `None` is
+    /// `reset_pack_idx_option()`'s 0x7fffffff (pack-write.c:17-23).
+    off32_limit: Option<u32>,
     /// `--revs`: stdin carries rev-list arguments rather than an object list.
     revs: bool,
     /// `--incremental`: leave out objects an existing pack already holds.
@@ -1140,7 +1158,7 @@ fn execute(st: &State) -> Result<ExitCode> {
         (format!("{base}-{hex_id}.pack"), packed.bytes.clone(), Pack),
         (
             format!("{base}-{hex_id}.idx"),
-            index_file(kind, index_version, &packed.id, &by_oid)?,
+            index_file_with(kind, index_version, st.off32_limit.unwrap_or(DEFAULT_OFF32_LIMIT), &[], &packed.id, &by_oid)?,
             PackMetadata,
         ),
     ];
@@ -3410,6 +3428,33 @@ pub(super) fn index_file(
     pack_id: &ObjectId,
     sorted: &[PackedEntry],
 ) -> Result<Vec<u8>> {
+    index_file_with(kind, version, DEFAULT_OFF32_LIMIT, &[], pack_id, sorted)
+}
+
+/// `reset_pack_idx_option()`'s `off32_limit` (pack-write.c:17-23).
+pub(super) const DEFAULT_OFF32_LIMIT: u32 = 0x7fff_ffff;
+
+/// [`index_file`] under an `--index-version=<v>,<off32-limit>`:
+/// `write_idx_file()` (pack-write.c:57-180) with `need_large_offset()`
+/// (:40-51), which sends an offset past `off32_limit` to the 64-bit table as
+/// well as one of 2 GiB or more — and writes a v2 index whatever version was
+/// asked for when the last object's offset needs one. `anomalies` are the
+/// offsets below 4 GiB an index being verified keeps in its 64-bit table
+/// anyway (`read_v2_anomalous_offsets()`, builtin/index-pack.c:1708-1740),
+/// which `need_large_offset()` sends there too.
+pub(super) fn index_file_with(
+    kind: gix::hash::Kind,
+    version: u64,
+    off32_limit: u32,
+    anomalies: &[u32],
+    pack_id: &ObjectId,
+    sorted: &[PackedEntry],
+) -> Result<Vec<u8>> {
+    let need_large_offset = |offset: u64| {
+        (offset >> 31) != 0 || u64::from(off32_limit) < offset || anomalies.contains(&(offset as u32))
+    };
+    let last_obj_offset = sorted.iter().map(|e| e.offset).max().unwrap_or(0);
+    let version = if need_large_offset(last_obj_offset) { 2 } else { version };
     let mut bytes = Vec::new();
     let v2 = version >= 2;
     if v2 {
@@ -3440,15 +3485,12 @@ pub(super) fn index_file(
         }
         let mut large: Vec<u64> = Vec::new();
         for entry in sorted {
-            match u32::try_from(entry.offset) {
-                Ok(small) if small & 0x8000_0000 == 0 => {
-                    bytes.extend_from_slice(&small.to_be_bytes());
-                }
-                _ => {
-                    let slot = large.len() as u32;
-                    large.push(entry.offset);
-                    bytes.extend_from_slice(&(slot | 0x8000_0000).to_be_bytes());
-                }
+            if need_large_offset(entry.offset) {
+                let slot = large.len() as u32;
+                large.push(entry.offset);
+                bytes.extend_from_slice(&(slot | 0x8000_0000).to_be_bytes());
+            } else {
+                bytes.extend_from_slice(&(entry.offset as u32).to_be_bytes());
             }
         }
         for offset in large {
@@ -5185,25 +5227,27 @@ fn collect_counts(
         ids.retain(|id| !covered.contains(id));
         ids
     } else {
-        let mut ids = rev_list_objects(repo, st, stdin, edges)?;
-        // Restricting to what no pack holds only makes sense for a set derived
-        // from a reachability walk; the two branches above name their packs
-        // outright.
-        if st.unpacked || st.incremental {
-            let loose: HashSet<ObjectId> = loose_objects(repo).into_iter().collect();
-            ids.retain(|id| loose.contains(id));
-        }
-        ids
+        // `read_object_list_from_stdin()` or `get_object_list()`: every object
+        // either one shows goes through `add_object_entry()`, which drops a
+        // repeat and asks `want_object_in_pack()` about the rest.
+        let inventory = PackInventory::load(repo, st);
+        let mut ids = rev_list_objects(repo, st, stdin, edges, &inventory)?;
+        dedup(&mut ids);
+        ids.retain(|id| inventory.want(id));
+        after_traversal(repo, st, &inventory, &mut ids)?;
+        return Ok(ids
+            .into_iter()
+            .map(|id| pack::data::output::Count {
+                id,
+                entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
+            })
+            .collect());
     };
 
     if st.local {
         drop_borrowed(repo, &mut ids);
     }
     dedup(&mut ids);
-    // `pack-objects` builds its pending list from `--all`/`--reflog`/`--revs`,
-    // whose entries are commits, and a commit is not something any spec
-    // implemented here removes — so there is nothing to exempt on this path and
-    // the set is passed empty rather than threaded out of the walk.
     apply_filter(repo, st.filter.as_deref(), &[], &mut ids);
 
     Ok(ids
@@ -5213,6 +5257,601 @@ fn collect_counts(
             entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
         })
         .collect())
+}
+
+/// One entry of the pack list `repo_for_each_pack()` walks: this repository's
+/// packs and every alternate's, each with the flags `want_found_object()`,
+/// `add_objects_in_unpacked_packs()` and `loosen_unused_packed_objects()` read.
+struct KnownPack {
+    index: pack::index::File,
+    /// `p->pack_local`: the pack lives in this repository's own object directory.
+    local: bool,
+    /// `p->pack_keep`: a `.keep` file sits beside it.
+    keep: bool,
+    /// `p->pack_keep_in_core`: `--keep-pack` named it (`add_extra_kept_packs()`).
+    keep_in_core: bool,
+    /// `p->mtime`, the `.pack` file's modification time.
+    mtime: i64,
+}
+
+/// The packs and the switches that decide `want_object_in_pack()`
+/// (builtin/pack-objects.c:1622-1829) for every object `add_object_entry()` is
+/// offered.
+struct PackInventory {
+    /// In `sort_pack()`'s order (packfile.c): local packs first, then the
+    /// youngest first.
+    packs: Vec<KnownPack>,
+    /// The alternates' object directories, for `--local`'s loose-object check.
+    alternates: Vec<std::path::PathBuf>,
+    incremental: bool,
+    local: bool,
+    /// `ignore_packed_keep_on_disk`, cleared when no local pack has a `.keep`
+    /// (:5447-5455).
+    ignore_keep_on_disk: bool,
+    /// `ignore_packed_keep_in_core`, set by `add_extra_kept_packs()` when a
+    /// `--keep-pack` name matched (:5002-5025).
+    ignore_keep_in_core: bool,
+}
+
+impl PackInventory {
+    fn load(repo: &gix::Repository, st: &State) -> Self {
+        let hash = repo.object_hash();
+        let own = repo.objects.store_ref().path().to_path_buf();
+        let alternates = repo.objects.store_ref().alternate_db_paths().unwrap_or_default();
+        // `fspathcmp()` (dir.c): `core.ignoreCase` makes the name match case-blind.
+        let ignore_case = repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
+        let mut packs = Vec::new();
+        let mut ignore_keep_in_core = false;
+        for (objdir, local) in std::iter::once((&own, true)).chain(alternates.iter().map(|d| (d, false))) {
+            let dir = objdir.join("pack");
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(base) = name.strip_suffix(".idx") else { continue };
+                let pack_name = format!("{base}.pack");
+                let Some(mtime) = super::prune::mtime_of(&dir.join(&pack_name)) else { continue };
+                let Ok(index) = pack::index::File::at(dir.join(&name), hash) else { continue };
+                // `add_extra_kept_packs()` compares `basename(p->pack_name)` and
+                // only ever marks a local pack.
+                let keep_in_core = local
+                    && st.keep_packs.iter().any(|want| match ignore_case {
+                        true => want.eq_ignore_ascii_case(&pack_name),
+                        false => *want == pack_name,
+                    });
+                ignore_keep_in_core |= keep_in_core;
+                packs.push(KnownPack {
+                    index,
+                    local,
+                    keep: dir.join(format!("{base}.keep")).exists(),
+                    keep_in_core,
+                    mtime,
+                });
+            }
+        }
+        packs.sort_by(|a, b| b.local.cmp(&a.local).then(b.mtime.cmp(&a.mtime)));
+        let ignore_keep_on_disk = st.honor_pack_keep && packs.iter().any(|p| p.local && p.keep);
+        PackInventory {
+            packs,
+            alternates,
+            incremental: st.incremental,
+            local: st.local,
+            ignore_keep_on_disk,
+            ignore_keep_in_core,
+        }
+    }
+
+    fn containing<'a>(&'a self, id: &'a ObjectId) -> impl Iterator<Item = &'a KnownPack> + 'a {
+        self.packs.iter().filter(move |p| p.index.lookup(id).is_some())
+    }
+
+    /// `has_object_pack()` (packfile.c:1922-1933): some pack, ours or an
+    /// alternate's, holds `id`.
+    fn has_object_pack(&self, id: &ObjectId) -> bool {
+        self.containing(id).next().is_some()
+    }
+
+    /// `want_object_in_pack()` for an object that is not a preferred base.
+    ///
+    /// `--local` first drops anything an alternate holds loose (:1765-1777).
+    /// Then every pack holding the object is put to `want_found_object()`
+    /// (:1622-1712): `--incremental` refuses any of them, `--local` a borrowed
+    /// one, `--honor-pack-keep` one with a `.keep` and `--keep-pack` one it
+    /// named — `has_object_kept_pack()` looks across every kept pack, so the
+    /// pack git happens to find first does not change the answer. An object no
+    /// pack holds is wanted.
+    fn want(&self, id: &ObjectId) -> bool {
+        if self.local {
+            let hex = id.to_hex().to_string();
+            if self.alternates.iter().any(|objdir| objdir.join(&hex[..2]).join(&hex[2..]).is_file()) {
+                return false;
+            }
+        }
+        !self.containing(id).any(|p| {
+            self.incremental
+                || (self.local && !p.local)
+                || (self.ignore_keep_on_disk && p.keep)
+                || (self.ignore_keep_in_core && p.keep_in_core)
+        })
+    }
+
+    /// `has_sha1_pack_kept_or_nonlocal()` (:4583-4607).
+    fn kept_or_nonlocal(&self, id: &ObjectId) -> bool {
+        self.containing(id).any(|p| !p.local || p.keep || p.keep_in_core)
+    }
+
+    /// The local packs neither `.keep` nor `--keep-pack` protects, which both
+    /// `add_objects_in_unpacked_packs()` (its `ODB_FOR_EACH_OBJECT_LOCAL_ONLY |
+    /// SKIP_IN_CORE_KEPT_PACKS | SKIP_ON_DISK_KEPT_PACKS` walk, :4513-4539) and
+    /// `loosen_unused_packed_objects()` (:4555-4558) read.
+    fn unkept_local(&self) -> impl Iterator<Item = &KnownPack> {
+        self.packs.iter().filter(|p| p.local && !p.keep && !p.keep_in_core)
+    }
+}
+
+/// The tail of `get_object_list()` (builtin/pack-objects.c:4980-4998) and the
+/// `--include-tag` pass after it (:5497-5499): the objects added once the
+/// traversal is done, and the loose copies `--unpack-unreachable` writes.
+/// `ids` is `to_pack` so far.
+fn after_traversal(repo: &gix::Repository, st: &State, inventory: &PackInventory, ids: &mut Vec<ObjectId>) -> Result<(), String> {
+    let mut packed: HashSet<ObjectId> = ids.iter().copied().collect();
+    let mut add = |id: ObjectId, ids: &mut Vec<ObjectId>, packed: &mut HashSet<ObjectId>| {
+        // `add_object_entry()`: a repeat is dropped, the rest go through
+        // `want_object_in_pack()`.
+        if !packed.contains(&id) && inventory.want(&id) {
+            packed.insert(id);
+            ids.push(id);
+        }
+    };
+
+    // `add_objects_in_unpacked_packs()`: every object of an unkept local pack,
+    // pack by pack, each in pack order (`ODB_FOR_EACH_OBJECT_PACK_ORDER`).
+    if st.keep_unreachable {
+        for p in inventory.unkept_local() {
+            let mut entries: Vec<(u64, ObjectId)> = p.index.iter().map(|e| (e.pack_offset, e.oid)).collect();
+            entries.sort_unstable();
+            for (_, id) in entries {
+                add(id, ids, &mut packed);
+            }
+        }
+    }
+
+    if st.unpack_unreachable {
+        loosen_unused_packed_objects(repo, st, inventory, &packed)?;
+    }
+
+    // `if (include_tag && nr_result) refs_for_each_tag_ref(..., add_ref_tag)`.
+    if st.include_tag && !ids.is_empty() {
+        let mut tags: Vec<(String, ObjectId)> = Vec::new();
+        if let Ok(platform) = repo.references() {
+            if let Ok(iter) = platform.prefixed("refs/tags/") {
+                for mut reference in iter.flatten() {
+                    if let Ok(id) = reference.follow_to_object() {
+                        tags.push((reference.name().as_bstr().to_string(), id.detach()));
+                    }
+                }
+            }
+        }
+        tags.sort();
+        for (_, tip) in tags {
+            add_ref_tag(repo, tip, ids, &mut packed, &mut add)?;
+        }
+    }
+    Ok(())
+}
+
+/// `add_ref_tag()` and `add_tag_chain()` (builtin/pack-objects.c:3357-3394): a
+/// tag ref whose fully peeled target is being packed brings its tag object, and
+/// every tag that one names, into the pack.
+fn add_ref_tag(
+    repo: &gix::Repository,
+    tip: ObjectId,
+    ids: &mut Vec<ObjectId>,
+    packed: &mut HashSet<ObjectId>,
+    add: &mut impl FnMut(ObjectId, &mut Vec<ObjectId>, &mut HashSet<ObjectId>),
+) -> Result<(), String> {
+    // `reference_get_peeled_oid()` fails for a ref that names no tag, so a
+    // lightweight tag contributes nothing.
+    let Ok(object) = repo.find_object(tip) else { return Ok(()) };
+    if object.kind != gix::object::Kind::Tag {
+        return Ok(());
+    }
+    drop(object);
+    let Some(peeled) = repo.find_object(tip).ok().and_then(|o| o.peel_tags_to_end().ok()) else {
+        return Ok(());
+    };
+    if !packed.contains(&peeled.id) {
+        return Ok(());
+    }
+    // `if (obj_is_packed(oid)) return;`
+    if packed.contains(&tip) {
+        return Ok(());
+    }
+    let mut id = tip;
+    loop {
+        let tagged = repo
+            .find_object(id)
+            .ok()
+            .and_then(|o| o.try_into_tag().ok())
+            .and_then(|t| t.decode().ok().map(|t| (t.target(), t.target_kind)));
+        let Some((target, kind)) = tagged else {
+            return Err(format!("unable to pack objects reachable from tag {tip}"));
+        };
+        add(id, ids, packed);
+        if kind != gix::object::Kind::Tag {
+            return Ok(());
+        }
+        id = target;
+    }
+}
+
+/// `loosen_unused_packed_objects()` (builtin/pack-objects.c:4549-4577): every
+/// object of an unkept local pack that is not going into the new pack, that no
+/// kept or borrowed pack also holds, and that `--unpack-unreachable=<time>`
+/// does not let go, is written out loose, dated with its pack.
+fn loosen_unused_packed_objects(
+    repo: &gix::Repository,
+    st: &State,
+    inventory: &PackInventory,
+    packed: &HashSet<ObjectId>,
+) -> Result<(), String> {
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    // `unpack_unreachable_expiration = approxidate(arg)`, zero when no date —
+    // and zero again unless `--all`, `--reflog` and `--indexed-objects` were all
+    // given, since only then is everything else known to be unreachable
+    // (builtin/pack-objects.c:5396-5397).
+    let expiration = match st.all && st.reflog && st.indexed_objects {
+        true => st.unpack_unreachable_expiration.as_deref().map_or(0, crate::date::approxidate),
+        false => 0,
+    };
+    // `recent_objects`: what `add_unseen_recent_objects_to_traversal()`
+    // (reachable.c:247-284) seeds — every local loose object dated after the
+    // cut, and every object of a local pack dated after it — and the second
+    // traversal reaches from there (:4980-4990).
+    let recent: HashSet<ObjectId> = match expiration {
+        0 => HashSet::new(),
+        cut => {
+            let mut tips: Vec<ObjectId> = Vec::new();
+            for id in super::prune::loose_object_ids(repo, &objdir) {
+                let hex = id.to_hex().to_string();
+                if super::prune::mtime_of(&objdir.join(&hex[..2]).join(&hex[2..])).is_some_and(|m| m > cut) {
+                    tips.push(id);
+                }
+            }
+            for p in inventory.packs.iter().filter(|p| p.local) {
+                let mtimes = super::repack::read_mtimes(&p.index.path().with_extension("mtimes"), p.index.num_objects());
+                for (pos, entry) in p.index.iter().enumerate() {
+                    let dated = mtimes.as_ref().and_then(|m| m.get(pos)).map_or(p.mtime, |m| i64::from(*m));
+                    if dated > cut {
+                        tips.push(entry.oid);
+                    }
+                }
+            }
+            super::prune::close_over(repo, tips, super::prune::TrueParents::Keep)
+        }
+    };
+    // `loosened_object_can_be_discarded()` (:4618-4628).
+    let discardable = |id: &ObjectId, mtime: i64| expiration != 0 && mtime <= expiration && !recent.contains(id);
+    for p in inventory.unkept_local() {
+        for n in 0..p.index.num_objects() {
+            let id = p.index.oid_at_index(n).to_owned();
+            if !packed.contains(&id) && !inventory.kept_or_nonlocal(&id) && !discardable(&id, p.mtime) {
+                super::repack::force_object_loose(repo, &objdir, id, p.mtime)
+                    .map_err(|_| "unable to force loose object".to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `get_object_list()`'s traversal (builtin/pack-objects.c:4969-4978):
+/// `prepare_revision_walk()`, `mark_edges_uninteresting()` and
+/// `traverse_commit_list()` over the revisions `pending` (shown) and `hidden`
+/// (`UNINTERESTING`), in the order `show_commit()` and `show_object()` see the
+/// objects.
+///
+/// An exclusion does not remove everything it reaches. Its commits, and every
+/// commit behind them, are `UNINTERESTING` (`mark_parents_uninteresting()`,
+/// `limit_list()`), but of trees and blobs only these are:
+///
+///   * a tree or blob named as an exclusion itself, a tree with everything
+///     under it (`handle_commit()`, revision.c:382-475);
+///   * the trees of the excluded parents of a commit the walk shows — every
+///     object under them without `sparse` (`mark_edge_parents_uninteresting()`,
+///     list-objects.c:236-253), or with it (the `pack.useSparse` default) only
+///     along the paths where an excluded tree meets an included one
+///     (`mark_trees_uninteresting_sparse()`, revision.c:214-252).
+///
+/// So an object an excluded commit reaches is still listed when no shown commit
+/// has an excluded parent leading to it — `--indexed-objects` under `--not`
+/// lists the index's blobs whatever history holds them.
+///
+/// `--unpacked` (`revs->unpacked`) ignores a commit some pack holds
+/// (`commit_early_ignore()`, revision.c:4225-4241), so its tree is never pended,
+/// and `show_object()` (list-objects.c:38-49) drops any other object a pack
+/// holds; the walk still goes through both.
+fn traverse_revs(
+    repo: &gix::Repository,
+    pending: &[ObjectId],
+    hidden: &[ObjectId],
+    sparse: bool,
+    unpacked: Option<&PackInventory>,
+) -> Vec<ObjectId> {
+    use gix::object::Kind;
+
+    let mut uninteresting: HashSet<ObjectId> = HashSet::new();
+    // `handle_commit()` for each excluded revision: a tag is marked and peeled,
+    // a commit marked and queued, a tree marked with its contents, a blob marked.
+    let mut excluded_commits: Vec<ObjectId> = Vec::new();
+    for &tip in hidden {
+        let mut id = tip;
+        for _ in 0..16 {
+            let Ok(object) = repo.find_object(id) else { break };
+            match object.kind {
+                Kind::Tag => {
+                    uninteresting.insert(id);
+                    let Ok(target) = object.into_tag().decode().map(|t| t.target()) else { break };
+                    id = target;
+                }
+                Kind::Commit => {
+                    uninteresting.insert(id);
+                    excluded_commits.push(id);
+                    break;
+                }
+                Kind::Tree => {
+                    drop(object);
+                    mark_tree_uninteresting(repo, id, &mut uninteresting);
+                    break;
+                }
+                Kind::Blob => {
+                    uninteresting.insert(id);
+                    break;
+                }
+            }
+        }
+    }
+    // `revs->limited`: an excluded commit makes `prepare_revision_walk()` run
+    // `limit_list()`, which paints the whole ancestry of every excluded commit.
+    let limited = !excluded_commits.is_empty();
+    let mut stack = excluded_commits.clone();
+    while let Some(id) = stack.pop() {
+        if let Some((_, parents)) = commit_tree_and_parents(repo, id) {
+            for parent in parents {
+                if uninteresting.insert(parent) {
+                    stack.push(parent);
+                }
+            }
+        }
+    }
+
+    // `revs->commits`: the excluded commits join the date-ordered list with
+    // the rest, and `limit_list()` keeps only the interesting ones, in the
+    // order it pops them.
+    let mut tips: Vec<ObjectId> = pending.to_vec();
+    tips.extend(excluded_commits.iter().copied());
+    let commits: Vec<ObjectId> = traversal_commits(repo, tips)
+        .into_iter()
+        .filter(|id| !uninteresting.contains(id))
+        .collect();
+
+    if limited {
+        if sparse {
+            // `mark_edges_uninteresting(revs, show_edge, 1)` (list-objects.c:283-306)
+            // with `add_edge_parents()` (:255-281): every interesting commit's
+            // tree and every parent's tree join the set, an excluded parent's
+            // tree marked but not its contents.
+            let mut set: Vec<ObjectId> = Vec::new();
+            let mut in_set: HashSet<ObjectId> = HashSet::new();
+            for &commit in &commits {
+                let Some((tree, parents)) = commit_tree_and_parents(repo, commit) else { continue };
+                if in_set.insert(tree) {
+                    set.push(tree);
+                }
+                for parent in parents {
+                    let Some((parent_tree, _)) = commit_tree_and_parents(repo, parent) else { continue };
+                    if in_set.insert(parent_tree) {
+                        set.push(parent_tree);
+                    }
+                    if uninteresting.contains(&parent) {
+                        uninteresting.insert(parent_tree);
+                    }
+                }
+            }
+            mark_trees_uninteresting_sparse(repo, &set, &mut uninteresting);
+        } else {
+            // `mark_edge_parents_uninteresting()` for each interesting commit.
+            for &commit in &commits {
+                let Some((_, parents)) = commit_tree_and_parents(repo, commit) else { continue };
+                for parent in parents {
+                    if !uninteresting.contains(&parent) {
+                        continue;
+                    }
+                    if let Some((parent_tree, _)) = commit_tree_and_parents(repo, parent) {
+                        mark_tree_uninteresting(repo, parent_tree, &mut uninteresting);
+                    }
+                }
+            }
+        }
+    }
+
+    let packed = |id: &ObjectId| unpacked.is_some_and(|inventory| inventory.has_object_pack(id));
+    let mut out: Vec<ObjectId> = Vec::new();
+    // `prepare_revision_walk()` leaves the named tags, trees and blobs in
+    // `revs->pending` (`handle_commit()` pends a tag before following it), and
+    // `do_traverse()` appends each shown commit's tree as it shows the commit.
+    let mut objects: Vec<ObjectId> = Vec::new();
+    for &tip in pending {
+        let mut id = tip;
+        for _ in 0..16 {
+            let Ok(object) = repo.find_object(id) else { break };
+            match object.kind {
+                Kind::Tag => {
+                    objects.push(id);
+                    let Ok(target) = object.into_tag().decode().map(|t| t.target()) else { break };
+                    id = target;
+                }
+                Kind::Commit => break,
+                Kind::Tree | Kind::Blob => {
+                    objects.push(id);
+                    break;
+                }
+            }
+        }
+    }
+    for &commit in &commits {
+        if packed(&commit) {
+            continue;
+        }
+        if let Some((tree, _)) = commit_tree_and_parents(repo, commit) {
+            objects.push(tree);
+        }
+        out.push(commit);
+    }
+
+    // `traverse_non_commits()` (list-objects.c:344-374): an `UNINTERESTING`
+    // or already `SEEN` entry is passed over, a tag is shown alone, a tree is
+    // shown and then walked in entry order.
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for id in objects {
+        if uninteresting.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        process_tree(repo, id, &uninteresting, &mut seen, &packed, &mut out);
+    }
+    out
+}
+
+/// `process_tree()` / `process_blob()` / `process_tag()` (list-objects.c) for
+/// an object `traverse_trees_and_blobs()` takes off `revs->pending`: show it
+/// unless `--unpacked` drops it, and when it is a tree walk its entries in
+/// order, depth first, passing over gitlinks and anything `UNINTERESTING` or
+/// already `SEEN`. A blob is shown on the strength of the tree entry naming
+/// it; `process_blob()` does not read it.
+fn process_tree(
+    repo: &gix::Repository,
+    id: ObjectId,
+    uninteresting: &HashSet<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
+    packed: &dyn Fn(&ObjectId) -> bool,
+    out: &mut Vec<ObjectId>,
+) {
+    let Ok(object) = repo.find_object(id) else { return };
+    let kind = object.kind;
+    drop(object);
+    if !packed(&id) {
+        out.push(id);
+    }
+    if kind != gix::object::Kind::Tree {
+        return;
+    }
+    for (child, is_tree) in tree_entries(repo, id).unwrap_or_default() {
+        if uninteresting.contains(&child) || !seen.insert(child) {
+            continue;
+        }
+        if is_tree {
+            process_tree(repo, child, uninteresting, seen, packed, out);
+        } else if !packed(&child) {
+            out.push(child);
+        }
+    }
+}
+
+/// A tree's entries in order, `(id, is a tree)`, gitlinks left out; `None` for
+/// anything that does not read as a tree.
+fn tree_entries(repo: &gix::Repository, id: ObjectId) -> Option<Vec<(ObjectId, bool)>> {
+    let object = repo.find_object(id).ok()?;
+    if object.kind != gix::object::Kind::Tree {
+        return None;
+    }
+    let tree = gix::objs::TreeRef::from_bytes(&object.data, repo.object_hash()).ok()?;
+    Some(
+        tree.entries
+            .iter()
+            .filter(|e| e.mode.kind() != gix::objs::tree::EntryKind::Commit)
+            .map(|e| (e.oid.to_owned(), e.mode.is_tree()))
+            .collect(),
+    )
+}
+
+/// A commit's root tree and parents, as `parse_commit_buffer()` reads them.
+fn commit_tree_and_parents(repo: &gix::Repository, id: ObjectId) -> Option<(ObjectId, Vec<ObjectId>)> {
+    let object = repo.find_object(id).ok()?;
+    if object.kind != gix::object::Kind::Commit {
+        return None;
+    }
+    let info = gix::objs::commit::walk::WalkInfo::from_bytes(&object.data, object.id.kind()).ok()?;
+    Some((info.tree, info.parents.into_vec()))
+}
+
+/// `mark_tree_uninteresting()` (revision.c:101-112): mark a tree and, unless it
+/// was marked already, everything under it — gitlinks excepted.
+fn mark_tree_uninteresting(repo: &gix::Repository, tree: ObjectId, uninteresting: &mut HashSet<ObjectId>) {
+    if !uninteresting.insert(tree) {
+        return;
+    }
+    mark_tree_contents_uninteresting(repo, tree, uninteresting);
+}
+
+/// `mark_tree_contents_uninteresting()` (revision.c:70-99).
+fn mark_tree_contents_uninteresting(repo: &gix::Repository, tree: ObjectId, uninteresting: &mut HashSet<ObjectId>) {
+    for (child, is_tree) in tree_entries(repo, tree).unwrap_or_default() {
+        if is_tree {
+            mark_tree_uninteresting(repo, child, uninteresting);
+        } else {
+            uninteresting.insert(child);
+        }
+    }
+}
+
+/// `mark_trees_uninteresting_sparse()` (revision.c:214-252) with
+/// `add_children_by_path()` (:173-212): when the set holds both marked and
+/// unmarked trees, the children of each marked tree are marked, and the trees
+/// found at each entry name across the whole set are taken as the next set.
+fn mark_trees_uninteresting_sparse(repo: &gix::Repository, trees: &[ObjectId], uninteresting: &mut HashSet<ObjectId>) {
+    let marked = trees.iter().any(|t| uninteresting.contains(t));
+    let unmarked = trees.iter().any(|t| !uninteresting.contains(t));
+    if !marked || !unmarked {
+        return;
+    }
+    // The hashmap of `path_and_oids_entry`, keyed by entry name; each value an
+    // oidset, so a tree is listed once per name.
+    let mut by_path: Vec<(Vec<ObjectId>, HashSet<ObjectId>)> = Vec::new();
+    let mut slot: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    for &tree in trees {
+        let Ok(object) = repo.find_object(tree) else { continue };
+        if object.kind != gix::object::Kind::Tree {
+            continue;
+        }
+        let Ok(parsed) = gix::objs::TreeRef::from_bytes(&object.data, repo.object_hash()) else { continue };
+        let tree_marked = uninteresting.contains(&tree);
+        for entry in &parsed.entries {
+            let child = entry.oid.to_owned();
+            match entry.mode.kind() {
+                gix::objs::tree::EntryKind::Tree => {
+                    let name: &[u8] = entry.filename.as_ref();
+                    let at = *slot.entry(name.to_vec()).or_insert_with(|| {
+                        by_path.push((Vec::new(), HashSet::new()));
+                        by_path.len() - 1
+                    });
+                    let (ids, members) = &mut by_path[at];
+                    if members.insert(child) {
+                        ids.push(child);
+                    }
+                    if tree_marked {
+                        uninteresting.insert(child);
+                    }
+                }
+                gix::objs::tree::EntryKind::Commit => {}
+                _ => {
+                    if tree_marked {
+                        uninteresting.insert(child);
+                    }
+                }
+            }
+        }
+    }
+    for (ids, _) in by_path {
+        mark_trees_uninteresting_sparse(repo, &ids, uninteresting);
+    }
 }
 
 /// `--local`'s half of `want_object_in_pack()` (builtin/pack-objects.c:1615-1830):
@@ -5432,7 +6071,15 @@ fn rev_list_objects(
     st: &State,
     stdin: &[u8],
     edges: &mut Vec<ObjectId>,
+    inventory: &PackInventory,
 ) -> Result<Vec<ObjectId>, String> {
+    // `sparse = git_env_bool("GIT_TEST_PACK_SPARSE", -1)`, else
+    // `pack.useSparse` (builtin/pack-objects.c:5255-5259), and `--[no-]sparse`
+    // parsed after both.
+    let sparse = st.sparse.unwrap_or_else(|| match std::env::var("GIT_TEST_PACK_SPARSE") {
+        Ok(raw) => crate::setup::git_env_bool_value("GIT_TEST_PACK_SPARSE", &raw),
+        Err(_) => crate::repo_settings::RepoSettings::load(repo).map_or(true, |s| s.pack_use_sparse),
+    });
     // `revs->pending`, in the order git fills it. `cmd_pack_objects()` builds the
     // rev-list argv as `--all`, `--reflog`, `--indexed-objects`, then the stdin
     // specs, and `setup_revisions()` adds each option's objects as it reaches it,
@@ -5532,23 +6179,25 @@ fn rev_list_objects(
     // write reaches it. Both are why these bypass the traversal, which expands
     // trees and can only report objects it could read.
     let mut out = from_stdin;
-    // Everything `pending` reaches that `hidden` does not — the difference
-    // `push` and `bundle create` pack as well.
+    // `revs->unpacked`: `--unpacked` reaches the rev list unless `--stdin-packs`
+    // took it over (builtin/pack-objects.c:5343-5346), and this is not that path.
+    let mut walked = traverse_revs(repo, &pending, &hidden, sparse, st.unpacked.then_some(inventory));
     if st.delta_islands {
         // `--topo-order` joins the rev list under islands
         // (builtin/pack-objects.c:5440-5441): the same objects, shown in the
         // topological walk's order.
-        let wanted: HashSet<ObjectId> = super::push_proto::objects_to_send(repo, &pending, &hidden)
+        let wanted: HashSet<ObjectId> = walked.into_iter().collect();
+        walked = traverse_commit_list_topo(repo, pending.clone())
             .into_iter()
+            .filter(|id| wanted.contains(id))
             .collect();
-        out.extend(
-            traverse_commit_list_topo(repo, pending.clone())
-                .into_iter()
-                .filter(|id| wanted.contains(id)),
-        );
-    } else {
-        out.extend(super::push_proto::objects_to_send(repo, &pending, &hidden));
     }
+    // The filter runs inside the traversal (`list_objects_filter__filter_object()`,
+    // list-objects-filter.c:799-822), so a bare object list is never filtered,
+    // and the revisions named outright are exempt: only what the walk discovers
+    // carries `NOT_USER_GIVEN`.
+    apply_filter(repo, st.filter.as_deref(), &pending, &mut walked);
+    out.extend(walked);
     // `--thin` pushes `--objects-edge` (`--objects-edge-aggressive` under
     // `--shallow`) onto the internal rev list (builtin/pack-objects.c:5323-5327),
     // and `get_object_list()` runs `mark_edges_uninteresting(revs, show_edge,
@@ -6496,6 +7145,13 @@ fn strtoul(s: &str, base: u32) -> (u64, &str) {
 fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
     match long {
         "stdout" => st.stdout = on,
+        "include-tag" => st.include_tag = on,
+        "honor-pack-keep" => st.honor_pack_keep = on,
+        // `OPT_STRING_LIST`: each value appends, `--no-keep-pack` empties the list.
+        "keep-pack" => match (on, value) {
+            (true, Some(name)) => st.keep_packs.push(name.to_string()),
+            _ => st.keep_packs.clear(),
+        },
         "thin" => st.thin = on,
         "shallow" => st.shallow = on,
         // git's `--cruft-expiration` callback sets the `cruft` flag itself, so
@@ -6536,6 +7192,8 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         }
         "unpack-unreachable" => {
             st.unpack_unreachable = on;
+            // The table hands a bare `--unpack-unreachable` over as an empty value.
+            st.unpack_unreachable_expiration = value.filter(|v| on && !v.is_empty()).map(str::to_string);
             st.internal_rev_list |= on;
         }
         "all" => {
@@ -6577,7 +7235,17 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "reuse-object" => st.reuse_object = Some(on),
         // Already validated by `check_index_version`, so the `strtoul` prefix is
         // the version and the rest is the `,<offset>` tail.
-        "index-version" => st.index_version = value.map(|v| strtoul(v, 10).0),
+        "index-version" => {
+            if let Some(v) = value {
+                let (version, rest) = strtoul(v, 10);
+                st.index_version = Some(version);
+                // `if (*c == ',' && c[1]) popts->off32_limit = strtoul(c+1, &c, 0);`,
+                // stored in a `uint32_t`.
+                if let Some(tail) = rest.strip_prefix(',').filter(|t| !t.is_empty()) {
+                    st.off32_limit = Some(strtoul(tail, 0).0 as u32);
+                }
+            }
+        }
         _ => {}
     }
 }

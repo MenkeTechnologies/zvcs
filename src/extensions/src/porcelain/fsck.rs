@@ -160,17 +160,16 @@ const ERROR_COMMIT_GRAPH: u8 = 16;
 ///    or `error: <oid>: hash-path mismatch, found at: <path>`, sets
 ///    `ERROR_OBJECT`, and the scan continues. Such an object never gains
 ///    `HAS_OBJ`, so it draws no `unreachable`/`dangling` line and something
-///    reachable that names it draws a `missing` one. Two details are not
-///    reproduced: git's `error_errno()` line after an empty object file carries
-///    a stale errno from an unrelated syscall, and a *corrupt* blob larger than
-///    `core.bigFileThreshold` is verified by git with `check_stream_oid()`
-///    rather than `unpack_loose_rest()`, which only changes which message
-///    precedes the identical `object corrupt or missing` line. The threshold's
+///    reachable that names it draws a `missing` one. One detail is not
+///    reproduced: a *corrupt* blob larger than `core.bigFileThreshold` is
+///    verified by git with `check_stream_oid()` rather than
+///    `unpack_loose_rest()`, which only changes which message precedes the
+///    identical `object corrupt or missing` line. The threshold's
 ///    other consequence — that an intact blob over it reaches `fsck_blob()` with
 ///    no buffer, which is what reports `gitmodulesLarge` — *is* reproduced; see
 ///    [`blob_buffer`]. The neighbouring case — an object that reads fine but that
-///    `parse_object_buffer()` rejects — is ported too: the `error: <oid>: object
-///    could not be parsed: <path>` line, the `error:` diagnostic
+///    `parse_object_buffer()` rejects — is ported too: `fsck_obj()`'s
+///    `error: <oid>: object corrupt or missing` line, the `error:` diagnostic
 ///    `parse_commit_buffer()`/`parse_tag_buffer()` prints ahead of it,
 ///    `ERROR_OBJECT`, and carrying on with the rest of the odb.
 /// 5. **Gitlink entries are not walked**, matching `gix-fsck` and git: a
@@ -657,15 +656,19 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `lookup_<type>()` is called in one long sequence over the whole command,
     // and [`SlotOrder`] can only replay it when every caller is accounted for.
     // That holds when the scan itself is in git's order — or, under
-    // `--connectivity-only`, the listing that replaces it — and when there is no
-    // linked worktree, whose HEAD git snapshots with the main one but which this
-    // port handles in one later block together with that worktree's index and
-    // reflogs; and when every `<object>` argument's `repo_get_oid()` was traced
-    // in full, since a step [`GetOid`] does not model may create objects.
+    // `--connectivity-only`, the listing that replaces it — and when no linked
+    // worktree takes part, as its index and reflogs are not replayed in place; and
+    // when every `<object>` argument's `repo_get_oid()` was traced in full, since
+    // a step [`GetOid`] does not model may create objects. An `<object>` argument
+    // without `--cache` leaves every worktree out: `snapshot_refs()` returns
+    // before the worktree HEADs, reflogs are off, and no index is read
+    // (builtin/fsck.c:608-611, :945-947).
+    let worktrees_take_part = !(explicit_heads && !opt.keep_cache_objects)
+        && !repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
     let mut creation_modeled = match opt.connectivity_only {
         true => listing.is_some(),
         false => scan_ordered,
-    } && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true)
+    } && !worktrees_take_part
         && traces.iter().all(|trace| trace.complete);
     let has_promisor_remote = super::rev_list::has_promisor_remote(&repo);
 
@@ -699,11 +702,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // verbose header (odb/source-loose.c:1114-1115), which this port places with
     // the cruft whenever the scan order is known; `--connectivity-only` skips the
     // scan, header included.
-    let mut cruft_lines: Vec<(usize, String)> = Vec::new();
+    // Each keeps the `objects/??` subdirectory the walk met it in, which is
+    // where `--progress` draws around it.
+    let mut cruft_lines: Vec<(usize, String, Option<u16>)> = Vec::new();
     if opt.connectivity_only {
-        cruft_lines = loose_unopenable(&repo).into_iter().map(|line| (0, line)).collect();
+        cruft_lines = loose_unopenable(&repo).into_iter().map(|line| (0, line, None)).collect();
     } else if scan_ordered {
-        cruft_lines = object_scan.walk_lines.into_iter().map(|(at, line, _)| (at, line)).collect();
+        cruft_lines = object_scan.walk_lines.into_iter().map(|(at, line, _, sub)| (at, line, sub)).collect();
         // `verify_packs()` walks the packs in list order (odb/source-packed.c:986-992), and a
         // pack `is_pack_valid()` refuses prints all it prints before the next pack's objects
         // are checked (pack-check.c:69-70): its lines go where its own objects would have.
@@ -714,11 +719,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         for (path, range) in &pack_check.refused {
             let path = canonical(path);
             if let Some((_, at)) = starts.iter().find(|(start, _)| *start == path) {
-                cruft_lines.extend(pack_check.lines[range.clone()].iter().map(|line| (*at, line.clone())));
+                cruft_lines.extend(pack_check.lines[range.clone()].iter().map(|line| (*at, line.clone(), None)));
                 moved.push(range.clone());
             }
         }
-        cruft_lines.sort_by_key(|(at, _)| *at);
+        cruft_lines.sort_by_key(|(at, _, _)| *at);
         pack_check.lines = std::mem::take(&mut pack_check.lines)
             .into_iter()
             .enumerate()
@@ -736,10 +741,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 object_scan.sources
             );
         }
-        for (at, line, header) in object_scan.walk_lines {
+        for (at, line, header, sub) in object_scan.walk_lines {
             match header {
                 true => eprintln!("{line}"),
-                false => cruft_lines.push((at, line)),
+                false => cruft_lines.push((at, line, sub)),
             }
         }
     }
@@ -829,14 +834,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 if let Some(line) = failed.diagnostic {
                     msg_lines.push((slot, id, line));
                 }
-                let path = loose_object_label(&repo, id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{id} is a packed object git cannot parse: git reports those through \
-                         verify_pack()'s `object corrupt or missing` line, which this port does \
-                         not reach"
-                    )
-                })?;
-                msg_lines.push((slot, id, format!("error: {id}: object could not be parsed: {path}")));
+                if loose_object_label(&repo, id).is_none() {
+                    bail!(
+                        "{id} is a packed object git cannot parse: git reports those during \
+                         verify_pack(), whose place among the pack's lines this port does not reach"
+                    );
+                }
+                // `fsck_loose()` hands the object to `fsck_obj_buffer()`, whose
+                // `fsck_obj()` reports the NULL `parse_object_buffer()` without a
+                // path (builtin/fsck.c:403-409).
+                msg_lines.push((slot, id, format!("error: {id}: object corrupt or missing")));
                 errors |= ERROR_OBJECT;
                 unparseable.insert(id, kind);
                 continue;
@@ -856,12 +863,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // fatal line.
                 let mut walk = cruft_lines.iter().peekable();
                 for (i, (_, _, line)) in msg_lines.iter().enumerate() {
-                    while scan_ordered && walk.peek().is_some_and(|(k, _)| *k <= visit_of(&visit_start, i)) {
+                    while scan_ordered && walk.peek().is_some_and(|(k, _, _)| *k <= visit_of(&visit_start, i)) {
                         eprintln!("{}", walk.next().expect("peeked").1);
                     }
                     eprintln!("{line}");
                 }
-                while scan_ordered && walk.peek().is_some_and(|(k, _)| *k < visit_start.len()) {
+                while scan_ordered && walk.peek().is_some_and(|(k, _, _)| *k < visit_start.len()) {
                     eprintln!("{}", walk.next().expect("peeked").1);
                 }
                 return Err(crate::fatal::die(msg));
@@ -934,7 +941,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
         // `fsck_object()` next; `fsck_obj()` skips the `root`/`tagged` line when
         // it reported an error.
-        let checked = check_object(kind, &data, opt.strict, repo.object_hash().len_in_hex());
+        let stops = |msg: &'static Msg| {
+            let finding = Finding { msg, text: String::new() };
+            matches!(msg_config.severity(&finding, &id), Severity::Error | Severity::Fatal)
+        };
+        let checked = check_object_with(kind, &data, opt.strict, repo.object_hash().len_in_hex(), &stops);
         for line in checked.raw {
             msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
         }
@@ -946,7 +957,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             let entry = gitattributes_found.entry(blob).or_insert(u8::MAX);
             *entry = (*entry).min(id.as_bytes()[0]);
         }
-        let mut failed = false;
         for finding in checked.findings {
             match msg_config.severity(&finding, &id) {
                 Severity::Ignore => {}
@@ -955,26 +965,26 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     id,
                     format!("warning in {kind} {id}: {}: {}", finding.msg.id, finding.text),
                 )),
-                Severity::Error | Severity::Fatal => {
-                    msg_lines.push((
-                        Slot::Scan(id.as_bytes()[0]),
-                        id,
-                        format!("error in {kind} {id}: {}: {}", finding.msg.id, finding.text),
-                    ));
-                    // A loose object is checked by `fsck_object_dir()`, whose
-                    // failures are `ERROR_OBJECT`; a packed one is checked by
-                    // `verify_pack()`'s `fsck_obj_buffer` callback, and git
-                    // reports the whole pack instead with `ERROR_PACK`.
-                    errors |= if loose {
-                        ERROR_OBJECT
-                    } else {
-                        ERROR_PACK
-                    };
-                    failed = true;
-                }
+                Severity::Error | Severity::Fatal => msg_lines.push((
+                    Slot::Scan(id.as_bytes()[0]),
+                    id,
+                    format!("error in {kind} {id}: {}: {}", finding.msg.id, finding.text),
+                )),
             }
         }
-        if failed {
+        // `err = fsck_object(...); if (err) goto out;` (builtin/fsck.c:422-424):
+        // what `fsck_object()` returned, not whether an error was printed — a tag
+        // whose bad tagger is followed by an extra header returns that header's
+        // `report()` (fsck.c:1095-1126). A loose object is checked by
+        // `fsck_object_dir()`, whose failures are `ERROR_OBJECT`; a packed one is
+        // checked by `verify_pack()`'s `fsck_obj_buffer` callback, and git reports
+        // the whole pack instead with `ERROR_PACK`.
+        if checked.failed {
+            errors |= if loose {
+                ERROR_OBJECT
+            } else {
+                ERROR_PACK
+            };
             continue;
         }
 
@@ -1150,33 +1160,73 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // subdirectory is walked, before `fsck_subdir()` draws (odb/source-loose.c:
     // 1101-1106), a pack's lines while `verify_packfile()` runs between its own
     // draws (pack-check.c:108-178), and `fsck_finish()`'s after both meters have
-    // closed (builtin/fsck.c:934-938). The lines are gathered here rather than
-    // emitted in that walk, so their position among the redraws is not known.
-    if show_progress
-        && !opt.connectivity_only
-        && (!msg_lines.is_empty() || !cruft_lines.is_empty() || !pack_check.lines.is_empty())
-    {
-        bail!("--progress is not ported when the object scan reports a finding: git prints it between its progress redraws");
-    }
+    // closed (builtin/fsck.c:934-938). Each line here is placed by the
+    // subdirectory of the loose visit or walk entry it came from (`Some`), or
+    // is `fsck_finish()`'s (`None`); a packed object's line, a pack's own
+    // lines, or a scan whose order is unknown cannot be placed that way.
+    let mut scan_out: Vec<(Option<u16>, String)> = Vec::new();
+    let mut placeable = scan_index.is_some() && pack_check.lines.is_empty() && object_scan.sources == 1;
     let mut cruft = cruft_lines.into_iter().peekable();
     for (n, (slot, _, line)) in msg_lines.iter().enumerate() {
+        let at = match slot {
+            Slot::Scan(_) => msg_at.get(n).copied().flatten(),
+            _ => None,
+        };
         if scan_index.is_some() {
-            let at = match slot {
-                Slot::Scan(_) => msg_at.get(n).copied().flatten().unwrap_or(usize::MAX),
+            let key = match slot {
+                Slot::Scan(_) => at.unwrap_or(usize::MAX),
                 _ => usize::MAX,
             };
-            while cruft.peek().is_some_and(|&(k, _)| k <= at) {
-                eprintln!("{}", cruft.next().expect("peeked").1);
+            while cruft.peek().is_some_and(|&(k, _, _)| k <= key) {
+                let (_, line, sub) = cruft.next().expect("peeked");
+                placeable &= sub.is_some();
+                scan_out.push((sub, line));
             }
         }
-        eprintln!("{line}");
+        let sub = match slot {
+            Slot::Scan(_) => match at.and_then(|at| visits.get(at)) {
+                Some(visit) if visit.loose => Some(u16::from(visit.id.as_bytes()[0])),
+                _ => {
+                    placeable = false;
+                    None
+                }
+            },
+            _ => None,
+        };
+        scan_out.push((sub, line.clone()));
     }
-    for (_, line) in cruft {
-        eprintln!("{line}");
+    for (_, line, sub) in cruft {
+        placeable &= sub.is_some();
+        scan_out.push((sub, line));
     }
     if show_progress && !opt.connectivity_only {
-        if !odb_fsck_progress(&repo, opt.check_full, midx_on, pack_lists.as_ref())? {
+        if !scan_out.is_empty() && !placeable {
+            bail!("--progress is not ported when the object scan reports a finding: git prints it between its progress redraws");
+        }
+        // An empty object file's `unable to mmap` line carries a stale errno
+        // (see [`read_loose_object`]), and under `--progress` the last syscall to
+        // fail before it may be a redraw's `tcgetpgrp()` on a stderr that is no
+        // terminal (progress.c:106-110, :146) rather than an absent subdirectory's
+        // `opendir()`. Which one ran last is not modelled.
+        let empty_object = corrupt.iter().any(|id| {
+            loose_object_path(&repo, *id)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .is_some_and(|meta| meta.len() == 0)
+        });
+        if empty_object {
+            bail!("--progress is not ported for an empty loose object: the errno git appends to its `unable to mmap` line depends on the progress redraws before it");
+        }
+        let (loose, finish): (Vec<_>, Vec<_>) = scan_out.into_iter().partition(|(sub, _)| sub.is_some());
+        let loose = loose.into_iter().filter_map(|(sub, line)| Some((sub?, line))).collect();
+        if !odb_fsck_progress(&repo, opt.check_full, midx_on, pack_lists.as_ref(), loose)? {
             errors |= ERROR_OBJECT;
+        }
+        for (_, line) in finish {
+            eprintln!("{line}");
+        }
+    } else {
+        for (_, line) in scan_out {
+            eprintln!("{line}");
         }
     }
 
@@ -1325,25 +1375,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             opt.verbose,
         )?;
     }
-    // Every linked worktree contributes its own HEAD and index, exactly as
-    // git's `get_default_heads()` iterates all worktrees (their reflogs were
-    // walked with every other above).
-    // Order is irrelevant: heads only feed the reachability set and `known`,
-    // both of which are membership-based.
-    {
-        let (wt_count, wt_err) =
-            collect_linked_worktree_heads(
-                &repo,
-                &mut state,
-                &mut heads,
-                &mut index_blobs,
-                &mut names,
-                &opt,
-                explicit_heads,
-            )?;
-        default_refs += wt_count;
-        errors |= wt_err;
-    }
     if default_refs == 0 {
         eprintln!("notice: No default references");
         // git clears `show_unreachable` here: with no heads at all, everything
@@ -1363,6 +1394,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             opt.verbose,
         )?;
     }
+    // Then every linked worktree's, in `get_worktrees()` order after the main
+    // one (builtin/fsck.c:958-980); its HEAD was snapshotted with the refs and
+    // its reflogs walked with every other above.
+    errors |= collect_linked_worktree_heads(
+        &repo,
+        &mut state,
+        &mut heads,
+        &mut index_blobs,
+        &mut names,
+        &opt,
+        explicit_heads,
+    )?;
 
     // ---- 6. reachability ----------------------------------------------------
     // Each entry carries the type the reference site expected — git's
@@ -2574,7 +2617,7 @@ struct Decoded {
 
 /// Why `parse_object_buffer()` returned NULL. git prints its own diagnostic
 /// first for some failures and stays quiet for the rest, then `fsck_loose()`
-/// adds the `object could not be parsed` line either way.
+/// adds `fsck_obj()`'s `object corrupt or missing` line either way.
 struct ParseFailed {
     /// The `error:` line `parse_commit_buffer()`/`parse_tag_buffer()` printed
     /// before giving up, if it printed one.
@@ -3004,8 +3047,18 @@ fn collect_default_heads(
                 break;
             }
         }
-        // The iterator yields a boxed error, which anyhow cannot convert via `?`.
-        let reference = reference.map_err(|e| anyhow::anyhow!(e))?;
+        // `REFS_FOR_EACH_INCLUDE_BROKEN` (builtin/fsck.c:581-583): a loose ref whose
+        // file will not parse reaches `snapshot_ref()` with the null id, which
+        // `parse_object()` cannot produce, so it is `invalid sha1 pointer <null>`
+        // like any other unresolvable ref.
+        let reference = match crate::fatal::ref_walk_entry(reference)? {
+            crate::fatal::RefWalkEntry::Ref(reference) => reference,
+            crate::fatal::RefWalkEntry::Broken(name) => {
+                count += snapshot_ref(state, heads, pre_parsed, errors, &name, ObjectId::null(repo.object_hash()))?;
+                continue;
+            }
+            crate::fatal::RefWalkEntry::Omitted => continue,
+        };
         // Bind the direct target first so the borrow of `reference` ends before
         // the peeling fallback consumes it.
         let direct: Option<ObjectId> = reference.target().try_id().map(|id| id.to_owned());
@@ -3042,6 +3095,27 @@ fn collect_default_heads(
             count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id)?;
             if heads.last() == Some(&id) {
                 names.put(id, || "HEAD".to_string());
+            }
+        }
+    }
+    // Then each linked worktree's, in `get_worktrees()` order and under the name
+    // `strbuf_worktree_ref()` gives it (builtin/fsck.c:616-641).
+    // `refs_resolve_ref_unsafe()` with no flags yields nothing for a HEAD that
+    // will not parse and the null id for an unborn branch, both skipped; a
+    // detached HEAD naming an object the odb lacks goes through `snapshot_ref()`
+    // like any ref, and is `invalid sha1 pointer <oid>`.
+    if let Ok(worktrees) = repo.worktrees() {
+        for proxy in worktrees {
+            let name = format!("worktrees/{}/HEAD", proxy.id());
+            let Ok(wt) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
+                continue;
+            };
+            let Some(id) = wt.head().ok().and_then(|head| head.id().map(|id| id.detach())) else {
+                continue;
+            };
+            count += snapshot_ref(state, heads, pre_parsed, errors, &name, id)?;
+            if heads.last() == Some(&id) {
+                names.put(id, || name.clone());
             }
         }
     }
@@ -3641,12 +3715,26 @@ fn unreadable_unreachable_object(
     let path = loose_object_path(repo, id)?;
     let map = std::fs::read(&path).ok()?;
     let mut diag: Vec<String> = Vec::new();
-    let mut z = gix::zlib::Decompress::new();
-    let mut hdr = [0u8; MAX_HEADER_LEN];
-    match unpack_loose_header(&mut z, &map, &mut hdr, &mut diag) {
-        LooseHeader::Ok => return None,
-        LooseHeader::Bad | LooseHeader::TooLong => {
-            diag.push(format!("error: unable to unpack {id} header"));
+    // `read_object_info_from_path()` refuses an empty file before it inflates
+    // anything, naming the file (odb/source-loose.c:138-143).
+    if map.is_empty() {
+        diag.push(format!("error: object file {} is empty", loose_label_of(repo, &path)));
+    } else {
+        let mut z = gix::zlib::Decompress::new();
+        let mut hdr = [0u8; MAX_HEADER_LEN];
+        match unpack_loose_header(&mut z, &map, &mut hdr, &mut diag) {
+            // A header that parses to no known type dies on the first read,
+            // before anything is printed (odb/source-loose.c:166-172).
+            LooseHeader::Ok => match parse_loose_header(&hdr) {
+                Some((None, _)) => {
+                    eprintln!("fatal: invalid object type");
+                    return Some(ExitCode::from(128));
+                }
+                _ => return None,
+            },
+            LooseHeader::Bad | LooseHeader::TooLong => {
+                diag.push(format!("error: unable to unpack {id} header"));
+            }
         }
     }
     for _ in 0..reads {
@@ -3876,13 +3964,19 @@ fn read_loose_object(path: &Path, label: &str, id: ObjectId) -> Result<(Kind, Ve
         }
     };
     // `map_fd()`: "mmap() is forbidden on empty files", so an empty object file
-    // is reported and mapped to NULL, which `read_loose_object()` then reports
-    // again through `error_errno()`. git's second line carries whatever errno a
-    // previous syscall happened to leave behind — nothing set it here — so only
-    // the message is reproduced, not that stale suffix.
+    // is reported and mapped to NULL (object-file.c:163-170), which
+    // `read_loose_object()` then reports again through `error_errno()`
+    // (:1207-1213). Nothing between the two sets `errno` — `git_open()`,
+    // `fstat()` and `close()` all succeed — so the suffix is the one an earlier
+    // failed lookup left behind, and every probe before the scan that fails at
+    // all (an absent `packed-refs`, `info/alternates`, `objects/??`
+    // subdirectory, …) fails with `ENOENT`.
     if map.is_empty() {
         diag.push(format!("error: object file {label} is empty"));
-        diag.push(format!("error: unable to mmap {label}"));
+        diag.push(format!(
+            "error: unable to mmap {label}: {}",
+            strerror(&std::io::Error::from_raw_os_error(libc::ENOENT))
+        ));
         diag.push(corrupt_or_missing());
         return Err(diag);
     }
@@ -4180,9 +4274,27 @@ fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
 /// first update tick and never draws; with `GIT_PROGRESS_DELAY=0` it does.
 /// `verify_midx()` closes the packed half (:996-997) with its child, which
 /// draws its own meters under `--progress`; `false` when one failed.
-fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, midx_on: bool, pack_lists: Option<&PackLists>) -> Result<bool> {
+///
+/// `loose_lines` are the first source's scan lines, each with the `objects/??`
+/// subdirectory it was printed in: `fsck_subdir()` draws once a subdirectory
+/// has been walked (odb/source-loose.c:1101-1106), so its lines come first,
+/// and a subdirectory that would not open prints its error and ends the walk
+/// undrawn (object-file.c:1061-1066).
+fn odb_fsck_progress(
+    repo: &gix::Repository,
+    check_full: bool,
+    midx_on: bool,
+    pack_lists: Option<&PackLists>,
+    loose_lines: Vec<(u16, String)>,
+) -> Result<bool> {
     use crate::progress::Meter;
     let mut ok = true;
+    let mut loose_lines = loose_lines.into_iter().peekable();
+    let mut print_through = |nr: usize| {
+        while let Some((_, line)) = loose_lines.next_if(|&(sub, _)| usize::from(sub) <= nr) {
+            eprintln!("{line}");
+        }
+    };
 
     for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
         // Only the repository's own object directory is `local`.
@@ -4193,11 +4305,18 @@ fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, midx_on: bool, pa
         let mut meter = Meter::counted("Checking object directories", 256, true);
         for nr in 0..256usize {
             match std::fs::read_dir(objdir.join(format!("{nr:02x}"))) {
-                Ok(_) => meter.set(nr + 1),
+                Ok(_) => {
+                    print_through(nr);
+                    meter.set(nr + 1);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => break,
+                Err(_) => {
+                    print_through(nr);
+                    break;
+                }
             }
         }
+        print_through(usize::MAX);
         meter.set(256);
         meter.stop("done");
 
@@ -5536,11 +5655,11 @@ fn pack_sizes(repo: &gix::Repository, objdir: &Path) -> Vec<usize> {
         .collect()
 }
 
-/// Every linked worktree's HEAD and index as heads, matching git's
-/// `get_default_heads()` iterating all worktrees. The main worktree's HEAD and
-/// index are collected by the callers above, and every worktree's reflogs by
-/// [`collect_reflog_heads`]; this adds only the linked ones. Returns the number
-/// of HEADs (git's `default_refs` contribution) and the errors found.
+/// Every linked worktree's index as heads, matching `cmd_fsck()`'s
+/// `fsck_index()` over every worktree (builtin/fsck.c:947-981). The main
+/// worktree's index is collected by the caller, every worktree's HEAD by
+/// [`collect_default_heads`] and every worktree's reflogs by
+/// [`collect_reflog_heads`]. Returns the errors found.
 fn collect_linked_worktree_heads(
     repo: &gix::Repository,
     state: &mut State,
@@ -5549,13 +5668,12 @@ fn collect_linked_worktree_heads(
     names: &mut ObjectNames,
     opt: &Options,
     explicit_heads: bool,
-) -> Result<(usize, u8)> {
-    let mut count = 0usize;
+) -> Result<u8> {
     let mut errors = 0u8;
     let worktrees = match repo.worktrees() {
         Ok(w) => w,
         // No `worktrees/` directory is the common case: nothing to add.
-        Err(_) => return Ok((count, errors)),
+        Err(_) => return Ok(errors),
     };
     for proxy in worktrees {
         // The worktree's working tree may be missing (a prunable worktree); its
@@ -5563,20 +5681,21 @@ fn collect_linked_worktree_heads(
         let Ok(wt) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
             continue;
         };
-        // An explicit `<object>` argument suppresses the default head set for the
-        // whole command, worktrees included.
-        if !explicit_heads {
-            if let Ok(head) = wt.head() {
-                if let Some(id) = head.id() {
-                    let id = id.detach();
-                    state.note(id);
-                    heads.push(id);
-                    count += 1;
-                }
-            }
-        }
         if !explicit_heads || opt.keep_cache_objects {
-            let label = index_path_label(&wt);
+            // `worktree_git_path(wt, "index")` lives under the common dir,
+            // which git names from the main worktree's top level. gix spells
+            // that dir with a `.` component git's path does not have.
+            let path: PathBuf = wt
+                .index_path()
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect();
+            let label = repo
+                .workdir()
+                .and_then(|work| path.strip_prefix(work).ok())
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
             errors |= collect_index_heads(
                 &wt,
                 state,
@@ -5588,7 +5707,7 @@ fn collect_linked_worktree_heads(
             )?;
         }
     }
-    Ok((count, errors))
+    Ok(errors)
 }
 
 /// `--lost-found`: write a dangling object into `$GIT_DIR/lost-found/`. Commits
@@ -5878,7 +5997,9 @@ struct ObjectScan {
     /// `fprintf_ln()`, so no error bit — and the `unable to open` `error()` of a
     /// subdirectory that ends a walk, whose return `odb_source_loose_fsck()`
     /// discards.
-    walk_lines: Vec<(usize, String, bool)>,
+    /// Each also carries the `objects/??` subdirectory it was met in, `None`
+    /// for a header.
+    walk_lines: Vec<(usize, String, bool, Option<u16>)>,
     /// The number of sources `odb_fsck()` scans.
     sources: usize,
     /// Each pack `verify_packs()` walks, by its `.pack` path, with the number of visits made
@@ -5901,7 +6022,7 @@ impl ObjectScan {
         let refused: Vec<PathBuf> = refused.iter().map(|path| canonical(path)).collect();
         let hexsz = repo.object_hash().len_in_hex();
         let mut visits: Vec<ScanVisit> = Vec::new();
-        let mut walk_lines: Vec<(usize, String, bool)> = Vec::new();
+        let mut walk_lines: Vec<(usize, String, bool, Option<u16>)> = Vec::new();
         let mut ordered = true;
         let mut sources = 0usize;
         let mut pack_starts: Vec<(PathBuf, usize)> = Vec::new();
@@ -5913,7 +6034,7 @@ impl ObjectScan {
             }
             sources += 1;
             if verbose {
-                walk_lines.push((visits.len(), "Checking object directory".to_owned(), true));
+                walk_lines.push((visits.len(), "Checking object directory".to_owned(), true, None));
             }
             for_each_loose_file_in_source(&objdir, &mut |step| match step {
                 LooseWalk::Entry { sub, name, path } => {
@@ -5923,10 +6044,17 @@ impl ObjectScan {
                     if name.len() == hexsz - 2 && name.iter().all(|b| b.is_ascii_hexdigit()) {
                         visits.extend(loose_id(sub, name, hexsz).map(|id| ScanVisit { id, loose: true, refused: false }));
                     } else if !name.starts_with(b"tmp_obj_") {
-                        walk_lines.push((visits.len(), format!("bad sha1 file: {}", loose_label_of(repo, &path)), false));
+                        walk_lines.push((
+                            visits.len(),
+                            format!("bad sha1 file: {}", loose_label_of(repo, &path)),
+                            false,
+                            Some(sub),
+                        ));
                     }
                 }
-                LooseWalk::Unopenable { dir, err } => walk_lines.push((visits.len(), unopenable_line(repo, &dir, &err), false)),
+                LooseWalk::Unopenable { sub, dir, err } => {
+                    walk_lines.push((visits.len(), unopenable_line(repo, &dir, &err), false, Some(sub)))
+                }
                 LooseWalk::Unvisited { .. } => {}
             });
             if !check_full {
@@ -6497,7 +6625,7 @@ enum LooseWalk<'a> {
     /// `opendir()` failed with anything but `ENOENT`. `for_each_file_in_obj_subdir()`
     /// returns `error_errno(_("unable to open %s"), path)`, and the non-zero
     /// return ends the source's walk (object-file.c:1061-1066, :1121-1126).
-    Unopenable { dir: PathBuf, err: std::io::Error },
+    Unopenable { sub: u16, dir: PathBuf, err: std::io::Error },
     /// An object in a subdirectory after the one that ended the walk: on disk,
     /// but never handed to `fsck_loose()`, so it never gets `HAS_OBJ`.
     Unvisited { sub: u16, name: &'a [u8] },
@@ -6523,7 +6651,7 @@ fn for_each_loose_file_in_source(objdir: &Path, visit: &mut impl FnMut(LooseWalk
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) if stopped => continue,
             Err(err) => {
-                visit(LooseWalk::Unopenable { dir, err });
+                visit(LooseWalk::Unopenable { sub, dir, err });
                 stopped = true;
                 continue;
             }
@@ -6760,7 +6888,7 @@ fn loose_unvisited(repo: &gix::Repository, scan_all: bool) -> HashSet<ObjectId> 
 fn loose_unopenable(repo: &gix::Repository) -> Vec<String> {
     let mut out = Vec::new();
     for_each_loose_file(repo, |step| {
-        if let LooseWalk::Unopenable { dir, err } = step {
+        if let LooseWalk::Unopenable { dir, err, .. } = step {
             out.push(unopenable_line(repo, &dir, &err));
         }
     });
@@ -8374,6 +8502,8 @@ pub struct Checked {
     pub gitmodules: Vec<ObjectId>,
     /// The same for `.gitattributes` — `options->gitattributes_found`.
     pub gitattributes: Vec<ObjectId>,
+    /// Whether `fsck_object()` returned non-zero (see [`check_object_with`]).
+    pub failed: bool,
 }
 
 /// `fsck.c::fsck_object` for the three types whose contents this port lints.
@@ -8385,13 +8515,45 @@ pub struct Checked {
 /// ids of `hexsz / 2` bytes and a commit's `parent` lines carry `hexsz` hex
 /// characters, so the checks below cannot be written against one width.
 pub fn check_object(kind: Kind, data: &[u8], strict: bool, hexsz: usize) -> Checked {
+    check_object_with(kind, data, strict, hexsz, &|_| true)
+}
+
+/// [`check_object`] with `report()`'s return value supplied by the caller.
+///
+/// `fsck_commit()` and `fsck_tag_standalone()` stop at a finding only when
+/// `report()` returns non-zero (fsck.c:971-1009, :1037-1126), and `report()`
+/// returns 0 for a message whose severity is `ignore` or whose object the skip
+/// list names (fsck.c:241-242, :272-273) and for a warning, which
+/// `fsck_objects_error_func()` prints and answers 0 for (builtin/fsck.c:93-98).
+/// So `stops` answers whether `report()` of that message would return non-zero,
+/// and a commit with an ignored `badDateOverflow` author goes on to have its
+/// committer line checked. [`check_object`] stops at every finding.
+pub fn check_object_with(
+    kind: Kind,
+    data: &[u8],
+    strict: bool,
+    hexsz: usize,
+    stops: &dyn Fn(&'static Msg) -> bool,
+) -> Checked {
     let mut out = Checked::default();
     match kind {
-        Kind::Commit => check_commit(data, &mut out.findings, hexsz),
-        Kind::Tree => check_tree(data, &mut out, strict, hexsz),
+        Kind::Commit => {
+            let mut rep = Reporter { out: &mut out.findings, stops, ret: false };
+            check_commit(data, &mut rep, hexsz);
+            out.failed = rep.ret;
+        }
+        Kind::Tree => {
+            check_tree(data, &mut out, strict, hexsz);
+            // `retval += report(...)` for every finding (fsck.c:639-809).
+            out.failed = out.findings.iter().any(|finding| stops(finding.msg));
+        }
         // `fsck_tag` walks its headers line by line and never measures an id, so
         // it needs no hash width.
-        Kind::Tag => check_tag(data, &mut out.findings),
+        Kind::Tag => {
+            let mut rep = Reporter { out: &mut out.findings, stops, ret: false };
+            check_tag(data, &mut rep);
+            out.failed = rep.ret;
+        }
         Kind::Blob => {}
     }
     out
@@ -8402,16 +8564,32 @@ fn report(out: &mut Vec<Finding>, msg: &'static Msg, text: impl Into<String>) {
     out.push(Finding { msg, text: text.into() });
 }
 
+/// `report()` for the commit and tag checks, which act on what it returns.
+struct Reporter<'a> {
+    out: &'a mut Vec<Finding>,
+    stops: &'a dyn Fn(&'static Msg) -> bool,
+    /// The `ret`/`err` the C function returns: `fsck_obj()` skips its `root` and
+    /// `tagged` lines and sets `ERROR_OBJECT` when it is non-zero
+    /// (builtin/fsck.c:422-424).
+    ret: bool,
+}
+
+impl Reporter<'_> {
+    /// Push the finding; `ret = report(...)`, so whether the caller stops.
+    fn report(&mut self, msg: &'static Msg, text: impl Into<String>) -> bool {
+        self.out.push(Finding { msg, text: text.into() });
+        self.ret = (self.stops)(msg);
+        self.ret
+    }
+}
+
 /// `fsck.c::verify_headers`: the header block must be terminated, and must not
-/// contain a NUL. Returns `true` when it reported, which stops the caller —
+/// contain a NUL. Returns what `report()` returned, which stops the caller —
 /// everything after this point indexes into the buffer.
-fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
+fn verify_headers(data: &[u8], rep: &mut Reporter<'_>) -> bool {
     for (i, &b) in data.iter().enumerate() {
         match b {
-            0 => {
-                report(out, &NUL_IN_HEADER, format!("unterminated header: NUL at offset {i}"));
-                return true;
-            }
+            0 => return rep.report(&NUL_IN_HEADER, format!("unterminated header: NUL at offset {i}")),
             b'\n' if data.get(i + 1) == Some(&b'\n') => return false,
             _ => {}
         }
@@ -8421,8 +8599,7 @@ fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
     if data.last() == Some(&b'\n') {
         return false;
     }
-    report(out, &UNTERMINATED_HEADER, "unterminated header");
-    true
+    rep.report(&UNTERMINATED_HEADER, "unterminated header")
 }
 
 /// `fsck.c::fsck_commit`.
@@ -8438,103 +8615,103 @@ fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
 /// `bufptr + hexsz + 7 < tail` — a `parent` line in the last `hexsz + 8` bytes
 /// of the buffer is never looked at there and reaches `fsck_commit` intact. So
 /// `badParentSha1` is reported here.
-fn check_commit(data: &[u8], out: &mut Vec<Finding>, hexsz: usize) {
-    if verify_headers(data, out) {
+fn check_commit(data: &[u8], rep: &mut Reporter<'_>, hexsz: usize) {
+    // `if (verify_headers(...)) return -1;` (fsck.c:966-967).
+    if verify_headers(data, rep) {
+        rep.ret = true;
         return;
     }
     // `if (buffer >= buffer_end || !skip_prefix(buffer, "tree ", &buffer))`
-    // (fsck.c:969-970).
+    // (fsck.c:969-970) returns whatever `report()` did.
     let Some(after_tree) = strip(data, b"tree ") else {
-        report(out, &MISSING_TREE, "invalid format - expected 'tree' line");
+        rep.report(&MISSING_TREE, "invalid format - expected 'tree' line");
         return;
     };
     // `if (parse_oid_hex_algop(buffer, &tree_oid, &p, …) || *p != '\n')`
-    // (fsck.c:971-975), then `buffer = p + 1`. `report()` answering non-zero
-    // returns; every severity this port can resolve for `badTreeSha1` does.
-    let well_formed = after_tree.len() > hexsz
-        && after_tree[..hexsz].iter().all(u8::is_ascii_hexdigit)
-        && after_tree[hexsz] == b'\n';
-    if !well_formed {
-        report(out, &BAD_TREE_SHA1, "invalid 'tree' line format - bad sha1");
-        return;
-    }
-    let mut p = &after_tree[hexsz + 1..];
-    while let Some(after) = strip(p, b"parent ") {
-        // `parse_oid_hex_algop(buffer, &parent_oid, &p) || *p != '\n'`.
-        let well_formed = after.len() > hexsz
-            && after[..hexsz].iter().all(u8::is_ascii_hexdigit)
-            && after[hexsz] == b'\n';
-        if !well_formed {
-            report(out, &BAD_PARENT_SHA1, "invalid 'parent' line format - bad sha1");
+    // (fsck.c:971-976), then `buffer = p + 1`. A `report()` that answers 0
+    // carries on from `p + 1`, which is only defined when the id itself parsed;
+    // `parse_commit_buffer()` has already refused any other `tree` line, so
+    // that case stops here.
+    let parsed = after_tree.len() >= hexsz && after_tree[..hexsz].iter().all(u8::is_ascii_hexdigit);
+    if !parsed || after_tree.get(hexsz) != Some(&b'\n') {
+        if rep.report(&BAD_TREE_SHA1, "invalid 'tree' line format - bad sha1") || !parsed {
             return;
         }
-        p = &after[hexsz + 1..];
+    }
+    let mut p = after_tree.get(hexsz + 1..).unwrap_or(&[]);
+    // fsck.c:977-984, with the same reading of `p + 1`.
+    while let Some(after) = strip(p, b"parent ") {
+        let parsed = after.len() >= hexsz && after[..hexsz].iter().all(u8::is_ascii_hexdigit);
+        if !parsed || after.get(hexsz) != Some(&b'\n') {
+            if rep.report(&BAD_PARENT_SHA1, "invalid 'parent' line format - bad sha1") || !parsed {
+                return;
+            }
+        }
+        p = after.get(hexsz + 1..).unwrap_or(&[]);
     }
 
+    // `err = fsck_ident(&buffer, …); if (err) return err;` (fsck.c:985-991):
+    // `fsck_ident()` moves `buffer` past the line before it checks anything.
     let mut authors = 0;
     while let Some(after) = strip(p, b"author ") {
         authors += 1;
-        match check_ident(after, out) {
-            None => return,
-            Some(rest) => p = rest,
+        let (rest, stop) = check_ident(after, rep);
+        if stop {
+            return;
         }
+        p = rest;
     }
-    if authors < 1 {
-        report(out, &MISSING_AUTHOR, "invalid format - expected 'author' line");
+    // fsck.c:992-997.
+    let stop = match authors {
+        0 => rep.report(&MISSING_AUTHOR, "invalid format - expected 'author' line"),
+        1 => false,
+        _ => rep.report(&MULTIPLE_AUTHORS, "invalid format - multiple 'author' lines"),
+    };
+    if stop {
         return;
     }
-    if authors > 1 {
-        report(out, &MULTIPLE_AUTHORS, "invalid format - multiple 'author' lines");
-        return;
-    }
+    // fsck.c:998-999 returns whatever `report()` did.
     let Some(after) = strip(p, b"committer ") else {
-        report(out, &MISSING_COMMITTER, "invalid format - expected 'committer' line");
+        rep.report(&MISSING_COMMITTER, "invalid format - expected 'committer' line");
         return;
     };
-    if check_ident(after, out).is_none() {
+    if check_ident(after, rep).1 {
         return;
     }
     if data.contains(&0) {
-        report(out, &NUL_IN_COMMIT, "NUL byte in the commit object body");
+        rep.report(&NUL_IN_COMMIT, "NUL byte in the commit object body");
     }
 }
 
 /// `fsck.c::fsck_ident`, checked branch by branch in git's order. `ident`
-/// starts just past `author `/`committer `/`tagger `. `None` means a defect was
-/// pushed, which makes `fsck_commit`/`fsck_tag` return immediately; `Some` is
-/// the rest of the buffer, cursor advanced past the line.
-fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> {
+/// starts just past `author `/`committer `/`tagger `. Returns the rest of the
+/// buffer past the line — `*ident = nl + 1` happens before any check
+/// (fsck.c:884-887) — and whether the `report()` it returned stops the caller;
+/// a report that does not leaves the caller to carry on from that next line.
+fn check_ident<'a>(ident: &'a [u8], rep: &mut Reporter<'_>) -> (&'a [u8], bool) {
+    let rest = skip_line(ident).unwrap_or(&[]);
+    let mut report = |msg: &'static Msg, text: &str| (rest, rep.report(msg, text));
     if ident.first() == Some(&b'<') {
-        report(out, &MISSING_NAME_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
-        return None;
+        return report(&MISSING_NAME_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
     }
     let mut i = span_to_email(ident, 0);
     match ident.get(i) {
         // git's name loop reports a `>` before any `<` as `badName`; only the
         // second loop, past the `<`, calls the same shape `badEmail`.
-        Some(b'>') => {
-            report(out, &BAD_NAME, "invalid author/committer line - bad name");
-            return None;
-        }
+        Some(b'>') => return report(&BAD_NAME, "invalid author/committer line - bad name"),
         Some(b'<') => {}
-        _ => {
-            report(out, &MISSING_EMAIL, "invalid author/committer line - missing email");
-            return None;
-        }
+        _ => return report(&MISSING_EMAIL, "invalid author/committer line - missing email"),
     }
     if i == 0 || ident[i - 1] != b' ' {
-        report(out, &MISSING_SPACE_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
-        return None;
+        return report(&MISSING_SPACE_BEFORE_EMAIL, "invalid author/committer line - missing space before email");
     }
     i = span_to_email(ident, i + 1);
     if ident.get(i) != Some(&b'>') {
-        report(out, &BAD_EMAIL, "invalid author/committer line - bad email");
-        return None;
+        return report(&BAD_EMAIL, "invalid author/committer line - bad email");
     }
     i += 1;
     if ident.get(i) != Some(&b' ') {
-        report(out, &MISSING_SPACE_BEFORE_DATE, "invalid author/committer line - missing space before date");
-        return None;
+        return report(&MISSING_SPACE_BEFORE_DATE, "invalid author/committer line - missing space before date");
     }
     i += 1;
     // Extra linear whitespace before the timestamp is allowed, a newline is not
@@ -8543,8 +8720,7 @@ fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> 
         i += 1;
     }
     if ident.get(i) == Some(&b'0') && ident.get(i + 1) != Some(&b' ') {
-        report(out, &ZERO_PADDED_DATE, "invalid author/committer line - zero-padded date");
-        return None;
+        return report(&ZERO_PADDED_DATE, "invalid author/committer line - zero-padded date");
     }
     let digits = ident[i.min(ident.len())..]
         .iter()
@@ -8556,12 +8732,10 @@ fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> 
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
     if digits > 0 && value.is_none_or(|v| v > i64::MAX as u64) {
-        report(out, &BAD_DATE_OVERFLOW, "invalid author/committer line - date causes integer overflow");
-        return None;
+        return report(&BAD_DATE_OVERFLOW, "invalid author/committer line - date causes integer overflow");
     }
     if digits == 0 || ident.get(i + digits) != Some(&b' ') {
-        report(out, &BAD_DATE, "invalid author/committer line - bad date");
-        return None;
+        return report(&BAD_DATE, "invalid author/committer line - bad date");
     }
     i += digits + 1;
     let tz = &ident[i.min(ident.len())..];
@@ -8570,10 +8744,9 @@ fn check_ident<'a>(ident: &'a [u8], out: &mut Vec<Finding>) -> Option<&'a [u8]> 
         && tz[1..5].iter().all(u8::is_ascii_digit)
         && tz[5] == b'\n';
     if !tz_ok {
-        report(out, &BAD_TIMEZONE, "invalid author/committer line - bad time zone");
-        return None;
+        return report(&BAD_TIMEZONE, "invalid author/committer line - bad time zone");
     }
-    Some(skip_line(ident).unwrap_or(&[]))
+    (rest, false)
 }
 
 /// `strcspn(p, "<>\n")` from `from`: the index of the first `<`, `>` or newline,
@@ -9625,14 +9798,16 @@ fn url_normalize(url: &str) -> Option<String> {
 ///
 /// The `tag` name is validated whichever way the buffer arrived, because gix
 /// accepts names `check_refname_format()` rejects.
-fn check_tag(data: &[u8], out: &mut Vec<Finding>) {
-    if verify_headers(data, out) {
+fn check_tag(data: &[u8], rep: &mut Reporter<'_>) {
+    // Every `goto done` below returns `ret`, the last `report()`'s answer
+    // (fsck.c:1037-1131).
+    if verify_headers(data, rep) {
         return;
     }
     // `if (buffer >= buffer_end || !skip_prefix(buffer, "object ", &buffer))`
     // (fsck.c:1041-1044).
     let Some(after_object) = strip(data, b"object ") else {
-        report(out, &MISSING_OBJECT, "invalid format - expected 'object' line");
+        rep.report(&MISSING_OBJECT, "invalid format - expected 'object' line");
         return;
     };
     // `if (parse_oid_hex_algop(buffer, tagged_oid, &p, …) || *p != '\n')`
@@ -9640,63 +9815,83 @@ fn check_tag(data: &[u8], out: &mut Vec<Finding>) {
     // off `options->repo->hash_algo`; `check_tag` is only ever handed a buffer
     // whose ids are `HEXSZ_MAX` or `HEXSZ_SHA1` wide, so the first hex run that
     // ends in a newline decides it.
+    // A `report()` that answers 0 carries on from `p + 1`, which is only
+    // defined when the id itself parsed (fsck.c:1045-1050); `parse_tag_buffer()`
+    // has already refused any other `object` line, so this stops either way.
     let Some(nl) = after_object.iter().position(|&b| b == b'\n') else {
-        report(out, &BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
+        rep.report(&BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
         return;
     };
     if !matches!(nl, 40 | 64) || !after_object[..nl].iter().all(u8::is_ascii_hexdigit) {
-        report(out, &BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
+        rep.report(&BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
         return;
     }
     let p = &after_object[nl + 1..];
     // `if (buffer >= buffer_end || !skip_prefix(buffer, "type ", &buffer))`
     // (fsck.c:1052-1055).
     let Some(after_type) = strip(p, b"type ") else {
-        report(out, &MISSING_TYPE_ENTRY, "invalid format - expected 'type' line");
+        rep.report(&MISSING_TYPE_ENTRY, "invalid format - expected 'type' line");
         return;
     };
     // `eol = memchr(...); if (!eol) report(MISSING_TYPE, "invalid format -
     // unexpected end after 'type' line")` (fsck.c:1056-1060) — git's wording says
     // `'type'` for both this and `missingTag` below.
     let Some(eol) = after_type.iter().position(|&b| b == b'\n') else {
-        report(out, &MISSING_TYPE, "invalid format - unexpected end after 'type' line");
+        rep.report(&MISSING_TYPE, "invalid format - unexpected end after 'type' line");
         return;
     };
     // `*tagged_type = type_from_string_gently(buffer, eol - buffer, 1);`
-    // (fsck.c:1061-1065).
-    if !matches!(&after_type[..eol], b"blob" | b"tree" | b"commit" | b"tag") {
-        report(out, &BAD_TYPE, "invalid 'type' value");
+    // (fsck.c:1061-1066).
+    if !matches!(&after_type[..eol], b"blob" | b"tree" | b"commit" | b"tag")
+        && rep.report(&BAD_TYPE, "invalid 'type' value")
+    {
         return;
     }
     let p = &after_type[eol + 1..];
     // `if (buffer >= buffer_end || !skip_prefix(buffer, "tag ", &buffer))`
     // (fsck.c:1068-1071).
     let Some(p) = strip(p, b"tag ") else {
-        report(out, &MISSING_TAG_ENTRY, "invalid format - expected 'tag' line");
+        rep.report(&MISSING_TAG_ENTRY, "invalid format - expected 'tag' line");
         return;
     };
     let Some(eol) = p.iter().position(|&b| b == b'\n') else {
-        report(out, &MISSING_TAG, "invalid format - unexpected end after 'type' line");
+        rep.report(&MISSING_TAG, "invalid format - unexpected end after 'type' line");
         return;
     };
+    // fsck.c:1077-1085.
     let name = &p[..eol];
-    if !refname_ok(name) {
-        report(out, &BAD_TAG_NAME, format!("invalid 'tag' name: {}", String::from_utf8_lossy(name)));
+    if !refname_ok(name)
+        && rep.report(&BAD_TAG_NAME, format!("invalid 'tag' name: {}", String::from_utf8_lossy(name)))
+    {
+        return;
     }
     let p = &p[eol + 1..];
-    let rest = match strip(p, b"tagger ") {
+    // fsck.c:1088-1095: a missing `tagger` stops only when `report()` says so;
+    // `fsck_ident()`'s answer is kept in `ret` but does not end the walk.
+    let mut rest = match strip(p, b"tagger ") {
         None => {
             // Early tags have no tagger, so git only warns.
-            report(out, &MISSING_TAGGER_ENTRY, "invalid format - expected 'tagger' line");
+            if rep.report(&MISSING_TAGGER_ENTRY, "invalid format - expected 'tagger' line") {
+                return;
+            }
             p
         }
-        Some(after) => match check_ident(after, out) {
-            None => return,
-            Some(rest) => rest,
-        },
+        Some(after) => check_ident(after, rep).0,
     };
+    // fsck.c:1097-1113: a `gpgsig`/`gpgsig-sha256` header and its ` `-indented
+    // continuation lines may follow the tagger. Their `badGpgsig` and
+    // `badHeaderContinuation` reports need a header line with no newline, which
+    // `verify_headers()` has already refused (see [`BAD_GPGSIG`]), so every line
+    // skipped here has one.
+    if let Some(sig) = strip(rest, b"gpgsig ").or_else(|| strip(rest, b"gpgsig-sha256 ")) {
+        rest = skip_line(sig).unwrap_or(&[]);
+        while rest.starts_with(b" ") {
+            rest = skip_line(rest).unwrap_or(&[]);
+        }
+    }
+    // fsck.c:1115-1126.
     if !rest.is_empty() && !rest.starts_with(b"\n") {
-        report(out, &EXTRA_HEADER_ENTRY, "invalid format - extra header(s) after 'tagger'");
+        rep.report(&EXTRA_HEADER_ENTRY, "invalid format - extra header(s) after 'tagger'");
     }
 }
 

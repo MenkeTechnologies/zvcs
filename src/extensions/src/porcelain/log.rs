@@ -6272,7 +6272,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 block.push(rec_term);
             }
             if graph {
-                push_graph_block(&mut blocks, ni, Some(GraphBlock::message_only(block)), &line_prefix);
+                let term = terminator && !empty_user_format;
+                push_graph_block(&mut blocks, ni, Some(GraphBlock::message_only(block, term)), &line_prefix);
                 continue;
             }
             let mut piece: Vec<u8> = Vec::new();
@@ -6290,7 +6291,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             }
             continue;
         }
-        let mut block = match from {
+        let entry = match from {
             None => entries.get(&repo, &nodes, ni, &abbrev_cache)?,
             // A per-parent `-m` record is rendered on its own: the batched window has
             // one slot per commit and no room for the ` (from <oid>)` insert.
@@ -6301,8 +6302,10 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // Where `show_log()` stops and `log_tree_diff_flush()` takes over. Under
         // `--graph` that hand-over is where the graph's remaining rows are drained
         // (`graph_show_commit_msg`), so the split has to survive into
-        // [`render_graph`]; everything appended below is diff output.
-        let mut msg_len = block.len();
+        // [`render_graph`]; everything appended below is diff output. `msg_len` ends
+        // `msgbuf`, ahead of the terminator, and `head_len` begins it.
+        let Entry { text: mut block, mut head_len, term: mut msg_term } = entry;
+        let mut msg_len = block.len() - usize::from(msg_term);
         // What git has written of this record when `diff_flush()` reads its first blob, for
         // [`log_flavored`]: `show_log()`, and the separator `log_tree_diff_flush()` writes after
         // it for a format that is not `oneline` (log-tree.c:939-967). Under `--no-commit-id`
@@ -7278,7 +7281,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     }
                     header_owed = false;
                 } else {
-                    block = entry_block_from(
+                    let entry = entry_block_from(
                         &repo,
                         &nodes[ni],
                         &entries.params,
@@ -7286,13 +7289,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                         None,
                         entries.params.fence_shown.get(ni).copied().unwrap_or(false),
                     )?;
-                    msg_len = block.len();
+                    (block, head_len, msg_term) = (entry.text, entry.head_len, entry.term);
+                    msg_len = block.len() - usize::from(msg_term);
                 }
             } else if record_queue_empty {
                 if !last_of_merge || shown_before {
                     continue;
                 }
-                block = entry_block_from(
+                let entry = entry_block_from(
                     &repo,
                     &nodes[ni],
                     &entries.params,
@@ -7300,7 +7304,8 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     None,
                     entries.params.fence_shown.get(ni).copied().unwrap_or(false),
                 )?;
-                msg_len = block.len();
+                (block, head_len, msg_term) = (entry.text, entry.head_len, entry.term);
+                msg_len = block.len() - usize::from(msg_term);
                 painted = None;
                 bare.clear();
             }
@@ -7335,7 +7340,15 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         }
         if graph {
             // Buffer for the column layout, which spans all commits at once.
-            let block = GraphBlock { text: block, msg_len, bare, more: Vec::new(), lead: Vec::new() };
+            let block = GraphBlock {
+                text: block,
+                head_len,
+                msg_len,
+                term: msg_term,
+                bare,
+                more: Vec::new(),
+                lead: Vec::new(),
+            };
             push_graph_block(&mut blocks, ni, Some(block), &line_prefix);
             continue;
         }
@@ -7406,9 +7419,6 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
         // previous block: `show_log()` prints it once the *next* commit has been
         // through `graph_update()`, so [`render_graph`] emits it there.
         let separator = (!terminator).then_some(rec_term);
-        // A terminator format's byte is already at the end of each block; the graph
-        // path re-emits it after the commit's remaining rows, where git puts it.
-        let record_terminator = terminator.then_some(rec_term);
         // A `whatchanged --max-count` run stops mid-list: `get_revision()` returns
         // nothing once the cap is spent, so the commits past it were never walked
         // and never reached `graph_update()`.
@@ -7420,7 +7430,6 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             graph_colors(&repo),
             want_color,
             separator,
-            record_terminator,
             first_parent,
             left_right,
             &interest,
@@ -8037,7 +8046,7 @@ struct EntryWindow<'a> {
     params: EntryParams<'a>,
     /// Index of `slots[0]` within the caller's node list.
     start: usize,
-    slots: Vec<Vec<u8>>,
+    slots: Vec<Entry>,
 }
 
 impl<'a> EntryWindow<'a> {
@@ -8060,7 +8069,7 @@ impl<'a> EntryWindow<'a> {
         nodes: &[Node],
         i: usize,
         abbrev: &std::cell::RefCell<AbbrevCache>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Entry> {
         if i < self.start || i >= self.start + self.slots.len() {
             let end = (i + Self::SPAN).min(nodes.len());
             self.slots = self.render_span(repo, &nodes[i..end], i, abbrev)?;
@@ -8075,7 +8084,7 @@ impl<'a> EntryWindow<'a> {
         span: &[Node],
         base: usize,
         abbrev: &std::cell::RefCell<AbbrevCache>,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Entry>> {
         let workers = crate::threads::count(span.len(), Self::PER_WORKER);
         if workers <= 1 {
             return span
@@ -8086,7 +8095,7 @@ impl<'a> EntryWindow<'a> {
         }
 
         let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let mut done: Vec<(usize, Vec<u8>)> = Vec::with_capacity(span.len());
+        let mut done: Vec<(usize, Entry)> = Vec::with_capacity(span.len());
         let mut caches: Vec<AbbrevCache> = Vec::with_capacity(workers);
         let mut failure: Option<anyhow::Error> = None;
         std::thread::scope(|scope| {
@@ -8100,7 +8109,7 @@ impl<'a> EntryWindow<'a> {
                 let cursor = &cursor;
                 let params = &self.params;
                 #[allow(clippy::type_complexity)] // per-worker (rows, abbrev-cache) result
-                handles.push(scope.spawn(move || -> Result<(Vec<(usize, Vec<u8>)>, AbbrevCache)> {
+                handles.push(scope.spawn(move || -> Result<(Vec<(usize, Entry)>, AbbrevCache)> {
                     let repo = proto;
                     let mut mine = Vec::new();
                     loop {
@@ -8138,15 +8147,25 @@ impl<'a> EntryWindow<'a> {
     }
 }
 
-/// One commit's rendered record: its header/message block plus the record
-/// terminator, with no diff attached.
+/// One commit's rendered record, with no diff attached: what `show_log()` prints
+/// ahead of `msgbuf`, `msgbuf` itself, and the record terminator.
+#[derive(Default)]
+struct Entry {
+    text: Vec<u8>,
+    /// Where `msgbuf` begins in `text` (see [`render_entry`]).
+    head_len: usize,
+    /// Whether `text` ends in the terminator `show_log()` prints after `msgbuf`
+    /// (log-tree.c:916-920).
+    term: bool,
+}
+
 fn entry_block(
     repo: &gix::Repository,
     node: &Node,
     p: &EntryParams<'_>,
     abbrev: &std::cell::RefCell<AbbrevCache>,
     index: usize,
-) -> Result<Vec<u8>> {
+) -> Result<Entry> {
     entry_block_from(repo, node, p, abbrev, None, p.fence_shown.get(index).copied().unwrap_or(false))
 }
 
@@ -8159,7 +8178,7 @@ fn entry_block_from(
     abbrev: &std::cell::RefCell<AbbrevCache>,
     from: Option<ObjectId>,
     notes_fence_shown: bool,
-) -> Result<Vec<u8>> {
+) -> Result<Entry> {
     let mut commit = repo.find_object(node.id)?.try_into_commit()?;
     // `show_log()` renders from `repo_logmsg_reencode(commit, NULL, encoding)`
     // (`pretty.c:2315-2316`) rather than from the stored buffer, so the whole
@@ -8267,17 +8286,18 @@ fn entry_block_from(
         log_size: p.log_size,
         email: p.email,
     };
-    let mut block: Vec<u8> = Vec::new();
-    render_entry(&mut block, &commit, p.pretty, &ctx)?;
+    let mut text: Vec<u8> = Vec::new();
+    let head_len = render_entry(&mut text, &commit, p.pretty, &ctx)?;
     // A `tformat:` record is terminated by a newline. git still terminates a
     // record whose expansion happened to be empty (so `%d` prints one line per
     // commit); only the genuinely empty user format emits no terminator.
     // The `-g` oneline record already ended itself: see [`render_entry`].
     let reflog_oneline = node.reflog.is_some() && matches!(p.pretty, Pretty::Oneline);
-    if p.terminator && !p.empty_user_format && !reflog_oneline {
-        block.push(p.rec_term);
+    let term = p.terminator && !p.empty_user_format && !reflog_oneline;
+    if term {
+        text.push(p.rec_term);
     }
-    Ok(block)
+    Ok(Entry { text, head_len, term })
 }
 
 /// A look-ahead buffer of rendered `-p` patch bodies.
@@ -13545,12 +13565,17 @@ fn checked_signature(
 /// Render one commit's header in the selected format. Built-in formats end with
 /// a newline; user formats, `oneline`, and `reference` do not, because their
 /// record ending is supplied by the separator/terminator rule in [`log`].
+///
+/// Returns where `pretty_print_commit()`'s `msgbuf` begins in `out`: what comes
+/// before it — the `commit` line, the signature report, `log size <n>` — is
+/// written by `show_log()` itself, which draws a `--graph` row after each of its
+/// lines unconditionally (`graph_show_oneline()`, log-tree.c:576, :834, :903).
 fn render_entry(
     out: &mut Vec<u8>,
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
     ctx: &RenderCtx<'_>,
-) -> Result<()> {
+) -> Result<usize> {
     let id = if ctx.abbrev_commit {
         ctx.abbrev.borrow_mut().get(commit.id())
     } else {
@@ -13591,7 +13616,7 @@ fn render_entry(
                 out.extend_from_slice(b": ");
                 out.extend_from_slice(&rl.message);
                 out.push(b'\n');
-                return Ok(());
+                return Ok(msg_start);
             }
             out.extend_from_slice(&subject(commit_message(&commit.data)));
             out.extend_from_slice(&notes_block(commit, ctx)?);
@@ -13616,6 +13641,10 @@ fn render_entry(
             };
             // `%ad` of an ident that does not split is empty (pretty.c:798-799).
             let author = commit_ident(&commit.data, "author", HeaderPick::Last);
+            // `show_signature()` sits outside `show_log()`'s format switch
+            // (log-tree.c:851-854), so `reference` gets the report too.
+            write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
             out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.id()).as_bytes());
             out.extend_from_slice(b" (");
             out.extend_from_slice(&subject(commit_message(&commit.data)));
@@ -13762,10 +13791,12 @@ fn render_entry(
         }
     }
     if ctx.log_size {
-        let size = format!("log size {}\n", out.len() - msg_start);
-        out.splice(msg_start..msg_start, size.into_bytes());
+        let size = format!("log size {}\n", out.len() - msg_start).into_bytes();
+        let size_len = size.len();
+        out.splice(msg_start..msg_start, size);
+        msg_start += size_len;
     }
-    Ok(())
+    Ok(msg_start)
 }
 
 /// `repo_format_commit_message()` converts the record it expanded, `msgbuf`, out
@@ -15822,7 +15853,6 @@ pub(super) fn render_graph(
     colors: Vec<String>,
     want_color: bool,
     separator: Option<u8>,
-    terminator: Option<u8>,
     first_parent: bool,
     left_right: bool,
     interest: &GraphInterest,
@@ -15874,7 +15904,14 @@ pub(super) fn render_graph(
         // `graph_show_commit()` draws them a padding row instead of the commit row
         // (graph.c:1864-1872); the separator in front of each is `show_log()`'s own.
         for record in std::iter::once(first).chain(first.more.iter()) {
-            let current: &[u8] = &record.text;
+            let text: &[u8] = &record.text;
+            // `show_log()`'s own lines, `msgbuf`, the terminator, and the diff
+            // `log_tree_diff_flush()` writes after them.
+            let msg_end = record.msg_len.min(text.len());
+            let head = &text[..record.head_len.min(msg_end)];
+            let msg = &text[head.len()..msg_end];
+            let term = text.get(msg_end).filter(|_| record.term);
+            let diff = &text[(msg_end + usize::from(term.is_some())).min(text.len())..];
 
             // `show_log()` prints the record separator *after* the next commit has been
             // through `graph_update()`, and puts that commit's padding row in front of
@@ -15888,7 +15925,7 @@ pub(super) fn render_graph(
                 }
                 out.push(sep);
             }
-            prev_message = Some(&record.text[..record.msg_len.min(record.text.len())]);
+            prev_message = Some(msg);
 
             // `graph_show_commit()` drains every row that comes *before* the commit
             // row onto lines of its own — the `...` skip row, and the expansion rows
@@ -15899,36 +15936,27 @@ pub(super) fn render_graph(
                 out.push(b'\n');
             }
 
-            // A terminator format's byte is carried at the end of the block, but git
-            // prints it *after* the commit's remaining graph rows (log-tree.c:915-919),
-            // so it is taken off here and put back below.
-            let block: &[u8] = match terminator {
-                Some(t) if current.last() == Some(&t) => &current[..current.len() - 1],
-                _ => current,
-            };
-            // `show_log()` hands only the commit *message* to `graph_show_commit_msg()`;
+            // `show_log()` hands only `msgbuf` to `graph_show_commit_msg()`;
             // everything after it — the blank line fencing the diff off, and the diff
             // itself — is written by `log_tree_diff_flush()` through the diff prefix
             // callback, which is `graph_padding_line()` (graph.c:329-342). The graph's
             // remaining rows are therefore drained *between* the two, not after the
             // whole record: a commit under a collapse prints `|/` on a row of its own
             // and its diff on the padded rows below it.
-            let split = record.msg_len.min(block.len());
-            let (msg, diff) = block.split_at(split);
-
             let msg_nl = msg.ends_with(b"\n");
-            if !msg.is_empty() {
+            if !head.is_empty() || !msg.is_empty() {
                 out.extend_from_slice(&record.lead);
             }
-            graph_write_message(&mut out, &mut graph, msg);
+            graph_write_message(&mut out, &mut graph, head, msg);
 
             // Rows the commit's message did not consume: the `|\` of a merge and the
             // `|/` of a collapse both appear on lines of their own. `graph_show_commit_msg()`
             // opens a line for them when the message did not end in one, then
             // `graph_show_remainder()` puts a newline *between* the rows only — the
             // trailing one comes back at the end, and only for a message that was newline
-            // terminated. A collapse needs at most one row per column, so the bound below
-            // can only trip on a bug here — failing beats hanging the caller.
+            // terminated (graph.c:1989-2010). A collapse needs at most one row per column,
+            // so the bound below can only trip on a bug here — failing beats hanging the
+            // caller.
             if graph.state != GraphState::Padding {
                 if !msg_nl {
                     out.push(b'\n');
@@ -15950,24 +15978,29 @@ pub(super) fn render_graph(
                 }
             }
 
+            // ```c
+            // if (opt->use_terminator && !commit_format_is_empty(opt->commit_format)) {
+            //         if (!opt->missing_newline)
+            //                 graph_show_padding(opt->graph);
+            //         putc(opt->diffopt.line_termination, opt->diffopt.file);
+            // }
+            // ```
+            //
+            // (log-tree.c:916-920.) A terminator format closes the record ahead of
+            // the diff, with a padding row in front of the terminator when `msgbuf`
+            // ended in a newline: an empty line would read as a hole in the graph.
+            if let Some(&term) = term {
+                if msg_nl {
+                    out.extend_from_slice(&graph.next_line());
+                }
+                out.push(term);
+            }
+
             if !diff.is_empty() {
+                let split = text.len() - diff.len();
                 let bare: Vec<(usize, usize)> =
                     record.bare.iter().map(|&(s, e)| (s - split, e - split)).collect();
                 graph_write_lines(&mut out, &mut graph, diff, &bare, bare_out);
-            }
-
-            // `show_log()` closes a terminator format's record last of all, and puts a
-            // padding row in front of the terminator when the record's own text ended
-            // in a newline (log-tree.c:915-919) — the same reason the separator carries
-            // one: an empty line would read as a hole in the graph.
-            if let Some(term) = terminator {
-                if current.last() == Some(&term) {
-                    let tail_nl = if diff.is_empty() { msg_nl } else { diff.ends_with(b"\n") };
-                    if tail_nl {
-                        out.extend_from_slice(&graph.next_line());
-                    }
-                    out.push(term);
-                }
             }
         }
     }
@@ -15978,10 +16011,16 @@ pub(super) fn render_graph(
 pub(super) struct GraphBlock {
     /// Everything the record prints, message and diff together.
     text: Vec<u8>,
-    /// How much of `text` is the commit message — what `graph_show_commit_msg()`
-    /// receives, and after which the graph's remaining rows are drained. The rest
-    /// is diff output, which git prefixes with `graph_padding_line()` instead.
+    /// Where `msgbuf` begins: the lines before it are `show_log()`'s own, each
+    /// followed by a graph row whatever comes next (see [`graph_write_message`]).
+    head_len: usize,
+    /// Where `msgbuf` ends — what `graph_show_commit_msg()` receives, and after
+    /// which the graph's remaining rows are drained. The rest is the terminator
+    /// and diff output, which git prefixes with `graph_padding_line()` instead.
     msg_len: usize,
+    /// Whether `text[msg_len]` is the record terminator `show_log()` prints
+    /// before the diff (log-tree.c:916-920).
+    term: bool,
     /// The spans of `text`, all past `msg_len`, holding a combined patch's bare
     /// `printf()` lines (combine-diff.c:971, :1150): git writes them without
     /// `diff_line_prefix()`, so no padding row is drawn in front of them and the
@@ -15997,9 +16036,18 @@ pub(super) struct GraphBlock {
 }
 
 impl GraphBlock {
-    /// A record with no diff, so nothing follows the message.
-    pub(super) fn message_only(text: Vec<u8>) -> Self {
-        GraphBlock { msg_len: text.len(), text, bare: Vec::new(), more: Vec::new(), lead: Vec::new() }
+    /// A record with no diff and no head lines, so only its terminator, when
+    /// `term` says its last byte is one, follows the message.
+    pub(super) fn message_only(text: Vec<u8>, term: bool) -> Self {
+        GraphBlock {
+            head_len: 0,
+            msg_len: text.len() - usize::from(term),
+            term,
+            text,
+            bare: Vec::new(),
+            more: Vec::new(),
+            lead: Vec::new(),
+        }
     }
 }
 
@@ -16036,14 +16084,25 @@ fn push_graph_block(
 ///
 /// A line that opens one of the `bare` spans of `buf` gets no row: the diff
 /// prefix callback is never asked for it. Its span in `out` goes to `bare_out`.
-/// `graph_show_commit()`'s row and then `graph_show_strbuf()` (graph.c:1948-1973)
-/// over the commit message: the message is walked with `strchr()`, so a line
-/// break past a NUL is never found and everything from that line to the end is
-/// written in one piece, and no graph row is drawn in front of a line that
-/// begins with a NUL — a record converted into UTF-16 or UTF-32 is laid out by
-/// its newline bytes only up to its first NUL.
-fn graph_write_message(out: &mut Vec<u8>, graph: &mut Graph, msg: &[u8]) {
+/// `graph_show_commit()`'s row, then `show_log()`'s own lines (`head`) and
+/// `graph_show_strbuf()` (graph.c:1948-1973) over `msgbuf` (`msg`).
+///
+/// Each line of `head` — the `commit` line, a signature report line, `log size
+/// <n>` — is followed by `graph_show_oneline()` whatever comes next (log-tree.c:576,
+/// :834, :903). `msgbuf` is walked with `strchr()`, so a line break past a NUL is
+/// never found and everything from that line to the end is written in one piece,
+/// and no graph row is drawn in front of a line that begins with a NUL — a record
+/// converted into UTF-16 or UTF-32 is laid out by its newline bytes only up to its
+/// first NUL.
+fn graph_write_message(out: &mut Vec<u8>, graph: &mut Graph, head: &[u8], msg: &[u8]) {
     out.extend_from_slice(&graph.next_line());
+    let mut rest = head;
+    while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+        out.extend_from_slice(&rest[..=nl]);
+        out.extend_from_slice(&graph.next_line());
+        rest = &rest[nl + 1..];
+    }
+    out.extend_from_slice(rest);
     let mut p = 0;
     while p < msg.len() {
         let rest = &msg[p..];

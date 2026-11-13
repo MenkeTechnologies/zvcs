@@ -1927,23 +1927,20 @@ fn collect_commit_info(
         if info.contains_key(&line.commit_id) {
             continue;
         }
-        let ci = if &line.commit_id == null_id {
-            not_committed_info(line.commit_id, opts, rel_path)
+        // `get_commit_info()` reads the identities and the subject out of
+        // `repo_logmsg_reencode(commit, NULL, get_log_output_encoding())`
+        // (builtin/blame.c:205-206), not out of the stored bytes — the synthetic
+        // working-tree commit's buffer included.
+        let (mut data, boundary) = if &line.commit_id == null_id {
+            let now = gix::date::Time::now_local_or_utc();
+            // `commit->date = now` (blame.c:209), so `assign_blame()`'s `max_age` test
+            // can stop the dig at the working tree itself and mark it the boundary.
+            (fake_working_tree_buffer(opts, rel_path, now), fake_commit_cut(opts, now.seconds))
         } else {
-            // `get_commit_info()` reads the identities and the subject out of
-            // `repo_logmsg_reencode(commit, NULL, get_log_output_encoding())`
-            // (builtin/blame.c:205-206), not out of the stored bytes.
             let stored = repo.find_commit(line.commit_id)?;
             // Parentage is the graph's, shallow and graft files included, not
             // the `parent` lines of the buffer.
             let is_root = stored.parent_ids().next().is_none();
-            let mut data = stored.data.clone();
-            super::log::logmsg_reencode(&mut data, &output_encoding);
-            // `get_ac_line()` and `find_commit_subject()` read the re-coded buffer
-            // as a C string, so a UTF-16 or UTF-32 one ends at its first NUL.
-            let visible = data.split(|&b| b == 0).next().unwrap_or_default();
-            let author = get_ac_line(visible, b"\nauthor ", &mailmap);
-            let committer = get_ac_line(visible, b"\ncommitter ", &mailmap);
             // `commit->date`, which `assign_blame()` compares, is parsed out of the
             // stored object, not out of the re-coded copy.
             let committer_seconds = stored.committer().ok().and_then(|c| c.time().ok()).map_or(0, |t| t.seconds);
@@ -1971,39 +1968,45 @@ fn collect_commit_info(
                 || opts.reverse_from.is_some_and(|from| from == line.commit_id)
                 || opts.bottom.contains(&line.commit_id)
                 || date_cut;
-            // ```c
-            // len = find_commit_subject(message, &subject);
-            // if (len) strbuf_add(&ret->summary, subject, len);
-            // else strbuf_addf(&ret->summary, "(%s)", oid_to_hex(&commit->object.oid));
-            // ```
-            // (builtin/blame.c:213-217.)
-            let summary = gix::objs::CommitRef::from_bytes(visible, repo.object_hash())
-                .ok()
-                .map(|commit| Vec::from(commit.message().summary().into_owned()))
-                .filter(|summary| !summary.is_empty())
-                .unwrap_or_else(|| format!("({})", line.commit_id.to_hex()).into_bytes());
-            // `format_time()` (builtin/blame.c:392-418): `-t` prints the time and the
-            // tz string as they are, any other mode takes `atoi(tz_str)`.
-            let display_date = match &author.unparsed {
-                _ if !author.known && opts.raw_timestamp => format!("0 {}", author.tz),
-                Some(raw) => raw.clone(),
-                None => opts.date_mode.format_time(author.time, author.offset),
-            };
-            CommitInfo {
-                display_author: display_author(&author.name, &author.mail, opts.show_email),
-                display_date,
-                boundary,
-                hex: line.commit_id.to_hex().to_string(),
-                author_name: author.name,
-                author_mail: author.mail,
-                author_time: author.time,
-                author_tz: author.tz,
-                committer_name: committer.name,
-                committer_mail: committer.mail,
-                committer_time: committer.time,
-                committer_tz: committer.tz,
-                summary,
-            }
+            (stored.data.clone(), boundary)
+        };
+        super::log::logmsg_reencode(&mut data, &output_encoding);
+        // `get_ac_line()` and `find_commit_subject()` read the re-coded buffer
+        // as a C string, so a UTF-16 or UTF-32 one ends at its first NUL.
+        let visible = data.split(|&b| b == 0).next().unwrap_or_default();
+        let author = get_ac_line(visible, b"\nauthor ", &mailmap);
+        let committer = get_ac_line(visible, b"\ncommitter ", &mailmap);
+        // ```c
+        // len = find_commit_subject(message, &subject);
+        // if (len) strbuf_add(&ret->summary, subject, len);
+        // else strbuf_addf(&ret->summary, "(%s)", oid_to_hex(&commit->object.oid));
+        // ```
+        // (builtin/blame.c:213-217.)
+        let summary = match find_commit_subject(visible) {
+            b"" => format!("({})", line.commit_id.to_hex()).into_bytes(),
+            subject => subject.to_vec(),
+        };
+        // `format_time()` (builtin/blame.c:392-418): `-t` prints the time and the
+        // tz string as they are, any other mode takes `atoi(tz_str)`.
+        let display_date = match &author.unparsed {
+            _ if !author.known && opts.raw_timestamp => format!("0 {}", author.tz),
+            Some(raw) => raw.clone(),
+            None => opts.date_mode.format_time(author.time, author.offset),
+        };
+        let ci = CommitInfo {
+            display_author: display_author(&author.name, &author.mail, opts.show_email),
+            display_date,
+            boundary,
+            hex: line.commit_id.to_hex().to_string(),
+            author_name: author.name,
+            author_mail: author.mail,
+            author_time: author.time,
+            author_tz: author.tz,
+            committer_name: committer.name,
+            committer_mail: committer.mail,
+            committer_time: committer.time,
+            committer_tz: committer.tz,
+            summary,
         };
         info.insert(line.commit_id, ci);
     }
@@ -2018,43 +2021,44 @@ fn fake_commit_cut(opts: &Options, now: i64) -> bool {
     opts.reverse_from.is_none() && opts.ages().below_max_age(now)
 }
 
-/// The synthetic commit git invents for the final image (working tree, or the
-/// `--contents` file). git's `fake_working_tree_commit` uses a different author
-/// identity and message `from` field when `--contents` supplies the image.
-fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInfo {
-    let now = gix::date::Time::now_local_or_utc();
-    // git: `"External file (--contents)" / "external.file"` for `--contents`,
-    // else `"Not Committed Yet" / "not.committed.yet"`.
+/// The buffer `fake_working_tree_commit()` gives the synthetic commit standing
+/// for the final image (blame.c:218-235): the working tree, or the `--contents`
+/// file, which takes a different identity and names its source in the message.
+/// `fmt_ident()` with no date stamps it with the current time and zone.
+///
+/// The `parent` lines git writes between `tree` and `author` are left out: they
+/// are ASCII hex, which no output encoding re-codes differently from `tree`, and
+/// `get_commit_info()` reads only the identities and the subject.
+fn fake_working_tree_buffer(opts: &Options, rel_path: &str, now: gix::date::Time) -> Vec<u8> {
     let (name, mail): (&[u8], &[u8]) = if opts.contents.is_some() {
         (b"External file (--contents)", b"external.file")
     } else {
         (NOT_COMMITTED_NAME, NOT_COMMITTED_MAIL)
     };
-    let mail = [&b"<"[..], mail, b">"].concat();
-    // git's message: `"Version of %s from %s"` where the second `%s` is the path,
-    // or the `--contents` argument (`"standard input"` for `-`).
+    let ident = [name, b" <", mail, b"> ", format!("{} {}", now.seconds, format_tz(now.offset)).as_bytes()].concat();
     let from = match opts.contents.as_deref() {
-        Some("-") => "standard input".to_string(),
-        Some(f) => f.to_string(),
-        None => rel_path.to_string(),
+        Some("-") => "standard input",
+        Some(f) => f,
+        None => rel_path,
     };
-    CommitInfo {
-        display_author: display_author(name, &mail, opts.show_email),
-        display_date: opts.date_mode.format_time(now.seconds, now.offset),
-        // `commit->date = now` (blame.c:209), so `assign_blame()`'s `max_age` test
-        // can stop the dig at the working tree itself and mark it the boundary.
-        boundary: fake_commit_cut(opts, now.seconds),
-        hex: id.to_hex().to_string(),
-        author_name: name.to_vec(),
-        author_mail: mail.clone(),
-        author_time: now.seconds,
-        author_tz: format_tz(now.offset),
-        committer_name: name.to_vec(),
-        committer_mail: mail,
-        committer_time: now.seconds,
-        committer_tz: format_tz(now.offset),
-        summary: format!("Version of {rel_path} from {from}").into_bytes(),
+    let mut msg = b"tree 0000000000000000000000000000000000000000\n".to_vec();
+    for header in [&b"author "[..], b"committer "] {
+        msg.extend_from_slice(header);
+        msg.extend_from_slice(&ident);
+        msg.push(b'\n');
     }
+    msg.extend_from_slice(format!("\nVersion of {rel_path} from {from}\n").as_bytes());
+    msg
+}
+
+/// `find_commit_subject()` (commit.c:675-691): the first line after the first
+/// blank line and any blank lines after it, read as a C string.
+fn find_commit_subject(buf: &[u8]) -> &[u8] {
+    let subject = match buf.windows(2).position(|w| w == b"\n\n") {
+        Some(at) => super::format_patch::skip_blank_lines(&buf[at + 2..]),
+        None => &buf[buf.len()..],
+    };
+    &subject[..subject.iter().position(|&b| b == b'\n').unwrap_or(subject.len())]
 }
 
 /// `blame_date_width`, which `format_time()` pads to only when it is not

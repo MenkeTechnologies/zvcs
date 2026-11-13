@@ -4189,7 +4189,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // A commit that printed nothing is `None`: git still runs it through
             // `graph_update()`, so its lane moves on with no row of its own.
             let text = out.split_off(record_start);
-            graph_blocks.push((!text.is_empty()).then(|| super::log::GraphBlock::message_only(text)));
+            let term = text.last() == Some(&hdr_term);
+            graph_blocks.push((!text.is_empty()).then(|| super::log::GraphBlock::message_only(text, term)));
         }
         if objects && in_commit_order && !is_boundary {
             // The objects shown ahead of a missing one stand: see
@@ -4265,7 +4266,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             super::log::graph_colors(&repo),
             false,
             None,
-            Some(hdr_term),
             first_parent,
             left_right,
             &interest,

@@ -2464,8 +2464,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 updating = Some(meter);
                 hook
             };
-            let (repo, _) =
-                checkout.main_worktree_with_index_hook(gix::progress::Discard, &should_interrupt, &mut prepare)?;
+            let (repo, _) = checkout
+                .main_worktree_with_index_hook(gix::progress::Discard, &should_interrupt, &mut prepare)
+                .map_err(|err| {
+                    // A `required` smudge driver that fails dies inside `checkout()`'s
+                    // `unpack_trees()` (convert.c:1516-1517), after `junk_mode = JUNK_LEAVE_REPO`.
+                    let err = anyhow::Error::new(err);
+                    if let Some(msg) = crate::fatal::smudge_filter_fatal(&err) {
+                        checkout_died_with(&msg);
+                    }
+                    err
+                })?;
             work_tree_entered = true;
             if let Some(updating) = updating {
                 updating.stop();

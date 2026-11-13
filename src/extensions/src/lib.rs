@@ -1091,6 +1091,14 @@ fn run_command(argv: &[String]) -> ExitCode {
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
+        // A `required` smudge driver that fails is `convert_to_working_tree_ca_internal()`'s
+        // `die()` (convert.c:1516-1517); see [`fatal::smudge_filter_fatal`].
+        Err(e) if fatal::smudge_filter_fatal(&e).is_some() => {
+            let msg = fatal::smudge_filter_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            fatal::write_report("fatal: ", &msg);
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         // A gitlink whose `<path>/.git` is no git directory is
         // `is_submodule_modified()`'s `die()`; see [`fatal::submodule_git_dir_fatal`].
         Err(e) if fatal::submodule_git_dir_fatal(&e).is_some() => {

@@ -579,24 +579,6 @@ fn clean_shared_index_files(
     current: gix::ObjectId,
     bad_expiry: &mut Option<Option<String>>,
 ) -> std::io::Result<()> {
-    // `get_shared_index_expire_date()` (read-cache.c:3186-3207): `2.weeks.ago` unless
-    // configured, and `repo_config_get_expiry()` refuses anything but `now` that resolves to
-    // the present or later.
-    let expire = match crate::config::last_value_implicit(repo, "splitIndex.sharedIndexExpire") {
-        None => "2.weeks.ago".to_owned(),
-        Some(None) => {
-            *bad_expiry = Some(Some("missing value for 'splitindex.sharedindexexpire'".to_owned()));
-            return Err(std::io::Error::other("splitindex.sharedindexexpire"));
-        }
-        Some(Some(value)) => {
-            if crate::date::config_expiry_rejected(&value) {
-                *bad_expiry = Some(Some(format!("Invalid splitindex.sharedindexexpire: '{value}'")));
-                return Err(std::io::Error::other("splitindex.sharedindexexpire"));
-            }
-            value
-        }
-    };
-    let expiration = crate::date::approxidate(&expire);
     let dir = match std::fs::read_dir(git_dir) {
         Ok(dir) => dir,
         Err(err) => {
@@ -605,12 +587,23 @@ fn clean_shared_index_files(
         }
     };
     let current = current.to_string();
+    let mut expiration = None;
     for de in dir.flatten() {
         let name = de.file_name();
         let Some(hex) = name.to_str().and_then(|n| n.strip_prefix("sharedindex.")) else {
             continue;
         };
-        if hex == current || expiration == 0 {
+        if hex == current {
+            continue;
+        }
+        // `should_delete_shared_index()` asks for the expiry only once it has another shared
+        // index to judge (read-cache.c:3213-3214), so a bad value goes unread while there is
+        // none.
+        let expiration = match expiration {
+            Some(expiration) => expiration,
+            None => *expiration.insert(shared_index_expire_date(repo, bad_expiry)?),
+        };
+        if expiration == 0 {
             continue;
         }
         let path = git_dir.join(&name);
@@ -632,6 +625,27 @@ fn clean_shared_index_files(
         }
     }
     Ok(())
+}
+
+/// `get_shared_index_expire_date()` (read-cache.c:3186-3207): `2.weeks.ago` unless
+/// configured, and `repo_config_get_expiry()` refuses anything but `now` that resolves to
+/// the present or later.
+fn shared_index_expire_date(repo: &gix::Repository, bad_expiry: &mut Option<Option<String>>) -> std::io::Result<i64> {
+    let expire = match crate::config::last_value_implicit(repo, "splitIndex.sharedIndexExpire") {
+        None => "2.weeks.ago".to_owned(),
+        Some(None) => {
+            *bad_expiry = Some(Some("missing value for 'splitindex.sharedindexexpire'".to_owned()));
+            return Err(std::io::Error::other("splitindex.sharedindexexpire"));
+        }
+        Some(Some(value)) => {
+            if crate::date::config_expiry_rejected(&value) {
+                *bad_expiry = Some(Some(format!("Invalid splitindex.sharedindexexpire: '{value}'")));
+                return Err(std::io::Error::other("splitindex.sharedindexexpire"));
+            }
+            value
+        }
+    };
+    Ok(crate::date::approxidate(&expire))
 }
 
 /// `tweak_split_index()` (read-cache.c:1932-1946), which git runs on every index it reads:

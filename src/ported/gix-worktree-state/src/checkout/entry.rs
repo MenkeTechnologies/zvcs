@@ -92,14 +92,27 @@ where
                     path: dest.to_path_buf(),
                 })?;
 
-            let filtered = filters.convert_to_worktree(
+            let filtered = match filters.convert_to_worktree(
                 obj.data,
                 entry_path,
                 &mut |_, attrs| {
                     path_cache.matching_attributes(attrs);
                 },
                 filter_process_delay,
-            )?;
+            ) {
+                Ok(filtered) => filtered,
+                Err(err) => {
+                    // `checkout_entry_ca()` unlinks the old file (entry.c:565-577) before
+                    // `write_entry()` converts the blob, so when `convert_to_working_tree_ca()`
+                    // dies over a `required` smudge driver (convert.c:1516-1517) the path is
+                    // already gone. `open_file()` below is where this port unlinks; a
+                    // conversion that fails never reaches it, so the unlink is done here.
+                    if overwrite_existing || !destination_is_initially_empty {
+                        let _ = std::fs::symlink_metadata(dest).and_then(|meta| try_unlink_path_recursively(dest, &meta));
+                    }
+                    return Err(err.into());
+                }
+            };
             let (num_bytes, file, set_executable_after_creation) = match filtered {
                 ToWorktreeOutcome::Unchanged(buf) | ToWorktreeOutcome::Buffer(buf) => {
                     let (mut file, flag) = open_file(

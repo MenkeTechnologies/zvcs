@@ -40,13 +40,30 @@ impl State {
                 let client = match self.running.remove(process) {
                     Some(c) => c,
                     None => {
-                        let (child, cmd) = spawn_driver(process.clone(), &self.context)?;
-                        process::Client::handshake(child, "git-filter", &[2], &["clean", "smudge", "delay"]).map_err(
-                            |err| Error::ProcessHandshake {
-                                source: err,
-                                command: cmd,
-                            },
-                        )?
+                        // `subprocess_start()` (sub-process.c:75-110): a command that will not start
+                        // and a handshake that fails are each reported, and the filter is skipped.
+                        let (child, cmd) = spawn_driver(process.clone(), &self.context).inspect_err(|_| {
+                            eprintln!("error: cannot fork to run subprocess '{process}'");
+                        })?;
+                        process::Client::try_handshake(child, "git-filter", &[2], &["clean", "smudge", "delay"])
+                            .map_err(|failed| {
+                                let process::client::handshake::Failed {
+                                    error,
+                                    process: mut child,
+                                    input,
+                                    out,
+                                } = *failed;
+                                if !matches!(error, process::client::handshake::Error::UnsupportedCapability { .. }) {
+                                    eprintln!("error: {}", error.git_message(&process.to_string()));
+                                    eprintln!("error: initialization for subprocess '{process}' failed");
+                                }
+                                subprocess_stop(&mut child, process.as_ref());
+                                drop((input, out));
+                                Error::ProcessHandshake {
+                                    source: error,
+                                    command: cmd,
+                                }
+                            })?
                     }
                 };
 
@@ -79,7 +96,18 @@ impl State {
                     None => return Ok(None),
                 };
 
-                let (child, command) = spawn_driver(cmd, &self.context)?;
+                // `filter_buffer_or_fd()` names the command as configured (`params->cmd`), and
+                // `apply_single_file_filter()` reports the failed async after it (convert.c:665-668,
+                // 734-736).
+                let (child, command) = spawn_driver(cmd, &self.context).inspect_err(|_| {
+                    let configured = match operation {
+                        Operation::Clean => driver.clean.as_ref(),
+                        Operation::Smudge => driver.smudge.as_ref(),
+                    }
+                    .expect("a command was substituted from it");
+                    eprintln!("error: cannot fork to run external filter '{configured}'");
+                    eprintln!("error: external filter '{configured}' failed");
+                })?;
                 Ok(Some(Process::SingleFile { child, command }))
             }
         }
@@ -90,6 +118,7 @@ fn spawn_driver(
     cmd: BString,
     context: &gix_command::Context,
 ) -> Result<(std::process::Child, std::process::Command), Error> {
+    let program = cmd.clone();
     let mut cmd: std::process::Command = gix_command::prepare(gix_path::from_bstr(cmd).into_owned())
         .command_may_be_shell_script()
         .with_context(context.clone())
@@ -101,6 +130,7 @@ fn spawn_driver(
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
+            report_start_failure(program.as_ref(), &err);
             return Err(Error::SpawnCommand {
                 source: err,
                 command: cmd,
@@ -108,4 +138,46 @@ fn spawn_driver(
         }
     };
     Ok((child, cmd))
+}
+
+/// What `start_command()` reports for a `use_shell` command that would not start. Only a
+/// command `prepare_shell_cmd()` runs without a shell can fail here (run-command.c:290-293);
+/// one without a `/` is looked up in `PATH` first, and not finding it is `cannot run`
+/// (run-command.c:435-444, 757-761), while an `execve()` that fails is the child's `die()`,
+/// relayed as `fatal: cannot exec` (run-command.c:378-405, 870-898).
+fn report_start_failure(program: &BStr, err: &std::io::Error) {
+    // `strerror()`: the description Rust puts in front of its ` (os error N)`.
+    let full = err.to_string();
+    let reason = full.rsplit_once(" (os error ").map_or(full.as_str(), |(reason, _)| reason);
+    if program.contains(&b'/') {
+        eprintln!("fatal: cannot exec '{program}': {reason}");
+    } else {
+        eprintln!("error: cannot run {program}: {reason}");
+    }
+}
+
+/// `subprocess_stop()` (sub-process.c:52-62): `SIGTERM`, then `finish_command()`, whose
+/// `wait_or_whine()` reports a child that a signal other than `SIGINT`, `SIGQUIT` or `SIGPIPE`
+/// ended (run-command.c:574-577). The pipes are still open while it is stopped.
+fn subprocess_stop(child: &mut std::process::Child, cmd: &BStr) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        // SAFETY: `kill()` takes plain integers; the pid is that of a child this process has not
+        // reaped yet, so it cannot name another process.
+        #[expect(unsafe_code)]
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        if let Some(signal) = child.wait().ok().and_then(|status| status.signal()) {
+            if ![libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE].contains(&signal) {
+                eprintln!("error: {cmd} died of signal {signal}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.kill().ok();
+        child.wait().ok();
+    }
 }

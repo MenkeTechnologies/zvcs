@@ -1167,6 +1167,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "gix-utils",
+ "libc",
  "smallvec",
  "thiserror",
 ]

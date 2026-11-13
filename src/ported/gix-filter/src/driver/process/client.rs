@@ -16,10 +16,42 @@ pub mod handshake {
     pub enum Error {
         #[error("Failed to read or write to the process")]
         Io(#[from] std::io::Error),
-        #[error("{msg} '{actual}'")]
-        Protocol { msg: String, actual: String },
+        /// `Could not write <what>` (sub-process.c:125-133, 175-179).
+        #[error("Could not write {what}")]
+        Write { what: &'static str },
+        /// `could not read <what> from subprocess '<cmd>'` (sub-process.c:135-151, 185-187).
+        #[error("could not read {what} from subprocess")]
+        Read { what: &'static str },
+        /// `Unexpected line '<line>', expected <expected>` (sub-process.c:138-153), where a
+        /// flush packet is `<flush packet>`.
+        #[error("Unexpected line '{}', expected {expected}", line.as_deref().unwrap_or("<flush packet>"))]
+        UnexpectedLine { line: Option<String>, expected: String },
+        /// `Version <n> not supported` (sub-process.c:160-161).
+        #[error("Version {version} not supported")]
+        VersionNotSupported { version: i32 },
         #[error("The server sent the '{name}' capability which isn't among the ones we desire can support")]
         UnsupportedCapability { name: String },
+    }
+
+    /// A handshake that failed, with the process it was held with, still running and with its
+    /// pipes open.
+    #[expect(missing_docs)]
+    pub struct Failed {
+        pub error: Error,
+        pub process: std::process::Child,
+        pub input: gix_packetline::blocking_io::Writer<std::process::ChildStdin>,
+        pub out: gix_packetline::blocking_io::StreamingPeekableIter<std::process::ChildStdout>,
+    }
+
+    impl Error {
+        /// The `error()` line git prints for this failure, without its `error: ` prefix, with
+        /// `cmd` as `process->args.v[0]`, the subprocess git names.
+        pub fn git_message(&self, cmd: &str) -> String {
+            match self {
+                Error::Read { what } => format!("could not read {what} from subprocess '{cmd}'"),
+                other => other.to_string(),
+            }
+        }
     }
 }
 
@@ -61,76 +93,133 @@ impl Client {
     /// `versions`, along with the `desired_capabilities`, and perform the handshake to negotiate a version to use along with
     /// obtaining supported capabilities, which may be a sub-set of the desired capabilities.
     pub fn handshake(
-        mut process: std::process::Child,
+        process: std::process::Child,
         welcome_prefix: &str,
         versions: &[usize],
         desired_capabilities: &[&str],
     ) -> Result<Self, handshake::Error> {
-        let mut out = Writer::new(process.stdin.take().expect("configured stdin when spawning"));
-        out.write_all(format!("{welcome_prefix}-client").as_bytes())?;
-        for version in versions {
-            out.write_all(format!("version={version}").as_bytes())?;
-        }
-        encode::flush_to_write(out.inner_mut())?;
-        out.flush()?;
+        Self::try_handshake(process, welcome_prefix, versions, desired_capabilities).map_err(|failed| {
+            let handshake::Failed { error, mut process, input, out } = *failed;
+            process.kill().ok();
+            process.wait().ok();
+            drop((input, out));
+            error
+        })
+    }
 
+    /// [`handshake()`](Self::handshake()), but a failed handshake hands back the still running
+    /// `process` with both of its pipes open, for the caller to stop as git's
+    /// `subprocess_start()` does once it has reported the failure (sub-process.c:101-105).
+    pub fn try_handshake(
+        mut process: std::process::Child,
+        welcome_prefix: &str,
+        versions: &[usize],
+        desired_capabilities: &[&str],
+    ) -> Result<Self, Box<handshake::Failed>> {
+        let mut out = Writer::new(process.stdin.take().expect("configured stdin when spawning"));
         let mut input = StreamingPeekableIter::new(
             process.stdout.take().expect("configured stdout when spawning"),
             &[gix_packetline::PacketLineRef::Flush],
             false, /* packet tracing */
         );
-        let mut read = input.as_read();
-        let mut buf = String::new();
-        read.read_line_to_string(&mut buf)?;
-        if buf
-            .strip_prefix(welcome_prefix)
-            .is_none_or(|rest| rest.trim_end() != "-server")
-        {
-            return Err(handshake::Error::Protocol {
-                msg: format!("Wanted '{welcome_prefix}-server, got "),
-                actual: buf,
-            });
+        match Self::handshake_inner(&mut out, &mut input, welcome_prefix, versions, desired_capabilities) {
+            Ok((capabilities, version)) => Ok(Client {
+                child: process,
+                out: input,
+                input: out,
+                capabilities,
+                version,
+            }),
+            Err(error) => Err(Box::new(handshake::Failed {
+                error,
+                process,
+                input: out,
+                out: input,
+            })),
         }
+    }
 
-        buf.clear();
-        read.read_line_to_string(&mut buf)?;
-        let chosen_version = match buf
-            .strip_prefix("version=")
-            .and_then(|version| usize::from_str(version.trim_end()).ok())
-        {
-            Some(version) => version,
-            None => {
-                return Err(handshake::Error::Protocol {
-                    msg: "Needed 'version=<integer>', got ".into(),
-                    actual: buf,
-                });
+    /// `handshake_version()` and `handshake_capabilities()` (sub-process.c:111-205), step by
+    /// step, so each failure is the one git reports.
+    fn handshake_inner(
+        out: &mut Writer<std::process::ChildStdin>,
+        input: &mut StreamingPeekableIter<std::process::ChildStdout>,
+        welcome_prefix: &str,
+        versions: &[usize],
+        desired_capabilities: &[&str],
+    ) -> Result<(process::Capabilities, usize), handshake::Error> {
+        use handshake::Error;
+        let write_failed = |what: &'static str| move |_: std::io::Error| Error::Write { what };
+        out.write_all(format!("{welcome_prefix}-client").as_bytes())
+            .map_err(write_failed("client identification"))?;
+        for version in versions {
+            out.write_all(format!("version={version}").as_bytes())
+                .map_err(write_failed("requested version"))?;
+        }
+        encode::flush_to_write(out.inner_mut())
+            .and_then(|_| out.flush())
+            .map_err(write_failed("flush packet"))?;
+
+        let mut read = input.as_read();
+        // `packet_read_line_gently()`: `None` for a flush packet, the line without its
+        // newline otherwise, and an error (`< 0`) for a read that failed or hit the end.
+        let mut next_line = |what: &'static str| -> Result<Option<String>, Error> {
+            let mut buf = String::new();
+            match read.read_line_to_string(&mut buf) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    if buf.ends_with('\n') {
+                        buf.pop();
+                    }
+                    Ok(Some(buf))
+                }
+                Err(_) => Err(Error::Read { what }),
             }
         };
+        let unexpected = |line: Option<String>, expected: String| Error::UnexpectedLine { line, expected };
 
-        if !versions.contains(&chosen_version) {
-            return Err(handshake::Error::Protocol {
-                msg: format!("Server offered {chosen_version}, we only support "),
-                actual: versions.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-            });
+        let line = next_line("greeting")?;
+        if line
+            .as_deref()
+            .and_then(|line| line.strip_prefix(welcome_prefix))
+            .is_none_or(|rest| rest != "-server")
+        {
+            return Err(unexpected(line, format!("{welcome_prefix}-server")));
         }
+        let line = next_line("version")?;
+        // `strtol_i(p, 10, chosen_version)`: the whole rest is a base-10 `int`.
+        let chosen_version = match line
+            .as_deref()
+            .and_then(|line| line.strip_prefix("version="))
+            .and_then(|version| version.trim_start_matches(|c: char| c.is_ascii_whitespace()).parse::<i32>().ok())
+        {
+            Some(version) => version,
+            None => return Err(unexpected(line, "version".into())),
+        };
+        if let Some(line) = next_line("version flush")? {
+            return Err(unexpected(Some(line), "flush".into()));
+        }
+        let chosen_version = match usize::try_from(chosen_version).ok().filter(|v| versions.contains(v)) {
+            Some(version) => version,
+            None => return Err(Error::VersionNotSupported { version: chosen_version }),
+        };
+        drop(next_line);
 
-        if read.read_line_to_string(&mut buf)? != 0 {
-            return Err(handshake::Error::Protocol {
-                msg: "expected flush packet, got".into(),
-                actual: buf,
-            });
-        }
         for capability in desired_capabilities {
-            out.write_all(format!("capability={capability}").as_bytes())?;
+            out.write_all(format!("capability={capability}").as_bytes())
+                .map_err(write_failed("requested capability"))?;
         }
-        encode::flush_to_write(out.inner_mut())?;
-        out.flush()?;
+        encode::flush_to_write(out.inner_mut())
+            .and_then(|_| out.flush())
+            .map_err(write_failed("flush packet"))?;
 
         read.reset_with(&[gix_packetline::PacketLineRef::Flush]);
         let mut capabilities = HashSet::new();
         loop {
-            buf.clear();
-            let num_read = read.read_line_to_string(&mut buf)?;
+            let mut buf = String::new();
+            let num_read = read
+                .read_line_to_string(&mut buf)
+                .map_err(|_| Error::Read { what: "capabilities" })?;
             if num_read == 0 {
                 break;
             }
@@ -138,7 +227,7 @@ impl Client {
                 Some(cap) => {
                     let cap = cap.trim_end();
                     if !desired_capabilities.contains(&cap) {
-                        return Err(handshake::Error::UnsupportedCapability { name: cap.into() });
+                        return Err(Error::UnsupportedCapability { name: cap.into() });
                     }
                     capabilities.insert(cap.to_owned());
                 }
@@ -147,13 +236,7 @@ impl Client {
         }
 
         drop(read);
-        Ok(Client {
-            child: process,
-            out: input,
-            input: out,
-            capabilities,
-            version: chosen_version,
-        })
+        Ok((capabilities, chosen_version))
     }
 
     /// Invoke `command` and send all `meta` data before sending all `content` in full.

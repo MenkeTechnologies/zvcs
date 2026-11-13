@@ -372,6 +372,34 @@ pub fn packed_refs_fatal(err: &anyhow::Error) -> Option<String> {
     err.chain().find_map(gix::refs::packed::InvalidLine::in_error).map(|line| line.to_string())
 }
 
+/// The `die()` `convert_to_working_tree_ca_internal()` raises when a `required` smudge
+/// driver fails (convert.c:1514-1517): `<path>: smudge filter <driver> failed` at 128.
+///
+/// It is raised from `write_entry()` (entry.c:351-366), below every command that checks a
+/// file out of the index — `restore`, `checkout`, `switch`, `reset --hard`, `clone` — so
+/// it is wired into `run_command` once rather than into each verb. The checkout state
+/// carries the conversion error inside its `Filter` variant, and a clone's checkout carries
+/// that inside its `IndexCheckout` variant; both are transparent and so never show up as
+/// separate links of the chain, so each carrier is unwrapped here.
+pub fn smudge_filter_fatal(err: &anyhow::Error) -> Option<String> {
+    use gix::clone::checkout::main_worktree::Error as MainWorktree;
+    use gix::filter::plumbing::pipeline::convert::to_worktree::Error as ToWorktree;
+    use gix::worktree::state::checkout::Error as Checkout;
+    err.chain().find_map(|source| {
+        let checkout = match source.downcast_ref::<MainWorktree>() {
+            Some(MainWorktree::IndexCheckout(inner)) => Some(inner),
+            Some(_) => return None,
+            None => source.downcast_ref::<Checkout>(),
+        };
+        let failed = match checkout {
+            Some(Checkout::Filter(inner)) => inner,
+            Some(_) => return None,
+            None => source.downcast_ref::<ToWorktree>()?,
+        };
+        matches!(failed, ToWorktree::RequiredSmudgeFilterFailed { .. }).then(|| failed.to_string())
+    })
+}
+
 /// The `die()` `is_submodule_modified()` raises over a gitlink's `<path>/.git`
 /// (submodule.c:1892-1899, and `read_gitfile()`'s setup.c:927-952), from inside
 /// `match_stat_with_submodule()` — so below `diff-files`, `diff`, `diff-index`

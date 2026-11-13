@@ -24,6 +24,7 @@ enum EventType {
     Whitespace,
     Comment,
     Eof,
+    Error,
 }
 
 /// One entry of `store->parsed`: the byte span an event covers, plus the
@@ -110,11 +111,14 @@ struct Source<'a> {
     /// Set by `get_base_var()`/`get_extended_base_var()`; picks `strncasecmp` vs
     /// `strncmp` when the header is compared to the key's section.
     subsection_case_sensitive: bool,
+    /// `cs->linenr`, starting at 1 (`top->linenr = 1`, config.c:1375): what the
+    /// `bad config line <n>` a failed parse dies with names.
+    linenr: usize,
 }
 
 impl<'a> Source<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0, eof: false, var: Vec::new(), subsection_case_sensitive: true }
+        Self { buf, pos: 0, eof: false, var: Vec::new(), subsection_case_sensitive: true, linenr: 1 }
     }
 
     /// `config_buf_fgetc()`.
@@ -137,7 +141,8 @@ impl<'a> Source<'a> {
     }
 
     /// `get_next_char()` (config.c:799): CRLF folding, and EOF surfaces as a synthetic
-    /// `'\n'` with `cs->eof` set.
+    /// `'\n'` with `cs->eof` set. A real line end and the synthetic one both count a
+    /// line (config.c:828-833).
     fn next_char(&mut self) -> u8 {
         let mut c = self.fgetc();
         if c == Some(b'\r') {
@@ -150,9 +155,15 @@ impl<'a> Source<'a> {
             }
         }
         match c {
-            Some(c) => c,
+            Some(c) => {
+                if c == b'\n' {
+                    self.linenr += 1;
+                }
+                c
+            }
             None => {
                 self.eof = true;
+                self.linenr += 1;
                 b'\n'
             }
         }
@@ -206,18 +217,36 @@ impl Store {
 
     /// `store_aux_event()` (config.c:2629) — record one event's span, and for a section
     /// header decide whether it is the key's section.
-    fn event(&mut self, ty: EventType, begin: usize, end: usize, var: &[u8], case_sensitive: bool) {
+    ///
+    /// ```c
+    /// if (cs->var.len < 2 || cs->var.buf[cs->var.len - 1] != '.')
+    ///         return error(_("invalid section name '%s'"), cs->var.buf);
+    /// ```
+    ///
+    /// (config.c:2654-2655.) A header that parsed leaves `cs->var` as
+    /// "section[.subsection].", so this fires only when the header did *not* parse
+    /// and the error event flushes it: `cs->var` then holds whatever
+    /// `get_base_var()` had read, and the parse stops with this `error()` instead
+    /// of dying `bad config line`.
+    fn event(
+        &mut self,
+        ty: EventType,
+        begin: usize,
+        end: usize,
+        var: &[u8],
+        case_sensitive: bool,
+    ) -> Result<(), ()> {
         if self.parsed.len() <= self.parsed_nr {
             self.parsed.push(Parsed { begin: 0, end: 0, ty: EventType::Eof, is_keys_section: false });
         }
         self.parsed[self.parsed_nr] = Parsed { begin, end, ty, is_keys_section: false };
 
         if ty == EventType::Section {
-            // `cs->var` is "section[.subsection]." here — the header has been parsed by
-            // the time the event is flushed.
-            let is_keys_section = var.len() >= 2
-                && var.last() == Some(&b'.')
-                && var.len() - 1 == self.baselen
+            if var.len() < 2 || var.last() != Some(&b'.') {
+                eprintln!("error: invalid section name '{}'", String::from_utf8_lossy(var));
+                return Err(());
+            }
+            let is_keys_section = var.len() - 1 == self.baselen
                 && match case_sensitive {
                     true => var[..self.baselen].eq_ignore_ascii_case(&self.key[..self.baselen]),
                     false => var[..self.baselen] == self.key[..self.baselen],
@@ -231,6 +260,7 @@ impl Store {
         }
 
         self.parsed_nr += 1;
+        Ok(())
     }
 
     /// `ALLOC_GROW(store->seen, store->seen_nr + 1, …); store->seen[store->seen_nr] = v;`
@@ -267,10 +297,11 @@ impl Store {
 }
 
 /// `do_event()` (config.c:1006): flush the previous event with its end offset, then
-/// remember this one's start.
-fn do_event(cs: &Source<'_>, ty: EventType, store: &mut Store) {
+/// remember this one's start. `Err` is the callback refusing the flushed event, which
+/// ends the parse without a `bad config line` (config.c:1030-1033).
+fn do_event(cs: &Source<'_>, ty: EventType, store: &mut Store) -> Result<(), ()> {
     if ty == EventType::Whitespace && store.previous_type == EventType::Whitespace {
-        return;
+        return Ok(());
     }
     let mut offset = cs.ftell();
     // At EOF the parser has "inserted" an extra '\n', so the end offset is the current
@@ -280,10 +311,11 @@ fn do_event(cs: &Source<'_>, ty: EventType, store: &mut Store) {
     }
     if store.previous_type != EventType::Eof {
         let (pt, po) = (store.previous_type, store.previous_offset);
-        store.event(pt, po, offset, &cs.var, cs.subsection_case_sensitive);
+        store.event(pt, po, offset, &cs.var, cs.subsection_case_sensitive)?;
     }
     store.previous_type = ty;
     store.previous_offset = offset;
+    Ok(())
 }
 
 /// `parse_value()` (config.c:835). `None` is a parse error.
@@ -296,6 +328,7 @@ fn parse_value(cs: &mut Source<'_>) -> Option<Vec<u8>> {
         let c = cs.next_char();
         if c == b'\n' {
             if quote {
+                cs.linenr -= 1;
                 return None;
             }
             if trim_len != 0 {
@@ -365,7 +398,11 @@ fn get_value(cs: &mut Source<'_>, store: &mut Store, name: &mut Vec<u8>) -> Resu
         }
         value = Some(parse_value(cs).ok_or(())?);
     }
+    // The `\n` is already consumed, so the line is stepped back for the callback
+    // and forward again after it (config.c:936-944); `store_aux()` never fails.
+    cs.linenr -= 1;
     store.entry(name, value.as_deref());
+    cs.linenr += 1;
     Ok(())
 }
 
@@ -375,6 +412,8 @@ fn get_extended_base_var(cs: &mut Source<'_>, name: &mut Vec<u8>, mut c: u8) -> 
     cs.subsection_case_sensitive = false;
     loop {
         if c == b'\n' {
+            // `error_incomplete_line:` (config.c:981-983).
+            cs.linenr -= 1;
             return Err(());
         }
         c = cs.next_char();
@@ -389,6 +428,8 @@ fn get_extended_base_var(cs: &mut Source<'_>, name: &mut Vec<u8>, mut c: u8) -> 
     loop {
         let mut c = cs.next_char();
         if c == b'\n' {
+            // `error_incomplete_line:` (config.c:981-983).
+            cs.linenr -= 1;
             return Err(());
         }
         if c == b'"' {
@@ -397,6 +438,8 @@ fn get_extended_base_var(cs: &mut Source<'_>, name: &mut Vec<u8>, mut c: u8) -> 
         if c == b'\\' {
             c = cs.next_char();
             if c == b'\n' {
+                // `error_incomplete_line:` (config.c:981-983).
+                cs.linenr -= 1;
                 return Err(());
             }
         }
@@ -432,14 +475,25 @@ fn get_base_var(cs: &mut Source<'_>, name: &mut Vec<u8>) -> Result<(), ()> {
 /// U+FEFF encoded in UTF-8, skipped at the head of a config file (config.c:1064).
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
-/// `git_parse_source()` (config.c:1048), driving the store callbacks. `Err` is the
-/// `bad config line` path.
-fn parse_source(contents: &[u8], store: &mut Store) -> Result<(), ()> {
+/// How [`parse_source`] failed.
+enum ParseFail {
+    /// The store callback refused an event and has printed its own `error()`; the
+    /// parse returns -1 with nothing more said (config.c:1030-1033).
+    Callback,
+    /// The text itself would not parse: `git_parse_source()`'s `bad config line <n>`,
+    /// which `git_config_from_file_with_options()` leaves at `CONFIG_ERROR_DIE`
+    /// (config.c:1144-1175).
+    BadLine(usize),
+}
+
+/// `git_parse_source()` (config.c:1050-1178), driving the store callbacks.
+fn parse_source(contents: &[u8], store: &mut Store) -> Result<(), ParseFail> {
     let mut cs = Source::new(contents);
     let mut comment = false;
     let mut baselen = 0usize;
     let mut bom = 0usize;
     let mut in_bom = true;
+    let event = |cs: &Source<'_>, ty, store: &mut Store| do_event(cs, ty, store).map_err(|()| ParseFail::Callback);
 
     loop {
         let c = cs.next_char();
@@ -451,7 +505,7 @@ fn parse_source(contents: &[u8], store: &mut Store) -> Result<(), ()> {
                 }
                 // Do not tolerate a partial BOM.
                 if bom != 0 {
-                    return Err(());
+                    break;
                 }
                 in_bom = false;
             } else {
@@ -460,10 +514,9 @@ fn parse_source(contents: &[u8], store: &mut Store) -> Result<(), ()> {
         }
         if c == b'\n' {
             if cs.eof {
-                do_event(&cs, EventType::Eof, store);
-                return Ok(());
+                return event(&cs, EventType::Eof, store);
             }
-            do_event(&cs, EventType::Whitespace, store);
+            event(&cs, EventType::Whitespace, store)?;
             comment = false;
             continue;
         }
@@ -471,35 +524,42 @@ fn parse_source(contents: &[u8], store: &mut Store) -> Result<(), ()> {
             continue;
         }
         if is_space(c) {
-            do_event(&cs, EventType::Whitespace, store);
+            event(&cs, EventType::Whitespace, store)?;
             continue;
         }
         if c == b'#' || c == b';' {
-            do_event(&cs, EventType::Comment, store);
+            event(&cs, EventType::Comment, store)?;
             comment = true;
             continue;
         }
         if c == b'[' {
-            do_event(&cs, EventType::Section, store);
-            let mut var = Vec::new();
-            if get_base_var(&mut cs, &mut var).is_err() || var.is_empty() {
-                return Err(());
-            }
-            var.push(b'.');
-            baselen = var.len();
+            event(&cs, EventType::Section, store)?;
+            // `strbuf_reset(var)` and the header read straight into `cs->var`, so a
+            // header that fails leaves its partial name there for the error event.
+            let mut var = std::mem::take(&mut cs.var);
+            var.clear();
+            let parsed = get_base_var(&mut cs, &mut var);
             cs.var = var;
+            if parsed.is_err() || cs.var.is_empty() {
+                break;
+            }
+            cs.var.push(b'.');
+            baselen = cs.var.len();
             continue;
         }
         if !c.is_ascii_alphabetic() {
-            return Err(());
+            break;
         }
-        do_event(&cs, EventType::Entry, store);
+        event(&cs, EventType::Entry, store)?;
         let mut name = cs.var[..baselen.min(cs.var.len())].to_vec();
         name.push(c.to_ascii_lowercase());
         if get_value(&mut cs, store, &mut name).is_err() {
-            return Err(());
+            break;
         }
     }
+
+    event(&cs, EventType::Error, store)?;
+    Err(ParseFail::BadLine(cs.linenr))
 }
 
 // ---------------------------------------------------------------------------
@@ -730,8 +790,20 @@ pub fn set_multivar_in_file(
         previous_offset: 0,
     };
 
-    if parse_source(&contents, &mut store).is_err() {
-        return Err(StoreError::InvalidFile);
+    match parse_source(&contents, &mut store) {
+        Ok(()) => {}
+        Err(ParseFail::Callback) => return Err(StoreError::InvalidFile),
+        // `die()` inside the parse: the lock is rolled back by the atexit handler and
+        // nothing is written. `cs->name` is `config_filename` as the caller passed it.
+        Err(ParseFail::BadLine(linenr)) => {
+            drop(lock);
+            let shown = path.to_string_lossy();
+            eprintln!(
+                "fatal: bad config line {linenr} in file {}",
+                shown.strip_prefix("./").unwrap_or(&shown)
+            );
+            std::process::exit(128);
+        }
     }
 
     // Nothing to unset, or too many matches to replace with one value.
@@ -1120,6 +1192,14 @@ fn resolve_symlink(path: &Path) -> PathBuf {
 fn config_lock_timeout_ms() -> i64 {
     static TIMEOUT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
+        // `repo_config_get_int()` reads the whole configuration with its includes,
+        // so an `include.path` git refuses dies here, ahead of the lock — the first
+        // such read a `git config` write makes.
+        if let Some(message) =
+            crate::config::bad_config_line(crate::config::ConfigScopes::Repository, crate::config::GitDirNaming::AsDiscovered)
+        {
+            crate::config::die_128(&message);
+        }
         let repo = crate::setup::discover().ok();
         match crate::config::config_int_gently(repo.as_ref(), "core.configlocktimeout") {
             Ok(value) => value.unwrap_or(1000),

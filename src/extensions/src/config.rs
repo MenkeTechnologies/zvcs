@@ -1830,7 +1830,20 @@ pub enum ConfigScopes {
 /// handed to [`crate::fatal::die`] or printed by a gate that already knows it is
 /// leaving with 128.
 pub fn bad_config_line(scopes: ConfigScopes, naming: GitDirNaming) -> Option<String> {
-    first_unparsable_config_file(scopes, naming).map(|stop| stop.message())
+    let stop = first_unparsable_config_file(scopes, naming)?;
+    stop.print_preface();
+    Some(stop.message())
+}
+
+/// [`bad_config_line`] reading each file on its own, without following any
+/// `include.path`: the read `read_repository_format()` makes of the repository
+/// config for setup (setup.c), which refuses a malformed line but never looks at
+/// what the file includes.
+pub fn bad_config_line_without_includes(scopes: ConfigScopes, naming: GitDirNaming) -> Option<String> {
+    config_file_sequence(scopes, naming)
+        .iter()
+        .find_map(|candidate| read_config_file_like_git(&candidate.path, &candidate.shown, false, 0, None).err())
+        .map(|stop| stop.message())
 }
 
 /// `MAX_INCLUDE_DEPTH` (config.c:135): how many nested `include.path` hops git
@@ -1842,7 +1855,10 @@ pub const MAX_INCLUDE_DEPTH: usize = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigReadStop {
     /// `git_parse_source()`'s `bad config line %d in file %s` (config.c:1147-1150).
-    BadLine { shown: String, line: usize },
+    /// `preface` is what the callback said before it failed the parse, when it was
+    /// `handle_path_include()` refusing an `include.path`: the `error()` or
+    /// `warning()` git prints ahead of the `fatal:`.
+    BadLine { shown: String, line: usize, preface: Option<String> },
     /// `handle_path_include()`'s `die(_(include_depth_advice), …)` (config.c:136-141,
     /// :177-182): `path` is the include it refused to open, `from` the
     /// `kvi->filename` of the file that named it.
@@ -1850,10 +1866,25 @@ pub enum ConfigReadStop {
 }
 
 impl ConfigReadStop {
+    /// Whether this is `handle_path_include()` refusing an `include.path` that names
+    /// no readable file — no value, or a directory — rather than a line the parser
+    /// refused or a circular chain.
+    pub fn is_include_refusal(&self) -> bool {
+        matches!(self, ConfigReadStop::BadLine { preface: Some(_), .. })
+    }
+
+    /// Put the callback's own diagnostic on stderr, ahead of the `fatal:` that
+    /// [`ConfigReadStop::message`] carries.
+    pub fn print_preface(&self) {
+        if let ConfigReadStop::BadLine { preface: Some(preface), .. } = self {
+            eprintln!("{preface}");
+        }
+    }
+
     /// The text after `fatal: `.
     pub fn message(&self) -> String {
         match self {
-            ConfigReadStop::BadLine { shown, line } => format!("bad config line {line} in file {shown}"),
+            ConfigReadStop::BadLine { shown, line, .. } => format!("bad config line {line} in file {shown}"),
             ConfigReadStop::IncludeDepth { path, from } => format!(
                 "exceeded maximum include depth ({MAX_INCLUDE_DEPTH}) while including\n\t{path}\nfrom\n\t{from}\nThis might be due to circular includes."
             ),
@@ -1941,9 +1972,18 @@ pub fn read_config_file_like_git(
     let mut header: Vec<u8> = Vec::new();
     let mut in_include = false;
     let mut at_path = false;
+    // Whether the `include.path` being read has its `=`: one without is git's NULL
+    // value, which `handle_path_include()` refuses.
+    let mut separated = false;
     let mut pending: Option<Vec<u8>> = None;
+    // `cs->linenr` of the entry being read: one past the line ends written so far.
+    let mut line = 1usize;
     for event in &events {
+        let start = text.len();
         event.write_to(&mut text).expect("writing to a Vec cannot fail");
+        let entry_line = line;
+        line += text[start..].iter().filter(|b| **b == b'\n').count();
+        // `Some(None)` is a valueless `include.path`.
         let value = match event {
             EventRef::SectionHeader { name, subsection_name, .. } => {
                 header.clear();
@@ -1954,9 +1994,16 @@ pub fn read_config_file_like_git(
             }
             EventRef::SectionValueName(name) => {
                 at_path = in_include && name.to_str_lossy().eq_ignore_ascii_case("path");
+                separated = false;
                 None
             }
-            EventRef::Value(raw) if at_path => Some(raw.to_vec()),
+            EventRef::KeyValueSeparator => {
+                separated = true;
+                None
+            }
+            // gitoxide reports a name with no `=` as an empty value, so only the
+            // missing separator tells it from `path =`.
+            EventRef::Value(raw) if at_path => Some(separated.then(|| raw.to_vec())),
             EventRef::ValueNotDone(raw) if at_path => {
                 pending.get_or_insert_with(Vec::new).extend_from_slice(raw);
                 None
@@ -1964,7 +2011,7 @@ pub fn read_config_file_like_git(
             EventRef::ValueDone(raw) if at_path => {
                 let mut whole = pending.take().unwrap_or_default();
                 whole.extend_from_slice(raw);
-                Some(whole)
+                Some(Some(whole))
             }
             _ => None,
         };
@@ -1974,32 +2021,43 @@ pub fn read_config_file_like_git(
             out.push(ConfigSegment { shown: shown.to_owned(), text: std::mem::take(&mut text) });
         }
         text = header.clone();
+        // ```c
+        // if (!path)
+        //         return config_error_nonbool("include.path");
+        // ```
+        //
+        // (config.c:150-151.) The entry has been passed along already; the callback's
+        // failure then ends the parse on the entry's own line.
+        let Some(raw) = raw else {
+            return Err(ConfigReadStop::BadLine {
+                shown: shown.to_owned(),
+                line: entry_line,
+                preface: Some("error: missing value for 'include.path'".to_owned()),
+            });
+        };
         let value = gix::config::value::normalize(raw.as_bstr()).to_str_lossy().into_owned();
-        handle_path_include(path, shown, &value, depth, segments.as_deref_mut())?;
+        handle_path_include(path, shown, &value, entry_line, depth, segments.as_deref_mut())?;
     }
     if let Some(out) = segments {
         out.push(ConfigSegment { shown: shown.to_owned(), text });
     }
     match bad {
-        Some(line) => Err(ConfigReadStop::BadLine { shown: shown.to_owned(), line }),
+        Some(line) => Err(ConfigReadStop::BadLine { shown: shown.to_owned(), line, preface: None }),
         None => Ok(()),
     }
 }
 
 /// `handle_path_include()` (config.c:142-191) for the `include.path` value
-/// `value` read from `from` (spelled `from_shown`) at include depth `depth`.
+/// `value` read from `from` (spelled `from_shown`) on line `line` at include depth
+/// `depth`.
 fn handle_path_include(
     from: &std::path::Path,
     from_shown: &str,
     value: &str,
+    line: usize,
     depth: usize,
     segments: Option<&mut Vec<ConfigSegment>>,
 ) -> Result<(), ConfigReadStop> {
-    // An empty value names no file; `interpolate_path()` keeps it empty and the
-    // `access()` below finds nothing to read under it.
-    if value.is_empty() {
-        return Ok(());
-    }
     let expanded = expand_tilde(value);
     // ```c
     // if (!is_absolute_path(path)) {
@@ -2030,6 +2088,16 @@ fn handle_path_include(
     // `if (++inc->depth > MAX_INCLUDE_DEPTH) die(_(include_depth_advice), …)`.
     if depth + 1 > MAX_INCLUDE_DEPTH {
         return Err(ConfigReadStop::IncludeDepth { path: shown, from: from_shown.to_owned() });
+    }
+    // `git_config_from_file_with_options()` opens it with `fopen_or_warn()`, and
+    // `git_fopen()` refuses a directory with EISDIR (FREAD_READS_DIRECTORIES), so
+    // the include fails with a warning and the includer's parse ends on its line.
+    if path.is_dir() {
+        return Err(ConfigReadStop::BadLine {
+            shown: from_shown.to_owned(),
+            line,
+            preface: Some(format!("warning: unable to access '{shown}': Is a directory")),
+        });
     }
     read_config_file_like_git(&path, &shown, true, depth + 1, segments)
 }

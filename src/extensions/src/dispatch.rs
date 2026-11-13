@@ -1544,7 +1544,25 @@ fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
         "jump" => crate::config::ConfigScopes::EarlyRepository,
         _ => crate::config::ConfigScopes::Repository,
     };
-    let msg = crate::config::bad_config_line(scopes, naming)?;
+    // `git config` is `RUN_SETUP_GENTLY`: setup reads the repository's config for
+    // its format alone, through `read_repository_format()`, which follows no
+    // `include.path` (setup.c). Whether it reads them again with its includes is
+    // its own options' business — the pager check, `respect_includes`, the
+    // `core.configLockTimeout` read of a write — so it meets an include it
+    // refuses at that point ([`crate::porcelain::config`]). Only the refusals
+    // gix reads past (an `include.path` with no value or naming a directory) are
+    // left to those points: a circular chain or an included file that will not
+    // parse keeps gix from opening the repository at all, so those still die here.
+    let msg = match sub {
+        "config" => match crate::config::first_unparsable_config_file(scopes, naming) {
+            Some(stop) if !stop.is_include_refusal() => {
+                stop.print_preface();
+                stop.message()
+            }
+            _ => crate::config::bad_config_line_without_includes(scopes, naming)?,
+        },
+        _ => crate::config::bad_config_line(scopes, naming)?,
+    };
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))

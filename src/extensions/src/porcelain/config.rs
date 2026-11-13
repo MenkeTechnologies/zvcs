@@ -1541,6 +1541,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     let args = &expanded[..];
 
     let mut mode = Mode::Auto;
+    // The option as `optname()` (parse-options.c) names it in a conflict: `-l`/`-e` when
+    // spelled short, the full long name otherwise.
+    let mut mode_spelling = "";
     let mut scope = Scope::Default;
     let mut name_only = false;
     let mut d = Display::default();
@@ -1637,12 +1640,21 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // second *different* one is rejected the moment it is parsed — before
         // any post-parse validation gets a chance to complain.
         if let Some(new) = action {
+            let spelling = match a {
+                "-l" => "-l",
+                "-e" => "-e",
+                _ => new.flag(),
+            };
             if mode != Mode::Auto && mode != new {
                 return usage_error(&format!(
                     "options '{}' and '{}' cannot be used together",
-                    new.flag(),
-                    mode.flag()
+                    spelling,
+                    mode_spelling
                 ));
+            }
+            // The first spelling sticks: `-l --list -e` names `-l`.
+            if mode == Mode::Auto {
+                mode_spelling = spelling;
             }
             mode = new;
             continue;
@@ -2176,6 +2188,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     };
     if auto_pager && crate::pager::pager_choice_open() && !crate::pager::in_use() {
         crate::setup::read_early_config_ignored_format();
+        // That `read_early_config()` follows the repository's includes whatever
+        // `--no-includes` says, so an include it refuses dies here.
+        if let Some(msg) = crate::config::bad_config_line(
+            crate::config::ConfigScopes::EarlyRepository,
+            crate::config::GitDirNaming::AsDiscovered,
+        ) {
+            return Ok(fatal(&msg));
+        }
     }
 
     // ```c
@@ -2207,32 +2227,23 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                     .err()
                     .map(|stop| (stop, segments))
             }
-            // A circular include also stops the repository from *opening* — gix
-            // gives up on the configuration and discovery fails with it — so the
-            // git directory is located directly rather than through `repo`,
-            // which is `None` in exactly the case this diagnostic is for.
-            Scope::Default | Scope::Local if includes => {
-                let git_dir = match repo.as_ref() {
-                    Some(repo) => Some(repo.common_dir().to_path_buf()),
-                    None => gix::discover::upwards(std::path::Path::new("."))
-                        .ok()
-                        .map(|(path, _trust)| path.into_repository_and_work_tree_directories().0),
-                };
-                git_dir
-                    .and_then(|dir| {
-                        let config = dir.join("config");
-                        crate::config::read_config_file_like_git(&config, &display_origin_path(&config), true, 0, None)
-                            .err()
-                    })
-                    .filter(|stop| matches!(stop, crate::config::ConfigReadStop::IncludeDepth { .. }))
-                    .map(|stop| (stop, Vec::new()))
-            }
+            // The repository's own includes: `respect_includes` follows them for
+            // the default scope, and `--local`/`--worktree` meet them even under
+            // `--no-includes` (measured against stock 2.56). Every refusal counts —
+            // a circular chain, an `include.path` with no value or naming a
+            // directory, an included file that will not parse. The dispatcher's
+            // gate for `config` left them alone, since setup's own read follows no
+            // include. The files are located without `repo`, which a circular
+            // include leaves `None`.
+            Scope::Default if includes => repository_include_stop(),
+            Scope::Local | Scope::Worktree => repository_include_stop(),
             _ => None,
         };
         if let Some((stop, segments)) = stop {
             if mode == Mode::List && !segments.is_empty() {
                 list(&read_segments(&segments, &d)?, &d)?;
             }
+            stop.print_preface();
             return Ok(fatal(&stop.message()));
         }
     }
@@ -2449,11 +2460,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
 
     // `git_config_from_file_with_options()` leaves `default_error_action` at
     // `CONFIG_ERROR_DIE` (config.c:1394), so a `--file` that will not parse is
-    // fatal before the action runs — a write to it included, which is why git
-    // refuses to append to a file it cannot read back. `--edit` never parses the
-    // file, so it is the one action a malformed file survives.
+    // fatal before a read action runs. A write never reads it here: the set and
+    // unset forms meet the text in the store's own parse, which dies the same way
+    // except that a header it could not read is `invalid section name` at exit 3
+    // (config.c:2654-2655, 3141-3147), and `--rename-section`/`--remove-section`
+    // copy lines without parsing them at all (config.c:3353-3505). `--edit` never
+    // parses the file either.
     if let Scope::File(path) = &scope {
-        if mode != Mode::Edit {
+        if reads_config {
             // Read straight through rather than with [`read_config_bytes`]: an
             // unreadable file is not this diagnostic, and its warning belongs to
             // the read that follows, once.
@@ -3064,7 +3078,9 @@ fn typed(
     implicit: bool,
     meta: &gix::config::file::Metadata,
 ) -> std::result::Result<Option<Vec<u8>>, ExitCode> {
-    let Some(t) = d.ty else { return Ok(Some(value.to_vec())) };
+    // `if (opts->omit_values) goto terminator;` (builtin/config.c:418-419): under
+    // `--name-only` the value is never read as its type, so it cannot fail.
+    let Some(t) = d.ty.filter(|_| !d.name_only) else { return Ok(Some(value.to_vec())) };
     match t.canonicalize(key, value, implicit, d.path_base.as_deref()) {
         Ok(v) => Ok(Some(v)),
         // `collect_config()` releases the item and moves on (builtin/config.c:529-533).
@@ -3228,6 +3244,16 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
     }
 }
 
+/// The first `include.path` of the repository's configuration git refuses, as a
+/// stop with no `--list` output ahead of it.
+fn repository_include_stop() -> Option<(crate::config::ConfigReadStop, Vec<crate::config::ConfigSegment>)> {
+    crate::config::first_unparsable_config_file(
+        crate::config::ConfigScopes::Repository,
+        crate::config::GitDirNaming::AsDiscovered,
+    )
+    .map(|stop| (stop, Vec::new()))
+}
+
 /// A config file's path as git prints it in a diagnostic: exactly as it resolved
 /// it, without the `./` a relative discovery leaves on the front.
 fn display_origin_path(path: &std::path::Path) -> String {
@@ -3305,11 +3331,29 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     // than dying on the first one.
     for_each_entry(file, |key, value, implicit, meta| {
         let canonical = match d.ty {
+            // `if (opts->omit_values) goto terminator;` (builtin/config.c:418-419): with
+            // `--name-only` no type reader runs, so nothing is dropped or complained about.
+            _ if d.name_only => value.to_vec(),
             None => value.to_vec(),
             // A valueless key is git's `NULL`, and the boolean readers answer *true*
             // for it — the same distinction `--get` already makes.
             Some(t) => match t.canonicalize(key, value, implicit, d.path_base.as_deref()) {
                 Ok(v) => v,
+                // `format_config_path()` (builtin/config.c:343-360) calls
+                // `git_config_pathname()` whatever `gently` says, so `--list
+                // --type=path` still prints `missing value for '<key>'` for a
+                // valueless key and skips it, and still dies on a `~user` it
+                // cannot expand (config.c:1316-1325).
+                Err(TypeError::Callback(message)) if t == ValueType::Path => {
+                    eprintln!("{message}");
+                    return Ok(());
+                }
+                Err(TypeError::ExpandUser) if t == ValueType::Path => {
+                    return Err(crate::fatal::die(format!(
+                        "failed to expand user dir in: '{}'",
+                        String::from_utf8_lossy(value)
+                    )));
+                }
                 Err(_) => return Ok(()),
             },
         };
@@ -4011,6 +4055,14 @@ fn match_urls(url: &UrlInfo, pattern: &UrlInfo) -> Option<UrlMatch> {
 /// side effect only — an editor that fails has said so with `error:`, and the
 /// command still returns 0.
 fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
+    // `repo_config(the_repository, git_default_config, NULL)` (builtin/config.c:1301)
+    // reads the configuration with its includes before the editor is chosen.
+    if let Some(msg) = crate::config::bad_config_line(
+        crate::config::ConfigScopes::Repository,
+        crate::config::GitDirNaming::AsDiscovered,
+    ) {
+        return Ok(fatal(&msg));
+    }
     let repo = crate::setup::discover().ok();
     // `show_editor()` (builtin/config.c:1305-1315): only `--global` creates its
     // file, `O_CREAT | O_EXCL`, seeded with `default_user_config()`
@@ -4249,8 +4301,10 @@ fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCo
         None => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
 
-    let key = parse_key(name)?;
-    let wanted = key_of(&key);
+    // `git_get_colorbool_config()` (builtin/config.c) compares each variable with the
+    // slot by `strcmp()`: the slot is never parsed as a key, so one without a
+    // section, or spelled in capitals, simply matches nothing.
+    let wanted = name.to_string();
     let (mut slot, mut diff_color, mut color_ui) = (None, None, None);
     // The value that is not one of the three words and not a boolean either —
     // `color.diff = red`, say — is `git_config_bool()`'s `die()`, and it fires

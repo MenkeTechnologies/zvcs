@@ -102,7 +102,9 @@
 //!   `--reflog`, `--indexed-objects`, `--revs`, `--stdin-packs`, `--unpacked`,
 //!   `--cruft`, a bare object list on stdin, and every combination of those
 //!   (see [`collect_counts`]), walked as `get_object_list()` walks it — an
-//!   exclusion marks only what git marks (see [`traverse_revs`]) — and put to
+//!   exclusion marks only what git marks (see [`traverse_revs`]), and a
+//!   `--filter` (every form, repeated or `combine:`d) runs inside that walk
+//!   through the shared [`super::list_objects_filter`] — and put to
 //!   `want_object_in_pack()` for `--incremental`, `--local`,
 //!   `--honor-pack-keep` and `--keep-pack` (see [`PackInventory`]), then
 //!   `--keep-unreachable`, `--unpack-unreachable[=<time>]` and `--include-tag`
@@ -147,9 +149,6 @@
 //!
 //! Stated so this doc claims no more than the code does:
 //!
-//!   * `--filter=<spec>` implements `blob:none`, `blob:limit=<n>`, `tree:<n>`
-//!     and `object:type=<t>`; `sparse:oid=` and `combine:` are accepted and
-//!     ignored, as no sparse-spec reader exists in the vendored crates.
 //!   * `--max-pack-size` does not split the output across several packs; one
 //!     pack is always written. Splitting only ever triggers on repositories far
 //!     larger than the limit, and the split boundary is a function of the delta
@@ -161,8 +160,9 @@
 //!     the moment the config is read (ahead of parse-options, so a bad value is
 //!     fatal even for `-h`), and warns below git's 1 MiB floor — but, like
 //!     `--max-pack-size` itself, does not split the output.
-//!   * `--missing=allow-promisor` does not additionally imply
-//!     `--exclude-promisor-objects` handling.
+//!   * `--exclude-promisor-objects` marks nothing `UNINTERESTING`, and
+//!     `--exclude-promisor-objects-best-effort` only switches `--missing` to
+//!     `allow-any`: neither leaves a promisor pack's objects out of the walk.
 //!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
 //!     cruft object is written with its current mtime.
 //!   * `<rev>^!` and `<rev>^@` among the revision arguments on stdin are
@@ -216,6 +216,11 @@ use gix::odb::pack::FindExt;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::process::ExitCode;
+
+use super::list_objects_filter::{
+    filter_object, parse_list_objects_filter, Filter, FilterOptions, ShownButRevisit, Situation, LOFR_DO_SHOW,
+    LOFR_MARK_SEEN, LOFR_SKIP_TREE,
+};
 
 /// Stock git's `pack-objects` usage block, byte-for-byte (4170 bytes, git
 /// 2.55.0), including the trailing blank line. Printed on `-h` (stdout), after
@@ -487,6 +492,22 @@ const LONG_OPTS: &[super::LongOpt] = &{
 /// The only `--missing=<action>` values git accepts.
 const MISSING_ACTIONS: [&str; 3] = ["error", "allow-any", "allow-promisor"];
 
+/// `enum missing_action` as `option_parse_missing_action()` sets it
+/// (builtin/pack-objects.c:4463-4491): which `fn_show_object` the traversal
+/// hands its objects to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MissingAction {
+    /// `show_object()`: every object is packed, a missing one failing later.
+    #[default]
+    Error,
+    /// `show_object__ma_allow_any()` (:4433-4445): a missing object is
+    /// quietly left out.
+    AllowAny,
+    /// `show_object__ma_allow_promisor()` (:4447-4461): left out only when a
+    /// promisor pack promises it.
+    AllowPromisor,
+}
+
 /// The only `--stdin-packs=<mode>` values; a bare `--stdin-packs` is the empty mode.
 const STDIN_PACKS_MODES: [&str; 2] = ["", "follow"];
 
@@ -531,6 +552,8 @@ struct State {
     /// their `--no-` forms switch them back off.
     exclude_promisor: bool,
     exclude_promisor_best_effort: bool,
+    /// `arg_missing_action`: the last `--missing=<action>`.
+    missing: MissingAction,
     /// `--compression=<n>`, as the integer git parsed.
     compression: Option<i64>,
     /// `--name-hash-version=<n>`, as the integer git parsed.
@@ -573,8 +596,11 @@ struct State {
     /// `--reuse-object` / `--no-reuse-object`: whether an entry already stored
     /// in a pack is copied out of it verbatim. Unset leaves git's default, on.
     reuse_object: Option<bool>,
-    /// `--filter=<spec>`, as given; see [`apply_filter`].
-    filter: Option<String>,
+    /// `filter_options`: every `--filter=<spec>` given, folded by
+    /// `parse_list_objects_filter()` into one filter (a second one makes it a
+    /// `combine:`), and cleared by `--no-filter`. The traversal runs it; see
+    /// [`traverse_revs`].
+    filter: Option<FilterOptions>,
     /// `--write-bitmap-index`: write a `.bitmap` beside the `.idx`.
     write_bitmap_index: bool,
     /// `--delta-islands`: honour `pack.island` in the delta search.
@@ -755,37 +781,20 @@ impl PackConfig {
 ///
 /// With no `path_walk_info` to fill in, every filter form returns 1 except a
 /// `tree:<depth>` with a non-zero depth, which `error()`s first and then returns
-/// 0; `combine:` recurses and fails on the first sub-filter that does. So the
-/// answer is "does this spec contain a non-zero `tree:<n>` anywhere", and the
-/// depth that answer found is the one git names.
+/// 0; `combine:` recurses and fails on the first sub-filter that does
+/// (path-walk.c:574-674). So the answer is "does this filter contain a non-zero
+/// `tree:<n>` anywhere", and the depth that answer found is the one git names.
 ///
 /// `Err(depth)` is git's 0 return, carrying the number for the
 /// `error: tree:<n> filter not supported by the path-walk API` line the caller
 /// prints. Verified against git 2.55.0: `--filter=tree:0` is compatible,
 /// `--filter=tree:1` and `--filter=combine:blob:none+tree:2` are not.
-fn path_walk_filter_compatible(spec: &[u8]) -> Result<(), u64> {
-    if let Some(rest) = spec.strip_prefix(b"tree:".as_slice()) {
-        // The spec reached here only after `gently_parse_filter` accepted it, so
-        // the magnitude parses; a `None` cannot occur and is treated as the
-        // compatible depth zero rather than invented into a diagnostic.
-        let depth = super::list_objects_filter::git_parse_ulong(rest).unwrap_or(0);
-        if depth != 0 {
-            return Err(depth);
-        }
-        return Ok(());
+fn path_walk_filter_compatible(options: &FilterOptions) -> Result<(), u64> {
+    match options {
+        FilterOptions::TreeDepth(depth) if *depth != 0 => Err(*depth),
+        FilterOptions::Combine(subs) => subs.iter().try_for_each(path_walk_filter_compatible),
+        _ => Ok(()),
     }
-    if let Some(body) = spec.strip_prefix(b"combine:".as_slice()) {
-        // `parse_combine_filter`'s split, minus the validation it already did:
-        // percent-decode each segment and recurse, skipping the empty segments a
-        // leading or trailing `+` leaves behind.
-        for segment in body.split(|&c| c == b'+') {
-            if segment.is_empty() {
-                continue;
-            }
-            path_walk_filter_compatible(&super::list_objects_filter::url_percent_decode(segment))?;
-        }
-    }
-    Ok(())
 }
 
 /// `builtin/pack-objects.c:5188-5197`: the `--path-walk` default, resolved
@@ -5184,8 +5193,10 @@ fn mtimes_file(
 ///      object list from stdin. Tips are expanded to their trees and blobs by
 ///      `gix-pack`'s counter rather than by a walk written here.
 ///
-/// `--unpacked` and `--incremental` then drop anything already in a pack, and
-/// `--filter` drops whatever its spec excludes.
+/// `--unpacked` and `--incremental` then drop anything already in a pack. Only
+/// the rev list runs `--filter`, inside its traversal: `--stdin-packs` refuses a
+/// filter outright and `read_cruft_objects()` walks with a fresh `rev_info`
+/// that carries none (builtin/pack-objects.c:4274-4280).
 ///
 /// Objects reached by a walk that cannot be found are skipped rather than fatal:
 /// a reflog naming a pruned commit is ordinary, and git drops those too. An id
@@ -5248,7 +5259,6 @@ fn collect_counts(
         drop_borrowed(repo, &mut ids);
     }
     dedup(&mut ids);
-    apply_filter(repo, st.filter.as_deref(), &[], &mut ids);
 
     Ok(ids
         .into_iter()
@@ -5572,13 +5582,19 @@ fn loosen_unused_packed_objects(
 fn traverse_revs(
     repo: &gix::Repository,
     pending: &[ObjectId],
+    paths: &[Vec<u8>],
     hidden: &[ObjectId],
     sparse: bool,
     unpacked: Option<&PackInventory>,
-) -> Vec<ObjectId> {
+    filter: Option<&FilterOptions>,
+    missing: MissingAction,
+    marked: &HashSet<ObjectId>,
+) -> Result<Vec<ObjectId>, String> {
     use gix::object::Kind;
 
-    let mut uninteresting: HashSet<ObjectId> = HashSet::new();
+    // `marked` is what `--exclude-promisor-objects` flags `UNINTERESTING`
+    // before the walk is set up (revision.c:4001-4003).
+    let mut uninteresting: HashSet<ObjectId> = marked.clone();
     // `handle_commit()` for each excluded revision: a tag is marked and peeled,
     // a commit marked and queued, a tree marked with its contents, a blob marked.
     let mut excluded_commits: Vec<ObjectId> = Vec::new();
@@ -5674,90 +5690,266 @@ fn traverse_revs(
     }
 
     let packed = |id: &ObjectId| unpacked.is_some_and(|inventory| inventory.has_object_pack(id));
-    let mut out: Vec<ObjectId> = Vec::new();
+    // `traverse_commit_list_filtered()` builds the filter before the walk
+    // (list-objects.c:440-441); `sparse:oid=` dies there on a blob it cannot
+    // read.
+    let filter = match filter {
+        Some(options) => Some(Filter::init(repo, options, false)?),
+        None => None,
+    };
+    let mut walk = Walk {
+        repo,
+        uninteresting: &uninteresting,
+        packed: &packed,
+        filter,
+        missing,
+        revisit: ShownButRevisit::default(),
+        seen: HashSet::new(),
+        not_user_given: HashSet::new(),
+        out: Vec::new(),
+    };
     // `prepare_revision_walk()` leaves the named tags, trees and blobs in
-    // `revs->pending` (`handle_commit()` pends a tag before following it), and
-    // `do_traverse()` appends each shown commit's tree as it shows the commit.
-    let mut objects: Vec<ObjectId> = Vec::new();
-    for &tip in pending {
+    // `revs->pending` (`handle_commit()` pends a tag before following it, and a
+    // tree or blob with the path its operand named), and `do_traverse()` appends
+    // each shown commit's tree as it shows the commit. The commits a revision
+    // peels to are the user-given ones: `process_parents()` sets
+    // `NOT_USER_GIVEN` only on a parent not yet `SEEN` (revision.c:1214-1217),
+    // and every named commit is `SEEN` before the walk starts.
+    let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    let mut named_commits: HashSet<ObjectId> = HashSet::new();
+    for (at, &tip) in pending.iter().enumerate() {
+        let path = paths.get(at).cloned().unwrap_or_default();
         let mut id = tip;
         for _ in 0..16 {
             let Ok(object) = repo.find_object(id) else { break };
             match object.kind {
                 Kind::Tag => {
-                    objects.push(id);
+                    objects.push((id, Vec::new()));
                     let Ok(target) = object.into_tag().decode().map(|t| t.target()) else { break };
                     id = target;
                 }
-                Kind::Commit => break,
+                Kind::Commit => {
+                    named_commits.insert(id);
+                    break;
+                }
                 Kind::Tree | Kind::Blob => {
-                    objects.push(id);
+                    objects.push((id, path));
                     break;
                 }
             }
         }
     }
+    // `do_traverse()` (list-objects.c:377-424): the filter is asked about each
+    // commit first, the commit's root tree is pended flagged `NOT_USER_GIVEN`
+    // whatever it answered, and the commit is shown only on `LOFR_DO_SHOW`.
     for &commit in &commits {
         if packed(&commit) {
             continue;
         }
+        let r = filter_object(
+            repo,
+            walk.filter.as_mut(),
+            !named_commits.contains(&commit),
+            Situation::Commit,
+            commit,
+            b"",
+            b"",
+            &mut walk.revisit,
+        );
         if let Some((tree, _)) = commit_tree_and_parents(repo, commit) {
-            objects.push(tree);
+            walk.not_user_given.insert(tree);
+            objects.push((tree, Vec::new()));
         }
-        out.push(commit);
+        if r & LOFR_DO_SHOW != 0 {
+            walk.out.push(commit);
+        }
     }
 
     // `traverse_non_commits()` (list-objects.c:344-374): an `UNINTERESTING`
-    // or already `SEEN` entry is passed over, a tag is shown alone, a tree is
-    // shown and then walked in entry order.
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    for id in objects {
-        if uninteresting.contains(&id) || !seen.insert(id) {
+    // or already `SEEN` entry is passed over, a tag goes to `process_tag()`, a
+    // tree to `process_tree()` and a blob to `process_blob()`, each under the
+    // entry's path.
+    for (id, path) in objects {
+        if uninteresting.contains(&id) || walk.seen.contains(&id) {
             continue;
         }
-        process_tree(repo, id, &uninteresting, &mut seen, &packed, &mut out);
-    }
-    out
-}
-
-/// `process_tree()` / `process_blob()` / `process_tag()` (list-objects.c) for
-/// an object `traverse_trees_and_blobs()` takes off `revs->pending`: show it
-/// unless `--unpacked` drops it, and when it is a tree walk its entries in
-/// order, depth first, passing over gitlinks and anything `UNINTERESTING` or
-/// already `SEEN`. A blob is shown on the strength of the tree entry naming
-/// it; `process_blob()` does not read it.
-fn process_tree(
-    repo: &gix::Repository,
-    id: ObjectId,
-    uninteresting: &HashSet<ObjectId>,
-    seen: &mut HashSet<ObjectId>,
-    packed: &dyn Fn(&ObjectId) -> bool,
-    out: &mut Vec<ObjectId>,
-) {
-    let Ok(object) = repo.find_object(id) else { return };
-    let kind = object.kind;
-    drop(object);
-    if !packed(&id) {
-        out.push(id);
-    }
-    if kind != gix::object::Kind::Tree {
-        return;
-    }
-    for (child, is_tree) in tree_entries(repo, id).unwrap_or_default() {
-        if uninteresting.contains(&child) || !seen.insert(child) {
-            continue;
-        }
-        if is_tree {
-            process_tree(repo, child, uninteresting, seen, packed, out);
-        } else if !packed(&child) {
-            out.push(child);
+        let Ok(object) = repo.find_object(id) else { continue };
+        let kind = object.kind;
+        drop(object);
+        match kind {
+            Kind::Tag => walk.process_tag(id),
+            Kind::Tree => walk.process_tree(id, &mut Vec::new(), &path),
+            Kind::Blob => walk.process_blob(id, &mut Vec::new(), &path),
+            Kind::Commit => {}
         }
     }
+    Ok(walk.out)
 }
 
-/// A tree's entries in order, `(id, is a tree)`, gitlinks left out; `None` for
-/// anything that does not read as a tree.
-fn tree_entries(repo: &gix::Repository, id: ObjectId) -> Option<Vec<(ObjectId, bool)>> {
+/// `arg_missing_action` once `cmd_pack_objects()` has settled it:
+/// `--exclude-promisor-objects-best-effort` sets `MA_ALLOW_ANY` over any
+/// `--missing` (builtin/pack-objects.c:5360-5364), and with either allowing
+/// action `fetch_if_missing` is off for the rest of the run (:4478, :4485,
+/// :5363), so the walk never fetches what it is about to skip.
+fn missing_action(st: &State) -> MissingAction {
+    let action = match st.exclude_promisor_best_effort && !st.exclude_promisor {
+        true => MissingAction::AllowAny,
+        false => st.missing,
+    };
+    if action != MissingAction::Error {
+        gix::odb::store::set_fetch_if_missing(false);
+    }
+    action
+}
+
+/// `struct traversal_context` (list-objects.c:21-28) together with the object
+/// flags its walk reads and writes.
+struct Walk<'a> {
+    repo: &'a gix::Repository,
+    /// `UNINTERESTING`.
+    uninteresting: &'a HashSet<ObjectId>,
+    /// `revs->unpacked && has_object_pack()`: what `show_object()` drops.
+    packed: &'a dyn Fn(&ObjectId) -> bool,
+    /// Which `fn_show_object` receives what the walk shows.
+    missing: MissingAction,
+    filter: Option<Filter>,
+    /// `FILTER_SHOWN_BUT_REVISIT`.
+    revisit: ShownButRevisit,
+    /// `SEEN`, which only the filter's `LOFR_MARK_SEEN` sets.
+    seen: HashSet<ObjectId>,
+    /// `NOT_USER_GIVEN`: set on a commit's root tree and on every tree entry
+    /// before it is processed, and never cleared, so an object the user also
+    /// named is still filtered once the walk has reached it.
+    not_user_given: HashSet<ObjectId>,
+    /// What `show_commit()` and `show_object()` hand to `add_object_entry()`,
+    /// in order.
+    out: Vec<ObjectId>,
+}
+
+impl Walk<'_> {
+    /// `show_object()` (list-objects.c:38-49), handing the object to the
+    /// `fn_show_object` `--missing` chose. Neither `odb_has_object(..., 0)`
+    /// rechecks the packs or fetches.
+    fn show_object(&mut self, id: ObjectId) {
+        let dropped = match self.missing {
+            MissingAction::Error => false,
+            MissingAction::AllowAny => !self.repo.has_object(id),
+            MissingAction::AllowPromisor => {
+                !self.repo.has_object(id) && super::rev_list::promisor_objects(self.repo).contains(&id)
+            }
+        };
+        if dropped {
+            return;
+        }
+        if !(self.packed)(&id) {
+            self.out.push(id);
+        }
+    }
+
+    /// Apply a `LOFR_*` answer for `id`: mark it seen, show it.
+    fn take(&mut self, r: u8, id: ObjectId) {
+        if r & LOFR_MARK_SEEN != 0 {
+            self.seen.insert(id);
+        }
+        if r & LOFR_DO_SHOW != 0 {
+            self.show_object(id);
+        }
+    }
+
+    /// `process_tag()` (list-objects.c:221-234).
+    fn process_tag(&mut self, id: ObjectId) {
+        let r = filter_object(
+            self.repo,
+            self.filter.as_mut(),
+            self.not_user_given.contains(&id),
+            Situation::Tag,
+            id,
+            b"",
+            b"",
+            &mut self.revisit,
+        );
+        self.take(r, id);
+    }
+
+    /// `process_blob()` (list-objects.c:51-93). The blob is never read: only a
+    /// `blob:limit=` filter looks at its size.
+    fn process_blob(&mut self, id: ObjectId, path: &mut Vec<u8>, name: &[u8]) {
+        if self.uninteresting.contains(&id) || self.seen.contains(&id) {
+            return;
+        }
+        let pathlen = path.len();
+        path.extend_from_slice(name);
+        let r = filter_object(
+            self.repo,
+            self.filter.as_mut(),
+            self.not_user_given.contains(&id),
+            Situation::Blob,
+            id,
+            path,
+            &path[pathlen..],
+            &mut self.revisit,
+        );
+        self.take(r, id);
+        path.truncate(pathlen);
+    }
+
+    /// `process_tree()` (list-objects.c:149-219): offer the tree to the filter
+    /// as `LOFS_BEGIN_TREE`, walk its entries unless it answered
+    /// `LOFR_SKIP_TREE`, then offer it again as `LOFS_END_TREE`. `base` is the
+    /// path of the tree being walked into, `/`-terminated when non-empty, and
+    /// is restored on return. A tree that does not read is passed over.
+    fn process_tree(&mut self, id: ObjectId, base: &mut Vec<u8>, name: &[u8]) {
+        if self.uninteresting.contains(&id) || self.seen.contains(&id) {
+            return;
+        }
+        let Some(entries) = tree_entries(self.repo, id) else { return };
+        let not_user_given = self.not_user_given.contains(&id);
+        let baselen = base.len();
+        base.extend_from_slice(name);
+        let r = filter_object(
+            self.repo,
+            self.filter.as_mut(),
+            not_user_given,
+            Situation::BeginTree,
+            id,
+            base,
+            &base[baselen..],
+            &mut self.revisit,
+        );
+        self.take(r, id);
+        if !base.is_empty() {
+            base.push(b'/');
+        }
+        // `process_tree_contents()` (list-objects.c:100-147): every entry is
+        // flagged `NOT_USER_GIVEN` before it is processed.
+        if r & LOFR_SKIP_TREE == 0 {
+            for (child, filename, is_tree) in entries {
+                self.not_user_given.insert(child);
+                if is_tree {
+                    self.process_tree(child, base, &filename);
+                } else {
+                    self.process_blob(child, base, &filename);
+                }
+            }
+        }
+        let r = filter_object(
+            self.repo,
+            self.filter.as_mut(),
+            not_user_given,
+            Situation::EndTree,
+            id,
+            base,
+            &base[baselen..],
+            &mut self.revisit,
+        );
+        self.take(r, id);
+        base.truncate(baselen);
+    }
+}
+
+/// A tree's entries in order, `(id, name, is a tree)`, gitlinks left out;
+/// `None` for anything that does not read as a tree.
+fn tree_entries(repo: &gix::Repository, id: ObjectId) -> Option<Vec<(ObjectId, Vec<u8>, bool)>> {
     let object = repo.find_object(id).ok()?;
     if object.kind != gix::object::Kind::Tree {
         return None;
@@ -5767,7 +5959,7 @@ fn tree_entries(repo: &gix::Repository, id: ObjectId) -> Option<Vec<(ObjectId, b
         tree.entries
             .iter()
             .filter(|e| e.mode.kind() != gix::objs::tree::EntryKind::Commit)
-            .map(|e| (e.oid.to_owned(), e.mode.is_tree()))
+            .map(|e| (e.oid.to_owned(), e.filename.to_vec(), e.mode.is_tree()))
             .collect(),
     )
 }
@@ -5793,7 +5985,7 @@ fn mark_tree_uninteresting(repo: &gix::Repository, tree: ObjectId, uninteresting
 
 /// `mark_tree_contents_uninteresting()` (revision.c:70-99).
 fn mark_tree_contents_uninteresting(repo: &gix::Repository, tree: ObjectId, uninteresting: &mut HashSet<ObjectId>) {
-    for (child, is_tree) in tree_entries(repo, tree).unwrap_or_default() {
+    for (child, _, is_tree) in tree_entries(repo, tree).unwrap_or_default() {
         if is_tree {
             mark_tree_uninteresting(repo, child, uninteresting);
         } else {
@@ -5976,6 +6168,7 @@ fn from_stdin_revs(
     repo: &gix::Repository,
     stdin: &[u8],
     pending: &mut Vec<ObjectId>,
+    paths: &mut Vec<Vec<u8>>,
     hidden: &mut Vec<ObjectId>,
 ) -> Result<(), String> {
     // `get_object_list()` brackets this loop with
@@ -6016,7 +6209,12 @@ fn from_stdin_revs(
         let resolve = |name: &str| repo.rev_parse_single(name).ok().map(|id| id.detach());
         let mut file = |id: Option<ObjectId>, hide: bool| {
             if let Some(id) = id {
-                if hide { hidden.push(id) } else { pending.push(id) }
+                if hide {
+                    hidden.push(id)
+                } else {
+                    pending.push(id);
+                    paths.push(Vec::new());
+                }
             }
         };
         if let Some(range) = crate::objname::split_range(base) {
@@ -6047,6 +6245,10 @@ fn from_stdin_revs(
         crate::objname::warn_ambiguous_refname(repo, base);
         if let Ok(id) = repo.rev_parse_single(base) {
             pending.push(id.detach());
+            // `add_pending_object_with_path(revs, object, arg, oc.mode, oc.path)`
+            // (revision.c:2247): the path a `<rev>:<path>` operand read the
+            // object out of is the base its tree is walked under.
+            paths.push(super::rev_list::operand_path(repo, base));
         }
     }
     Ok(())
@@ -6087,67 +6289,23 @@ fn rev_list_objects(
     // unpeeled: an annotated tag's own object belongs in the pack, and
     // `handle_commit()` is what peels it.
     let mut pending: Vec<ObjectId> = Vec::new();
+    // Each pending entry's `path` (`struct object_array_entry`), the base
+    // `traverse_non_commits()` walks a tree under; empty for every entry but an
+    // index or cache-tree one and a `<rev>:<path>` operand.
+    let mut paths: Vec<Vec<u8>> = Vec::new();
     let mut from_stdin: Vec<ObjectId> = Vec::new();
     // The `UNINTERESTING` half: what the walk must not reach.
     let mut hidden: Vec<ObjectId> = Vec::new();
 
-    if st.all {
-        if let Ok(platform) = repo.references() {
-            if let Ok(all) = platform.all() {
-                for reference in all {
-                    let Ok(mut reference) = reference else { continue };
-                    if let Ok(id) = reference.follow_to_object() {
-                        // ```c
-                        // if (!repo_has_object_file(repo, oid)) {
-                        //         error(_("%s does not point to a valid object!"), refname);
-                        //         return 0;
-                        // }
-                        // ```
-                        //
-                        // (`ref_resolves_to_object()`, refs.c) and then, because the ref was
-                        // still pended, `die("bad object %s", name)` from `get_reference()`
-                        // (revision.c). A pack built from a ref list that quietly dropped
-                        // one would be missing whatever only that ref reaches.
-                        if repo.find_object(id).is_err() {
-                            let name = reference.name().as_bstr().to_string();
-                            eprintln!("error: {name} does not point to a valid object!");
-                            return Err(format!("bad object {name}"));
-                        }
-                        pending.push(id.detach());
-                    }
-                }
-            }
-        }
-        // A symbolic HEAD repeats a ref already collected; a detached one is
-        // only reachable here.
-        if let Ok(head) = repo.head() {
-            if let Some(id) = head.id() {
-                pending.push(id.detach());
-            }
-        }
-    }
-
-    if st.reflog {
-        pending.extend(
-            super::prune::add_reflogs_to_pending(repo, false, super::prune::PrunedReflogWarning::Print)
-                .map_err(|e| e.to_string())?,
-        );
-    }
-
-    if st.indexed_objects {
-        if let Ok(index) = repo.index_or_empty() {
-            for entry in index.entries() {
-                // git's `add_index_objects_to_pending()` skips gitlinks, whose
-                // ids name commits in another repository.
-                if entry.mode != gix::index::entry::Mode::COMMIT {
-                    pending.push(entry.id);
-                }
-            }
-            if let Some(tree) = index.tree() {
-                push_cache_tree(tree, &mut pending);
-            }
-        }
-    }
+    pend_rev_list_options(
+        repo,
+        st.all,
+        st.reflog,
+        st.indexed_objects,
+        super::prune::PrunedReflogWarning::Print,
+        &mut pending,
+        &mut paths,
+    )?;
 
     // ```c
     // if (stdin_packs) {
@@ -6166,7 +6324,7 @@ fn rev_list_objects(
     // options that sets it. `--all` on its own makes stdin a list of revisions
     // too, and `--thin` does as well (:5233-5234).
     if st.internal_rev_list_at_stdin() {
-        from_stdin_revs(repo, stdin, &mut pending, &mut hidden)?;
+        from_stdin_revs(repo, stdin, &mut pending, &mut paths, &mut hidden)?;
     } else {
         from_stdin = read_object_list_from_stdin(stdin, repo.object_hash().len_in_hex())?;
     }
@@ -6181,7 +6339,19 @@ fn rev_list_objects(
     let mut out = from_stdin;
     // `revs->unpacked`: `--unpacked` reaches the rev list unless `--stdin-packs`
     // took it over (builtin/pack-objects.c:5343-5346), and this is not that path.
-    let mut walked = traverse_revs(repo, &pending, &hidden, sparse, st.unpacked.then_some(inventory));
+    // The filter runs inside the traversal (`list_objects_filter__filter_object()`,
+    // list-objects-filter.c:799-822), so a bare object list is never filtered.
+    let mut walked = traverse_revs(
+        repo,
+        &pending,
+        &paths,
+        &hidden,
+        sparse,
+        st.unpacked.then_some(inventory),
+        st.filter.as_ref(),
+        missing_action(st),
+        &HashSet::new(),
+    )?;
     if st.delta_islands {
         // `--topo-order` joins the rev list under islands
         // (builtin/pack-objects.c:5440-5441): the same objects, shown in the
@@ -6192,11 +6362,6 @@ fn rev_list_objects(
             .filter(|id| wanted.contains(id))
             .collect();
     }
-    // The filter runs inside the traversal (`list_objects_filter__filter_object()`,
-    // list-objects-filter.c:799-822), so a bare object list is never filtered,
-    // and the revisions named outright are exempt: only what the walk discovers
-    // carries `NOT_USER_GIVEN`.
-    apply_filter(repo, st.filter.as_deref(), &pending, &mut walked);
     out.extend(walked);
     // `--thin` pushes `--objects-edge` (`--objects-edge-aggressive` under
     // `--shallow`) onto the internal rev list (builtin/pack-objects.c:5323-5327),
@@ -6530,14 +6695,144 @@ fn walk_date(commit: &gix::Commit<'_>) -> i64 {
     gix::objs::commit::walk::WalkInfo::from_bytes(&commit.data, commit.id().kind()).map_or(0, |info| info.date)
 }
 
-/// Add every valid cache-tree id, recursively. A section with no entry count is
-/// invalid and its id meaningless, which git skips via `entry_count >= 0`.
-fn push_cache_tree(tree: &gix::index::extension::Tree, out: &mut Vec<ObjectId>) {
+/// The objects the `pack-objects` child of `repack --filter=<spec>` shows: its
+/// `--all --reflog --indexed-objects` walk with the filter run inside it
+/// (builtin/repack.c:350-352, builtin/pack-objects.c:4904-4999), `--unpacked`
+/// when the repack is incremental, and `marked` (a promisor pack's objects,
+/// under `--exclude-promisor-objects`) never walked. `Err` is the text of
+/// the child's `die()`.
+pub(crate) fn filtered_walk(
+    repo: &gix::Repository,
+    filter: &FilterOptions,
+    unpacked: bool,
+    marked: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>, String> {
+    let mut pending = Vec::new();
+    let mut paths = Vec::new();
+    // The child's reflog walk is the one that warns; the caller's own pass
+    // over the same reflogs already did.
+    pend_rev_list_options(
+        repo,
+        true,
+        true,
+        true,
+        super::prune::PrunedReflogWarning::Silent,
+        &mut pending,
+        &mut paths,
+    )?;
+    let inventory = unpacked.then(|| PackInventory::load(repo, &State::default()));
+    let shown = traverse_revs(
+        repo,
+        &pending,
+        &paths,
+        &[],
+        true,
+        inventory.as_ref(),
+        Some(filter),
+        MissingAction::Error,
+        marked,
+    )?;
+    Ok(shown.into_iter().collect())
+}
+
+/// The pending entries `cmd_pack_objects()`'s `--all`, `--reflog` and
+/// `--indexed-objects` put in its rev-list argv, in that fixed order
+/// (builtin/pack-objects.c:5331-5342), each with its `path`.
+fn pend_rev_list_options(
+    repo: &gix::Repository,
+    all: bool,
+    reflog: bool,
+    indexed_objects: bool,
+    reflog_warning: super::prune::PrunedReflogWarning,
+    pending: &mut Vec<ObjectId>,
+    paths: &mut Vec<Vec<u8>>,
+) -> Result<(), String> {
+    if all {
+        if let Ok(platform) = repo.references() {
+            if let Ok(all) = platform.all() {
+                for reference in all {
+                    let Ok(mut reference) = reference else { continue };
+                    if let Ok(id) = reference.follow_to_object() {
+                        // ```c
+                        // if (!repo_has_object_file(repo, oid)) {
+                        //         error(_("%s does not point to a valid object!"), refname);
+                        //         return 0;
+                        // }
+                        // ```
+                        //
+                        // (`ref_resolves_to_object()`, refs.c) and then, because the ref was
+                        // still pended, `die("bad object %s", name)` from `get_reference()`
+                        // (revision.c). A pack built from a ref list that quietly dropped
+                        // one would be missing whatever only that ref reaches.
+                        if repo.find_object(id).is_err() {
+                            let name = reference.name().as_bstr().to_string();
+                            eprintln!("error: {name} does not point to a valid object!");
+                            return Err(format!("bad object {name}"));
+                        }
+                        pending.push(id.detach());
+                        paths.push(Vec::new());
+                    }
+                }
+            }
+        }
+        // A symbolic HEAD repeats a ref already collected; a detached one is
+        // only reachable here.
+        if let Ok(head) = repo.head() {
+            if let Some(id) = head.id() {
+                pending.push(id.detach());
+                paths.push(Vec::new());
+            }
+        }
+    }
+
+    if reflog {
+        pending.extend(
+            super::prune::add_reflogs_to_pending(repo, false, reflog_warning)
+                .map_err(|e| e.to_string())?,
+        );
+        paths.resize(pending.len(), Vec::new());
+    }
+
+    if indexed_objects {
+        if let Ok(index) = repo.index_or_empty() {
+            for entry in index.entries() {
+                // git's `add_index_objects_to_pending()` skips gitlinks, whose
+                // ids name commits in another repository; a blob is pended
+                // under its index path (revision.c:1822-1824).
+                if entry.mode != gix::index::entry::Mode::COMMIT {
+                    pending.push(entry.id);
+                    paths.push(entry.path(&index).to_vec());
+                }
+            }
+            if let Some(tree) = index.tree() {
+                push_cache_tree(tree, &mut Vec::new(), pending, paths);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `add_cache_tree()` (revision.c:1749-1769): add every valid cache-tree id,
+/// recursively, each under its directory's path. A section with no entry count
+/// is invalid and its id meaningless, which git skips via `entry_count >= 0`.
+fn push_cache_tree(
+    tree: &gix::index::extension::Tree,
+    path: &mut Vec<u8>,
+    out: &mut Vec<ObjectId>,
+    paths: &mut Vec<Vec<u8>>,
+) {
+    let baselen = path.len();
     if tree.num_entries.is_some() {
         out.push(tree.id);
+        paths.push(path.clone());
     }
     for child in &tree.children {
-        push_cache_tree(child, out);
+        if baselen != 0 {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&child.name);
+        push_cache_tree(child, path, out, paths);
+        path.truncate(baselen);
     }
 }
 
@@ -6719,7 +7014,8 @@ fn loose_objects(repo: &gix::Repository) -> Vec<ObjectId> {
 }
 
 /// Drop `--filter`ed objects from the set, except the ones the caller asked for
-/// by name.
+/// by name. `upload-pack` and `bundle` filter their object lists this way;
+/// `pack-objects` itself runs the filter inside its walk ([`traverse_revs`]).
 ///
 /// git evaluates a filter during the reachability walk, so a filtered-out tree
 /// also hides everything below it. Applying it afterwards agrees for every spec
@@ -7061,8 +7357,8 @@ fn check_value(def: &OptDef, shown: &str, v: &str) -> Option<ExitCode> {
 /// no-output usage check ever runs. `None` when git accepts the spec.
 ///
 /// Ported from git 2.55.0 `list-objects-filter-options.c`, with pack-objects'
-/// `allow_auto_filter = false`. Only validation is ported here; how an accepted
-/// spec then shapes the object set is [`apply_filter`]'s job.
+/// `allow_auto_filter = false`. Only validation is ported here; the accepted
+/// spec is folded into `State::filter` and run by [`traverse_revs`].
 fn check_filter_spec(spec: &str) -> Option<ExitCode> {
     gently_parse_filter(spec.as_bytes()).err().map(|m| fatal(&m))
 }
@@ -7186,6 +7482,14 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "all-progress-implied" => st.all_progress_implied = on,
         "exclude-promisor-objects" => st.exclude_promisor = on,
         "exclude-promisor-objects-best-effort" => st.exclude_promisor_best_effort = on,
+        // The value was checked against [`MISSING_ACTIONS`] already.
+        "missing" => {
+            st.missing = match value.unwrap_or("") {
+                "allow-any" => MissingAction::AllowAny,
+                "allow-promisor" => MissingAction::AllowPromisor,
+                _ => MissingAction::Error,
+            }
+        }
         "keep-unreachable" => {
             st.keep_unreachable = on;
             st.internal_rev_list |= on;
@@ -7213,7 +7517,16 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
             st.internal_rev_list |= on;
         }
         "pack-loose-unreachable" => st.internal_rev_list |= on,
-        "filter" => st.filter = on.then(|| value.unwrap_or("").to_string()),
+        // `opt_parse_list_objects_filter()` (list-objects-filter-options.c:314-324):
+        // `--no-filter` is `list_objects_filter_set_no_filter()`, anything else
+        // `parse_list_objects_filter()`, which [`check_filter_spec`] has already
+        // run on this spec, so the fold cannot fail here.
+        "filter" => match on {
+            true => {
+                let _ = parse_list_objects_filter(&mut st.filter, value.unwrap_or("").as_bytes(), false);
+            }
+            false => st.filter = None,
+        },
         "compression" => st.compression = on.then(|| to_number(value.unwrap_or("0"))).flatten(),
         "name-hash-version" => {
             st.name_hash_version = on.then(|| to_number(value.unwrap_or("0"))).flatten();
@@ -7350,8 +7663,8 @@ fn preflight(st: &State, settings: Option<&crate::repo_settings::RepoSettings>) 
     // `error: tree:<n> filter not supported by the path-walk API` is printed
     // first, from inside the compatibility check.
     if resolve_path_walk(st, settings) {
-        let incompatible = match st.filter.as_deref() {
-            Some(spec) => match path_walk_filter_compatible(spec.as_bytes()) {
+        let incompatible = match st.filter.as_ref() {
+            Some(filter) => match path_walk_filter_compatible(filter) {
                 Err(depth) => {
                     eprintln!("error: tree:{depth} filter not supported by the path-walk API");
                     Some("--filter")
@@ -7394,6 +7707,17 @@ fn preflight(st: &State, settings: Option<&crate::repo_settings::RepoSettings>) 
         return Some(fatal(
             "options '--keep-unreachable' and '--unpack-unreachable' cannot be used together",
         ));
+    }
+
+    // ```c
+    // die_for_incompatible_opt2(stdin_packs, "--stdin-packs",
+    //                           filter_options.choice, "--filter");
+    // ```
+    //
+    // (builtin/pack-objects.c:5398-5399.) A `--no-filter` after the last
+    // `--filter` leaves no choice, and so no conflict.
+    if st.stdin_packs && st.filter.is_some() {
+        return Some(fatal("options '--stdin-packs' and '--filter' cannot be used together"));
     }
 
     // `--unpacked` is deliberately absent from this condition: it is the one

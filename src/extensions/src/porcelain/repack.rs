@@ -96,16 +96,12 @@
 //!     any pack named by `--keep-pack`, is left alone.
 //!   * **`--filter`** makes git write a *second* pack for the filtered-out
 //!     objects, so two `.pack`/`.idx`/`.rev` triples appear rather than one.
-//!     `blob:none` and `blob:limit=<n>` (which keeps a blob only when it is
-//!     *smaller* than `n`) are applied to the traversal, which the
-//!     index objects are then unioned back into — the model git's own output
-//!     confirms (on the `branched` fixture, `blob:none` yields 11 of 13 objects:
-//!     13 less 4 blobs, plus the 2 blobs the index holds).
-//!     `tree:<depth>` is worked out as pack-objects' traversal works it out, see
-//!     [`filtered_traversal`]: the index's blobs and cache-tree nodes are objects the
-//!     user named, which the filter is never asked about, so a `tree:0` pack still
-//!     holds every index blob and the cache-tree nodes that no earlier named tree
-//!     listed as a child.
+//!     The main pack holds what the `pack-objects` child's filtered
+//!     `--all --reflog --indexed-objects` walk shows, which is
+//!     [`super::pack_objects::filtered_walk`]: every filter form and `combine:`
+//!     is run inside the traversal, and the index's blobs and cache-tree nodes
+//!     are objects the user named, which the filter is only asked about once
+//!     the walk has reached them as a tree entry or a commit's root tree.
 //!     That second pack is not the traversal's leftovers but *the existing packs
 //!     minus the new one*: `write_filtered_pack()` runs `pack-objects
 //!     --stdin-packs` over the non-kept and cruft packs with the new pack
@@ -830,13 +826,35 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         }, super::prune::TrueParents::Keep),
     };
 
-    // `--filter=tree:<depth>` is decided by pack-objects' traversal as a whole, not object by
-    // object, so what it shows is worked out up front.
-    let filters = st.filter_spec.as_deref().map(filter_subs).unwrap_or_default();
-    let tree_shown = filters
-        .iter()
-        .any(|f| matches!(f, FilterSub::TreeDepth(_)))
-        .then(|| filtered_traversal(&repo, &filters, &reachable, &promisor_held));
+    // ```c
+    // if (po_args.filter_options.choice)
+    //         strvec_pushf(&cmd.args, "--filter=%s",
+    //                      expand_list_objects_filter_spec(&po_args.filter_options));
+    // ```
+    //
+    // (builtin/repack.c:549-551.) The `pack-objects` child runs the filter inside
+    // its `--all --reflog --indexed-objects` traversal, `--unpacked` when this
+    // run is incremental (:539-544), so the main pack holds what that walk shows:
+    // [`super::pack_objects::filtered_walk`], the one traversal `pack-objects`
+    // and this share. A `die()` in it (an unreadable `sparse:oid=`) is the
+    // child's, and the run ends with its status.
+    let filter_shown = match st
+        .filter_spec
+        .as_deref()
+        .map(|spec| super::list_objects_filter::gently_parse_list_objects_filter(spec.as_bytes(), false))
+    {
+        Some(Ok(options)) => {
+            match super::pack_objects::filtered_walk(&repo, &options, !st.all_into_one, &promisor_held) {
+                Ok(shown) => Some(shown),
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        // The spec was validated while parsing, and a fold of several stays valid.
+        _ => None,
+    };
 
     // ```c
     // if (geometric_factor) {
@@ -862,32 +880,13 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // existing pack already holds is left where it is.
         .filter(|id| st.all_into_one || !existing.iter().any(|f| f.lookup(*id).is_some()))
         .collect();
-    // `cmd_repack()` passes `--indexed-objects` alongside `--filter`, and
-    // pack-objects unions those back in afterwards: an object the index names
-    // stays in the main pack whatever the spec says. `do_add_index_objects_to_pending()`
-    // skips gitlinks, so this does too.
-    let indexed: HashSet<ObjectId> = repo
-        .index_or_empty()
-        .map(|index| {
-            index
-                .entries()
-                .iter()
-                .filter(|entry| entry.mode != gix::index::entry::Mode::COMMIT)
-                .map(|entry| entry.id)
-                // `--indexed-objects` adds the index's blobs to the same walk,
-                // where the UNINTERESTING mark applies to them too.
-                .filter(|id| !promisor_held.contains(id))
-                .collect()
-        })
-        .unwrap_or_default();
-
     // `--filter` *splits* the object set, it does not shrink it: what the spec
     // rejects goes into a second pack of its own. Dropping those objects instead
     // would destroy them, because `-d` is about to delete the packs they live in
     // now — `git repack -a -d --filter=blob:none` must leave every blob readable.
     let mut to_pack: Vec<ObjectId> = candidates
         .into_iter()
-        .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo, tree_shown.as_ref()))
+        .filter(|id| filter_shown.as_ref().is_none_or(|shown| shown.contains(id)))
         .collect();
     // `-l` is `pack-objects --local` (builtin/repack.c): nothing an alternate
     // holds goes into the new pack.
@@ -2501,87 +2500,6 @@ fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
     Ok(())
 }
 
-/// Whether `id` survives the `--filter` spec.
-///
-/// `blob:none` drops every blob and `blob:limit=<n>` every blob of `n` bytes or more.
-/// Both are applied to the traversal only; the index objects the caller already
-/// folded in are what git unions back afterwards, and since this filter runs
-/// over the closed set the two coincide for every blob the index names.
-/// `tree:<depth>` is decided by [`filtered_traversal`], whose result arrives as `tree_shown`: a
-/// commit or tag always stays, a tree or blob only when the traversal showed it.
-fn keeps_object(
-    st: &State,
-    id: &ObjectId,
-    repo: &gix::Repository,
-    tree_shown: Option<&HashSet<ObjectId>>,
-) -> bool {
-    let Some(spec) = st.filter_spec.as_deref() else {
-        return true;
-    };
-    if let Some(shown) = tree_shown {
-        return match repo.find_object(*id) {
-            Ok(obj) if matches!(obj.kind, gix::objs::Kind::Tree | gix::objs::Kind::Blob) => shown.contains(id),
-            _ => true,
-        };
-    }
-    // Several blob filters keep only what each of them keeps: the smallest limit wins.
-    let limit = filter_subs(spec)
-        .into_iter()
-        .filter_map(|f| match f {
-            FilterSub::BlobNone => Some(0),
-            FilterSub::BlobLimit(n) => Some(n),
-            FilterSub::TreeDepth(_) => None,
-        })
-        .min();
-    let Some(limit) = limit else {
-        return true;
-    };
-    match repo.find_object(*id) {
-        Ok(obj) if obj.kind == gix::objs::Kind::Blob => (obj.data.len() as u64) < limit,
-        _ => true,
-    }
-}
-
-/// One filter of a `--filter` spec, which is one `combine:` member when there are several.
-#[derive(Clone, Copy, Debug)]
-enum FilterSub {
-    /// `blob:none`.
-    BlobNone,
-    /// `blob:limit=<n>`: a blob is kept when it is smaller than `n`.
-    BlobLimit(u64),
-    /// `tree:<depth>`.
-    TreeDepth(u64),
-}
-
-/// The filters `spec` names - `combine:a+b` splits into its percent-decoded members - leaving
-/// out the kinds this port does not apply (`object:type=`, `sparse:oid=`).
-fn filter_subs(spec: &str) -> Vec<FilterSub> {
-    let members: Vec<String> = match spec.strip_prefix("combine:") {
-        Some(rest) => rest
-            .split('+')
-            .filter(|member| !member.is_empty())
-            .map(|member| {
-                String::from_utf8_lossy(&super::list_objects_filter::url_percent_decode(member.as_bytes()))
-                    .into_owned()
-            })
-            .collect(),
-        None => vec![spec.to_string()],
-    };
-    members
-        .iter()
-        .flat_map(|member| {
-            if member == "blob:none" {
-                return Some(FilterSub::BlobNone);
-            }
-            if let Some(n) = member.strip_prefix("blob:limit=").and_then(scaled) {
-                return u64::try_from(n).ok().map(FilterSub::BlobLimit);
-            }
-            let depth = member.strip_prefix("tree:").and_then(scaled)?;
-            u64::try_from(depth).ok().map(FilterSub::TreeDepth)
-        })
-        .collect()
-}
-
 /// Add `spec` to the `--filter` already given. A second `--filter` does not replace the first:
 /// `parse_list_objects_filter()` turns the pair into `combine:<first>+<second>`, and a third
 /// extends it.
@@ -2592,285 +2510,6 @@ fn push_filter_spec(previous: Option<String>, spec: &str) -> String {
         Some(previous) if previous.starts_with("combine:") => format!("{previous}+{}", encode(spec)),
         Some(previous) => format!("combine:{}+{}", encode(&previous), encode(spec)),
     }
-}
-
-/// The trees and blobs `pack-objects --all --reflog --indexed-objects --filter=<spec>` shows when
-/// the spec holds a `tree:<depth>`: `traverse_commit_list_filtered()` over the pending list
-/// `get_object_list()` builds - the index's blobs, then the cache-tree's valid nodes in
-/// pre-order, then (as the walk adds them) the root tree of every commit.
-///
-/// What the filter decides is who it is asked about. `list_objects_filter__filter_object()`
-/// only consults the filter for an object flagged `NOT_USER_GIVEN`; one the user named, which
-/// an index blob or cache-tree node is, is shown and marked `SEEN` outright, and skips the
-/// depth bookkeeping altogether (its `LOFS_BEGIN_TREE` never reaches `filter_trees_depth()`,
-/// so `current_depth` does not move). Everything `process_tree_contents()` reaches is flagged
-/// `NOT_USER_GIVEN` first, including an object that is *also* a later pending entry:
-///
-/// * a commit's root tree is flagged when the walk adds it, so `tree:0` omits it even when
-///   the index names the same tree;
-/// * a cache-tree node is shown only if no earlier user-given tree listed it as a child, which
-///   under `tree:0` (whose children are all omitted) leaves exactly the nodes at even depth.
-///
-/// A filtered tree is shown when `current_depth < depth` and its contents are walked one level
-/// deeper; one met again at a depth no shallower than before is skipped
-/// (`seen_at_depth`). A filtered blob is shown when `current_depth < depth`, `current_depth`
-/// already counting the tree that holds it.
-///
-/// Two or more filters are `filter_combine()`: an object is shown when every member shows it,
-/// and a tree's contents are skipped only when every member skips them, so the descendants of a
-/// tree one member omits are still visited - and flagged `NOT_USER_GIVEN` - for the others.
-/// A member that marked an object `SEEN` is not asked about it again.
-fn filtered_traversal(
-    repo: &gix::Repository,
-    subs: &[FilterSub],
-    reachable: &HashSet<ObjectId>,
-    uninteresting: &HashSet<ObjectId>,
-) -> HashSet<ObjectId> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Situation {
-        BeginTree,
-        EndTree,
-        Blob,
-    }
-
-    /// `enum list_objects_filter_result`.
-    #[derive(Clone, Copy, Default)]
-    struct Verdict {
-        show: bool,
-        mark_seen: bool,
-        skip_tree: bool,
-    }
-    const ZERO: Verdict = Verdict { show: false, mark_seen: false, skip_tree: false };
-    const SHOW_AND_SEEN: Verdict = Verdict { show: true, mark_seen: true, skip_tree: false };
-
-    /// One member filter and what `combine_filter_data` keeps beside it.
-    struct Member {
-        kind: FilterSub,
-        /// `struct filter::is_skipping_tree` / `skip_tree`.
-        skipping: Option<ObjectId>,
-        /// `struct subfilter::seen`: what the member marked `SEEN`.
-        seen: HashSet<ObjectId>,
-        /// `filter_trees_depth_data`.
-        seen_at_depth: HashMap<ObjectId, u64>,
-        current_depth: u64,
-    }
-
-    impl Member {
-        /// The member's own `filter_object_fn`. `pack-objects` collects no omitted ids, so the
-        /// `omits` set is NULL and an omitted tree is always skipped.
-        fn event(&mut self, situation: Situation, id: ObjectId, blob_size: u64) -> Verdict {
-            match self.kind {
-                FilterSub::BlobNone => match situation {
-                    Situation::BeginTree => SHOW_AND_SEEN,
-                    Situation::EndTree => ZERO,
-                    Situation::Blob => Verdict { mark_seen: true, ..ZERO },
-                },
-                FilterSub::BlobLimit(limit) => match situation {
-                    Situation::BeginTree => SHOW_AND_SEEN,
-                    Situation::EndTree => ZERO,
-                    Situation::Blob if blob_size < limit => SHOW_AND_SEEN,
-                    Situation::Blob => Verdict { mark_seen: true, ..ZERO },
-                },
-                FilterSub::TreeDepth(depth) => {
-                    let include = self.current_depth < depth;
-                    match situation {
-                        Situation::EndTree => {
-                            self.current_depth = self.current_depth.saturating_sub(1);
-                            ZERO
-                        }
-                        Situation::Blob => {
-                            if include { SHOW_AND_SEEN } else { ZERO }
-                        }
-                        Situation::BeginTree => {
-                            let already_seen = match self.seen_at_depth.get(&id) {
-                                Some(&at) => self.current_depth >= at,
-                                None => false,
-                            };
-                            let verdict = if already_seen {
-                                Verdict { skip_tree: true, ..ZERO }
-                            } else {
-                                self.seen_at_depth.insert(id, self.current_depth);
-                                if include {
-                                    Verdict { show: true, ..ZERO }
-                                } else {
-                                    Verdict { skip_tree: true, ..ZERO }
-                                }
-                            };
-                            self.current_depth += 1;
-                            verdict
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    struct Walk<'a> {
-        repo: &'a gix::Repository,
-        uninteresting: &'a HashSet<ObjectId>,
-        members: Vec<Member>,
-        /// `obj->flags & NOT_USER_GIVEN`.
-        filtered: HashSet<ObjectId>,
-        /// `obj->flags & SEEN`.
-        seen: HashSet<ObjectId>,
-        shown: HashSet<ObjectId>,
-    }
-
-    impl Walk<'_> {
-        /// `list_objects_filter__filter_object()` for an object the filter is asked about.
-        fn ask(&mut self, situation: Situation, id: ObjectId) -> Verdict {
-            let blob_size = match (situation, self.members.iter().any(|m| matches!(m.kind, FilterSub::BlobLimit(_)))) {
-                (Situation::Blob, true) => self.repo.find_header(id).map_or(0, |h| h.size()),
-                _ => 0,
-            };
-            if let [only] = self.members.as_mut_slice() {
-                return only.event(situation, id, blob_size);
-            }
-            // `filter_combine()` and `process_subfilter()`.
-            let mut combined = Verdict { show: true, mark_seen: true, skip_tree: true };
-            for member in &mut self.members {
-                let verdict = if member.skipping.is_some()
-                    && !(situation == Situation::EndTree && member.skipping == Some(id))
-                {
-                    ZERO
-                } else {
-                    if situation == Situation::EndTree && member.skipping == Some(id) {
-                        member.skipping = None;
-                    }
-                    if member.seen.contains(&id) {
-                        ZERO
-                    } else {
-                        let verdict = member.event(situation, id, blob_size);
-                        if verdict.mark_seen {
-                            member.seen.insert(id);
-                        }
-                        if verdict.skip_tree {
-                            member.skipping = Some(id);
-                        }
-                        verdict
-                    }
-                };
-                combined.show &= verdict.show;
-                combined.mark_seen &= verdict.mark_seen;
-                combined.skip_tree &= member.skipping.is_some();
-            }
-            combined
-        }
-
-        fn blob(&mut self, id: ObjectId) {
-            if self.seen.contains(&id) || self.uninteresting.contains(&id) {
-                return;
-            }
-            let verdict = if self.filtered.contains(&id) {
-                self.ask(Situation::Blob, id)
-            } else {
-                SHOW_AND_SEEN
-            };
-            if verdict.mark_seen {
-                self.seen.insert(id);
-            }
-            if verdict.show {
-                self.shown.insert(id);
-            }
-        }
-
-        fn tree(&mut self, id: ObjectId) {
-            use gix::object::tree::EntryKind;
-
-            if self.seen.contains(&id) || self.uninteresting.contains(&id) {
-                return;
-            }
-            let Ok(object) = self.repo.find_object(id) else { return };
-            let Ok(entries) = object.into_tree().decode().map(|tree| {
-                tree.entries
-                    .iter()
-                    .map(|entry| (entry.mode.kind(), entry.oid.to_owned()))
-                    .collect::<Vec<_>>()
-            }) else {
-                return;
-            };
-
-            let user_given = !self.filtered.contains(&id);
-            let verdict = if user_given { SHOW_AND_SEEN } else { self.ask(Situation::BeginTree, id) };
-            if verdict.mark_seen {
-                self.seen.insert(id);
-            }
-            if verdict.show {
-                self.shown.insert(id);
-            }
-            if !verdict.skip_tree {
-                for (kind, oid) in entries {
-                    match kind {
-                        EntryKind::Tree => {
-                            self.filtered.insert(oid);
-                            self.tree(oid);
-                        }
-                        EntryKind::Commit => {}
-                        _ => {
-                            self.filtered.insert(oid);
-                            self.blob(oid);
-                        }
-                    }
-                }
-            }
-            if !user_given {
-                self.ask(Situation::EndTree, id);
-            }
-        }
-    }
-
-    let mut walk = Walk {
-        repo,
-        uninteresting,
-        members: subs
-            .iter()
-            .map(|&kind| Member {
-                kind,
-                skipping: None,
-                seen: HashSet::new(),
-                seen_at_depth: HashMap::new(),
-                current_depth: 0,
-            })
-            .collect(),
-        filtered: HashSet::new(),
-        seen: HashSet::new(),
-        shown: HashSet::new(),
-    };
-
-    // The walk adds each commit's root tree to the pending list, flagged `NOT_USER_GIVEN`,
-    // before the pending list is traversed.
-    let mut commit_trees = Vec::new();
-    let mut ids: Vec<&ObjectId> = reachable.iter().collect();
-    ids.sort();
-    for id in ids {
-        let Ok(object) = repo.find_object(*id) else { continue };
-        if object.kind != gix::objs::Kind::Commit {
-            continue;
-        }
-        if let Some(tree) = object.into_commit().decode().ok().map(|c| c.tree()) {
-            walk.filtered.insert(tree);
-            commit_trees.push(tree);
-        }
-    }
-
-    if let Ok(index) = repo.index_or_empty() {
-        for entry in index.entries() {
-            if entry.mode != gix::index::entry::Mode::COMMIT {
-                walk.blob(entry.id);
-            }
-        }
-        let mut nodes = Vec::new();
-        if let Some(tree) = index.tree() {
-            super::prune::push_cache_tree(tree, &mut nodes);
-        }
-        for node in nodes {
-            walk.tree(node);
-        }
-    }
-    for tree in commit_trees {
-        walk.tree(tree);
-    }
-    walk.shown
 }
 
 /// Whether `-d` may remove the pack whose index is at `index_path`: a `.keep`

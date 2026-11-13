@@ -819,6 +819,12 @@ struct Traversal<'r> {
     revisit: list_objects_filter::ShownButRevisit,
     /// `SEEN | UNINTERESTING`: an object here is never offered again.
     seen: HashSet<ObjectId>,
+    /// `NOT_USER_GIVEN` as a flag on the object: set on each tree entry before
+    /// it is processed (list-objects.c:129, :143) and on a commit's root tree
+    /// when the commit is walked (:402), and never cleared, so a pending object
+    /// the user named is still filtered once the walk has reached it. Kept only
+    /// while a filter is active, the one reader of the flag.
+    not_user_given: HashSet<ObjectId>,
     missing: Missing,
     /// The `--` pathspecs, which restrict the listed trees and blobs the same
     /// way they restrict the commits. `None` means every object is listed.
@@ -3847,6 +3853,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         filter,
         revisit: HashSet::new(),
         seen,
+        not_user_given: HashSet::new(),
         missing,
         pathspecs: object_specs.as_ref(),
         lines: Vec::new(),
@@ -3871,6 +3878,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+        // `do_traverse()` flags each commit's root tree `NOT_USER_GIVEN` as it
+        // pends it (list-objects.c:397-403), and every commit comes off
+        // `get_revision()` before `traverse_non_commits()` reaches the named
+        // objects — only the first one does under `--in-commit-order`, whose
+        // first `traverse_non_commits()` follows that commit.
+        if trav.filter.is_some() {
+            let walked = match in_commit_order {
+                true => &commits[..commits.len().min(1)],
+                false => &commits[..],
+            };
+            for commit in walked {
+                if let Some(tree) = commit_tree(&repo, *commit) {
+                    trav.not_user_given.insert(tree);
+                }
+            }
+        }
         for entry in pending.iter().filter(|e| !e.uninteresting) {
             if trav.seen.contains(&entry.id) {
                 continue;
@@ -3879,14 +3902,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // consults the filter only for an object carrying `NOT_USER_GIVEN`; a
             // pending object has it only under `--filter-provided-objects`
             // (builtin/rev-list.c:958-966).
+            let not_user_given = filter_provided_objects || trav.not_user_given.contains(&entry.id);
             let walked = match entry.kind {
-                gix::object::Kind::Tag => process_tag(&mut trav, entry.id, &entry.name, filter_provided_objects),
-                gix::object::Kind::Tree => {
-                    process_tree(&mut trav, entry.id, &mut Vec::new(), &entry.name, filter_provided_objects)
-                }
-                gix::object::Kind::Blob => {
-                    process_blob(&mut trav, entry.id, &mut Vec::new(), &entry.name, filter_provided_objects)
-                }
+                gix::object::Kind::Tag => process_tag(&mut trav, entry.id, &entry.name, not_user_given),
+                gix::object::Kind::Tree => process_tree(&mut trav, entry.id, &mut Vec::new(), &entry.name, not_user_given),
+                gix::object::Kind::Blob => process_blob(&mut trav, entry.id, &mut Vec::new(), &entry.name, not_user_given),
                 gix::object::Kind::Commit => {
                     trav.seen.insert(entry.id);
                     trav.lines.push((entry.id, entry.name.clone()));
@@ -5110,7 +5130,7 @@ fn pend_non_commit(
 /// `traverse_non_commits()` uses it as the base for everything under a tree, so
 /// `git rev-list --objects main:sub` names its entries `sub` and `sub/s.txt`
 /// rather than `` and `s.txt`.
-fn operand_path(repo: &gix::Repository, spec: &str) -> Vec<u8> {
+pub(super) fn operand_path(repo: &gix::Repository, spec: &str) -> Vec<u8> {
     let Ok(canonical) = crate::objpath::canonical_paths(repo, spec) else {
         return Vec::new();
     };
@@ -6200,6 +6220,9 @@ fn process_tree_contents(
             if !interesting {
                 continue;
             }
+        }
+        if trav.filter.is_some() && !mode.is_commit() {
+            trav.not_user_given.insert(*id);
         }
         if is_tree {
             process_tree(trav, *id, base, filename, true)?;

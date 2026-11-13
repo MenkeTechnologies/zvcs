@@ -873,7 +873,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // whether a `--` was seen.
                 // A hex prefix `get_short_oid()` found ambiguous is not gitoxide's to
                 // pick from (see [`crate::objname::hinted_spec`]).
+                // `try_difference()` resolves each endpoint and the single
+                // operand goes to `get_oid_with_context()`, both through
+                // `get_oid_basic()`, whose `@{-…}` gates gitoxide's grammar
+                // does not share (see [`crate::objname::nth_prior_refused`]).
                 let parsed = if arg.is_empty()
+                    || crate::objname::nth_prior_refused_operand(&repo, arg)
                     || reflog_operand_anywhere(arg)
                     || carries_walk_mark(arg)
                     || crate::objname::hinted_spec(&repo, arg, crate::objname::disambiguate_filter(&repo)).is_none()

@@ -1075,6 +1075,12 @@ pub fn resolve_quiet_as(repo: &gix::Repository, spec: &str, want: Option<&'stati
     if full_hex(repo, ambiguity_base(spec)).is_some_and(|id| repo.find_object(id).is_err()) {
         return None;
     }
+    // `get_oid_basic()`'s `@{-…}` gates, on the name the reduction hands it.
+    // gitoxide's own `@{…}` grammar reads a malformed `@{--1}` or `@{-1 }` as
+    // a date and answers HEAD's log where git refuses the name.
+    if nth_prior_refused(repo, spec) {
+        return None;
+    }
     // `get_oid_basic()` dispatches on the operand's *shape*. Once a reflog
     // selector has been cut off the end, the ref half is looked up with
     // `repo_dwim_log()` and nothing else — so a reflog operand never reaches
@@ -2478,6 +2484,41 @@ fn split_reflog_selector(spec: &str) -> Option<(&str, &str)> {
     Some((&spec[..at], sel))
 }
 
+/// `get_oid_basic()`'s "N-th entry or approxidate?" loop (`object-name.c:762-769`):
+///
+/// ```c
+/// for (i = nth = 0; 0 <= nth && i < reflog_len; i++) {
+///         char ch = str[at+2+i];
+///         if ('0' <= ch && ch <= '9')
+///                 nth = nth * 10 + ch - '0';
+///         else
+///                 nth = -1;
+/// }
+/// ```
+///
+/// `nth` is an `int`, and the multiplication wraps: a run whose value wraps
+/// back to a small non-negative number is that entry (`@{4294967297}` is
+/// `@{1}`), while one that turns negative stops the loop and is read as a date.
+/// An empty selector keeps the -1 the date reader then rejects, because
+/// `get_oid_basic()` never enters this branch with `reflog_len == 0`.
+fn reflog_selector_nth(sel: &str) -> i64 {
+    if sel.is_empty() {
+        return -1;
+    }
+    let mut nth: i32 = 0;
+    for ch in sel.bytes() {
+        if nth < 0 {
+            break;
+        }
+        nth = if ch.is_ascii_digit() {
+            nth.wrapping_mul(10).wrapping_add(i32::from(ch - b'0'))
+        } else {
+            -1
+        };
+    }
+    i64::from(nth)
+}
+
 /// git's `get_oid_basic()` reflog branch (`object-name.c:758-822`), which is the
 /// only place a `<ref>@{<n>}` / `<ref>@{<date>}` operand out of range is
 /// diagnosed. Without it the name simply fails to resolve and every caller
@@ -2568,11 +2609,7 @@ pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach
     };
 
     let (nth, at_time) = {
-        let digits = !sel.is_empty() && sel.bytes().all(|c| c.is_ascii_digit());
-        // `nth * 10 + ch - '0'` overflows into a negative `int` for a long enough
-        // run, which the `100000000 <= nth` test then reads as "not an epoch"; the
-        // saturating parse below lands on the same side of that test.
-        let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
+        let n = reflog_selector_nth(sel);
         if n >= 100_000_000 {
             (-1i64, n as u64)
         } else if n >= 0 {
@@ -3193,8 +3230,7 @@ fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, u6
 
     // The selector, read exactly as `get_oid_basic()` reads it: an all-digit run is
     // the N-th entry unless it is large enough to be a unix timestamp.
-    let digits = !sel.is_empty() && sel.bytes().all(|c| c.is_ascii_digit());
-    let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
+    let n = reflog_selector_nth(sel);
     let (nth, at_time) = if n >= 100_000_000 {
         (-1i64, n as u64)
     } else if n >= 0 {
@@ -3743,7 +3779,94 @@ pub fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
     if nth <= 0 {
         return None;
     }
-    Some((nth as usize, brace + 1))
+    // `cb.remaining = nth;` (`object-name.c:1294`) narrows the `long` into
+    // `grab_nth_branch_switch_cbdata`'s `int remaining` (`object-name.c:1238`),
+    // keeping the low 32 bits: `@{-4294967297}` counts one switch back. A
+    // count that narrows to zero or below is decremented by
+    // `grab_nth_branch_switch()` (`object-name.c:1259`) away from zero and never
+    // reaches it, so the reflog never holds that many switches.
+    let remaining = nth as i32;
+    let remaining = if remaining > 0 { remaining as usize } else { usize::MAX };
+    Some((remaining, brace + 1))
+}
+
+/// What `get_oid_basic()`'s backwards `@{` scan (`object-name.c:702-722`) makes
+/// of a name's `@{-…}`:
+///
+/// ```c
+/// if (len && str[len-1] == '}') {
+///         for (at = len-4; at >= 0; at--) {
+///                 if (str[at] == '@' && str[at+1] == '{') {
+///                         if (str[at+2] == '-') {
+///                                 if (at != 0)
+///                                         /* @{-N} not at start */
+///                                         return -1;
+///                                 nth_prior = 1;
+///                                 continue;
+///                         }
+///                         …
+///                         break;
+///                 }
+///         }
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NthPriorScan {
+    /// The scan stopped at some other `@{`, or found none: not `@{-<n>}` syntax.
+    Absent,
+    /// `@{-` was the first `@{` the scan met, at offset 0: `nth_prior = 1`.
+    AtStart,
+    /// `@{-` was the first `@{` the scan met, past offset 0: `return -1`.
+    NotAtStart,
+}
+
+fn nth_prior_scan(name: &str) -> NthPriorScan {
+    let b = name.as_bytes();
+    if b.last() != Some(&b'}') || b.len() < 4 {
+        return NthPriorScan::Absent;
+    }
+    match (0..=b.len() - 4).rev().find(|&at| b[at] == b'@' && b[at + 1] == b'{') {
+        Some(at) if b[at + 2] == b'-' => {
+            if at == 0 {
+                NthPriorScan::AtStart
+            } else {
+                NthPriorScan::NotAtStart
+            }
+        }
+        _ => NthPriorScan::Absent,
+    }
+}
+
+/// Whether `get_oid_basic()` (`object-name.c:702-746`) refuses the name `spec`
+/// reduces to ([`ambiguity_base`]) because of its `@{-…}`: a `@{-` that is
+/// not at the start is `return -1`, and one at the start leaves the whole name to `repo_dwim_ref()`, whose
+/// `substitute_branch_name()` (`refs.c:795-803`) rewrites it only when
+/// `interpret_nth_prior_checkout()` (`object-name.c:1270-1306`) accepts the
+/// syntax and the reflog holds that many switches. Anything else is dwimmed
+/// as typed, and no ref name may contain `@{` (`refs.c` `check_refname_format()`),
+/// so `@{--1}`, `@{-1 }`, `@{-0x1}` and `@{-<more switches than logged>}` do not
+/// resolve.
+pub fn nth_prior_refused(repo: &gix::Repository, spec: &str) -> bool {
+    !nth_prior_resolvable(repo, ambiguity_base(spec))
+}
+
+/// [`nth_prior_refused`] for a whole revision word: each endpoint of an
+/// `A..B`/`A...B` (`handle_dotdot_1()` and `try_difference()` resolve them
+/// one at a time), otherwise the name after any leading `^`.
+pub fn nth_prior_refused_operand(repo: &gix::Repository, arg: &str) -> bool {
+    match split_range(arg) {
+        Some(range) => nth_prior_refused(repo, range.a) || nth_prior_refused(repo, range.b),
+        None => nth_prior_refused(repo, uninteresting_mark(arg).0),
+    }
+}
+
+/// [`nth_prior_refused`]'s test on the name `get_oid_basic()` is handed.
+fn nth_prior_resolvable(repo: &gix::Repository, name: &str) -> bool {
+    match nth_prior_scan(name) {
+        NthPriorScan::Absent => true,
+        NthPriorScan::NotAtStart => false,
+        NthPriorScan::AtStart => matches!(nth_prior_checkout(repo, name), Some(Some(_))),
+    }
 }
 
 /// The reflog half: `grab_nth_branch_switch()` (`object-name.c:1246-1267`) run

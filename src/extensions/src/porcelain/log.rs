@@ -3077,8 +3077,14 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
     // :844, :799-800). `cmd_show()` leaves `revarg_opt` zero too (:691-693).
     let committish = flavor != Flavor::Reflog && flavor != Flavor::Show;
     let mut resolve_neg = |spec: &str, token: &str, gated: bool, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
-        match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
-            Ok(id) => {
+        // `get_oid_basic()`'s `@{-…}` gates (see [`crate::objname::nth_prior_refused`]).
+        let resolved = if crate::objname::nth_prior_refused(&repo, spec) {
+            None
+        } else {
+            resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()).ok()
+        };
+        match resolved {
+            Some(id) => {
                 // `get_reference()`'s `die(_("bad object %s"), name)`
                 // (revision.c:389-400): the excluded side is pended through the
                 // same function, so a name that resolved onto an absent object
@@ -3093,7 +3099,7 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                 neg_ids.extend(crate::objname::walk_pending(&repo, id));
                 None
             }
-            Err(_) => {
+            None => {
                 // `setup_revisions()`'s `if (seen_dashdash || *arg == '^') die(_("bad
                 // revision '%s'"), arg);` (revision.c:3035-3036): once a `--` has
                 // been seen anywhere on the line the operand can no longer be a
@@ -3577,7 +3583,9 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
             // The test is on the *reduced* name: `HEAD@{<n>}~1` reaches
             // `get_oid_basic()` as `HEAD@{<n>}` and walks from what came back.
             // See [`crate::objname::reflog_spec_oid`].
-            let resolved = if crate::objname::resolves_through_reflog(spec) {
+            let resolved = if crate::objname::nth_prior_refused(&repo, spec) {
+                Err(())
+            } else if crate::objname::resolves_through_reflog(spec) {
                 crate::objname::reflog_spec_oid(&repo, spec).ok_or(())
             } else {
                 // A hex prefix in it is `get_short_oid()`'s to decide under the hint
@@ -8577,8 +8585,9 @@ enum ReflogSelector {
 enum ReflogStart {
     /// No `@{…}` suffix: the newest entry.
     Newest,
-    /// `@{<n>}`: `n` entries back from the newest.
-    Index(usize),
+    /// `@{<n>}`: `n` entries back from the newest. `strtoul()`'s value lands in
+    /// `int recno`, so a count that wraps negative is looked up by time instead.
+    Index(i32),
     /// `@{<date>}`: the newest entry that was already current then.
     Date(i64),
 }
@@ -8596,10 +8605,12 @@ fn split_reflog_name(name: &str) -> (&str, ReflogStart) {
         return (name, ReflogStart::Newest);
     };
     let base = &name[..at];
-    let digits = inner.len() - inner.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if inner[digits..].starts_with('}') {
-        // `strtoul` answers 0 for an empty run, which is what `@{}` gets.
-        (base, ReflogStart::Index(inner[..digits].parse().unwrap_or(0)))
+    // `recno = strtoul(at + 2, &ep, 10); if (*ep != '}')` (reflog-walk.c:172-173):
+    // `strtoul()` skips leading whitespace and takes a sign, and answers 0
+    // having consumed nothing for an empty run, which is what `@{}` gets.
+    let (recno, end) = super::show_branch::strtoul(inner);
+    if inner[end..].starts_with('}') {
+        (base, ReflogStart::Index(recno))
     } else {
         // git hands `approxidate` the tail as-is, closing brace included; it
         // tokenizes on non-alphanumerics and ignores what it cannot read.
@@ -8802,6 +8813,12 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
     let reader = NodeReader::new(repo);
     let mut logs: Vec<ReflogCursor> = Vec::new();
     for name in names {
+        // `add_pending_object_with_path()` (revision.c:306-316) hands
+        // `add_reflog_for_walk()` the operand after `repo_interpret_branch_name()`,
+        // with what the rewrite did not consume appended: `@{-1}` walks the
+        // prior branch's log and `@{-1}@{1}` starts one entry into it.
+        let name = reflog_walk_name(repo, name);
+        let name = name.as_str();
         let (base, start) = split_reflog_name(name);
         let kind = match start {
             ReflogStart::Newest => ReflogSelector::None,
@@ -8827,13 +8844,19 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
             ReflogStart::Newest => nr - 1,
             // `commit_reflog->recno = reflogs->nr - recno - 1`, unchecked: a count
             // past the end simply leaves the cursor below zero and walks nothing.
-            ReflogStart::Index(n) => nr - n as i64 - 1,
+            ReflogStart::Index(n) if n >= 0 => nr - i64::from(n) - 1,
             // `get_reflog_recno_by_time()`: the newest entry already current then,
             // or nothing at all when the log does not go back that far. The test
             // `timestamp >= array->items[i].timestamp` (reflog-walk.c:110) is over
             // `timestamp_t`, which is unsigned, so a date before the epoch
             // (`100.years.ago`) wraps past every entry and starts at the newest.
-            ReflogStart::Date(when) => {
+            // A negative `recno` takes the `recno < 0` arm with `timestamp` still
+            // 0 (reflog-walk.c:156, :220-225).
+            ReflogStart::Index(_) | ReflogStart::Date(_) => {
+                let when = match start {
+                    ReflogStart::Date(when) => when,
+                    _ => 0,
+                };
                 match (0..items.len()).rev().find(|&i| when as u64 >= items[i].time.seconds as u64) {
                     Some(i) => i as i64,
                     None => continue,
@@ -8994,7 +9017,44 @@ pub(super) fn reflog_excluded_tip(
     negated: &[bool],
     seen_dashdash: bool,
 ) -> Option<String> {
+    reflog_excluded_spec(repo, revs, negated, seen_dashdash).map(|name| reflog_walk_name(repo, &name))
+}
+
+/// The name `add_pending_object_with_path()` (revision.c:306-316) hands
+/// `add_reflog_for_walk()` for a pended operand:
+///
+/// ```c
+/// int len = repo_interpret_branch_name(the_repository, name, namelen, &buf, &options);
+/// if (0 < len && len < namelen && buf.len)
+///         strbuf_addstr(&buf, name + len);
+/// add_reflog_for_walk(revs->reflog_info, (struct commit *)obj,
+///                     buf.buf[0] ? buf.buf: name);
+/// ```
+///
+/// [`crate::objname::interpret_branch_name`] answers with the tail already
+/// appended.
+fn reflog_walk_name(repo: &gix::Repository, name: &str) -> String {
+    match crate::objname::interpret_branch_name(repo, name) {
+        Some(Ok(rewritten)) if !rewritten.is_empty() => rewritten,
+        _ => name.to_string(),
+    }
+}
+
+/// [`reflog_excluded_tip`] before the name is interpreted.
+fn reflog_excluded_spec(
+    repo: &gix::Repository,
+    revs: &[String],
+    negated: &[bool],
+    seen_dashdash: bool,
+) -> Option<String> {
     for (spec, flip) in revs.iter().zip(negated.iter().copied()) {
+        // `handle_revision_arg()` resolves the operand before anything is
+        // pended, so a name `get_oid_basic()` refuses for its `@{-…}` ends at
+        // `bad revision`/`ambiguous argument` and never reaches
+        // `add_reflog_for_walk()`.
+        if crate::objname::nth_prior_refused_operand(repo, spec) {
+            return None;
+        }
         // `handle_revision_arg_1()` returns before `handle_dotdot()` for a
         // bare `..`, so it is never pended and `add_reflog_for_walk()` never
         // sees it -- nor anything after it, because that operand sends

@@ -5762,6 +5762,10 @@ fn resolve_named(
     let spec = crate::objname::hinted_spec(repo, spec, want)?;
     let spec = spec.as_ref();
     let path = operand_path(repo, spec);
+    // `get_oid_basic()`'s `@{-…}` gates (see [`crate::objname::nth_prior_refused`]).
+    if crate::objname::nth_prior_refused(repo, spec) {
+        return None;
+    }
     let named = if crate::objname::resolves_through_reflog(spec) {
         crate::objname::reflog_spec_oid(repo, spec)?
     } else {

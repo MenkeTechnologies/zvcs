@@ -1841,6 +1841,20 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // differently whenever more than one commit matches — so that spelling is
         // git's to resolve, not the fallback's.
         let oneline = crate::objname::oneline_operand(spec).is_some();
+        // `get_oid_basic()`'s `@{-…}` gates (see [`crate::objname::nth_prior_refused`]).
+        if crate::objname::nth_prior_refused_operand(&repo, spec) {
+            return Ok(bad_revision(&repo, spec, seen_dashdash));
+        }
+        // A plain reflog operand the reader refused has had `get_oid_basic()`'s
+        // answer: gitoxide's grammar reads `@{4294967297}` as a date where the
+        // C's wrapping `int nth` (`object-name.c:762-769`) reads entry 1.
+        if reflog.is_none()
+            && crate::objname::resolves_through_reflog(spec)
+            && crate::objname::split_range(spec).is_none()
+            && !spec.starts_with('^')
+        {
+            return Ok(bad_revision(&repo, spec, seen_dashdash));
+        }
         let parsed = match reflog {
             Some(parsed) => parsed,
             _ if oneline => match crate::objname::resolve_quiet(&repo, spec) {
@@ -1851,7 +1865,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // frame carries, not gitoxide's (see [`crate::objname::hinted_spec`]).
             None => match crate::objname::hinted_spec(&repo, spec, crate::objname::disambiguate_filter(&repo))
                 .ok_or(())
-                .and_then(|spec| repo.rev_parse(BStr::new(spec.as_ref())).map_err(drop))
+                // `get_oid_basic()` substitutes `@{-<n>}` with
+                // `interpret_nth_prior_checkout()`'s `strtol()` reading, which
+                // admits `@{- 1}` and `@{-+1}`; gitoxide's grammar reads both as
+                // dates on HEAD's log.
+                .and_then(|spec| {
+                    repo.rev_parse(BStr::new(crate::objname::canonical_spec(&repo, spec.as_ref()).as_ref()))
+                        .map_err(drop)
+                })
             {
                 Ok(p) => p.detach(),
                 // `repo_get_oid()`'s rewrites are wider than gitoxide's grammar:

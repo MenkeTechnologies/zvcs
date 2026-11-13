@@ -510,7 +510,7 @@ fn parse_reflog_param(arg: &str, opts: &mut Opts) -> Result<(), ParseFail> {
 /// When no digit is converted `endptr` is left at the start of the string
 /// (C99 7.20.1.4p7), which is what lets `--reflog=,3` reach the `,<base>` arm
 /// and `--reflog=-` reach the refusal.
-fn strtoul(s: &str) -> (i32, usize) {
+pub(crate) fn strtoul(s: &str) -> (i32, usize) {
     let b = s.as_bytes();
     let mut i = 0;
     // The "C" locale's `isspace`, which includes the vertical tab Rust's

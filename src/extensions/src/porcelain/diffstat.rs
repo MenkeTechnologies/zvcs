@@ -84,26 +84,22 @@ impl StatWidths {
     }
 }
 
-/// Parse `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`): each
-/// present, numeric field overwrites the corresponding slot; an empty or
-/// non-numeric field is left unchanged, which is byte-equivalent to git's
-/// `strtoul` (empty == `0` == unset).
+/// Parse `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`, diff.c:5391-5400):
+/// the width is always `strtoul()`ed, and each later field is whenever a comma
+/// introduces it, so an empty field is `0` — not the `-1` "unset" a bare `--stat`
+/// leaves, which makes `--stat=,5` render at 80 columns rather than the terminal's.
+/// A value [`super::diff_optval::reject`] would refuse never gets here.
 pub(crate) fn parse_stat_geometry(sw: &mut StatWidths, spec: &str) {
+    let strtoul = |field: &str| field.trim().parse::<i64>().unwrap_or(0);
     let mut it = spec.split(',');
     if let Some(w) = it.next() {
-        if let Ok(v) = w.trim().parse::<i64>() {
-            sw.width = v;
-        }
+        sw.width = strtoul(w);
     }
     if let Some(n) = it.next() {
-        if let Ok(v) = n.trim().parse::<i64>() {
-            sw.name_width = v;
-        }
+        sw.name_width = strtoul(n);
     }
     if let Some(c) = it.next() {
-        if let Ok(v) = c.trim().parse::<i64>() {
-            sw.count = v;
-        }
+        sw.count = strtoul(c);
     }
 }
 

@@ -54,28 +54,28 @@ struct Dir {
 }
 
 /// One `pathspec_item`, for the magic this port matches against a sparse directory itself.
-struct Item {
+pub(super) struct Item {
     /// `item->match`: the element relative to the top of the work tree.
-    mat: BString,
+    pub(super) mat: BString,
     /// `item->prefix`: how much of `mat` is the command's prefix, always compared exactly.
-    prefix: usize,
+    pub(super) prefix: usize,
     /// `item->nowildcard_len`.
-    nowildcard_len: usize,
+    pub(super) nowildcard_len: usize,
     /// `PATHSPEC_EXCLUDE`.
-    exclude: bool,
+    pub(super) exclude: bool,
     /// `PATHSPEC_ICASE`.
-    icase: bool,
+    pub(super) icase: bool,
     /// `PATHSPEC_GLOB`.
-    glob: bool,
+    pub(super) glob: bool,
     /// The element of the command line this item came from; `None` for the empty item
     /// `parse_pathspec()` adds when every element is an exclusion (pathspec.c:649-656).
-    element: Option<usize>,
+    pub(super) element: Option<usize>,
 }
 
 impl Item {
     /// `ps_strncmp()` (pathspec.h): whether the first `n` bytes of `a` and `b` are equal,
     /// ignoring case under `:(icase)`. A string shorter than `n` ends in git's NUL.
-    fn eq_n(&self, a: &[u8], b: &[u8], n: usize) -> bool {
+    pub(super) fn eq_n(&self, a: &[u8], b: &[u8], n: usize) -> bool {
         let (a, b) = (&a[..n.min(a.len())], &b[..n.min(b.len())]);
         if self.icase { a.eq_ignore_ascii_case(b) } else { a == b }
     }
@@ -96,7 +96,7 @@ impl Item {
     /// `git_fnmatch()` (dir.c:113-143): the first `prefix` bytes compare as `ps_strncmp()`
     /// does, the rest goes to `wildmatch()`, with `WM_PATHNAME` under `:(glob)` and
     /// `WM_CASEFOLD` under `:(icase)`.
-    fn fnmatch(&self, pattern: &[u8], string: &[u8], prefix: usize) -> bool {
+    pub(super) fn fnmatch(&self, pattern: &[u8], string: &[u8], prefix: usize) -> bool {
         let mut prefix = prefix;
         if prefix > 0 {
             if !self.eq_n(pattern, string, prefix) || string.len() < prefix || pattern.len() < prefix {

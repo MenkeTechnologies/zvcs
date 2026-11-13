@@ -226,7 +226,12 @@ fn side_of(spec: &super::diffcore_rename::FileSpec, content: &DiskContent) -> Si
 
 /// `git diff --no-index`'s two operands, after `/dev/null` and directories are
 /// resolved into the pair list `diff_queue` would hold.
-fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
+fn queue(
+    lhs: &str,
+    rhs: &str,
+    reverse: bool,
+    ps: Option<&[super::checkout_sparse::Item]>,
+) -> Result<Vec<(Side, Side)>, String> {
     let l_null = lhs == DEV_NULL;
     let r_null = rhs == DEV_NULL;
     // `get_mode()` answers for standard input without touching the filesystem:
@@ -247,7 +252,10 @@ fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
     let l_dir = matches!(&l_meta, Some(Ok(m)) if m.is_dir());
     let r_dir = matches!(&r_meta, Some(Ok(m)) if m.is_dir());
     if l_dir || r_dir {
-        return Ok(queue_dirs(lhs, rhs, l_dir, r_dir));
+        let mut out = Vec::new();
+        let (mut m1, mut m2) = (Vec::new(), Vec::new());
+        walk_queue(Some(lhs), Some(rhs), reverse, ps, [&mut m1, &mut m2], &mut out)?;
+        return Ok(out);
     }
 
     // `queue_diff()`'s `if (!mode1 && !mode2) return 0;` — two operands that are
@@ -272,7 +280,13 @@ fn queue(lhs: &str, rhs: &str) -> Result<Vec<(Side, Side)>, String> {
         let mode = mode_of(&path).map_err(|_| format!("Could not access '{name}'"))?;
         Ok(Side { name: BString::from(name), file: Some(path), mode })
     };
-    Ok(vec![(side(lhs, l_null, l_in)?, side(rhs, r_null, r_in)?)])
+    let (mut a, mut b) = (side(lhs, l_null, l_in)?, side(rhs, r_null, r_in)?);
+    // `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1, special2)`
+    // (diff-no-index.c:279-283), at the leaf.
+    if reverse {
+        std::mem::swap(&mut a, &mut b);
+    }
+    Ok(vec![(a, b)])
 }
 
 /// `fixup_paths()` (diff-no-index.c): when exactly one operand is a directory, the
@@ -297,57 +311,279 @@ fn fixup_paths(paths: &mut [String; 2]) {
     paths[dir_i] = format!("{dir}{sep}{base}");
 }
 
-/// The directory half of `queue_diff()`: the union of both trees' relative names,
-/// in sorted order, each becoming a pair whose missing side is absent.
-fn queue_dirs(lhs: &str, rhs: &str, l_dir: bool, r_dir: bool) -> Vec<(Side, Side)> {
-    let mut names: Vec<BString> = Vec::new();
-    let mut collect = |root: &str, on: bool| {
-        if !on {
-            return;
-        }
-        walk(Path::new(root), Path::new(root), &mut names);
-    };
-    collect(lhs, l_dir);
-    collect(rhs, r_dir);
-    names.sort();
-    names.dedup();
-
-    let make = |root: &str, is_dir: bool, rel: &BString| -> Side {
-        let joined = format!("{root}/{rel}");
-        if !is_dir {
-            // A file compared against a directory keeps its own name on that side.
-            let path = PathBuf::from(root);
-            let mode = mode_of(&path).unwrap_or(0o100644);
-            return Side { name: BString::from(root), file: Some(path), mode };
-        }
-        let path = PathBuf::from(&joined);
-        // `get_mode()` (diff-no-index.c:94) is an `lstat()`: a symlink whose target
-        // is missing is still a side, holding its target text.
-        match mode_of(&path) {
-            Ok(mode) => Side { name: BString::from(joined), file: Some(path), mode },
-            _ => Side::absent(BString::from(DEV_NULL)),
-        }
-    };
-    names
-        .iter()
-        .map(|rel| {
-            (make(lhs, l_dir, rel), make(rhs, r_dir, rel))
-        })
-        .collect()
+/// `get_mode()` (diff-no-index.c:81-111) for a name `queue_diff()` reached by
+/// recursing, where no name is special: `NULL` and `/dev/null` have mode `0`, and
+/// anything else is `lstat()`ed, `Could not access '%s'` when that fails. The
+/// directory bit is all the walk needs beyond the blob mode [`mode_of`] gives.
+fn walk_mode(name: Option<&str>) -> Result<(u32, bool), String> {
+    let Some(name) = name.filter(|n| *n != DEV_NULL) else { return Ok((0, false)) };
+    let meta = std::fs::symlink_metadata(name).map_err(|_| format!("Could not access '{name}'"))?;
+    if meta.is_dir() {
+        return Ok((0o040000, true));
+    }
+    let mode = mode_of(Path::new(name)).map_err(|_| format!("Could not access '{name}'"))?;
+    Ok((mode, false))
 }
 
-/// Every file under `root`, as a path relative to it.
-fn walk(root: &Path, dir: &Path, out: &mut Vec<BString>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
-            walk(root, &path, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
-            out.push(gix::path::into_bstr(rel).into_owned());
+/// `noindex_filespec()` (diff-no-index.c:144-159): a missing name is `/dev/null`.
+fn walk_side(name: Option<&str>, mode: u32) -> Side {
+    match name {
+        Some(name) if mode != 0 => Side { name: BString::from(name), file: Some(PathBuf::from(name)), mode },
+        _ => Side::absent(BString::from(DEV_NULL)),
+    }
+}
+
+/// `queue_diff()` (diff-no-index.c:161-290) from a pair of names at least one of
+/// which is a directory, recursing as git does: each level lists both
+/// directories, merges the two sorted listings by `strcmp()` on the entry names,
+/// and recurses into every name either side has. A file facing a directory of
+/// the same name is queued as deleted (or created) on its own, and then the
+/// directory is walked against nothing (diff-no-index.c:174-194). `-R` swaps the
+/// sides of the leaf pairs only (diff-no-index.c:279-283), so that lone file
+/// keeps its side.
+///
+/// `ps_match` is each side's path below its operand, `/`-terminated per level,
+/// which `read_directory_contents()` tests every entry against.
+fn walk_queue(
+    name1: Option<&str>,
+    name2: Option<&str>,
+    reverse: bool,
+    ps: Option<&[super::checkout_sparse::Item]>,
+    ps_match: [&mut Vec<u8>; 2],
+    out: &mut Vec<(Side, Side)>,
+) -> Result<(), String> {
+    let (mut name1, mut name2) = (name1, name2);
+    let (mut mode1, dir1) = walk_mode(name1)?;
+    let (mut mode2, dir2) = walk_mode(name2)?;
+
+    if mode1 != 0 && mode2 != 0 && dir1 != dir2 {
+        if dir1 {
+            // "2 is file that is created"
+            out.push((Side::absent(BString::from(DEV_NULL)), walk_side(name2, mode2)));
+            name2 = None;
+            mode2 = 0;
+        } else {
+            // "1 is file that is deleted"
+            out.push((walk_side(name1, mode1), Side::absent(BString::from(DEV_NULL))));
+            name1 = None;
+            mode1 = 0;
         }
     }
+    let dir1 = dir1 && mode1 != 0;
+    let dir2 = dir2 && mode2 != 0;
+
+    if !(dir1 || dir2) {
+        let (mut a, mut b) = (walk_side(name1, mode1), walk_side(name2, mode2));
+        if reverse {
+            std::mem::swap(&mut a, &mut b);
+        }
+        out.push((a, b));
+        return Ok(());
+    }
+
+    let [m1, m2] = ps_match;
+    let p1 = match name1 {
+        Some(n) => read_directory_contents(n, ps, m1)?,
+        None => Vec::new(),
+    };
+    let p2 = match name2 {
+        Some(n) => read_directory_contents(n, ps, m2)?,
+        None => Vec::new(),
+    };
+    // `strbuf_complete(&buffer, '/')`: no doubled separator after an operand that
+    // already ends in one.
+    let base = |name: Option<&str>| {
+        name.map(|n| if n.ends_with('/') { n.to_owned() } else { format!("{n}/") }).unwrap_or_default()
+    };
+    let (base1, base2) = (base(name1), base(name2));
+    let (len1, len2) = (m1.len(), m2.len());
+    let (mut i1, mut i2) = (0, 0);
+    while i1 < p1.len() || i2 < p2.len() {
+        m1.truncate(len1);
+        m2.truncate(len2);
+        let comp = if i1 == p1.len() {
+            std::cmp::Ordering::Greater
+        } else if i2 == p2.len() {
+            std::cmp::Ordering::Less
+        } else {
+            p1[i1].as_slice().cmp(p2[i2].as_slice())
+        };
+        let next = |entries: &[Vec<u8>], i: &mut usize, base: &str, m: &mut Vec<u8>| {
+            let entry = &entries[*i];
+            *i += 1;
+            if ps.is_some() {
+                m.extend_from_slice(entry);
+                if m.last() != Some(&b'/') {
+                    m.push(b'/');
+                }
+            }
+            format!("{base}{}", String::from_utf8_lossy(entry))
+        };
+        let n1 = (comp != std::cmp::Ordering::Greater).then(|| next(&p1, &mut i1, &base1, m1));
+        let n2 = (comp != std::cmp::Ordering::Less).then(|| next(&p2, &mut i2, &base2, m2));
+        walk_queue(n1.as_deref(), n2.as_deref(), reverse, ps, [&mut *m1, &mut *m2], out)?;
+    }
+    m1.truncate(len1);
+    m2.truncate(len2);
+    Ok(())
+}
+
+/// `read_directory_contents()` (diff-no-index.c:22-62): the entries of one
+/// directory, without `.` and `..`, sorted and deduplicated as
+/// `string_list_insert()` keeps them, each first tested against the pathspec as
+/// `match_leading_pathspec()` with its `ps_match` path and directory bit.
+fn read_directory_contents(
+    path: &str,
+    ps: Option<&[super::checkout_sparse::Item]>,
+    ps_match: &mut Vec<u8>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let entries = std::fs::read_dir(path).map_err(|_| format!("Could not open directory {path}"))?;
+    let len = ps_match.len();
+    let mut list: Vec<Vec<u8>> = Vec::new();
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let name = gix::path::os_str_into_bstr(&entry.file_name()).map(|b| b.to_vec()).unwrap_or_default();
+        if let Some(items) = ps {
+            ps_match.truncate(len);
+            ps_match.extend_from_slice(&name);
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !match_leading_pathspec(items, ps_match, is_dir) {
+                continue;
+            }
+        }
+        list.push(name);
+    }
+    ps_match.truncate(len);
+    list.sort();
+    list.dedup();
+    Ok(list)
+}
+
+/// `DO_MATCH_DIRECTORY`, `DO_MATCH_LEADING_PATHSPEC` and `DO_MATCH_EXCLUDE` (dir.c:365-367).
+const DO_MATCH_DIRECTORY: u8 = 1 << 1;
+const DO_MATCH_LEADING_PATHSPEC: u8 = 1 << 2;
+const DO_MATCH_EXCLUDE: u8 = 1 << 0;
+
+/// `match_leading_pathspec()` (dir.c:616-623) through `match_pathspec_with_flags()`
+/// (dir.c:584-596): a positive match that no exclusion takes back. No index is
+/// involved, so neither `seen[]` nor `max_depth` is.
+fn match_leading_pathspec(items: &[super::checkout_sparse::Item], name: &[u8], is_dir: bool) -> bool {
+    let flags = if is_dir { DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC } else { 0 };
+    let positive = do_match_pathspec(items, name, flags);
+    if !items.iter().any(|i| i.exclude) || !positive {
+        return positive;
+    }
+    !do_match_pathspec(items, name, flags | DO_MATCH_EXCLUDE)
+}
+
+/// `do_match_pathspec()` (dir.c:518-582) reduced to "did any item match": the
+/// items of the wanted polarity, each through [`match_pathspec_item`].
+fn do_match_pathspec(items: &[super::checkout_sparse::Item], name: &[u8], flags: u8) -> bool {
+    let exclude = flags & DO_MATCH_EXCLUDE != 0;
+    items.iter().rev().filter(|i| i.exclude == exclude).any(|i| match_pathspec_item(i, name, flags))
+}
+
+/// `match_pathspec_item()` (dir.c:392-482) with a zero prefix, as a match or not.
+fn match_pathspec_item(item: &super::checkout_sparse::Item, name: &[u8], flags: u8) -> bool {
+    let m = item.mat.as_slice();
+    let (matchlen, namelen) = (m.len(), name.len());
+    if item.prefix > 0 && item.icase && m[..item.prefix] != name[..item.prefix.min(namelen)] {
+        return false;
+    }
+    // "If the match was just the prefix, we matched"
+    if m.is_empty() {
+        return true;
+    }
+    if matchlen <= namelen && item.eq_n(m, name, matchlen) {
+        if matchlen == namelen || m[matchlen - 1] == b'/' || name[matchlen] == b'/' {
+            return true;
+        }
+    } else if flags & DO_MATCH_DIRECTORY != 0
+        && m[matchlen - 1] == b'/'
+        && namelen == matchlen - 1
+        && item.eq_n(m, name, namelen)
+    {
+        return true;
+    }
+    if item.nowildcard_len < matchlen && item.fnmatch(m, name, item.nowildcard_len) {
+        return true;
+    }
+    // "Perform checks to see if "name" is a leading string of the pathspec"
+    if flags & DO_MATCH_LEADING_PATHSPEC != 0 && flags & DO_MATCH_EXCLUDE == 0 {
+        let offset = usize::from(name.last() == Some(&b'/'));
+        if namelen < matchlen && m[namelen - offset] == b'/' && item.eq_n(m, name, namelen) {
+            return true;
+        }
+        // "name doesn't match up to the first wild character"
+        if item.nowildcard_len < matchlen && !item.eq_n(m, name, item.nowildcard_len) {
+            return false;
+        }
+        // A wildcard item git cannot test a leading directory against
+        // `wildmatch()` with, so it says yes and lets the files decide.
+        return item.nowildcard_len < matchlen;
+    }
+    false
+}
+
+/// `parse_pathspec(&pathspec, PATHSPEC_FROMTOP | PATHSPEC_ATTR, PATHSPEC_PREFER_FULL |
+/// PATHSPEC_NO_REPOSITORY, NULL, &argv[2])` (diff-no-index.c:394-399): the
+/// operands past the two directories, with no prefix, so a path is only
+/// normalised, and one that climbs out is `'%s' is outside the directory tree`
+/// (pathspec.c:494-496). `:(top)` and `:(attr)` are refused after the element
+/// has been parsed (pathspec.c:657-658). An all-exclusion list gains an item for
+/// `.`, which matches everything (pathspec.c:674-678). `Err` is the `fatal:` body.
+fn parse_no_index_pathspec(specs: &[String]) -> Result<Vec<super::checkout_sparse::Item>, String> {
+    use crate::pathspec::{MAGIC_ATTR, MAGIC_EXCLUDE, MAGIC_GLOB, MAGIC_ICASE, MAGIC_LITERAL, MAGIC_TOP};
+    if let Some(msg) = crate::pathspec::global_magic_fatal() {
+        return Err(msg);
+    }
+    if let Some(msg) = crate::pathspec::empty_element_fatal(specs) {
+        return Err(msg);
+    }
+    let mut items = Vec::with_capacity(specs.len() + 1);
+    let item = |mat: BString, magic: u32, prefix: usize| super::checkout_sparse::Item {
+        nowildcard_len: if magic & MAGIC_LITERAL != 0 {
+            mat.len()
+        } else {
+            // `simple_length()`: up to the first glob-special byte, never short of
+            // the prefix (pathspec.c:526-532).
+            mat.iter().position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\')).unwrap_or(mat.len()).max(prefix)
+        },
+        mat,
+        prefix,
+        exclude: magic & MAGIC_EXCLUDE != 0,
+        icase: magic & MAGIC_ICASE != 0,
+        glob: magic & MAGIC_GLOB != 0,
+        element: None,
+    };
+    for spec in specs {
+        let elt = gix::bstr::BStr::new(spec.as_bytes());
+        let element = crate::pathspec::parse_element_magic(elt)?;
+        let path = element.path(elt);
+        // `:(prefix:<n>)` and `:(top)` keep `copyfrom` verbatim (pathspec.c:482-487).
+        let mat = if element.rooted() {
+            path.to_owned()
+        } else {
+            crate::pathspec::normalize_path(path)
+                .ok_or_else(|| format!("'{path}' is outside the directory tree"))?
+        };
+        let prefix = if element.prefix_magic { element.prefix_len } else { 0 };
+        // `init_pathspec_item()`'s sanity check (pathspec.c:548-551), ahead of the
+        // magic mask: a `:(prefix:<n>)` longer than its own path is git's `BUG()`,
+        // an abort.
+        if prefix > mat.len() {
+            eprintln!("BUG: pathspec.c:550: error initializing pathspec_item");
+            std::process::abort();
+        }
+        let bad = element.magic & (MAGIC_TOP | MAGIC_ATTR);
+        if bad != 0 {
+            return Err(crate::pathspec::unsupported_magic(elt, bad));
+        }
+        items.push(item(mat, element.magic, prefix));
+    }
+    if items.iter().all(|i| i.exclude) {
+        items.push(item(BString::default(), 0, 0));
+    }
+    Ok(items)
 }
 
 /// One emitted pair, as the non-patch formats need it.
@@ -1349,28 +1585,6 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         }
         return usage();
     }
-    // `else if (argc > 2)`: extra operands are a pathspec, and `fixup_paths()`
-    // accepts one only when both sides are directories. A pair that is not two
-    // directories is git's refusal; a pair that is has no pathspec support here
-    // yet, and says so in this port's own voice rather than borrowing git's.
-    if operands.len() > 2 {
-        let both_dirs = operands[..2].iter().all(|p| Path::new(p).is_dir());
-        if both_dirs {
-            anyhow::bail!("--no-index pathspec limiting is not supported");
-        }
-        eprintln!(
-            "warning: Limiting comparison with pathspecs is only supported if both paths are directories."
-        );
-        return usage();
-    }
-
-    // `setup_diff_pager()` (diff.c:7846-7859), after `diff_setup_done()` and ahead of
-    // `queue_diff()`: unless the exit status was asked for, `check_pager_config()` runs
-    // `read_early_config()`, whose walk re-finds a repository setup refused.
-    if !(exit_code || fmt.quiet) {
-        crate::setup::read_early_config_ignored_format();
-    }
-
     // `diff_no_index()` (diff-no-index.c:264-271) rewrites a bare `-` operand to
     // its standard-input marker before `fixup_paths()` runs, and `fixup_paths()`
     // returns untouched when either side is that marker.
@@ -1387,6 +1601,39 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     } else {
         fixup_paths(&mut pair);
     }
+    // `fixup_paths()` returning 1 (diff-no-index.c:333-335, :394): two operands that
+    // `stat()` as directories enable the pathspec in the rest of argv
+    // (diff-no-index.c:394-399); any other pair given one is refused with a
+    // warning and the usage (diff-no-index.c:400-404). Both checks follow the
+    // stdin refusal above.
+    let stat_dir = |p: &str| p != STDIN_NAME && std::fs::metadata(p).is_ok_and(|m| m.is_dir());
+    let pathspec = if stat_dir(&operands[0]) && stat_dir(&operands[1]) {
+        match operands.len() > 2 {
+            true => match parse_no_index_pathspec(&operands[2..]) {
+                Ok(items) => Some(items),
+                Err(msg) => {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            },
+            false => None,
+        }
+    } else if operands.len() > 2 {
+        eprintln!(
+            "warning: Limiting comparison with pathspecs is only supported if both paths are directories."
+        );
+        return usage();
+    } else {
+        None
+    };
+
+    // `setup_diff_pager()` (diff.c:7846-7859), after `diff_setup_done()` and ahead of
+    // `queue_diff()`: unless the exit status was asked for, `check_pager_config()` runs
+    // `read_early_config()`, whose walk re-finds a repository setup refused.
+    if !(exit_code || fmt.quiet) {
+        crate::setup::read_early_config_ignored_format();
+    }
+
     // `populate_from_stdin()`: the stream is read once, whichever side names it.
     let stdin_data = if l_stdin || r_stdin {
         let mut buf = Vec::new();
@@ -1707,6 +1954,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         ws_rule,
         stdin_data,
         drivers.as_mut(),
+        pathspec.as_deref(),
     ) {
         Ok(result) => result,
         Err(message) => {
@@ -1780,7 +2028,7 @@ fn compare(
     ws_rule: u32,
     stdin_data: Option<Vec<u8>>,
 ) -> std::result::Result<Compared, String> {
-    compare_with_drivers(lhs, rhs, reverse, opts, rename_opts, ws_rule, stdin_data, None)
+    compare_with_drivers(lhs, rhs, reverse, opts, rename_opts, ws_rule, stdin_data, None, None)
 }
 
 /// `diff_filespec_load_driver()` (diff.c:2308-2320): the userdiff driver a side's own
@@ -1877,17 +2125,11 @@ fn compare_with_drivers(
     ws_rule: u32,
     stdin_data: Option<Vec<u8>>,
     mut drivers: Option<&mut crate::userdiff::Lookup<'_>>,
+    // The pathspec past the two directories, `None` when there is none.
+    ps: Option<&[super::checkout_sparse::Item]>,
 ) -> std::result::Result<Compared, String> {
-    let mut pairs = queue(lhs, rhs)?;
-    // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
-    // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
-    // the directory recursion that decided which names pair with which, so the
-    // queue keeps its order and each pair simply trades sides.
-    if reverse {
-        for (a, b) in &mut pairs {
-            std::mem::swap(a, b);
-        }
-    }
+    // `queue_diff()` applies `-R` itself, at the leaves of its walk.
+    let mut pairs = queue(lhs, rhs, reverse, ps)?;
 
     // Every blob the rest of this function reads, from one cache: `diffcore_rename`
     // asks for the same file repeatedly and the emitters ask again afterwards.

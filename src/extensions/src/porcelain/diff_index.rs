@@ -356,8 +356,7 @@ struct Opts {
     /// The last `--relative=<path>` argument (`diff_opt_relative()`, diff.c:5884-5893),
     /// which replaces the cwd prefix `repo_init_revisions()` seeded.
     relative_arg: Option<BString>,
-    filter_include: Vec<u8>,       // --diff-filter upper-case letters
-    filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
+    filter: super::diff_filter::Filter, // --diff-filter, every occurrence or-ed in
     ws: Ws,
     ignore_lines: Option<diff_pickaxe::Needle>, // -I<s> / --ignore-matching-lines=<s>
     /// `--ignore-blank-lines`: `XDF_IGNORE_BLANK_LINES`, which
@@ -1536,13 +1535,13 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 // <arg>` (exit 129). Deferred with its argv index so a bad revision or
                 // option-value error earlier in argv still wins first, as it does in git.
                 let val = &s["--diff-filter=".len()..];
-                if let Some(bad) = parse_filter(val, &mut opts) {
+                if let Err(bad) = opts.filter.accumulate(val) {
                     set_earliest(
                         &mut deferred,
                         (
                             cur,
                             129,
-                            format!("error: unknown change class '{}' in {s}\n", bad as char).into_bytes(),
+                            format!("error: unknown change class '{bad}' in {s}\n").into_bytes(),
                         ),
                     );
                 }
@@ -2290,8 +2289,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         apply_content_filter(&repo, &mut deltas, &opts)?;
     }
     apply_pickaxe(&repo, &mut deltas, &opts)?;
-    if !opts.filter_include.is_empty() || !opts.filter_exclude.is_empty() {
-        deltas.retain(|d| passes_filter(d.status(), &opts));
+    // `diffcore_apply_filter()` (diff.c:7283-7321): `match_filter()` reads `p->score`,
+    // so a modification `-B` scored answers to `B` rather than to `M`, and `*` keeps
+    // or drops the whole queue.
+    if opts.filter.given() {
+        let classes: Vec<(u8, Option<u32>)> =
+            deltas.iter().map(|d| (d.status(), Some(d.score).filter(|&s| s != 0))).collect();
+        let mut keep = super::diff_filter::apply(opts.filter, &classes).into_iter();
+        deltas.retain(|_| keep.next().unwrap_or(false));
     }
 
     // git's `diff_flush()` reorders the queued pairs for `--skip-to`/`--rotate-to` before
@@ -2490,7 +2495,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                         path: name,
                         old_data: &an.old_data,
                         new_data: &an.new_data,
-                        hunks: an.hunks.as_deref(),
                         ws_rule: check_rules.for_path(d.path.as_bstr()),
                         // `run_checkdiff()` returns before the lookup for an unmerged pair.
                         marker_size: match d.unmerged {
@@ -2726,31 +2730,6 @@ fn line_counts(one: &[u8], two: &[u8], opts: &Opts) -> (u64, u64) {
     (u64::from(diff.count_additions()), u64::from(diff.count_removals()))
 }
 
-/// `--diff-filter=<letters>`: upper-case selects, lower-case excludes. Returns the first
-/// letter git does not know (as given, before case folding), or `None` when all are valid.
-fn parse_filter(spec: &str, opts: &mut Opts) -> Option<u8> {
-    const KNOWN: &[u8] = b"ACDMRTUXB*";
-    for c in spec.bytes() {
-        let upper = c.to_ascii_uppercase();
-        if !KNOWN.contains(&upper) {
-            return Some(c);
-        }
-        if c.is_ascii_lowercase() {
-            opts.filter_exclude.push(upper);
-        } else {
-            opts.filter_include.push(upper);
-        }
-    }
-    None
-}
-
-fn passes_filter(status: u8, opts: &Opts) -> bool {
-    if opts.filter_exclude.contains(&status) {
-        return false;
-    }
-    opts.filter_include.is_empty() || opts.filter_include.contains(&b'*') || opts.filter_include.contains(&status)
-}
-
 fn object_is_commit(repo: &gix::Repository, id: &ObjectId) -> bool {
     repo.find_object(*id).map(|o| o.kind == gix::objs::Kind::Commit).unwrap_or(false)
 }
@@ -2775,8 +2754,7 @@ fn plumbing_opts() -> Opts {
         relative: None,
         relative_name: false,
         relative_arg: None,
-        filter_include: Vec::new(),
-        filter_exclude: Vec::new(),
+        filter: super::diff_filter::Filter::default(),
         ws: Ws::default(),
         ignore_lines: None,
         ignore_blank_lines: false,
@@ -2893,8 +2871,7 @@ fn collect(
     // pair they queue unless `diff_from_contents` defers it to the content pass
     // (diff.c:7623-7625, 7664-7676); `diff_unmerge()` never does (diff.c:7722-7736).
     let quit_early = opts.quick
-        && opts.filter_include.is_empty()
-        && opts.filter_exclude.is_empty()
+        && !opts.filter.given()
         && !diff_from_contents(opts);
     let mut deltas: Vec<Delta> = Vec::new();
     for path in all {

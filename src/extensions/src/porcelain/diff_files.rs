@@ -124,11 +124,6 @@
 //!
 //! ### Not implemented (bailed on with a precise message, never faked)
 //!
-//!   * `-I<regex>`/`--ignore-matching-lines=<regex>` together with `--check`:
-//!     `builtin_checkdiff()` walks the pairs itself and never sees the change groups
-//!     the `ignore` bit lives on. `-I` with the patch, raw and stat formats is
-//!     supported — the unified writer takes the change list with that bit and
-//!     reproduces `xdl_get_hunk()`'s handling of it.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
 //!
@@ -404,8 +399,6 @@ struct Opts {
     /// leaves `diff_from_contents` alone and the raw and name listings keep every
     /// pair; only the content formats lose the all-blank ones.
     ignore_blank_lines: bool,
-    /// The spelling of the first `-I`, for the bail when a patch is also asked for.
-    ignore_flag: Option<String>,
     /// A flag that rewrites content output (word diff). Harmless for raw
     /// listings, so it only bails once a content format is requested.
     content_altering: Option<String>,
@@ -1029,7 +1022,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         ws: Whitespace::Keep,
         ignore_lines: Vec::new(),
         ignore_blank_lines: false,
-        ignore_flag: None,
         content_altering: None,
         color_when: None,
         // `diff.wsErrorHighlight`, or git's `WSEH_NEW` default.
@@ -1137,7 +1129,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             if flag == "-I" {
                 // `OPT_CALLBACK_F('I', "ignore-matching-lines", …)`: a required value,
                 // so parse-options takes the next argument when none is glued on.
-                record_ignore_lines(&flag, s, &mut opts)?;
+                record_ignore_lines(s, &mut opts)?;
             } else if flag == "--ws-error-highlight" {
                 opts.ws_error_highlight = parse_ws_error_highlight_opt(s)?;
             } else if GLUED_WHEN_SEPARATED.contains(&flag.as_str()) {
@@ -1447,17 +1439,6 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         }
     }
 
-    // `-I` suppresses a change group whose every line matches. The unified writer
-    // takes the `ignore` bit with the change list and reproduces
-    // `xdl_get_hunk()`'s handling of it, so the patch is rendered rather than
-    // refused. `--check` still is: `builtin_checkdiff()` walks the pairs itself and
-    // never sees the change groups.
-    if opts.fmt & F_CHECKDIFF != 0 {
-        if let Some(flag) = opts.ignore_flag.take() {
-            return Ok(Parsed::Unsupported(flag));
-        }
-    }
-
     Ok(match unsupported {
         Some(flag) => Parsed::Unsupported(flag),
         None => Parsed::Run { opts, paths },
@@ -1597,7 +1578,8 @@ fn classify(
             opts.fmt |= F_DIFFSTAT;
             opts.compact_summary = true;
         }
-        "--dirstat" => opts.fmt |= F_DIRSTAT,
+        // `OPT_CALLBACK_F('X', "dirstat", ..., PARSE_OPT_OPTARG, ...)` (diff.c:6052-6055).
+        "--dirstat" | "-X" => opts.fmt |= F_DIRSTAT,
         "--dirstat-by-file" => {
             opts.fmt |= F_DIRSTAT;
             opts.dirstat.by_file = true;
@@ -1906,27 +1888,32 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--stat=") {
-        parse_stat_spec(v, &mut opts.stat)?;
+        stat_value_ok(s)?;
+        diffstat::parse_stat_geometry(&mut opts.stat, v);
         opts.fmt |= F_DIFFSTAT;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--stat-width=") {
-        opts.stat.width = v.parse().map_err(|_| Fatal::Usage)?;
+        stat_value_ok(s)?;
+        opts.stat.width = v.trim_start().parse().unwrap_or(0);
         opts.fmt |= F_DIFFSTAT;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--stat-name-width=") {
-        opts.stat.name_width = v.parse().map_err(|_| Fatal::Usage)?;
+        stat_value_ok(s)?;
+        opts.stat.name_width = v.trim_start().parse().unwrap_or(0);
         opts.fmt |= F_DIFFSTAT;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--stat-graph-width=") {
-        opts.stat.graph_width = v.parse().map_err(|_| Fatal::Usage)?;
+        stat_value_ok(s)?;
+        opts.stat.graph_width = v.trim_start().parse().unwrap_or(0);
         opts.fmt |= F_DIFFSTAT;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--stat-count=") {
-        opts.stat.count = v.parse().map_err(|_| Fatal::Usage)?;
+        stat_value_ok(s)?;
+        opts.stat.count = v.trim_start().parse().unwrap_or(0);
         opts.fmt |= F_DIFFSTAT;
         return Ok(Flag::Handled);
     }
@@ -1936,7 +1923,8 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         opts.fmt |= F_DIRSTAT;
         return Ok(Flag::Handled);
     }
-    if let Some(v) = s.strip_prefix("--dirstat=") {
+    // `-X<params>`: the optional value only ever comes attached.
+    if let Some(v) = s.strip_prefix("--dirstat=").or_else(|| s.strip_prefix("-X").filter(|v| !v.is_empty())) {
         parse_dirstat_spec(v, &mut opts.dirstat)?;
         opts.fmt |= F_DIRSTAT;
         return Ok(Flag::Handled);
@@ -1946,13 +1934,13 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--ignore-matching-lines=") {
-        return record_ignore_lines(s, v, opts);
+        return record_ignore_lines(v, opts);
     }
     if let Some(v) = s.strip_prefix("-I") {
         if v.is_empty() {
             return Err(Fatal::MissingArgument("-I"));
         }
-        return record_ignore_lines(s, v, opts);
+        return record_ignore_lines(v, opts);
     }
     if let Some(v) = s.strip_prefix("-S") {
         // Finalized after the line is read, since `--pickaxe-regex` may still follow.
@@ -2081,15 +2069,12 @@ fn set_find_copies(opts: &mut Opts, v: &str) {
 }
 
 /// Record one `-I<re>` / `--ignore-matching-lines=<re>`.
-fn record_ignore_lines(flag: &str, value: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
+fn record_ignore_lines(value: &str, opts: &mut Opts) -> Result<Flag, Fatal> {
     // `diff_opt_ignore_regex` compiles inline, so a bad pattern is git's
     // `error: invalid regex given to -I: '<pat>'` (exit 129) at this argv position.
     match diff_pickaxe::compile_regex(value.as_bytes()) {
         Ok(re) => {
             opts.ignore_lines.push(diff_pickaxe::Needle::Regex(re));
-            if opts.ignore_flag.is_none() {
-                opts.ignore_flag = Some(flag.to_owned());
-            }
             Ok(Flag::Handled)
         }
         Err(_) => Err(Fatal::InvalidRegexIgnore(value.to_owned())),
@@ -2097,21 +2082,13 @@ fn record_ignore_lines(flag: &str, value: &str, opts: &mut Opts) -> Result<Flag,
 }
 
 /// `--stat=<width>[,<name-width>[,<count>]]` (`diff_opt_stat()`).
-fn parse_stat_spec(v: &str, stat: &mut StatWidths) -> Result<(), Fatal> {
-    let mut it = v.split(',');
-    if let Some(w) = it.next() {
-        stat.width = w.parse().map_err(|_| Fatal::Usage)?;
+/// `diff_opt_stat()` (diff.c:5380-5422): the `error()` it returns for a value
+/// `strtoul()` does not consume in full, at exit 129 — never the usage dump.
+fn stat_value_ok(arg: &str) -> Result<(), Fatal> {
+    match super::diff_optval::reject(arg) {
+        Some(msg) => Err(Fatal::OptionError(msg)),
+        None => Ok(()),
     }
-    if let Some(n) = it.next() {
-        stat.name_width = n.parse().map_err(|_| Fatal::Usage)?;
-    }
-    if let Some(c) = it.next() {
-        stat.count = c.parse().map_err(|_| Fatal::Usage)?;
-    }
-    if it.next().is_some() {
-        return Err(Fatal::Usage);
-    }
-    Ok(())
 }
 
 /// `parse_dirstat_opt()` (diff.c:5454): fold one `--dirstat=<param>,…` list into `ds`,
@@ -2490,7 +2467,6 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                     path: &d.path,
                     old_data: &an.old_data,
                     new_data: &an.new_data,
-                    hunks: an.hunks.as_deref(),
                     // `attr_path` is the unstripped name (diff.c:5102-5107).
                     ws_rule: check_rules.for_path(d.disk.as_bstr()),
                     // `run_checkdiff()` returns before the lookup for an unmerged pair.
@@ -5001,9 +4977,9 @@ fn summary_mode_name(out: &mut Vec<u8>, verb: &str, mode: u32, path: &BString) {
 /// under `core.whitespace`. Returns `o->flags.check_failed`, which is
 /// `diff_result_code()`'s bit 1.
 ///
-/// The hunk stream it walks is the one the command already computed, so unlike stock
-/// git — which runs a private `xecfg.ctxlen = 1`, `xpp.flags = 0` diff for the check —
-/// `-U<n>` and the whitespace-ignoring options do reach it here.
+/// The diff it walks is its own, as stock's is: a private `xecfg.ctxlen = 1`,
+/// `xpp.flags = 0` run (diff.c:4296-4307), so neither `-U<n>`, the whitespace-ignoring
+/// options, `-I`, the algorithm nor the indent heuristic changes which lines it checks.
 /// One pair as `--check` needs to see it, so the walk below can serve every command
 /// that has a pair list and a hunk stream rather than being tied to one module's types.
 pub(crate) struct CheckPair<'a> {
@@ -5012,8 +4988,6 @@ pub(crate) struct CheckPair<'a> {
     pub(crate) path: &'a BString,
     pub(crate) old_data: &'a [u8],
     pub(crate) new_data: &'a [u8],
-    /// The rendered unified hunks; `None` when the pair produced none.
-    pub(crate) hunks: Option<&'a [u8]>,
     /// `whitespace_rule(istate, attr_path)` (diff.c:4276).
     pub(crate) ws_rule: u32,
     /// `ll_merge_marker_size(istate, attr_path)` (diff.c:4277).
@@ -5044,51 +5018,33 @@ pub(crate) fn render_check(
         let new_lines = byte_lines(pair.new_data);
         // Only the added lines are checked: `--check` reports what the change
         // *introduces*, so the preimage is deliberately not examined.
-        let Some(hunks) = pair.hunks else {
-            continue;
-        };
-        let mut lineno = 0usize;
-        // `checkdiff_consume()` remembers the previous record's marker so the
-        // `\ No newline at end of file` line can tell which side it belongs to.
-        let mut last_line_kind = 0u8;
-        for line in byte_lines(hunks) {
-            let kind = line.first().copied().unwrap_or(0);
-            let previous_kind = last_line_kind;
-            last_line_kind = kind;
-            match line.first().copied() {
-                Some(b'@') => {
-                    lineno = hunk_new_start(line).saturating_sub(1);
+        // `builtin_checkdiff()`'s own xdiff run: `xpp.flags = 0` is plain Myers with
+        // no whitespace folding and no indent heuristic (diff.c:4296-4307).
+        let old_lines = byte_lines(pair.old_data);
+        let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+        input.update_before(old_lines.iter().map(|l| l.to_vec()));
+        input.update_after(new_lines.iter().map(|l| l.to_vec()));
+        let diff = super::diff_pairs::compute_compacted(Algorithm::Myers, &input, &old_lines, &new_lines, false);
+        for hunk in diff.hunks() {
+            for i in hunk.after.clone() {
+                let i = i as usize;
+                // `checkdiff_consume()` counts the post-image line it is on.
+                let lineno = i + 1;
+                // `xdl_emit_diffrec()` ends an incomplete record with a newline of
+                // its own before the `\ No newline at end of file` line, so the
+                // added line `ws_check()` sees always carries one.
+                let mut raw = new_lines[i].to_vec();
+                let incomplete = raw.last() != Some(&b'\n');
+                if incomplete {
+                    raw.push(b'\n');
                 }
-                Some(b' ') => lineno += 1,
-                Some(b'\\') => {
-                    // The incomplete last line, reported only when the record it
-                    // follows was an added one.
-                    if ws_rule & diff_color::WS_INCOMPLETE_LINE != 0 && previous_kind == b'+' {
-                        failed = true;
-                        out.extend_from_slice(&name);
-                        out.extend_from_slice(
-                            format!(
-                                ":{lineno}: {}.\n",
-                                whitespace_error_string(diff_color::WS_INCOMPLETE_LINE)
-                            )
-                            .as_bytes(),
-                        );
-                    }
+                if is_conflict_marker_sized(&raw, pair.marker_size) {
+                    failed = true;
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(format!(":{lineno}: leftover conflict marker\n").as_bytes());
                 }
-                Some(b'+') => {
-                    lineno += 1;
-                    let raw = &line[1..];
-                    if is_conflict_marker_sized(raw, pair.marker_size) {
-                        failed = true;
-                        out.extend_from_slice(&name);
-                        out.extend_from_slice(
-                            format!(":{lineno}: leftover conflict marker\n").as_bytes(),
-                        );
-                    }
-                    let bad = ws_check(raw, ws_rule);
-                    if bad == 0 {
-                        continue;
-                    }
+                let bad = ws_check(&raw, ws_rule);
+                if bad != 0 {
                     failed = true;
                     out.extend_from_slice(&name);
                     out.extend_from_slice(
@@ -5099,9 +5055,18 @@ pub(crate) fn render_check(
                     out.extend_from_slice(set.as_bytes());
                     out.push(b'+');
                     out.extend_from_slice(reset.as_bytes());
-                    diff_color::ws_check_emit(out, raw, ws_rule, set, reset, ws_color);
+                    diff_color::ws_check_emit(out, &raw, ws_rule, set, reset, ws_color);
                 }
-                _ => {}
+                // The `\ No newline at end of file` record that follows an added
+                // line is the incomplete-line error (diff.c:3576-3586).
+                if incomplete && ws_rule & diff_color::WS_INCOMPLETE_LINE != 0 {
+                    failed = true;
+                    out.extend_from_slice(&name);
+                    out.extend_from_slice(
+                        format!(":{lineno}: {}.\n", whitespace_error_string(diff_color::WS_INCOMPLETE_LINE))
+                            .as_bytes(),
+                    );
+                }
             }
         }
         if ws_rule & diff_color::WS_BLANK_AT_EOF != 0 {
@@ -5116,18 +5081,6 @@ pub(crate) fn render_check(
         }
     }
     failed
-}
-
-/// The `+<start>` field of a `@@ -a,b +c,d @@` header.
-fn hunk_new_start(header: &[u8]) -> usize {
-    let mut it = header.split(|b| *b == b'+');
-    it.next();
-    let Some(rest) = it.next() else { return 1 };
-    let digits: Vec<u8> = rest.iter().copied().take_while(|b| b.is_ascii_digit()).collect();
-    std::str::from_utf8(&digits)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
 }
 
 /// `ll_merge_marker_size()`'s default when no `conflict-marker-size` attribute

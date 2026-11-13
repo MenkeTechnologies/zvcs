@@ -567,30 +567,6 @@ pub(crate) struct Pickaxe {
     pub(crate) all: bool,
 }
 
-/// `--diff-filter=<letters>`.
-struct Filter {
-    /// Upper-cased status letters to keep.
-    keep: Vec<u8>,
-    /// Upper-cased status letters to exclude (lowercase input).
-    exclude: Vec<u8>,
-    /// `*`: all-or-none.
-    all_or_none: bool,
-    /// Every letter was an exclusion, so the base set is "everything but these".
-    only_exclude: bool,
-}
-
-impl Filter {
-    fn matches(&self, status: u8) -> bool {
-        if self.all_or_none {
-            return self.keep.contains(&status);
-        }
-        if self.only_exclude {
-            return !self.exclude.contains(&status);
-        }
-        self.keep.contains(&status)
-    }
-}
-
 /// Which output formats are active. git ORs these together and only falls back to a
 /// patch when none was requested.
 #[derive(Default)]
@@ -729,7 +705,7 @@ struct Opts {
     /// `diffcore_std()` and moves the status letter, which it does for every caller
     /// but `diff-pairs` itself.
     queue_time_reverse: bool,
-    filter: Option<Filter>,    // --diff-filter
+    filter: Option<super::diff_filter::Filter>, // --diff-filter, every occurrence or-ed in
     pickaxe: Option<Pickaxe>,  // -S / -G / --find-object (finalized after parse)
     relative: Relative,
     anchor: Option<Anchor>, // --rotate-to / --skip-to
@@ -1428,10 +1404,14 @@ pub(crate) fn render_raw_stream(
             // --diff-filter
             "--diff-filter" => {
                 let v = want_value!(s.len());
-                opts.filter = Some(parse_filter(&v));
+                if let Some(code) = accumulate_filter(&mut opts.filter, &v) {
+                    return Ok(code);
+                }
             }
             _ if s.starts_with("--diff-filter=") => {
-                opts.filter = Some(parse_filter(&s["--diff-filter=".len()..]));
+                if let Some(code) = accumulate_filter(&mut opts.filter, &s["--diff-filter=".len()..]) {
+                    return Ok(code);
+                }
             }
             // Pickaxe.
             "-S" => pickaxe_pending = Some((b'S', want_value!(s.len()).into_bytes())),
@@ -2120,6 +2100,20 @@ pub(super) fn parse_git_int(value: &str) -> Option<i32> {
 
 /// `diff_opt_ignore_regex()`'s refusal: parse-options' `error()` naming the
 /// pattern, and its 129. Not a `die()`, so there is no `fatal:` and no usage block.
+/// `diff_opt_diff_filter()` (diff.c:5449-5479): each `--diff-filter` value ors into
+/// the accumulated sets, and a letter that names no change class is refused inline
+/// at exit 129.
+fn accumulate_filter(filter: &mut Option<super::diff_filter::Filter>, value: &str) -> Option<Status> {
+    let f = filter.get_or_insert_with(Default::default);
+    match f.accumulate(value) {
+        Ok(()) => None,
+        Err(bad) => {
+            eprintln!("error: unknown change class '{bad}' in --diff-filter={value}");
+            Some(Status::from(129))
+        }
+    }
+}
+
 fn invalid_ignore_regex(pat: &str) -> Status {
     eprintln!("error: invalid regex given to -I: '{pat}'");
     Status::from(129)
@@ -2214,32 +2208,6 @@ fn classify_algo(name: &str) -> AlgoChoice {
         "histogram" => AlgoChoice::Use(Histogram),
         "patience" => AlgoChoice::Use(Patience),
         _ => AlgoChoice::Unknown,
-    }
-}
-
-/// `--diff-filter=<letters>`: uppercase includes, lowercase excludes, `*` is all-or-none.
-fn parse_filter(spec: &str) -> Filter {
-    let mut keep = Vec::new();
-    let mut exclude = Vec::new();
-    let mut all_or_none = false;
-    let mut has_include = false;
-    for c in spec.bytes() {
-        if c == b'*' {
-            all_or_none = true;
-            continue;
-        }
-        if c.is_ascii_lowercase() {
-            exclude.push(c.to_ascii_uppercase());
-        } else {
-            keep.push(c);
-            has_include = true;
-        }
-    }
-    Filter {
-        only_exclude: !has_include && !all_or_none && !exclude.is_empty(),
-        keep,
-        exclude,
-        all_or_none,
     }
 }
 
@@ -2649,14 +2617,13 @@ fn flush(
         rotate(&mut pairs, anchor);
     }
 
-    if let Some(f) = &opts.filter {
-        if f.all_or_none {
-            if !pairs.iter().any(|p| f.matches(p.kind())) {
-                pairs.clear();
-            }
-        } else {
-            pairs.retain(|p| f.matches(p.kind()));
-        }
+    // `diffcore_apply_filter()` (diff.c:7283-7321): `match_filter()` reads `p->score`,
+    // so a modification `-B` scored answers to `B` rather than to `M`.
+    if let Some(f) = opts.filter {
+        let classes: Vec<(u8, Option<u32>)> =
+            pairs.iter().map(|p| (p.kind(), Some(p.score()).filter(|&s| s != 0))).collect();
+        let mut keep = super::diff_filter::apply(f, &classes).into_iter();
+        pairs.retain(|_| keep.next().unwrap_or(false));
     }
 
     // `--relative` re-anchors the rendered paths and drops what falls outside.

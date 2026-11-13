@@ -2200,7 +2200,9 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
             "--summary" => fmt |= F_SUMMARY,
             // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
             // (`diff_opt_dirstat()`), all of which turn the format on.
-            "--dirstat" => fmt |= F_DIRSTAT,
+            // `OPT_CALLBACK_F('X', "dirstat", ..., PARSE_OPT_OPTARG, ...)` (diff.c:6052-6055):
+            // `-X` is `--dirstat`, and its optional value only ever comes attached.
+            "--dirstat" | "-X" => fmt |= F_DIRSTAT,
             "--dirstat-by-file" => {
                 fmt |= F_DIRSTAT;
                 dirstat.by_file = true;
@@ -2209,9 +2211,12 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                 fmt |= F_DIRSTAT;
                 dirstat.cumulative = true;
             }
-            s if s.starts_with("--dirstat=") || s.starts_with("--dirstat-by-file=") => {
+            s if s.starts_with("--dirstat=") || s.starts_with("--dirstat-by-file=") || (s.len() > 2 && s.starts_with("-X")) => {
                 let by_file = s.starts_with("--dirstat-by-file=");
-                let params = s.split_once('=').map(|(_, v)| v).unwrap_or_default();
+                let params = match s.strip_prefix("-X") {
+                    Some(attached) => attached,
+                    None => s.split_once('=').map(|(_, v)| v).unwrap_or_default(),
+                };
                 let errors = super::diff_files::parse_dirstat_params(params, &mut dirstat);
                 if !errors.is_empty() {
                     // `parse_dirstat_opt()`'s `die()`, carrying the accumulated text.
@@ -4058,6 +4063,42 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
             &ignore,
         )?;
     }
+    // `builtin_checkdiff()` (diff.c:4296-4307) runs xdiff with its own zeroed
+    // `xpp`/`xecfg`: `xpp.flags = 0`, no `ignore_regex`, `ctxlen = 1`. So neither
+    // `-w`/`-b`/`--ignore-*`, `-I`, `--ignore-blank-lines`, the diff algorithm nor
+    // the indent heuristic changes which added lines `--check` inspects, and it
+    // asks `diff_filespec_is_binary()` without `--text`. The analysis above was
+    // built with every one of them, so the check gets one of its own when any is set.
+    let check_analyses: Option<Vec<Analysis>> = match check
+        && !quiet
+        && !combined
+        && (ws != Whitespace::Keep
+            || indent_heuristic
+            || algorithm.is_some()
+            || ignore.blank_lines
+            || !ignore.lines.is_empty()
+            || ignore.text)
+    {
+        true => Some(analyze_all(
+            &repo,
+            &mut cache,
+            &deltas[..analyzed],
+            1,
+            Whitespace::Keep,
+            false,
+            hash_kind,
+            workdir.as_deref(),
+            true,
+            None,
+            worktree_mode,
+            reverse,
+            false,
+            false,
+            false,
+            &IgnoreOpts::default(),
+        )?),
+        false => None,
+    };
 
     // `external_diff()` (diff.c:5026), read once for the whole command as git's
     // function-scoped static is.
@@ -4303,6 +4344,7 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
                 .get(i)
                 .copied()
                 .unwrap_or((ws_rule, super::diff_files::DEFAULT_CONFLICT_MARKER_SIZE));
+            let analysis = check_analyses.as_ref().and_then(|a| a.get(i)).unwrap_or(analysis);
             found |= report_whitespace_to(&mut buf, delta, analysis, rule, marker_size, &colors);
         }
         // `checkdiff_consume()` writes through `emit_line()` like every other

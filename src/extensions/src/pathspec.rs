@@ -746,6 +746,9 @@ pub struct Element {
     /// (pathspec.c:482-487), so it is the second half of "is this element
     /// already rooted".
     pub prefix_magic: bool,
+    /// `pathspec_prefix` itself when [`Self::prefix_magic`] is set: the item's
+    /// `prefix` length (pathspec.c:482-484), zero otherwise.
+    pub prefix_len: usize,
 }
 
 impl Element {
@@ -887,6 +890,7 @@ fn check_attr_body(body: &[u8], already: bool) -> Result<(), String> {
 fn parse_long_magic(elt: &BStr) -> Result<Element, String> {
     let mut magic = 0u32;
     let mut prefix_magic = false;
+    let mut prefix_len = 0usize;
     let mut pos = 2usize;
     while pos < elt.len() && elt[pos] != b')' {
         let len = strcspn_escaped(&elt[pos..], b",)");
@@ -924,6 +928,7 @@ fn parse_long_magic(elt: &BStr) -> Result<Element, String> {
             // `:(prefix:-1)../x` from a subdirectory is still "is outside
             // repository", where `:(prefix:0)../x` is not.
             prefix_magic = value >= 0;
+            prefix_len = usize::try_from(value).unwrap_or(0);
             continue;
         }
         if kw.starts_with(b"attr:") {
@@ -939,7 +944,7 @@ fn parse_long_magic(elt: &BStr) -> Result<Element, String> {
     if elt.get(pos) != Some(&b')') {
         return Err(missing_closing_paren(elt));
     }
-    Ok(Element { magic, path_start: pos + 1, prefix_magic })
+    Ok(Element { magic, path_start: pos + 1, prefix_magic, prefix_len })
 }
 
 /// `parse_short_magic()` (pathspec.c:395-428).
@@ -967,7 +972,7 @@ fn parse_short_magic(elt: &BStr) -> Result<Element, String> {
     if elt.get(pos) == Some(&b':') {
         pos += 1;
     }
-    Ok(Element { magic, path_start: pos, prefix_magic: false })
+    Ok(Element { magic, path_start: pos, prefix_magic: false, prefix_len: 0 })
 }
 
 /// `parse_element_magic()` (pathspec.c:430-442) followed by
@@ -982,10 +987,10 @@ pub fn parse_element_magic(elt: &BStr) -> Result<Element, String> {
     if std::env::var_os("GIT_LITERAL_PATHSPECS").is_some_and(|v| {
         gix::config::Boolean::try_from(v).map(|b| b.0).unwrap_or(false)
     }) {
-        return Ok(Element { magic: MAGIC_LITERAL, path_start: 0, prefix_magic: false });
+        return Ok(Element { magic: MAGIC_LITERAL, path_start: 0, prefix_magic: false, prefix_len: 0 });
     }
     let mut element = if elt.first() != Some(&b':') {
-        Element { magic: 0, path_start: 0, prefix_magic: false }
+        Element { magic: 0, path_start: 0, prefix_magic: false, prefix_len: 0 }
     } else if elt.get(1) == Some(&b'(') {
         parse_long_magic(elt)?
     } else {

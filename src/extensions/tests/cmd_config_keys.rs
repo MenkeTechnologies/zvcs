@@ -4,7 +4,8 @@
 //! `parse_push_recurse_submodules_arg`.
 //!
 //! Every expectation is a literal captured from a differential run against git
-//! 2.55.0 in the fixture below. Two things are being pinned:
+//! 2.55.0 in the fixture below, except `gc`, which is compared with stock git
+//! 2.56 directly. Two things are being pinned:
 //!
 //!   * the bytes and the exit code of each refusal, and
 //!   * *when* it happens relative to the keys around it — which for `gc` is a
@@ -14,13 +15,20 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// git's `die()` exit status.
 const FATAL: i32 = 128;
 
 fn run(repo: &Path, home: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+    run_with(BIN, repo, home, args)
+}
+
+fn run_with(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
@@ -361,131 +369,66 @@ fn the_repack_keys_are_refused_by_repack() {
 // gc
 // ---------------------------------------------------------------------------
 
-/// `gc_config()` (builtin/gc.c:176-233) is a sequence of targeted lookups, not a
-/// callback, so within it the *source* order decides which key reports — and the
-/// whole block runs before the `git_default_config` walk at :232.
+/// `gc_config()` (builtin/gc.c:154-192) is a sequence of targeted lookups, not a
+/// callback, so within it the *source* order decides which key reports, and the
+/// whole block runs before the `git_default_config` walk. git 2.56 moved the
+/// `gc.auto`, `gc.autoPackLimit`, `gc.bigPackThreshold`, `pack.deltaCacheSize`
+/// and `core.deltaBaseCacheLimit` reads into odb/source-files.c (:430-432,
+/// :533-534, :616-618), where `gc --auto` reaches them only after `gc_config()`,
+/// and only when it gets that far. Every invocation runs on twin fixtures, stock's and zvcs's, and the
+/// stderr and exit codes must match.
 #[test]
 fn the_gc_keys_report_in_source_order_and_before_the_default_walk() {
+    let Some(stock) = stock_git::stock_git_at_least((2, 56, 0)) else {
+        return;
+    };
     let (repo, home) = fixture("gc");
+    let (stock_repo, stock_home) = fixture("gc-stock");
+    let same = |args: &[&str]| {
+        let want = run_with(stock, &stock_repo, &stock_home, args);
+        let got = run(&repo, &home, args);
+        assert_eq!((stderr(&got), code(&got)), (stderr(&want), code(&want)), "for {args:?}");
+    };
 
-    let cases: &[(&str, &str)] = &[
-        ("gc.packRefs=bogus", "fatal: bad boolean config value 'bogus' for 'gc.packrefs'\n"),
-        (
-            "gc.reflogExpire=bogus",
-            "fatal: failed to parse 'gc.reflogexpire' value 'bogus'\n",
-        ),
-        (
-            "gc.aggressiveWindow=bogus",
-            "fatal: bad numeric config value 'bogus' for 'gc.aggressivewindow': invalid unit\n",
-        ),
-        (
-            "gc.aggressiveDepth=bogus",
-            "fatal: bad numeric config value 'bogus' for 'gc.aggressivedepth': invalid unit\n",
-        ),
-        (
-            "gc.auto=bogus",
-            "fatal: bad numeric config value 'bogus' for 'gc.auto': invalid unit\n",
-        ),
-        (
-            "gc.autoPackLimit=bogus",
-            "fatal: bad numeric config value 'bogus' for 'gc.autopacklimit': invalid unit\n",
-        ),
-        ("gc.autoDetach=bogus", "fatal: bad boolean config value 'bogus' for 'gc.autodetach'\n"),
-        ("gc.cruftPacks=bogus", "fatal: bad boolean config value 'bogus' for 'gc.cruftpacks'\n"),
-        (
-            "gc.pruneExpire=bogus",
-            "error: Invalid gc.pruneexpire: 'bogus'\n\
-             fatal: unable to parse 'gc.pruneexpire' from command-line config\n",
-        ),
-        (
-            "gc.worktreePruneExpire=bogus",
-            "error: Invalid gc.worktreepruneexpire: 'bogus'\n\
-             fatal: unable to parse 'gc.worktreepruneexpire' from command-line config\n",
-        ),
-        (
-            "gc.bigPackThreshold=bogus",
-            "fatal: bad numeric config value 'bogus' for 'gc.bigpackthreshold': invalid unit\n",
-        ),
-        (
-            "pack.deltaCacheSize=bogus",
-            "fatal: bad numeric config value 'bogus' for 'pack.deltacachesize': invalid unit\n",
-        ),
-        (
-            "core.deltaBaseCacheLimit=bogus",
-            "fatal: bad numeric config value 'bogus' for 'core.deltabasecachelimit': invalid unit\n",
-        ),
-    ];
-
-    for (assignment, want) in cases {
-        let out = run(&repo, &home, &["-c", assignment, "gc", "--auto"]);
-        assert_eq!(stderr(&out), *want, "for {assignment}");
-        assert_eq!(code(&out), FATAL, "for {assignment}");
+    for assignment in [
+        "gc.packRefs=bogus",
+        "gc.reflogExpire=bogus",
+        "gc.aggressiveWindow=bogus",
+        "gc.aggressiveDepth=bogus",
+        "gc.auto=bogus",
+        "gc.autoPackLimit=bogus",
+        "gc.autoDetach=bogus",
+        "gc.cruftPacks=bogus",
+        "gc.pruneExpire=bogus",
+        "gc.worktreePruneExpire=bogus",
+        "gc.bigPackThreshold=bogus",
+        "pack.deltaCacheSize=bogus",
+        "core.deltaBaseCacheLimit=bogus",
+        // `gc.packRefs` takes one extra word, and the expiry keys take `now`,
+        // `never` and any moment in the past.
+        "gc.packRefs=notbare",
+        "gc.pruneExpire=now",
+        "gc.pruneExpire=never",
+        "gc.pruneExpire=2.weeks.ago",
+        // `gc_config_is_timestamp_never()`'s `&&` short-circuits, so the second
+        // reflog key is only read when the first resolved to "never".
+        "gc.reflogExpireUnreachable=bogus",
+    ] {
+        same(&["-c", assignment, "gc", "--auto"]);
     }
 
-    // The whole block precedes the default walk, so a `gc.*` key wins over a
-    // `core.*` one written before it.
+    // Which of two bad keys reports: a `core.*` one against the gc block, keys
+    // within the block, and the ones 2.56 reads after it.
     for pair in [
         ["core.ignorecase=bogus", "gc.auto=bogus"],
         ["gc.auto=bogus", "core.ignorecase=bogus"],
+        ["gc.auto=bogus", "gc.packRefs=bogus"],
+        ["gc.autoPackLimit=bogus", "gc.auto=bogus"],
+        ["gc.pruneExpire=bogus", "gc.auto=bogus"],
+        ["gc.reflogExpire=never", "gc.reflogExpireUnreachable=bogus"],
     ] {
-        let out = run(&repo, &home, &["-c", pair[0], "-c", pair[1], "gc", "--auto"]);
-        assert_eq!(
-            stderr(&out),
-            "fatal: bad numeric config value 'bogus' for 'gc.auto': invalid unit\n",
-            "for {pair:?}"
-        );
+        same(&["-c", pair[0], "-c", pair[1], "gc", "--auto"]);
     }
-
-    // And within the block the source order decides: `gc.packRefs` is read at
-    // builtin/gc.c:182 and `gc.auto` at :195, so the former reports even when it
-    // is written second.
-    let out = run(
-        &repo,
-        &home,
-        &["-c", "gc.auto=bogus", "-c", "gc.packRefs=bogus", "gc", "--auto"],
-    );
-    assert_eq!(stderr(&out), "fatal: bad boolean config value 'bogus' for 'gc.packrefs'\n");
-    // `gc.auto` (:195) beats `gc.autoPackLimit` (:196) and `gc.pruneExpire` (:201).
-    for other in ["gc.autoPackLimit=bogus", "gc.pruneExpire=bogus"] {
-        let out = run(&repo, &home, &["-c", other, "-c", "gc.auto=bogus", "gc", "--auto"]);
-        assert_eq!(
-            stderr(&out),
-            "fatal: bad numeric config value 'bogus' for 'gc.auto': invalid unit\n",
-            "for {other}"
-        );
-    }
-
-    // `gc.packRefs` takes one extra word, and the expiry keys take `now`, `never`
-    // and any moment in the past.
-    let out = run(&repo, &home, &["-c", "gc.packRefs=notbare", "gc", "--auto"]);
-    assert_eq!(stderr(&out), "");
-    for good in ["now", "never", "2.weeks.ago"] {
-        let out = run(&repo, &home, &["-c", &format!("gc.pruneExpire={good}"), "gc", "--auto"]);
-        assert_eq!(stderr(&out), "", "for {good}");
-    }
-
-    // `gc_config_is_timestamp_never()`'s `&&` short-circuits, so the second
-    // reflog key is only read when the first resolved to "never" — which is why
-    // a bogus value there alone runs clean.
-    let out = run(&repo, &home, &["-c", "gc.reflogExpireUnreachable=bogus", "gc", "--auto"]);
-    assert_eq!(stderr(&out), "");
-    let out = run(
-        &repo,
-        &home,
-        &[
-            "-c",
-            "gc.reflogExpire=never",
-            "-c",
-            "gc.reflogExpireUnreachable=bogus",
-            "gc",
-            "--auto",
-        ],
-    );
-    assert_eq!(
-        stderr(&out),
-        "fatal: failed to parse 'gc.reflogexpireunreachable' value 'bogus'\n"
-    );
-    assert_eq!(code(&out), FATAL);
 }
 
 // ---------------------------------------------------------------------------

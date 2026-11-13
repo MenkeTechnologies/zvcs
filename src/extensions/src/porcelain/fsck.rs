@@ -191,25 +191,30 @@ const ERROR_COMMIT_GRAPH: u8 = 16;
 ///    the header and checksum half is ported (`verify_index_hdr()`), the
 ///    entry-order half is not, as `gix-index` does not expose it. Index entries
 ///    and cache-tree ids become heads as in git.
-/// 8. **`broken link from`/`to` is ported; its NULL-object form is not.**
+/// 8. **`broken link from`/`to` is ported, NULL-object form included.**
 ///    `mark_object()` has two ways of reporting a link it cannot follow
-///    (builtin/fsck.c:135-175). The one this port reproduces is the pair
-///    `broken link from <type> <oid>` / `              to <type> <oid>`, both
-///    type names right-justified in seven columns, printed once per missing
-///    object — the `REACHABLE` guard runs first — when `odb_has_object()` agrees
-///    the object is gone. The other is the `!obj` branch, which fires when
-///    `lookup_tree()`/`lookup_blob()` refuse an id that `obj_hash` already holds
-///    under a different type; that needs git's per-id type cache, which this
-///    port does not model (see divergence 10).
-/// 10. **`obj_hash` remembers a type per id, and this port does not.** git's
-///    `lookup_commit()`/`lookup_tree()`/`lookup_blob()` bind a type to an id the
-///    first time anything names it, and a later `lookup_*()` or
-///    `parse_object()` for a *different* type prints `error: object <oid> is a
-///    <bound>, not a <asked>` and yields NULL. Two shapes reach it: a tree entry
-///    whose mode disagrees with another entry's for the same id, and a tag whose
-///    `type` header disagrees with the object it points at. Both make stock git
-///    report the id `missing` or the link broken; this port reads the object's
-///    real type from the odb instead and reports nothing.
+///    (builtin/fsck.c:120-175). One is the pair `broken link from <type> <oid>` /
+///    `              to <type> <oid>`, both type names right-justified in seven
+///    columns, printed once per missing object — the `REACHABLE` guard runs
+///    first — when `odb_has_object()` agrees the object is gone. The other is the
+///    `!obj` branch, `broken link from <type> <oid>` / `broken link from <type>
+///    unknown`, which fires when `lookup_tree()`/`lookup_blob()` refuse a tree
+///    entry's id that `obj_hash` already holds under a different type (see 10).
+/// 10. **`obj_hash`'s type per id is modelled** ([`State::types`]). git's
+///    `lookup_commit()`/`lookup_tree()`/`lookup_blob()`/`lookup_tag()` bind a type
+///    to an id the first time anything names it, and a later lookup for a
+///    *different* type prints `error: object <oid> is a <bound>, not a <asked>`
+///    and yields NULL (object.c:165-183), which each caller turns into its own
+///    failure: `snapshot_ref()`'s `invalid sha1 pointer`, the scan's `object
+///    corrupt or missing`, `parse_commit_buffer()`'s `bad tree pointer` / `bad
+///    parent`, `parse_tag_buffer()`'s `bad tag pointer`, `fsck_obj()`'s `broken
+///    links`, `fsck_index()` skipping the entry, the cache tree's `invalid sha1
+///    pointer in cache-tree`, `mark_object()`'s NULL branch, and a walk of the
+///    bound type's `Object <oid> not a <type>`. The lookups are replayed in git's
+///    order — snapshot, scan, process_refs, index, walk — so the first type an id
+///    is seen as binds it; where that order is the scan's (or the
+///    `--connectivity-only` listing's) and could not be reconstructed, a failed
+///    lookup refuses rather than guesses.
 /// 9. **The `--verbose` trace is approximate in ordering and in one block.**
 ///    `--verbose` changes nothing on stdout and nothing about the exit code —
 ///    every one of its lines is a `Checking ...` line on stderr — so the flag is
@@ -425,9 +430,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 if let Some(code) = unreadable_unreachable_object(&repo, id, 2) {
                     return Ok(code);
                 }
+                // Then `snapshot_ref()` calls `parse_object()` on what it resolved to, and a
+                // NULL is `invalid sha1 pointer` like a missing object's (builtin/fsck.c:534-556).
+                if let Err(lines) = parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, id, trace.snapshot_parses)? {
+                    lines.iter().for_each(|line| eprintln!("{line}"));
+                    eprintln!("error: {arg}: invalid sha1 pointer {id}");
+                    errors |= ERROR_REACHABLE;
+                    continue;
+                }
                 default_refs += 1;
-                // Then `snapshot_ref()` calls `parse_object()` on what it resolved to.
-                parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, id, trace.snapshot_parses)?;
                 heads.push(id);
             }
             None => {
@@ -824,14 +835,47 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // whose `lookup_<type>()` creates the object *before* the parse — an
         // object the parse then rejects still occupies a slot, one the read
         // never produced does not.
-        state.note(id);
+        //
+        // That `lookup_<type>()` yields NULL for an id something already looked up as another
+        // type, after `object_as_type()`'s `error()`, and so does the parse for a link it looks
+        // up so (object.c:165-183, :280-315; see [`State::lookup_links`]). A commit or tag
+        // parsed already looks nothing up (commit.c:527-528, tag.c:138-139).
+        let parses_links = !(pre_parsed.contains(&id) || scan_parsed.contains(&id));
+        let parsed = match state.lookup_as(id, kind) {
+            Err(line) => Err((ParseFailed { diagnostic: None }, vec![line])),
+            Ok(()) => match parse_object_buffer(id, kind, &data, repo.object_hash().len_in_hex()) {
+                Ok(d) => {
+                    let d = apply_commit_graft(&repo, id, kind, d);
+                    let grafted = kind == Kind::Commit && repo.commit_grafts().get(&id).is_some();
+                    match matches!(kind, Kind::Commit | Kind::Tag) && parses_links {
+                        true => match state.lookup_links(id, kind, &d, grafted) {
+                            Ok(()) => Ok(d),
+                            Err(lines) => Err((ParseFailed { diagnostic: None }, lines)),
+                        },
+                        false => Ok(d),
+                    }
+                }
+                Err(failed) => Err((failed, Vec::new())),
+            },
+        };
+        // The scan order decides which lookup of an id comes first; without it a failed one
+        // is not placed.
+        if state.type_conflicts > 0 && !scan_ordered {
+            bail!(
+                "refusing to guess the output: an object is looked up as two types, and which comes \
+                 first is the object scan's order, which could not be reconstructed"
+            );
+        }
         // `fsck_loose()` parses before it does anything else, and skips
         // `fsck_obj()` — the verbose line included — when the parse fails.
-        let decoded = match parse_object_buffer(id, kind, &data, repo.object_hash().len_in_hex()) {
-            Ok(d) => apply_commit_graft(&repo, id, kind, d),
-            Err(failed) => {
+        let decoded = match parsed {
+            Ok(d) => d,
+            Err((failed, lookup_lines)) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
                 if let Some(line) = failed.diagnostic {
+                    msg_lines.push((slot, id, line));
+                }
+                for line in lookup_lines {
                     msg_lines.push((slot, id, line));
                 }
                 if loose_object_label(&repo, id).is_none() {
@@ -845,7 +889,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // path (builtin/fsck.c:403-409).
                 msg_lines.push((slot, id, format!("error: {id}: object corrupt or missing")));
                 errors |= ERROR_OBJECT;
-                unparseable.insert(id, kind);
+                // `check_reachable_object()` names it by the type its `struct object` holds.
+                unparseable.insert(id, state.types.get(&id).copied().unwrap_or(kind));
                 continue;
             }
         };
@@ -900,7 +945,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // never. A tree is the other way round: `parse_tree_buffer()` creates
         // nothing and `fsck_walk_tree()` decodes the entries and looks every one
         // of them up, on every run.
-        let creates_children = kind == Kind::Tree || !(pre_parsed.contains(&id) || scan_parsed.contains(&id));
         // A commit an argument's `repo_parse_commit()` filled in from the commit-graph has no
         // tree yet, so `fsck_walk_commit()`'s `repo_get_commit_tree()` looks it up here
         // (commit-graph.c:1091-1120).
@@ -914,13 +958,25 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // A grafted commit's true parents are already gone: `apply_commit_graft()`
         // dropped them as `parse_commit_buffer()` does (commit.c:569), so they are
         // neither created nor marked used here, and the graft's parents are both.
-        for (child, _) in &decoded.children {
+        //
+        // A commit's or tag's links were looked up by its parse above; `fsck_walk_tree()`
+        // looks up every entry of a tree with `lookup_tree()` / `lookup_blob()`, on every walk.
+        // One that yields NULL, after `object_as_type()`'s `error()`, is `mark_used()`'s
+        // non-zero return, which `fsck_walk_tree()` hands back once the entries are done and
+        // `fsck_obj()` turns into `broken links` (fsck.c:364-394, builtin/fsck.c:200-206,
+        // :418-419); the entry is not marked used.
+        let mut walk_failed = false;
+        for (child, child_kind) in &decoded.children {
             // Absent children are `note`d all the same: `fsck_walk()` creates
             // them, so they occupy an `obj_hash` slot. They are not *reported*
             // here — `check_unreachable_object()` never prints `missing`, so an
             // object that only an unreachable object names stays quiet.
-            if creates_children {
-                state.note(*child);
+            if kind == Kind::Tree {
+                if let Err(line) = state.lookup_as(*child, *child_kind) {
+                    msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
+                    walk_failed = true;
+                    continue;
+                }
             }
             state.used.insert(*child);
         }
@@ -929,14 +985,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // walk that failed outright into `objerror(… "broken links")`.
         if let Some((line, broken)) = decoded.walk_error {
             msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, line));
-            if broken {
-                msg_lines.push((
-                    Slot::Scan(id.as_bytes()[0]),
-                    id,
-                    format!("error in {kind} {id}: broken links"),
-                ));
-                errors |= ERROR_OBJECT;
-            }
+            walk_failed |= broken;
+        }
+        if walk_failed {
+            msg_lines.push((Slot::Scan(id.as_bytes()[0]), id, format!("error in {kind} {id}: broken links")));
+            errors |= ERROR_OBJECT;
         }
 
         // `fsck_object()` next; `fsck_obj()` skips the `root`/`tagged` line when
@@ -1547,12 +1600,19 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     }
                 },
             };
-            // `fsck_walk_tree()` opens with `repo_parse_tree()` (fsck.c:361-362), which reads a tree
-            // whose buffer is not held and refuses an object of another type with
-            // `error("Object %s not a tree")` (tree.c:185-204); the walk then stops there.
-            if expected == Some(Kind::Tree) && kind != Kind::Tree && !state.parsed_trees.contains(&id) {
-                header_lines.iter().for_each(|line| eprintln!("{line}"));
-                eprintln!("error: Object {id} not a tree");
+            // An untyped object is `parse_object()`d by `fsck_walk()`, which types it as the odb
+            // does (fsck.c:487-488).
+            let walked_as = *state.types.entry(id).or_insert(kind);
+            // `fsck_walk()` walks the type the `struct object` holds (fsck.c:490-498). Its
+            // `repo_parse_tree()`, `repo_parse_commit()` or `parse_tag()` reads an object not
+            // parsed yet and refuses one the odb holds as another type with `error("Object %s
+            // not a <type>")` (tree.c:185-204, commit.c:625-650, tag.c:207-224); the walk then
+            // stops there, as it does at once for a blob.
+            if walked_as != kind && !(walked_as == Kind::Tree && state.parsed_trees.contains(&id)) {
+                if walked_as != Kind::Blob {
+                    header_lines.iter().for_each(|line| eprintln!("{line}"));
+                    eprintln!("error: Object {id} not a {walked_as}");
+                }
                 break 'traverse;
             }
             if kind == Kind::Blob {
@@ -1655,9 +1715,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             };
             if parses_here {
                 // `decode()` has already applied the graft, which is what
-                // `parse_commit_buffer()` looks parents up from.
-                for (child, _) in &decoded.children {
-                    state.note(*child);
+                // `parse_commit_buffer()` looks parents up from. A lookup that yields NULL
+                // fails the parse after its `error()`s, and `fsck_walk()` returns -1 with
+                // nothing behind the object walked (fsck.c:410-411, :471-472).
+                let grafted = kind == Kind::Commit && repo.commit_grafts().get(&id).is_some();
+                if let Err(lines) = state.lookup_links(id, kind, &decoded, grafted) {
+                    lines.iter().for_each(|line| eprintln!("{line}"));
+                    break 'traverse;
                 }
             }
             // `traverse_one_object()` is another `fsck_walk()`, so a tree whose
@@ -1679,10 +1743,26 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // why a name spreads out from the head that carries one and no further.
             // The names are put *before* `options->walk()` runs, so every child of
             // one object is named before any of them is descended into.
+            //
+            // `fsck_walk_tree()` looks each entry up with `lookup_tree()` / `lookup_blob()`
+            // first; one that yields NULL, after `object_as_type()`'s `error()`, is not named
+            // and reaches `mark_object()` as NULL (fsck.c:375-388).
+            let mut lookup_failed: Vec<bool> = vec![false; decoded.children.len()];
+            if kind == Kind::Tree {
+                for (index, (child, child_kind)) in decoded.children.iter().enumerate() {
+                    if let Err(line) = state.lookup_as(*child, *child_kind) {
+                        eprintln!("{line}");
+                        lookup_failed[index] = true;
+                    }
+                }
+            }
             let parent_name = names.get(&id).map(str::to_owned);
             if let Some(parent) = &parent_name {
                 let mut counter = 0usize;
                 for (index, (child, child_kind)) in decoded.children.iter().enumerate() {
+                    if lookup_failed[index] {
+                        continue;
+                    }
                     match kind {
                         Kind::Tree => {
                             let path = decoded
@@ -1718,17 +1798,38 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            for (child, child_kind) in decoded.children {
-                state.kinds.entry(child).or_insert(child_kind);
+            for (index, (child, child_kind)) in decoded.children.into_iter().enumerate() {
                 // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
                 // `lookup_blob()`, and a lookup moves a displaced object back to its
                 // home slot, so the call has to be replayed here as well as in the
-                // scan. `fsck_walk_commit()` and `fsck_walk_tag()` follow pointers
-                // `parse_object()` already stored and look nothing up, which is why
-                // only a tree's children are recorded.
-                if kind == Kind::Tree {
-                    state.note(child);
+                // scan — which the lookups above did. `fsck_walk_commit()` and
+                // `fsck_walk_tag()` follow pointers `parse_object()` already stored and
+                // look nothing up, which is why only a tree's children are recorded.
+                //
+                // ```c
+                // if (!obj) {
+                //         printf_ln(_("broken link from %7s %s"), …parent…);
+                //         printf_ln(_("broken link from %7s %s"),
+                //                   (type == OBJ_ANY ? _("unknown") : type_name(type)),
+                //                   _("unknown"));
+                //         errors_found |= ERROR_REACHABLE;
+                //         return 1;
+                // }
+                // ```
+                //
+                // (`mark_object()`, builtin/fsck.c:120-133.) A lookup that yielded NULL
+                // reaches it with the type the entry asked for.
+                if lookup_failed[index] {
+                    crate::cstdio::println!(
+                        "broken link from {:>7} {}\nbroken link from {:>7} unknown",
+                        kind.to_string(),
+                        names.describe(&id),
+                        child_kind.to_string(),
+                    );
+                    errors |= ERROR_REACHABLE;
+                    continue;
                 }
+                state.kinds.entry(child).or_insert(child_kind);
                 // ```c
                 // if (is_promisor_object(options->repo, &obj->oid))
                 //         /*
@@ -1862,6 +1963,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // and the packed half's order is the pack lists' at that moment (see
         // [`ReferentsPacks`]). Unreplayed, it is `all` in one piece.
         let mut parsed_here: HashSet<ObjectId> = HashSet::new();
+        let conflicts_before = state.type_conflicts;
         let mut packs_now = pack_lists.as_ref().filter(|_| listing.is_some()).map(ReferentsPacks::new);
         if let Some(packs) = &mut packs_now {
             for &(read, frozen) in &state.pack_reads {
@@ -1939,6 +2041,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     }
                 };
                 let kind = header.kind();
+                // `object_as_type(obj, type, 0)` on an untyped object (builtin/fsck.c:227-232).
+                state.types.entry(id).or_insert(kind);
                 // `odb_read_object_info()` for an object nothing has typed yet.
                 if state.typed.insert(id) {
                     if let Some(packs) = &mut packs_now {
@@ -2002,23 +2106,49 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     Err(_) => continue,
                 };
                 let children: Vec<ObjectId> = decoded.children.iter().map(|(child, _)| *child).collect();
+                // The lookups that yielded NULL, after `object_as_type()`'s `error()`: a tree
+                // entry is `mark_used()`'s NULL and stays unused (fsck.c:375-388,
+                // builtin/fsck.c:200-206); a commit's or tag's link fails its parse, which
+                // stays undone for the next walk (see [`State::lookup_links`]).
+                let mut failed: HashSet<ObjectId> = HashSet::new();
                 if !parsed_before {
-                    let looked_up = match graph_order {
-                        true => children.iter().skip(1).chain(children.first()).copied().collect(),
-                        false => children.clone(),
-                    };
-                    for child in looked_up {
-                        state.note(child);
-                        state.typed.insert(child);
+                    if graph_order {
+                        for child in children.iter().skip(1).chain(children.first()) {
+                            state.note(*child);
+                        }
+                    } else if kind == Kind::Tree {
+                        for (child, child_kind) in &decoded.children {
+                            if let Err(line) = state.lookup_as(*child, *child_kind) {
+                                eprintln!("{line}");
+                                failed.insert(*child);
+                            }
+                        }
+                    } else {
+                        let grafted = kind == Kind::Commit && repo.commit_grafts().get(&id).is_some();
+                        if let Err(lines) = state.lookup_links(id, kind, &decoded, grafted) {
+                            lines.iter().for_each(|line| eprintln!("{line}"));
+                            parsed_here.remove(&id);
+                            continue;
+                        }
                     }
+                    state.typed.extend(children.iter().copied());
                     for (child, kind) in &decoded.children {
                         state.kinds.entry(*child).or_insert(*kind);
                     }
                 }
                 for child in children {
-                    state.used.insert(child);
+                    if !failed.contains(&child) {
+                        state.used.insert(child);
+                    }
                 }
             }
+        }
+        // Which of two lookups of one id comes first is the listing's order.
+        if state.type_conflicts > conflicts_before && listing.is_none() {
+            bail!(
+                "refusing to guess the output: an object is looked up as two types, and which comes \
+                 first is the object listing's order, which could not be reconstructed"
+            );
         }
     }
 
@@ -2099,7 +2229,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // `check_object()` reaches the object.
             let (header, read_lines) = gix::odb::store::capture_errors(|| repo.find_header(id));
             let kind: Option<Kind> = match header {
-                Ok(header) => Some(header.kind()),
+                // `printable_type()` names the type the `struct object` holds, and asks the odb
+                // only for an untyped one (builtin/fsck.c:56-70).
+                Ok(header) => Some(state.types.get(&id).copied().unwrap_or(header.kind())),
                 Err(gix::object::find::existing::Error::NotFound { .. }) => match state.kinds.get(&id) {
                     Some(&kind) if state.typed.contains(&id) => Some(kind),
                     _ => None,
@@ -2566,9 +2698,64 @@ struct State {
     /// `add_promisor_object()` or by an earlier walk of the same pass: every other typed
     /// lookup names a head or something a head reaches.
     typed: HashSet<ObjectId>,
+    /// `obj->type` of every object a `lookup_commit()` / `lookup_tree()` / `lookup_blob()` /
+    /// `lookup_tag()` or a parse has typed. The first type an id is looked up as is the one
+    /// `obj_hash` keeps: a later `lookup_<type>()` for another type is `object_as_type()`'s
+    /// `object %s is a %s, not a %s` error and a NULL (object.c:165-183), which each caller
+    /// turns into its own failure — see [`State::lookup_as`]. An object only
+    /// `lookup_unknown_object()` or `lookup_object()` created is `OBJ_NONE` and absent here.
+    types: HashMap<ObjectId, Kind>,
+    /// How many of those lookups failed. Which lookup of an id comes first is the scan's
+    /// order, so a failure where that order is not reconstructed is refused.
+    type_conflicts: usize,
 }
 
 impl State {
+    /// `lookup_<kind>(id)`: [`note`](Self::note) it, then `object_as_type()` (object.c:165-183).
+    /// An id already typed as something else yields NULL after git's `error()`, whose line
+    /// is returned for the caller to print where git prints it.
+    fn lookup_as(&mut self, id: ObjectId, kind: Kind) -> Result<(), String> {
+        self.note(id);
+        self.object_as_type(id, kind)
+    }
+
+    /// `object_as_type(obj, kind, 0)` on an object that exists: an untyped one takes `kind`,
+    /// one of `kind` is returned, and any other is the error (object.c:165-183).
+    fn object_as_type(&mut self, id: ObjectId, kind: Kind) -> Result<(), String> {
+        match self.types.get(&id) {
+            Some(&bound) if bound != kind => {
+                self.type_conflicts += 1;
+                Err(format!("error: object {id} is a {bound}, not a {kind}"))
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.types.insert(id, kind);
+                Ok(())
+            }
+        }
+    }
+
+    /// The links `parse_commit_buffer()` and `parse_tag_buffer()` look up, in their order: a
+    /// commit's tree, then each parent the graft leaves, a tag's tagged object as its `type`
+    /// header names it (commit.c:543-586, tag.c:166-183). The first lookup that yields NULL
+    /// ends the parse with its `error()`, after `object_as_type()`'s; the lookups before it
+    /// stay made. `grafted` is a commit `lookup_commit_graft()` found, whose parents are the
+    /// graft's.
+    fn lookup_links(&mut self, id: ObjectId, kind: Kind, decoded: &Decoded, grafted: bool) -> Result<(), Vec<String>> {
+        for (n, &(child, child_kind)) in decoded.children.iter().enumerate() {
+            if let Err(line) = self.lookup_as(child, child_kind) {
+                let why = match kind {
+                    Kind::Commit if n == 0 => format!("error: bad tree pointer {child} in commit {id}"),
+                    Kind::Commit if grafted => format!("error: bad graft parent {child} in commit {id}"),
+                    Kind::Commit => format!("error: bad parent {child} in commit {id}"),
+                    _ => format!("error: bad tag pointer to {child} in {id}"),
+                };
+                return Err(vec![line, why]);
+            }
+        }
+        Ok(())
+    }
+
     /// Record one `lookup_<type>(id)` — which creates `id` when it is new and
     /// otherwise finds it. Returns whether it is new.
     fn note(&mut self, id: ObjectId) -> bool {
@@ -2665,19 +2852,30 @@ fn parse_object_ops(
     graph: &mut ProcessGraph<'_>,
     id: ObjectId,
     parses: bool,
-) -> Result<()> {
+) -> Result<Result<(), Vec<String>>> {
     state.note(id);
     if !parses {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let kind = repo.find_header(id).map(|h| h.kind()).ok();
+    // `parse_object_buffer()`'s `lookup_<type>()` of the object itself, then the lookups its
+    // parse makes; a NULL from either is `parse_object()`'s (see [`State::lookup_links`]).
+    if let Some(kind) = kind {
+        if let Err(line) = state.object_as_type(id, kind) {
+            return Ok(Err(vec![line]));
+        }
+    }
     if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
         if let Ok(Ok(parsed)) = decode(repo, id) {
             state.typed.insert(id);
+            let grafted = kind == Some(Kind::Commit) && repo.commit_grafts().get(&id).is_some();
+            let linked = state.lookup_links(id, kind.expect("matched"), &parsed, grafted);
             for (child, kind) in &parsed.children {
-                state.note(*child);
                 state.typed.insert(*child);
                 state.kinds.entry(*child).or_insert(*kind);
+            }
+            if linked.is_err() {
+                return Ok(linked);
             }
             pre_parsed.insert(id);
             if kind == Some(Kind::Commit) {
@@ -2685,7 +2883,7 @@ fn parse_object_ops(
             }
         }
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 /// `repo_parse_commit()` from `fsck_walk_commit()` (fsck.c:410) on a commit nothing has parsed
@@ -2866,9 +3064,9 @@ fn parent_entry_len(hexsz: usize) -> usize {
 }
 
 /// `commit.c::parse_commit_buffer`, which reads only the `tree` line and the
-/// `parent` lines and leaves every other header to the message layer. Its two
-/// `lookup_*` failures are not modelled: they need an id already known to this
-/// process under a conflicting type.
+/// `parent` lines and leaves every other header to the message layer. Its
+/// `lookup_*` failures need the process's type table, so the callers make them
+/// with [`State::lookup_links`].
 fn parse_commit_buffer(
     id: ObjectId,
     data: &[u8],
@@ -2902,7 +3100,8 @@ fn parse_commit_buffer(
 
 /// `tag.c::parse_tag_buffer`, which reads only the `object`, `type` and `tag`
 /// headers. Every failure but the unknown type is silent — it returns `-1`
-/// without printing.
+/// without printing. Its `bad tag pointer`, which needs the process's type table, is
+/// [`State::lookup_links`]'s.
 fn parse_tag_buffer(
     id: ObjectId,
     data: &[u8],
@@ -3018,6 +3217,34 @@ fn collect_default_heads(
         }
         state.note(id);
         let kind = repo.find_header(id).map(|h| h.kind()).ok();
+        // `parse_object()` returns an object already parsed as it stands (object.c:335-337);
+        // any other goes through `parse_object_buffer()`'s `lookup_<type>()` and the lookups
+        // its parse makes, and a NULL from one is this reference's `invalid sha1 pointer`
+        // (builtin/fsck.c:534-556).
+        let parsed_already = pre_parsed.contains(&id);
+        let typed = match kind {
+            Some(kind) if !parsed_already => state.object_as_type(id, kind).map_err(|line| vec![line]),
+            _ => Ok(()),
+        };
+        let decoded = match (typed, kind) {
+            (Ok(()), Some(kind @ (Kind::Commit | Kind::Tag))) if !parsed_already => match decode(repo, id) {
+                Ok(Ok(parsed)) => {
+                    let grafted = kind == Kind::Commit && repo.commit_grafts().get(&id).is_some();
+                    state.lookup_links(id, kind, &parsed, grafted).map(|()| Some(parsed))
+                }
+                _ => Ok(None),
+            },
+            (typed, _) => typed.map(|()| None),
+        };
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(lines) => {
+                lines.iter().for_each(|line| eprintln!("{line}"));
+                eprintln!("error: {name}: invalid sha1 pointer {id}");
+                *errors |= ERROR_REACHABLE;
+                return Ok(0);
+            }
+        };
         // ```c
         // if (obj->type != OBJ_COMMIT && is_branch(ref->name)) {
         //         error(_("%s: not a commit"), ref->name);
@@ -3032,15 +3259,10 @@ fn collect_default_heads(
             eprintln!("error: {name}: not a commit");
             *errors |= ERROR_REFS;
         }
-        if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
-            if let Ok(Ok(parsed)) = decode(repo, id) {
-                for (child, _) in &parsed.children {
-                    state.note(*child);
-                }
-                pre_parsed.insert(id);
-                if kind == Some(Kind::Commit) {
-                    commit_graph_info_now(graph, id)?;
-                }
+        if decoded.is_some() {
+            pre_parsed.insert(id);
+            if kind == Some(Kind::Commit) {
+                commit_graph_info_now(graph, id)?;
             }
         }
         heads.push(id);
@@ -3252,7 +3474,12 @@ fn collect_index_heads(
         if entry.mode.is_submodule() {
             continue;
         }
-        state.note(entry.id);
+        // `if (!blob) continue;` (builtin/fsck.c:778-781): an id something typed otherwise is
+        // `object_as_type()`'s `error()` and no head.
+        if let Err(line) = state.lookup_as(entry.id, Kind::Blob) {
+            eprintln!("{line}");
+            continue;
+        }
         // `fsck_index()` reaches an index entry through `lookup_blob()`
         // (builtin/fsck.c:894-898), so the object it creates carries `OBJ_BLOB`
         // whether or not the odb has it — which is the type
@@ -3409,11 +3636,6 @@ fn collect_cache_tree(
             );
             return Ok(ERROR_REFS);
         }
-        // `fsck_put_object_name(&fsck_walk_options, &it->oid, ":")`
-        // (builtin/fsck.c:830) — every cache-tree node, root or subtree, is
-        // named with a bare colon.
-        names.put(tree.id, || ":".to_string());
-        state.note(tree.id);
         // `parse_object()` reads a tree whose buffer is not held, and keeps it. That read is
         // `odb_read_object()`'s, which dies where the data cannot be unpacked, as at an offset
         // beyond the end of the pack (object.c:368, packfile.c:620-660). A refused pack the
@@ -3421,12 +3643,29 @@ fn collect_cache_tree(
         // `odb_read_object_info()`'s, as the `unknown object type` of an entry
         // `packed_to_object_type()` cannot use before a loose copy answers (object.c:345-346,
         // packfile.c:1124-1129), and the entry it marked bad is passed over after.
+        let mut read_kind = None;
         if !state.parsed_trees.contains(&tree.id) {
-            let (_, lines) = gix::odb::store::capture_errors(|| repo.find_object(tree.id));
+            let (object, lines) = gix::odb::store::capture_errors(|| repo.find_object(tree.id));
             if refused.is_empty() {
                 lines.iter().for_each(|line| eprintln!("{line}"));
             }
+            read_kind = object.ok().map(|object| object.kind);
         }
+        // The read hands the object to `parse_object_buffer()`, whose `lookup_<type>()` yields
+        // NULL for one a lookup typed as anything else (object.c:280-315, :345-378): the same
+        // `invalid sha1 pointer`, after `object_as_type()`'s `error()`, and no name.
+        state.note(tree.id);
+        if let Some(kind) = read_kind {
+            if let Err(line) = state.object_as_type(tree.id, kind) {
+                eprintln!("{line}");
+                eprintln!("error: {}: invalid sha1 pointer in cache-tree of {index_path}", tree.id);
+                return Ok(ERROR_REFS);
+            }
+        }
+        // `fsck_put_object_name(&fsck_walk_options, &it->oid, ":")`
+        // (builtin/fsck.c:830) — every cache-tree node, root or subtree, is
+        // named with a bare colon.
+        names.put(tree.id, || ":".to_string());
         if state.parsed_trees.insert(tree.id) {
             state.pack_reads.push((Some(tree.id), None));
         }
@@ -5595,12 +5834,18 @@ fn replay_arg_ops(
             ArgOp::Fatal(msg) => return Err(crate::fatal::die(msg.clone())),
             _ if !trace.complete => {}
             ArgOp::Read(_) => midx_retry.read(),
-            ArgOp::Parse(id, parses) => parse_object_ops(repo, state, pre_parsed, graph, *id, *parses)?,
+            ArgOp::Parse(id, parses) => {
+                if parse_object_ops(repo, state, pre_parsed, graph, *id, *parses)?.is_err() {
+                    bail!("refusing to guess the output: resolving the argument parses {id}, which a lookup already typed as another type");
+                }
+            }
             ArgOp::ParseCommit(id) => {
                 if let Ok(Ok(decoded)) = decode(repo, *id) {
                     state.typed.insert(*id);
                     for (child, kind) in &decoded.children {
-                        state.note(*child);
+                        if state.lookup_as(*child, *kind).is_err() {
+                            bail!("refusing to guess the output: resolving the argument parses a link a lookup already typed as another type");
+                        }
                         state.typed.insert(*child);
                         state.kinds.entry(*child).or_insert(*kind);
                     }
@@ -5616,7 +5861,9 @@ fn replay_arg_ops(
             ArgOp::ParseTag(id) => {
                 if let Ok(Ok(decoded)) = decode(repo, *id) {
                     for (child, kind) in &decoded.children {
-                        state.note(*child);
+                        if state.lookup_as(*child, *kind).is_err() {
+                            bail!("refusing to guess the output: resolving the argument parses a link a lookup already typed as another type");
+                        }
                         state.typed.insert(*child);
                         state.kinds.entry(*child).or_insert(*kind);
                     }

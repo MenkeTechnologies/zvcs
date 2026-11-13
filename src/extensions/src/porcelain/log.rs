@@ -8664,27 +8664,6 @@ impl ReflogEntry {
     }
 }
 
-/// The name `commit_reflog->reflogs->ref` ends up holding, which is what the
-/// `Reflog:` header and `%gD` print (and what `%gd` shortens).
-///
-/// `read_complete_reflog()` looks for the log file under four spellings of the
-/// argument — as typed, under the reference it resolves to, `refs/<name>` and
-/// `refs/heads/<name>` — and records the name **as typed** whenever one of them
-/// answers. Only when all four come up empty does `add_reflog_for_walk()` fall
-/// back to `repo_dwim_log()` and *replace* the name with the full ref it found.
-/// That is why `-g main` keeps `main@{0}` while `-g origin/main` prints
-/// `refs/remotes/origin/main@{0}`: no `refs/origin/main` or
-/// `refs/heads/origin/main` exists, so only the `refs/remotes/` rule reaches it.
-fn reflog_display_name(repo: &gix::Repository, name: &str) -> String {
-    if reflog_candidates(repo, name)
-        .iter()
-        .any(|cand| crate::refstore::reflog_exists(repo, cand))
-    {
-        return name.to_string();
-    }
-    super::reflog::dwim_log(repo, name).unwrap_or_else(|| name.to_string())
-}
-
 /// `read_complete_reflog()`'s four spellings of the argument (reflog-walk.c:68-103),
 /// in the order it tries them: as typed, then the reference it resolves to under
 /// `RESOLVE_REF_READING`, then `refs/<name>`, then `refs/heads/<name>`.
@@ -8707,20 +8686,14 @@ fn reflog_candidates(repo: &gix::Repository, name: &str) -> Vec<String> {
     .collect()
 }
 
-/// `read_complete_reflog()`: a ref's whole reflog in git's stored order (oldest
-/// entry first), each entry carrying the `@{<n>}` index its selector prints.
-///
-/// `None` means the ref has no log. That is not an error: `add_reflog_for_walk()`
-/// answers -1 and `add_pending_object_with_path()` returns without pending the
-/// commit either way, so `git log -g <tag>` prints nothing and exits 0.
-fn read_reflog(
+/// `read_complete_reflog()` (reflog-walk.c:68-103): the entries of the first of
+/// [`reflog_candidates`] that has any, each recorded under `ref` **as typed**
+/// (`reflogs->ref = xstrdup(ref)`), whichever spelling supplied them.
+fn read_complete_reflog(
     repo: &gix::Repository,
     name: &str,
     kind: ReflogSelector,
-) -> Result<Option<Vec<ReflogEntry>>> {
-    // `reflogs->ref` is the argument *as typed* (reflog-walk.c:71), whichever
-    // spelling ends up supplying the entries.
-    let refname = reflog_display_name(repo, name);
+) -> Result<Vec<ReflogEntry>> {
     let mut items: Vec<ReflogEntry> = Vec::new();
     for cand in reflog_candidates(repo, name) {
         let Some(reference) = repo.try_find_reference(cand.as_str()).ok().flatten() else {
@@ -8730,11 +8703,40 @@ fn read_reflog(
         let Some(iter) = platform.all()? else {
             continue;
         };
-        read_reflog_entries(iter, &refname, kind, &mut items);
+        read_reflog_entries(iter, name, kind, &mut items);
         // `if (reflogs->nr == 0)` guards each fallback, so the first spelling with
         // any entry at all is the one that answers.
         if !items.is_empty() {
             break;
+        }
+    }
+    Ok(items)
+}
+
+/// A ref's whole reflog in git's stored order (oldest entry first), each entry
+/// carrying the `@{<n>}` index its selector prints — `add_reflog_for_walk()`'s
+/// lookup (reflog-walk.c:189-210).
+///
+/// `read_complete_reflog()` runs on the name as typed; only when that finds no
+/// entry does `repo_dwim_log()` get a say, and only a single match replaces the
+/// name (`if (ret > 1) free(b); else if (ret == 1) { … branch = b; … }`) before
+/// the log is read again under it. That is why `-g main` keeps `main@{0}`, while
+/// `-g origin/main` prints `refs/remotes/origin/main@{0}` and `-g @` prints
+/// `HEAD@{0}`: `repo_dwim_log()` runs `substitute_branch_name()` first, which
+/// turns a bare `@` into `HEAD` (refs.c:839-843).
+///
+/// `None` means the ref has no log. That is not an error: `add_reflog_for_walk()`
+/// answers -1 and `add_pending_object_with_path()` returns without pending the
+/// commit either way, so `git log -g <tag>` prints nothing and exits 0.
+fn read_reflog(
+    repo: &gix::Repository,
+    name: &str,
+    kind: ReflogSelector,
+) -> Result<Option<Vec<ReflogEntry>>> {
+    let mut items = read_complete_reflog(repo, name, kind)?;
+    if items.is_empty() {
+        if let (1, Some(dwimmed)) = crate::objname::dwim_log(repo, name) {
+            items = read_complete_reflog(repo, &dwimmed, kind)?;
         }
     }
     if items.is_empty() {

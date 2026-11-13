@@ -528,7 +528,12 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             Ok(false) => {}
         }
         match a {
-            "--" => after_dashdash = true,
+            // `cmd_restore()` passes no `PARSE_OPT_KEEP_DASHDASH` (only a command
+            // taking both refs and paths does, builtin/checkout.c:1911-1912) and no
+            // `PARSE_OPT_KEEP_UNKNOWN_OPT`, so `--end-of-options` ends the options
+            // and is dropped exactly as `--` is (parse-options.c:1113-1124): what
+            // follows is pathspec, a later `--` included.
+            "--" | "--end-of-options" => after_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
             // exit 0, with no `error:` line — a help request is not a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
@@ -795,7 +800,13 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         let repo = crate::setup::discover()?;
         let revision = match source.as_deref() {
             None | Some("HEAD") => source.clone(),
-            Some(r) => Some(repo.rev_parse_single(r)?.detach().to_string()),
+            // `repo_get_oid_mb()` runs before the patch session starts
+            // (builtin/checkout.c:2023-2027), so `-s <a>...<b>` is the merge base
+            // here too, and a name that does not resolve is the same fatal.
+            Some(r) => match super::branch::get_oid_mb(&repo, r) {
+                Some(id) => Some(id.to_string()),
+                None => crate::git_fatal!("could not resolve '{r}'"),
+            },
         };
         let mode = match (staged, worktree) {
             (true, true) => super::add_patch::Mode::Checkout,
@@ -818,7 +829,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         let source_or_head = source.clone().or_else(|| staged.then(|| "HEAD".to_string()));
         if let Some(rev) = source_or_head {
             let repo = crate::setup::discover()?;
-            let Some(id) = crate::objname::resolve(&repo, rev.as_str()) else {
+            let Some(id) = super::branch::get_oid_mb(&repo, rev.as_str()) else {
                 crate::git_fatal!("could not resolve '{rev}'");
             };
             let id = super::checkout::branch_ref_id(&repo, rev.as_str()).unwrap_or(id);
@@ -917,7 +928,12 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // the tree lookup as `unable to read tree`, not as a name that would not
         // resolve.
         Some(rev) => {
-            let Some(id) = crate::objname::resolve(&repo, rev.as_str()) else {
+            // `if (repo_get_oid_mb(the_repository, opts->from_treeish, &rev))
+            //         die(_("could not resolve '%s'"), opts->from_treeish);`
+            // (builtin/checkout.c:2026-2027): the merge-base form of the lookup,
+            // so `--source=<a>...<b>` restores from the one merge base of the two
+            // sides and dies when there is none or more than one.
+            let Some(id) = super::branch::get_oid_mb(&repo, rev.as_str()) else {
                 crate::git_fatal!("could not resolve '{rev}'");
             };
             // `--source` goes through the same
@@ -1171,6 +1187,18 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // for each matched unmerged path (or removal when the chosen side deleted it).
     let mut resolved_entries: Vec<(BString, ObjectId, Mode)> = Vec::new();
     let mut resolved_remove: HashSet<BString> = HashSet::new();
+    // `checkout_merged()` hands `ll_merge()` `opts->conflict_style`, -1 unless
+    // `--conflict` was given (builtin/checkout.c:97, :350), and `ll_xdl_merge()`
+    // falls back to `git_xmerge_style`, the `merge.conflictStyle` that
+    // `git_xmerge_config()` stored while the configuration was read
+    // (merge-ll.c:135-138): so `-m` alone merges in the configured style.
+    let merge_style = conflict_style
+        .or_else(|| {
+            repo.config_snapshot()
+                .string("merge.conflictStyle")
+                .and_then(|v| crate::merge_apply::conflict_style(&v.to_string()))
+        })
+        .unwrap_or(ConflictStyle::Merge);
     if conflict_mode {
         for p in unmerged.keys() {
             let arr = visible(p);
@@ -1186,7 +1214,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                     arr[1].map(|(id, _)| id),
                     ours.map(|(id, _)| id),
                     theirs.map(|(id, _)| id),
-                    conflict_style.unwrap_or(ConflictStyle::Merge),
+                    merge_style,
                 )?;
                 let id = repo.write_blob(&merged)?.detach();
                 resolved_entries.push((p.clone(), id, mode));

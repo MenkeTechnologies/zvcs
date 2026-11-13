@@ -745,11 +745,17 @@ pub(super) fn reflog_delete(
     // `count_reflog_ent()` then counts the entries `refs_for_each_reflog_ent()`
     // yields: all of them for `@{<n>}` (`opts.recno = -recno` then one `++`
     // each), or those older than the date.
+    //
+    // `int recno = strtoul(spec + 2, &ep, 10)` (reflog.c:543) skips leading
+    // whitespace and takes a sign, so `@{ 1}` and `@{+1}` are ordinals, and
+    // `@{-1}` is `ULONG_MAX` truncated to -1: `opts.recno = -recno` starts the
+    // countdown at 1 and the count pushes it one past the log's length, so no
+    // entry is dropped, where reading `-1}` as a date dropped the newest.
     let tail = &spec[at + 2..];
-    let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let older_than = (!tail[digits..].starts_with('}')).then(|| crate::date::approxidate(tail));
+    let (parsed, end) = super::show_branch::strtoul(tail);
+    let older_than = (!tail[end..].starts_with('}')).then(|| crate::date::approxidate(tail));
     let mut recno: i64 = match older_than {
-        None => -tail[..digits].parse::<i64>().unwrap_or(0),
+        None => i64::from(parsed.wrapping_neg()),
         Some(_) => 0,
     };
     // `if (!cb->expire_total || timestamp < cb->expire_total)` (reflog.c:515), over
@@ -790,10 +796,17 @@ pub(super) fn reflog_delete(
     if dry_run {
         return Ok(true);
     }
+    // `files_reflog_expire()` writes every kept entry to the log's lockfile and
+    // commits it whenever `!cb.dry_run` (refs/files-backend.c:3576-3640), so the
+    // log is rewritten even when the countdown dropped nothing: a selector past
+    // the end still re-renders each line through `expire_reflog_ent()`'s
+    // `"%s %s %s %"PRItime" %+05d\t%s"`, which gives back the tab a
+    // `symbolic-ref` entry was written without, and `--rewrite` still closes the
+    // chain up.
     if let Some(i) = doomed {
         lines.remove(i);
-        write_raw_log(&path, &lines, rewrite)?;
     }
+    write_raw_log(&path, &lines, rewrite)?;
     // `EXPIRE_REFLOGS_UPDATE_REF`: the files backend writes the ref straight to its
     // lockfile, so the update leaves no reflog entry of its own.
     if updateref {
@@ -1172,8 +1185,34 @@ pub(super) fn expire_reflogs(repo: &gix::Repository, request: &ExpireRequest) ->
         };
         cb.prepare_for(&full, ref_value_resolved(repo, &full));
         let mut kept: Vec<RawLine> = Vec::new();
+        // ```c
+        // if (cb->rewrite)
+        //         ooid = &cb->last_kept_oid;
+        // if (fn(ooid, noid, email, timestamp, tz, message, cb->policy_cb))
+        //         return 0;
+        // if (cb->dry_run)
+        //         return 0; /* --dry-run */
+        // …
+        // oidcpy(&cb->last_kept_oid, noid);
+        // ```
+        //
+        // (`expire_reflog_ent()`, refs/files-backend.c:3505-3516.) Under `--rewrite`
+        // the policy judges each entry by the old id it will be written with, the
+        // new id of the last entry kept (null before the first), not the one it
+        // recorded; so an entry whose recorded predecessor is unreachable survives
+        // once that predecessor is pruned. `--dry-run` keeps nothing, so there the
+        // substitute stays null throughout.
+        let mut last_kept: Option<ObjectId> = None;
         for line in lines {
-            if !cb.should_expire(line.old, line.new, line.time, &raw_line_message(&line)) {
+            let old = if request.flags.rewrite {
+                last_kept.unwrap_or_else(|| ObjectId::null(line.old.kind()))
+            } else {
+                line.old
+            };
+            if !cb.should_expire(old, line.new, line.time, &raw_line_message(&line)) {
+                if !request.flags.dry_run {
+                    last_kept = Some(line.new);
+                }
                 kept.push(line);
             }
         }

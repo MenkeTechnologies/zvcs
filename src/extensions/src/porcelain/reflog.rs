@@ -950,6 +950,7 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut rewrite = false;
     let mut updateref = false;
+    let mut stale_fix = false;
     let mut expire: Option<i64> = None;
     let mut expire_unreachable: Option<i64> = None;
     let mut refs: Vec<String> = Vec::new();
@@ -1038,9 +1039,7 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
                 "rewrite" => rewrite = !unset,
                 "updateref" => updateref = !unset,
                 "verbose" => verbose = !unset,
-                // `opts.stalefix` only pre-marks reachable objects so that a broken
-                // commit is pruned; the entry is accepted and the walk is not run.
-                "stale-fix" => {}
+                "stale-fix" => stale_fix = !unset,
                 "all" => all = !unset,
                 "single-worktree" => single_worktree = !unset,
                 "expire" | "expire-unreachable" => {
@@ -1084,6 +1083,7 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         refs,
         expire,
         expire_unreachable,
+        stale_fix,
         flags: ExpireFlags { dry_run, update_ref: updateref, rewrite },
         verbose,
     };
@@ -1108,6 +1108,8 @@ pub(super) struct ExpireRequest {
     pub(super) expire_unreachable: Option<i64>,
     /// `--dry-run`, `--updateref`, `--rewrite`.
     pub(super) flags: ExpireFlags,
+    /// `--stale-fix`: `opts.stalefix`.
+    pub(super) stale_fix: bool,
     /// `--verbose`.
     pub(super) verbose: bool,
 }
@@ -1121,6 +1123,7 @@ impl ExpireRequest {
             refs: Vec::new(),
             expire: None,
             expire_unreachable: None,
+            stale_fix: false,
             flags: ExpireFlags::default(),
             verbose: false,
         }
@@ -1138,9 +1141,40 @@ pub(super) fn expire_reflogs(repo: &gix::Repository, request: &ExpireRequest) ->
     // over `REFLOG_EXPIRE_OPTIONS_INIT(now)`.
     let config = ExpireConfig::read(repo, now);
 
+    // ```c
+    // if (opts.stalefix) {
+    //         …
+    //         revs.ignore_missing_links = 1;
+    //         if (verbose)
+    //                 printf(_("Marking reachable objects..."));
+    //         mark_reachable_objects(&revs, 0, 0, NULL);
+    //         …
+    //         if (verbose)
+    //                 putchar('\n');
+    // }
+    // ```
+    //
+    // (builtin/reflog.c:231-243.) The marks it leaves are object flags, so they
+    // carry over from one reflog to the next.
+    let mut stale_fix = None;
+    if request.stale_fix {
+        let mut out = std::io::stdout();
+        if request.verbose {
+            let _ = std::io::Write::write_all(&mut out, b"Marking reachable objects...");
+        }
+        stale_fix = Some(StaleFix::mark_reachable_objects(repo)?);
+        if request.verbose {
+            let _ = std::io::Write::write_all(&mut out, b"\n");
+        }
+    }
+
     // `int status = 0`, which every `error()` below ORs `-1` into.
     let mut ok = true;
-    let mut targets: Vec<String> = Vec::new();
+    // Each reflog with the `cb.dry_run` its callback is built with: the `--all`
+    // loop sets it from the flags (builtin/reflog.c:265-268), the loop over named
+    // refs builds its callback as `{ .opts = opts }` (:289), so there `--verbose`
+    // says `prune`, not `would prune`, though nothing is written.
+    let mut targets: Vec<(String, bool)> = Vec::new();
     if request.all {
         // ```c
         // worktrees = get_worktrees();
@@ -1154,14 +1188,17 @@ pub(super) fn expire_reflogs(repo: &gix::Repository, request: &ExpireRequest) ->
         //
         // (builtin/reflog.c:253-260.) `--all` covers every worktree, in
         // `get_worktrees()` order.
-        targets = collect_reflogs(repo, request.single_worktree)?;
+        targets = collect_reflogs(repo, request.single_worktree)?
+            .into_iter()
+            .map(|full| (full, request.flags.dry_run))
+            .collect();
     }
     // `repo_dwim_log()`, and the `error()` for a name it does not answer. The
     // loop continues past a miss, so `expire nosuchref refs/heads/main` still
     // expires the branch and still fails.
     for name in &request.refs {
         match dwim_log(repo, name) {
-            Some(full) => targets.push(full),
+            Some(full) => targets.push((full, false)),
             None => {
                 eprintln!("error: reflog could not be found: '{name}'");
                 ok = false;
@@ -1169,12 +1206,13 @@ pub(super) fn expire_reflogs(repo: &gix::Repository, request: &ExpireRequest) ->
         }
     }
 
-    for full in targets {
+    for (full, cb_dry_run) in targets {
         // `reflog_expire_options_set_refname(&cb.opts, ref)` before each expiry: the
         // command line wins, then the first `gc.<pattern>.reflog*` whose pattern matches,
         // then `refs/stash`'s never-expire rule, then the `gc.reflog*` defaults.
         let (expire, expire_unreachable) = config.for_ref(&full, request.expire, request.expire_unreachable);
-        let mut cb = ExpirePolicyCb::new(repo, expire, expire_unreachable, request.verbose, request.flags.dry_run);
+        let mut cb = ExpirePolicyCb::new(repo, expire, expire_unreachable, request.verbose, cb_dry_run);
+        cb.stale_fix = stale_fix.as_mut();
         if crate::refstore::is_reftable(repo) {
             ok &= reftable_reflog_expire(repo, &full, request.flags, &mut cb)?;
             continue;
@@ -1686,6 +1724,9 @@ pub(super) struct ExpirePolicyCb<'r> {
     verbose: bool,
     /// `cb->dry_run`, which only changes what `--verbose` says.
     dry_run: bool,
+    /// `opts.stalefix`: the object marks `mark_reachable_objects()` left and
+    /// `keep_entry()` adds to, shared by every reflog the command expires.
+    stale_fix: Option<&'r mut StaleFix>,
 }
 
 impl<'r> ExpirePolicyCb<'r> {
@@ -1700,6 +1741,7 @@ impl<'r> ExpirePolicyCb<'r> {
             head_tips: None,
             verbose,
             dry_run,
+            stale_fix: None,
         }
     }
 
@@ -1755,7 +1797,18 @@ impl<'r> ExpirePolicyCb<'r> {
         if timestamp < self.expire_total {
             return true;
         }
-        // `opts.stalefix` is accepted and not acted on; see `--stale-fix` above.
+        // ```c
+        // if (cb->opts.stalefix &&
+        //     (!keep_entry(&old_commit, ooid) || !keep_entry(&new_commit, noid)))
+        //         return 1;
+        // ```
+        //
+        // (reflog.c:381-383.)
+        if let Some(stale_fix) = self.stale_fix.as_deref_mut() {
+            if !stale_fix.keep_entry(self.repo, old) || !stale_fix.keep_entry(self.repo, new) {
+                return true;
+            }
+        }
         if timestamp < self.expire_unreachable {
             match self.kind {
                 Unreachable::Always => return true,
@@ -1876,6 +1929,287 @@ fn reachable_commits(repo: &gix::Repository, tips: Vec<ObjectId>) -> HashSet<Obj
         }
     }
     set
+}
+
+/// The object flags `reflog expire --stale-fix` reads and sets (reflog.c:135-300):
+/// `SEEN` on what `mark_reachable_objects()` walked to and on what
+/// `commit_is_complete()` and `tree_is_complete()` have since proved whole,
+/// `INCOMPLETE` on what they found something missing below. `STUDYING` lives
+/// only for one `commit_is_complete()` call, so it is local there.
+///
+/// Blobs carry no mark here: `tree_is_complete()` asks the object database for
+/// every entry, and nothing reads `SEEN` on a blob.
+pub(super) struct StaleFix {
+    /// `SEEN`, on commits and trees.
+    seen: HashSet<ObjectId>,
+    /// `INCOMPLETE`, on commits and trees.
+    incomplete: HashSet<ObjectId>,
+}
+
+impl StaleFix {
+    /// `mark_reachable_objects(&revs, 0, 0, NULL)` with `revs.ignore_missing_links`
+    /// set (builtin/reflog.c:231-243, reachable.c:302-358): every commit and tree
+    /// reachable from the index of each worktree (its cache-tree), every ref,
+    /// `HEAD`, the `HEAD` of every other worktree and the rebase state files, the
+    /// reflogs left out (`mark_reflog == 0`).
+    ///
+    /// A root that names an object the repository does not have is
+    /// `parse_object_or_die()`'s `unable to parse object` (reachable.c:96, :48).
+    /// Below the roots a missing link only ends the walk there: a commit is marked
+    /// once the walk reaches it, and a tree only once it parses, since
+    /// `process_tree()` returns before the filter marks it `SEEN` when
+    /// `repo_parse_tree_gently()` fails (list-objects.c:173-176).
+    fn mark_reachable_objects(repo: &gix::Repository) -> Result<Self> {
+        let mut roots: Vec<ObjectId> = Vec::new();
+        // `add_index_objects_to_pending(revs, 0)` (revision.c:1836-1866): the
+        // current index, then every other worktree's. Only the cache-tree's
+        // trees can carry a mark anyone reads.
+        let index = repo.index_or_empty()?;
+        if let Some(tree) = index.tree() {
+            super::prune::push_cache_tree(tree, &mut roots);
+        }
+        let worktrees = super::prune::get_worktrees(repo);
+        for wt in worktrees.iter().filter(|wt| !wt.is_current) {
+            let Ok(index) = gix::index::File::at(
+                wt.git_dir.join("index"),
+                repo.object_hash(),
+                false,
+                gix::index::decode::Options::default(),
+            ) else {
+                continue;
+            };
+            if let Some(tree) = index.tree() {
+                super::prune::push_cache_tree(tree, &mut roots);
+            }
+        }
+
+        // `add_one_ref()` (reachable.c:86-100) over `refs_for_each_ref()`,
+        // `refs_head_ref()` and `other_head_refs()` (worktree.c:602-635).
+        let mut add_one_ref = |name: &str, id: ObjectId| -> Result<()> {
+            if !repo.has_object(id) {
+                crate::git_fatal!("unable to parse object: {name}");
+            }
+            roots.push(id);
+            Ok(())
+        };
+        for reference in repo.references()?.all()? {
+            let Ok(mut reference) = reference else { continue };
+            if let Ok(id) = reference.follow_to_object() {
+                add_one_ref(&reference.name().as_bstr().to_str_lossy(), id.detach())?;
+            }
+        }
+        if let Ok(head) = repo.head() {
+            if let Some(id) = head.id() {
+                add_one_ref("HEAD", id.detach())?;
+            }
+        }
+        for wt in worktrees.iter().filter(|wt| !wt.is_current) {
+            let head = wt.ref_name("HEAD".into()).to_str_lossy().into_owned();
+            let id = match crate::refstore::state_ref_read(repo, &head) {
+                Ok(Some(crate::refstore::StateRef::Object(id))) => Some(id),
+                Ok(Some(crate::refstore::StateRef::Symbolic(target))) => repo
+                    .try_find_reference(target.as_bstr())
+                    .ok()
+                    .flatten()
+                    .and_then(|mut r| r.follow_to_object().ok())
+                    .map(|id| id.detach()),
+                _ => None,
+            };
+            if let Some(id) = id {
+                add_one_ref(&head, id)?;
+            }
+        }
+
+        // `add_rebase_files()` (reachable.c:36-84): each worktree's
+        // `rebase-{apply,merge}/{autostash,orig-head}`, read with
+        // `read_oneliner(…, READ_ONELINER_SKIP_IF_EMPTY)`, trimmed, and taken
+        // when `get_oid_hex()` reads an id off its front.
+        let hex_len = repo.object_hash().len_in_hex();
+        for wt in &worktrees {
+            for path in ["rebase-apply/autostash", "rebase-apply/orig-head", "rebase-merge/autostash", "rebase-merge/orig-head"] {
+                let Ok(contents) = std::fs::read(wt.git_dir.join(path)) else {
+                    continue;
+                };
+                let line = contents.trim();
+                let Some(id) = line.get(..hex_len).and_then(|hex| ObjectId::from_hex(hex).ok()) else {
+                    continue;
+                };
+                add_one_ref(&line.to_str_lossy(), id)?;
+            }
+        }
+
+        let grafts = repo.commit_grafts();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut stack = roots;
+        while let Some(id) = stack.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            let Ok(object) = repo.find_object(id) else {
+                continue;
+            };
+            match object.kind {
+                gix::object::Kind::Blob => {}
+                gix::object::Kind::Tag => {
+                    if let Ok(tag) = object.into_tag().decode() {
+                        stack.push(tag.target());
+                    }
+                }
+                gix::object::Kind::Commit => {
+                    let Some((tree, parents)) = commit_tree_and_parents(object.into_commit(), grafts) else {
+                        continue;
+                    };
+                    seen.insert(id);
+                    stack.push(tree);
+                    stack.extend(parents);
+                }
+                gix::object::Kind::Tree => {
+                    let Ok(tree) = object.into_tree().decode().map(|t| t.into_owned()) else {
+                        continue;
+                    };
+                    seen.insert(id);
+                    // `process_tree_contents()` (list-objects.c:100-147): blobs
+                    // and gitlinks carry no mark this cache reads.
+                    stack.extend(
+                        tree.entries
+                            .iter()
+                            .filter(|e| e.mode.is_tree())
+                            .map(|e| e.oid),
+                    );
+                }
+            }
+        }
+        Ok(StaleFix { seen, incomplete: HashSet::new() })
+    }
+
+    /// `keep_entry()` (reflog.c:277-300): a null id is kept, as is a commit (or
+    /// a tag that peels to one) whose whole history and every tree and blob it
+    /// names are present; anything else, a missing object included, is not.
+    fn keep_entry(&mut self, repo: &gix::Repository, oid: ObjectId) -> bool {
+        if oid.is_null() {
+            return true;
+        }
+        let Some(commit) = peel_to_commit(repo, oid) else {
+            return false;
+        };
+        self.commit_is_complete(repo, commit)
+    }
+
+    /// `commit_is_complete()` (reflog.c:184-275): walk the ancestry of `commit`
+    /// down to commits already `SEEN`, then check that every commit met on the
+    /// way, the `SEEN` ones it stopped at included, has a complete tree. A commit
+    /// that will not parse ends the study; the outcome is cached on `commit`, and
+    /// on every commit found when it is complete.
+    fn commit_is_complete(&mut self, repo: &gix::Repository, commit: ObjectId) -> bool {
+        if self.seen.contains(&commit) {
+            return true;
+        }
+        if self.incomplete.contains(&commit) {
+            return false;
+        }
+        let grafts = repo.commit_grafts();
+        let mut trees: std::collections::HashMap<ObjectId, ObjectId> = Default::default();
+        let mut study = vec![commit];
+        let mut found = vec![commit];
+        let mut studying: HashSet<ObjectId> = HashSet::from([commit]);
+        let mut is_incomplete = false;
+        while let Some(c) = study.pop() {
+            // `if (!c->object.parsed && !parse_object(...)) c->object.flags |= INCOMPLETE;`
+            let parsed = repo
+                .find_object(c)
+                .ok()
+                .filter(|o| o.kind == gix::object::Kind::Commit)
+                .and_then(|o| commit_tree_and_parents(o.into_commit(), grafts));
+            if parsed.is_none() {
+                self.incomplete.insert(c);
+            }
+            if self.incomplete.contains(&c) {
+                is_incomplete = true;
+                break;
+            } else if self.seen.contains(&c) {
+                // Its tree is still checked below; it is in `found`.
+                if let Some((tree, _)) = parsed {
+                    trees.insert(c, tree);
+                }
+                continue;
+            }
+            let Some((tree, parents)) = parsed else { unreachable!("an unparsed commit is INCOMPLETE") };
+            trees.insert(c, tree);
+            for p in parents {
+                if !studying.insert(p) {
+                    continue;
+                }
+                study.push(p);
+                found.push(p);
+            }
+        }
+        if !is_incomplete {
+            // Make sure all commits in "found" have all the necessary objects.
+            for c in &found {
+                if !self.tree_is_complete(repo, trees[c]) {
+                    is_incomplete = true;
+                    self.incomplete.insert(*c);
+                }
+            }
+        }
+        if is_incomplete {
+            self.incomplete.insert(commit);
+        } else {
+            self.seen.extend(found);
+        }
+        !is_incomplete
+    }
+
+    /// `tree_is_complete()` (reflog.c:140-182): every entry of the tree is in the
+    /// object database and every subtree is itself complete. Every entry is
+    /// checked, so every incomplete subtree below is marked, not only the first.
+    fn tree_is_complete(&mut self, repo: &gix::Repository, oid: ObjectId) -> bool {
+        if self.seen.contains(&oid) {
+            return true;
+        }
+        if self.incomplete.contains(&oid) {
+            return false;
+        }
+        // `odb_read_object()`: the data is read whatever its type, and a read
+        // that fails marks the tree INCOMPLETE.
+        let Ok(object) = repo.find_object(oid) else {
+            self.incomplete.insert(oid);
+            return false;
+        };
+        let Ok(tree) = gix::objs::TreeRef::from_bytes(&object.data, repo.object_hash()).map(|t| t.into_owned()) else {
+            self.incomplete.insert(oid);
+            return false;
+        };
+        let mut complete = true;
+        for entry in &tree.entries {
+            // `odb_has_object()` first, then the recursion for a directory: the
+            // `||` short-circuits, so a missing subtree is not looked into.
+            if !repo.has_object(entry.oid) || (entry.mode.is_tree() && !self.tree_is_complete(repo, entry.oid)) {
+                self.incomplete.insert(oid);
+                complete = false;
+            }
+        }
+        if complete {
+            self.seen.insert(oid);
+        }
+        complete
+    }
+}
+
+/// A commit's tree and its parents as `parse_commit_buffer()` leaves them
+/// (commit.c:554-590): a graft, or a shallow boundary, replaces the recorded
+/// parents. `None` when the commit does not decode.
+fn commit_tree_and_parents(
+    commit: gix::Commit<'_>,
+    grafts: &gix::revwalk::graft::Table,
+) -> Option<(ObjectId, Vec<ObjectId>)> {
+    let id = commit.id;
+    let decoded = commit.decode().ok()?;
+    let parents = match grafts.parents_of(&id) {
+        Some(graft) => graft.to_vec(),
+        None => decoded.parents().collect(),
+    };
+    Some((decoded.tree(), parents))
 }
 
 

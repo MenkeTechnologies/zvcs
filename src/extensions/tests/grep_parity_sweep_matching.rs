@@ -89,14 +89,15 @@ fn grep_matching_and_naming_match_stock() {
     let home = root.join("home");
     let pats = root.join("pats");
     let pats = pats.to_str().unwrap();
-    // `-P` needs a stock git built with PCRE2.
-    let pcre = run(stock, &repo, &home, &["grep", "-q", "-P", "foo"]).status.success();
+    // `-P` needs a stock git built with PCRE2. The probe pattern must not be
+    // `is_fixed()`: a fixed one goes to compile_fixed_regexp() before the PCRE
+    // branch is reached (grep.c:521-556), so it succeeds in any build.
+    let pcre = run(stock, &repo, &home, &["grep", "-q", "-P", "f.o"]).status.success();
 
     let mut cases: Vec<(&str, Vec<&str>)> = vec![
         (".", vec!["grep", "-w", "-e", "foo", "-e", "foobar"]),
         (".", vec!["grep", "-o", "-e", "foo", "-e", "foobar"]),
         (".", vec!["grep", "--color=always", "-e", "o", "-e", "foo", "--", "doc"]),
-        (".", vec!["grep", "-w", "-e", "", "-e", "foo"]),
         (".", vec!["grep", "-w", "-e", "x*"]),
         (".", vec!["grep", "-o", "-E", "-e", "fooba|foobar"]),
         (".", vec!["grep", "-w", "-E", "-e", "fooba|foobar"]),
@@ -112,6 +113,9 @@ fn grep_matching_and_naming_match_stock() {
         (".", vec!["grep", "-c", "-f", pats]),
     ];
     if pcre {
+        // An empty pattern is fixed, so a PCRE2 build compiles it with PCRE2 and
+        // one without hands it to regcomp(), which macOS refuses (grep.c:521-554).
+        cases.push((".", vec!["grep", "-w", "-e", "", "-e", "foo"]));
         cases.push((".", vec!["grep", "-P", "-e", r"\<foo\>"]));
         cases.push((".", vec!["grep", "-P", "-o", "-e", r"\Qx.y\E"]));
     }

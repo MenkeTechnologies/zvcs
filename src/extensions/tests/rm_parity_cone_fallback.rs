@@ -73,6 +73,20 @@ fn prepare(stock: &str, r: &Path, files: Files) {
     for path in paths {
         std::fs::write(r.join(path), "1\n").unwrap();
     }
+    let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+    let backdate = |paths: &[&str]| {
+        for path in paths {
+            std::fs::File::options().write(true).open(r.join(path)).unwrap().set_modified(past).unwrap();
+        }
+    };
+    // The Grown fixture leaves `c/d/w` as committed. Were its mtime in the second the
+    // commit writes the index, `do_write_index()` would hash it as racily clean
+    // (read-cache.c:2574-2594, :2912-2917; whole seconds without USE_NSEC) and load the
+    // patterns on whichever twin the clock put there. Dated before `add`, it is recorded
+    // clean and never racy.
+    if let Files::Grown = files {
+        backdate(&paths);
+    }
     let ok = |args: &[&str]| assert_eq!(run(stock, r, args).2, 0, "{args:?}");
     ok(&["init", "-q", "-b", "main", "."]);
     ok(&["add", "."]);
@@ -83,12 +97,7 @@ fn prepare(stock: &str, r: &Path, files: Files) {
                 std::fs::write(r.join(path), "22\n").unwrap();
             }
         }
-        Files::Backdated => {
-            let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
-            for path in paths {
-                std::fs::File::options().write(true).open(r.join(path)).unwrap().set_modified(past).unwrap();
-            }
-        }
+        Files::Backdated => backdate(&paths),
     }
     ok(&["config", "core.sparseCheckout", "true"]);
     ok(&["config", "core.sparseCheckoutCone", "true"]);
@@ -136,7 +145,8 @@ fn the_path_checks_load_the_definition_with_its_warnings() {
 
 #[test]
 fn under_sparse_only_a_refresh_that_hashes_loads_the_definition() {
-    // The size changed, so nothing is hashed and nothing loads the patterns.
+    // The size changed and the untouched `c/d/w` is not racy, so nothing is hashed and
+    // nothing loads the patterns.
     compare("sparse-grown", Files::Grown, &["rm", "--sparse", "--cached", "top"]);
     // Clearing the stat-dirty entry hashes it, through the index's `.gitattributes` lookup.
     compare("sparse-backdated", Files::Backdated, &["rm", "--sparse", "top"]);

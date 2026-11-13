@@ -1749,21 +1749,14 @@ pub struct LoadedOpts {
 /// the last valid entry chose, for the caller's own `--cleanup` parser.
 pub fn init_config_cleanup(repo: Option<&gix::Repository>) -> Option<String> {
     let snapshot = repo?.config_snapshot();
-    // One callback per configured value: a `-c` this port delivered twice is
-    // counted once (see `crate::config::CliEcho`).
-    let mut echoes = crate::config::CliEcho::new();
     let mut mode = None;
     for section in snapshot.sections() {
         let header = section.header();
         if !header.name().eq_ignore_ascii_case(b"commit") || header.subsection_name().is_some() {
             continue;
         }
-        let source = section.meta().source;
         for value in section.values("cleanup") {
             let value = value.to_string();
-            if echoes.is_echo(source, "commit.cleanup", Some(&value)) {
-                continue;
-            }
             match value.as_str() {
                 "verbatim" | "whitespace" | "strip" | "scissors" => mode = Some(value),
                 other => eprintln!("warning: invalid commit message cleanup mode '{other}'"),

@@ -187,7 +187,6 @@ fn run(op: Op) -> Result<ExitCode> {
         Ok(parts) => parts,
         Err(e) => return Ok(fatal(&format!("{e}"))),
     };
-    discount_echoed_helpers(&mut cascade);
 
     // `credential_apply_config`: an http(s) path is not part of the credential
     // unless `credential.useHttpPath` says so. This governs both what helpers
@@ -307,7 +306,6 @@ pub(crate) fn transport_authenticate(
                 crate::hosted::exit(128);
             }
         };
-        discount_echoed_helpers(&mut cascade);
         // The transport's `http_auth` carries the capabilities it announces and the server's challenge into
         // the `get` (credential.c:409-442); the request rebuilt for the cascade has to keep them.
         if let (Action::Get(from), Some(to)) = (&action, get.context_mut()) {
@@ -1130,75 +1128,3 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// Drop the second copy of every `-c credential…helper=<value>` from the cascade.
-///
-/// `git_config()` runs its callback once per configured value, so
-/// `credential_apply_config()` (credential.c) appends one helper per `-c` — and
-/// `credential_fill()` then runs each helper it appended exactly once. This port
-/// hands `gix` a valued command-line override on two sources, which
-/// [`crate::setup::double_delivered`] documents and [`crate::config::CliEcho`]
-/// discounts for the config walks; `credential_helpers()` is a third walk, and
-/// without the same discount a `-c credential.helper=…` runs its program twice —
-/// storing twice, erasing twice, and repeating whatever the helper prints on
-/// stderr.
-///
-/// The later copy goes, which is the `Source::Cli` one: it sorts after the
-/// environment copy, so removing it leaves the cascade in the order the earlier
-/// sources established.
-fn discount_echoed_helpers(cascade: &mut gix::credentials::helper::Cascade) {
-    use gix::credentials::program::Kind;
-
-    // `Kind` is not hashable, so the pending discounts are a small association
-    // list; a command line carries a handful of `-c` at most.
-    let mut pending: Vec<(Kind, usize)> = Vec::new();
-    for (key, value) in crate::setup::double_delivered() {
-        // `credential.helper` and `credential.<url>.helper` are the two spellings
-        // that contribute a program; nothing else in the section does.
-        let is_helper = key
-            .split('.')
-            .next()
-            .is_some_and(|section| section.eq_ignore_ascii_case("credential"))
-            && key
-                .rsplit('.')
-                .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case("helper"));
-        if !is_helper {
-            continue;
-        }
-        let kind = gix::credentials::Program::from_custom_definition(value.as_str()).kind;
-        match pending.iter_mut().find(|(k, _)| *k == kind) {
-            Some((_, count)) => *count += 1,
-            None => pending.push((kind, 1)),
-        }
-    }
-    if pending.is_empty() {
-        return;
-    }
-
-    // An empty `credential.helper` resets the list (`credential_config_callback`),
-    // so the two deliveries of one override can collapse into a single surviving
-    // program rather than into two. Never take the last copy of a helper away:
-    // the discount only removes a program that a *second* one of the same kind is
-    // still standing behind.
-    for (kind, count) in &mut pending {
-        let present = cascade.programs.iter().filter(|p| p.kind == *kind).count();
-        *count = (*count).min(present.saturating_sub(1));
-    }
-
-    let mut drop_at = vec![false; cascade.programs.len()];
-    for (index, program) in cascade.programs.iter().enumerate().rev() {
-        if let Some((_, count)) = pending
-            .iter_mut()
-            .find(|(k, c)| *c > 0 && *k == program.kind)
-        {
-            *count -= 1;
-            drop_at[index] = true;
-        }
-    }
-    let mut index = 0;
-    cascade.programs.retain(|_| {
-        let keep = !drop_at[index];
-        index += 1;
-        keep
-    });
-}

@@ -331,8 +331,7 @@ pub fn handle_options(
                 let spec = &s["--list-cmds=".len()..];
                 // `handle_options()` has already pushed every `-c` ahead of this
                 // option (git.c:264-269, 325) when `list_cmds()` reads
-                // `completion.commands`, so the valueless ones — which only
-                // `setup::discover` carries — must be recorded before it answers.
+                // `completion.commands`; record them for the diagnostics too.
                 setup::set_cli_overrides(overrides);
                 return Handled::Exit(match spec {
                     "parseopt" => listcmds::parseopt(),
@@ -773,10 +772,8 @@ fn run_command(argv: &[String]) -> ExitCode {
         Handled::Consumed(n) => n,
         Handled::Exit(code) => return code,
     };
-    // Hand the overrides to `setup::discover`, which applies them to every
-    // repository this process opens. The environment triple below carries the
-    // valued ones to children; this carries all of them, including the
-    // valueless keys that channel cannot express.
+    // Record the overrides for the diagnostics that run before configuration is
+    // read; the configuration itself takes them from `GIT_CONFIG_PARAMETERS`.
     setup::set_cli_overrides(&config_overrides);
     let args = &raw[idx..];
 
@@ -1952,62 +1949,19 @@ pub(crate) fn system_path(path: &str) -> String {
     }
 }
 
-/// Record one command-line configuration override and publish it, the way
-/// `git_config_push_split_parameter()` appends to `GIT_CONFIG_PARAMETERS`.
-///
-/// The transport differs — this port uses git's other command-line-config
-/// channel, the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N`
-/// sequence, because that is the one `gix-config` reads — but the timing is the
-/// C's: each override is visible to every child process the moment it is parsed,
-/// and it appends to any count a parent process already set. A bare `-c <name>`
-/// (no `=`) is git's boolean-true form, encoded as an empty value, which gix
-/// reads as true for boolean keys.
+/// Record one command-line configuration override and publish it:
+/// `git_config_push_split_parameter()` (config.c:449-467, git v2.56.0) appends it to
+/// `GIT_CONFIG_PARAMETERS`, and that is the only place it goes. Every configuration
+/// read in this process, and in every child it starts, takes it from there
+/// (`git_config_from_parameters()`, config.c:731-790, which `gix-config`'s
+/// `File::from_env()` ports) once, after the inherited `GIT_CONFIG_COUNT` entries,
+/// spelled as typed, and a valueless `-c <name>` as the implicit `true`.
 ///
 /// The `overrides` list is kept for [`validate_config_overrides`], which is
 /// where git's own diagnostics for a malformed key are produced.
-///
-/// **A bare key does not survive this encoding, and cannot.** The comment above
-/// used to claim the empty value reads back as true; measured against stock
-/// 2.55.0 it does not, and neither implementation can express what git means by
-/// it:
-///
-/// ```text
-/// git -c user.useConfigOnly config --type=bool user.useConfigOnly   -> true
-/// GIT_CONFIG_COUNT=1 KEY_0=user.useConfigOnly VALUE_0=  …           -> false   (stock)
-/// GIT_CONFIG_COUNT=1 KEY_0=user.useConfigOnly           …           -> error: missing config value
-/// ```
-///
-/// git holds `value = NULL` in memory; the environment channel has no spelling
-/// for absent, so an empty string is the closest available and it means false.
-/// Fixing it means applying overrides to the config the process builds instead
-/// of round-tripping them through the environment — a change to how
-/// configuration reaches `gix`, not to this function.
 fn push_config_override(overrides: &mut Vec<ConfigOverride>, over: ConfigOverride) {
-    match over.value.as_deref() {
-        Some(value) => push_config_triple(&over.key, value),
-        // A valueless key is deliberately kept OUT of the triple. Writing an
-        // empty `GIT_CONFIG_VALUE_N` for it is not a neutral encoding: it sets
-        // the key to the empty string, which reads as *false* and prints as
-        // `key=` where git prints `key`. It reaches the configuration through
-        // `setup::discover`'s CLI overrides instead, and children through
-        // `GIT_CONFIG_PARAMETERS` below.
-        None => {}
-    }
     export_config_parameter(&over);
     overrides.push(over);
-}
-
-/// Append one `(key, value)` to the `GIT_CONFIG_COUNT` / `_KEY_<n>` / `_VALUE_<n>`
-/// sequence, the channel that carries the key and the value in separate variables and so
-/// is the only one that can hold a key containing an `=`.
-fn push_config_triple(key: &str, value: &str) {
-    let count: usize = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), key);
-    std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
-    std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
 }
 
 /// Append one override to `GIT_CONFIG_PARAMETERS`, the channel git itself
@@ -2048,14 +2002,17 @@ pub(crate) fn git_config_push_parameter(text: &str) {
     export_config_parameter(&ConfigOverride { key: key.to_string(), value });
 }
 
-/// `sq_quote()` (quote.c): wrap in single quotes, and spell an embedded quote
-/// as `'\''` — close the run, an escaped quote, reopen.
+/// `sq_quote_buf()` (quote.c:28-48): wrap in single quotes, and spell each embedded
+/// `'` or `!` (`need_bs_quote()`, quote.c:11-14) as `'\<c>'`: close the run, the
+/// escaped character, reopen.
 fn sq_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
+        if c == '\'' || c == '!' {
+            out.push_str("'\\");
+            out.push(c);
+            out.push('\'');
         } else {
             out.push(c);
         }
@@ -2070,10 +2027,7 @@ fn sq_quote(s: &str) -> String {
 /// This is git's *other* command-line-config channel and the one it exports:
 /// `git -c a.b=c <verb>` re-exports `'a.b'='c'` to every child, so a hook, a
 /// filter, an `!`-alias or a `submodule foreach` body inherits the settings the
-/// parent was run with. The port pushes its own `-c` through the
-/// `GIT_CONFIG_COUNT` / `_KEY_N` / `_VALUE_N` sequence instead, because that is
-/// what `gix-config` reads — and it never read this one, so every setting
-/// arriving from a parent git was silently dropped.
+/// parent was run with.
 ///
 /// The grammar is `sq_dequote_step()` applied in a loop
 /// (`parse_config_env_list`, config.c). Each entry is a single-quoted key,
@@ -2182,16 +2136,8 @@ fn inherit_config_parameters(overrides: &mut Vec<ConfigOverride>) {
             },
             _ => (key, value),
         };
-        // Already in the environment: this process inherited it, so re-exporting it to
-        // `GIT_CONFIG_PARAMETERS` would hand every child a second copy. A key carrying an
-        // `=` is the one shape `gix`'s CLI-override channel cannot spell (it splits each
-        // entry at the first `=`), so that one is handed over through the triple, which
-        // keeps key and value apart.
-        if key.contains('=') {
-            if let Some(value) = value.as_deref() {
-                push_config_triple(&key, value);
-            }
-        }
+        // Already in the environment, where every configuration read takes it from
+        // (`File::from_env()`); it is recorded only for the diagnostics.
         overrides.push(ConfigOverride { key, value });
         rest = next;
     }
@@ -2208,14 +2154,14 @@ fn sq_dequote_step(src: &str) -> Option<(String, &str)> {
         let end = rest.find('\'')?;
         out.push_str(&rest[..end]);
         rest = &rest[end + 1..];
-        // A closing quote followed by `\''` re-opens the run with a literal
-        // quote; anything else ends it.
-        match rest.strip_prefix("\\''") {
-            Some(reopened) => {
-                out.push('\'');
-                rest = reopened;
-            }
-            None => return Some((out, rest)),
+        // A closing quote followed by `\'` or `\!` and a quote re-opens the run with
+        // that character (`need_bs_quote()`, quote.c:146-157); anything else ends it.
+        let b = rest.as_bytes();
+        if b.len() >= 3 && b[0] == b'\\' && matches!(b[1], b'\'' | b'!') && b[2] == b'\'' {
+            out.push(b[1] as char);
+            rest = &rest[3..];
+        } else {
+            return Some((out, rest));
         }
     }
 }

@@ -550,12 +550,12 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
 /// `name =` is an empty value, not a missing one, and keeps its `=`.
 ///
 /// The entries come from the same walker `git config --list` uses, so the two
-/// listings agree on order, multivars, synthetic gitoxide layers and `-c` echoes.
+/// listings agree on order, multivars and synthetic gitoxide layers.
 ///
 /// `limit` stops the listing after that many entries.
 fn list_config(cfg: &ConfigFile, out: &mut impl Write, limit: Option<usize>) -> Result<()> {
     let mut left = limit.unwrap_or(usize::MAX);
-    super::config::for_each_entry(cfg, true, |key, value, implicit, _meta| {
+    super::config::for_each_entry(cfg, |key, value, implicit, _meta| {
         // `git_config()` reads through the configset, whose `configset_add_value()` refuses a
         // key with no section (config.c:1743-1745, 1764-1767), so an entry above the first
         // `[...]` line never reaches `show_config()`.

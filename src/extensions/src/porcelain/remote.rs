@@ -869,55 +869,10 @@ fn effective_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String>
 /// Raw multi-values of `remote.<name>.<key>` across all config scopes.
 fn configured_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> {
     let cfg = repo.config_snapshot();
-    let values: Vec<String> = cfg
-        .plumbing()
+    cfg.plumbing()
         .strings_by("remote", Some(BStr::new(name)), key)
-        .map(|values| {
-            values
-                .into_iter()
-                .map(|v| v.to_str_lossy().into_owned())
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-
-    // A refspec is a multivar, so this list is one entry per *configured* value —
-    // and every valued `-c` reaches the snapshot twice, once as `Source::Cli` and
-    // once through the `GIT_CONFIG_COUNT` environment channel children inherit
-    // (see [`crate::setup::double_delivered`]). Resolution is unaffected, but a
-    // count is: `git -c remote.origin.push=a:b remote show -n origin` listed the
-    // one refspec twice and headed the block with the plural `Local refs`. One
-    // copy per recorded override is discounted here, so a value that is *also*
-    // in the config file still contributes its own entry.
-    // The section and the value name are matched case-insensitively and the
-    // subsection exactly, which is how `git_config_parse_key` canonicalizes a key.
-    let mut discount: std::collections::HashMap<&str, usize> = Default::default();
-    for (k, v) in crate::setup::double_delivered() {
-        let Some((section, rest)) = k.split_once('.') else {
-            continue;
-        };
-        let Some((subsection, value_name)) = rest.rsplit_once('.') else {
-            continue;
-        };
-        if section.eq_ignore_ascii_case("remote")
-            && subsection == name
-            && value_name.eq_ignore_ascii_case(key)
-        {
-            *discount.entry(v.trim()).or_default() += 1;
-        }
-    }
-    if discount.is_empty() {
-        return values;
-    }
-    values
-        .into_iter()
-        .filter(|value| match discount.get_mut(value.trim()) {
-            Some(count) if *count > 0 => {
-                *count -= 1;
-                false
-            }
-            _ => true,
-        })
-        .collect()
+        .map(|values| values.into_iter().map(|v| v.to_str_lossy().into_owned()).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,7 +2361,14 @@ fn show_one(
         "  Fetch URL: {}",
         fetch.first().map_or(name, String::as_str)
     );
-    println!("  Push  URL: {}", push.first().map_or(name, String::as_str));
+    // `push_url_of_remote()` names every push URL, one line each, and `(no URL)` when
+    // there is none (builtin/remote.c:1449-1457).
+    for url in &push {
+        println!("  Push  URL: {url}");
+    }
+    if push.is_empty() {
+        println!("  Push  URL: (no URL)");
+    }
 
     match map {
         None => {

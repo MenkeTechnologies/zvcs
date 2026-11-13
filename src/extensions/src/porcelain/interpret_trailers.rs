@@ -323,14 +323,6 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
     };
 
     // Pass one: the dotless keys.
-    //
-    // A fresh [`crate::config::CliEcho`] per pass because git runs `git_config()`
-    // twice here, once per callback, and each run sees one occurrence per
-    // configured value. Without it a single `-c trailer.<x>.key=…` reads as two
-    // settings — a spurious `warning: more than one …` — and the surviving copy
-    // is the command-line one, whose parser has already eaten the trailing blank
-    // that decides whether the emitted trailer is `Acked-by: v` or `Acked-by:v`.
-    let mut echoes = crate::config::CliEcho::new();
     for section in config.sections() {
         let header = section.header();
         if header.subsection_name().is_some()
@@ -338,12 +330,7 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
         {
             continue;
         }
-        let source = section.meta().source;
         for (name, value) in ordered_entries(&section) {
-            let shown = value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
-            if echoes.is_echo(source, &format!("trailer.{name}"), shown.as_deref()) {
-                continue;
-            }
             // `trailer_set_*()` take git's `NULL` as "back to the default"
             // (trailer.c:389-436); only `separators` refuses it, through
             // `config_error_nonbool()` (trailer.c:510-513).
@@ -368,7 +355,6 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
     }
 
     // Pass two: the per-alias keys.
-    let mut echoes = crate::config::CliEcho::new();
     for section in config.sections() {
         let header = section.header();
         if !header.name().to_string().eq_ignore_ascii_case("trailer") {
@@ -377,8 +363,6 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
         let Some(alias) = header.subsection_name() else {
             continue;
         };
-        let source = section.meta().source;
-        let alias_shown = alias.to_string();
         let alias = alias.to_string().into_bytes();
 
         for (name, value) in ordered_entries(&section) {
@@ -386,10 +370,6 @@ pub(crate) fn load_config() -> Result<TrailerConfig> {
                 name.as_str(),
                 "key" | "command" | "cmd" | "where" | "ifexists" | "ifmissing"
             ) {
-                continue;
-            }
-            let shown = value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
-            if echoes.is_echo(source, &format!("trailer.{alias_shown}.{name}"), shown.as_deref()) {
                 continue;
             }
             let idx = get_conf_item(&mut cfg, &alias);

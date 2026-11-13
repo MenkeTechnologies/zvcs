@@ -257,11 +257,7 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
 
     // `cmd_for_each_repo` runs the child **once per configured value**
     // (builtin/for-each-repo.c: `for (i = 0; i < values->nr; i++)` over
-    // `repo_config_get_value_multi`), so a `-c <key>=<value>` that this port
-    // hands `gix` on two sources must still count as one. `crate::setup::double_delivered`
-    // is the list of those second copies and [`crate::config::CliEcho`] discounts
-    // them in the same order the snapshot walk meets them.
-    let mut echoes = crate::config::CliEcho::new();
+    // `repo_config_get_value_multi`).
     let mut raw: Vec<BString> = Vec::new();
     let mut found = false;
     for section in config.sections() {
@@ -286,16 +282,11 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
         if !values.is_empty() {
             found = true;
         }
-        let source = section.meta().source;
         for value in values {
             let Some(value) = value else {
                 eprintln!("error: missing value for '{key}'");
                 return Ok(Lookup::Bad);
             };
-            let shown = value.to_string();
-            if echoes.is_echo(source, key, Some(&shown)) {
-                continue;
-            }
             raw.push(value);
         }
     }

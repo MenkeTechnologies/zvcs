@@ -2108,12 +2108,6 @@ pub(super) fn local_branch_tips(repo: &gix::Repository) -> Vec<(String, ObjectId
 /// `remote.<name>.push`, the refspecs a bare `git push <name>` uses in place of the
 /// `push.default` machinery (builtin/push.c:432-433).
 fn configured_push_refspecs(repo: &gix::Repository, name: &str) -> Vec<String> {
-    // `crate::config::multi_values` and not `strings_by`: a valued `-c` override
-    // reaches the snapshot on two sources (see `crate::setup::double_delivered`),
-    // so the plain reader returns `-c remote.origin.push=<spec>` twice. One
-    // refspec pushed twice is two commands for one ref on the wire, and the
-    // server reports the second under no name at all — `! [remote rejected]
-    // <ref> (remote end did not report status)` on a push git reports as clean.
     let mut specs = crate::config::multi_values(repo, &format!("remote.{name}.push"));
     // A remote with no configured URL may come from a legacy `remotes/` or
     // `branches/` file, whose `Push:` refspecs are appended (remote.c:808-815).

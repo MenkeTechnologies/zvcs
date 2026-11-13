@@ -1969,10 +1969,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     let cfg_str = |k: &str| snap.string(k).and_then(|v| v.to_str().ok().map(str::to_owned));
     // `git_format_config()`'s `format.to`, `format.cc` and `format.headers` arms
     // (builtin/log.c:983-1004) in configuration order: a `To:`/`Cc:` header joins
-    // the very lists the other two feed. They are read through the shared walk
-    // rather than `snapshot.values()`: a `-c format.to=<addr>` reaches gix twice
-    // (see `crate::setup::double_delivered`), and `values()` would then write the
-    // address into the `To:` header twice over.
+    // the very lists the other two feed.
     let (mut cfg_to, mut cfg_cc, mut cfg_hdr) = (Vec::new(), Vec::new(), Vec::new());
     for v in crate::config::walk_config(repo) {
         let Some(value) = v.value else { continue };

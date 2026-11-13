@@ -368,8 +368,6 @@ struct Display {
     /// `config_origin_type_name()` is `standard input` (config.c:3601) and which names no
     /// file after the colon.
     stdin: bool,
-    /// The merged read, the only one that walks the command line — see [`for_each_entry`].
-    command_line: bool,
     /// The directory `git config` is standing in once setup has run, which is
     /// where `is_missing_file()` resolves a relative `:(optional)` path: the top
     /// of the work tree for a command started below it, the process directory
@@ -2239,7 +2237,6 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    d.command_line = matches!(scope, Scope::Default);
     let file: &gix::config::File = match &scope {
         Scope::Default => match snapshot.as_ref() {
             Some(s) => s.plumbing(),
@@ -2520,7 +2517,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 && positional[0].is_empty()
                 && d.default_value.is_some() =>
         {
-            get_color(file, d.command_line, "", d.default_value.as_deref())
+            get_color(file, "", d.default_value.as_deref())
         }
         Mode::Get => get(file, positional[0], false, positional.get(1).copied(), &d),
         Mode::GetAll => get(file, positional[0], true, positional.get(1).copied(), &d),
@@ -2536,8 +2533,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             get_regexp(file, positional[0], positional.get(1).copied(), &d, true, true)
         }
         Mode::GetUrlMatch => get_urlmatch(file, &positional, &d),
-        Mode::GetColor => get_color(file, d.command_line, positional[0], positional.get(1).copied()),
-        Mode::GetColorBool => get_colorbool(file, d.command_line, &positional),
+        Mode::GetColor => get_color(file, positional[0], positional.get(1).copied()),
+        Mode::GetColorBool => get_colorbool(file, &positional),
         // `show_editor()` refuses a blob before `check_write()` would have
         // (builtin/config.c:1299-1300), so this is not the write message.
         // `show_editor()` checks stdin before blobs, and both before `check_write()`
@@ -2773,7 +2770,7 @@ fn get(
     // type diagnostics both name the git-normalized spelling.
     let wanted = key_of(&key);
     let mut selected: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
-    for_each_entry(file, d.command_line, |k, value, implicit, meta| {
+    for_each_entry(file, |k, value, implicit, meta| {
         if k == wanted && filter.as_ref().is_none_or(|f| f.matches(value)) {
             selected.push((k.to_owned(), value.to_vec(), implicit, meta.clone()));
         }
@@ -3306,7 +3303,7 @@ fn list(file: &gix::config::File, d: &Display) -> Result<ExitCode> {
     // `gently = 1` to `format_config()` and prints only when it returns `>= 0`, so
     // a `--list --type=<t>` quietly drops every entry the type cannot read rather
     // than dying on the first one.
-    for_each_entry(file, d.command_line, |key, value, implicit, meta| {
+    for_each_entry(file, |key, value, implicit, meta| {
         let canonical = match d.ty {
             None => value.to_vec(),
             // A valueless key is git's `NULL`, and the boolean readers answer *true*
@@ -3381,7 +3378,7 @@ fn get_regexp(
     // ones after. Collecting here rather than streaming reproduces that.
     let mut collected: Vec<(String, Vec<u8>, bool, gix::config::file::Metadata)> = Vec::new();
     let mut failed: Option<ExitCode> = None;
-    for_each_entry(file, d.command_line, |key, value, implicit, meta| {
+    for_each_entry(file, |key, value, implicit, meta| {
         if failed.is_some() || !re.is_match(key.as_bytes()) {
             return Ok(());
         }
@@ -3464,18 +3461,12 @@ fn lowercase_key_pattern(pattern: &str) -> String {
 /// `a=3`. Section and value names are lower-cased (git-normalized); subsection
 /// case is preserved.
 ///
-/// `command_line` says `file` is the merged read, which in git is the only one
-/// that walks `git_config_from_parameters()` (config.c:1601, 1634-1645). There
-/// the `GIT_CONFIG_COUNT` entries come first and then every `-c` in argv order,
-/// valued and valueless interleaved (config.c:731-790), each with the bytes as
-/// typed; this port's snapshot holds a valued `-c` twice and puts every one of
-/// them ahead of the valueless ones, so the walk skips both copies and replays
-/// [`crate::setup::command_line_overrides`] where they began — see
-/// [`crate::config::command_line_splice`]. A scoped read (`--file`, `--blob`,
-/// `--local`, …) is walked exactly as it stands.
+/// The merged read ends with `git_config_from_parameters()` (config.c:731-790): the
+/// `GIT_CONFIG_COUNT` entries and then every `-c` in argv order, valued and valueless
+/// interleaved, each with the bytes as typed. gitoxide's `Source::Env` layer is built
+/// that way (`File::from_env()`), so every read is walked exactly as it stands.
 pub(crate) fn for_each_entry(
     file: &gix::config::File,
-    command_line: bool,
     mut emit: impl FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>,
 ) -> Result<()> {
     // `(key, value, implicit, metadata)` for every visible entry, in file order.
@@ -3531,59 +3522,8 @@ pub(crate) fn for_each_entry(
         }
     }
 
-    let splice = match command_line {
-        true => {
-            let values: Vec<Option<String>> = entries
-                .iter()
-                .map(|(_, value, implicit, _)| (!implicit).then(|| String::from_utf8_lossy(value).into_owned()))
-                .collect();
-            let view: Vec<crate::config::SpliceEntry<'_>> = entries
-                .iter()
-                .zip(&values)
-                .map(|((key, _, _, meta), value)| crate::config::SpliceEntry {
-                    source: meta.source,
-                    key: key.as_str(),
-                    value: value.as_deref(),
-                    level: meta.level,
-                })
-                .collect();
-            crate::config::command_line_splice(&view)
-        }
-        false => None,
-    };
-    let Some(splice) = splice else {
-        for (key, value, implicit, meta) in &entries {
-            emit(key, value, *implicit, meta)?;
-        }
-        return Ok(());
-    };
-
-    // `kvi_from_param()` (config.c:642-647): no file, no line, scope command.
-    let cli = param_metadata();
-    let replay = |emit: &mut dyn FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>| -> Result<()> {
-        for ((key, value), included) in splice.overrides.iter().zip(&splice.included) {
-            let key = crate::config::normalize_key(key);
-            match value {
-                Some(value) => emit(&key, value.as_bytes(), false, &cli)?,
-                None => emit(&key, b"", true, &cli)?,
-            }
-            for &j in included {
-                let (key, value, implicit, meta) = &entries[j];
-                emit(key, value, *implicit, meta)?;
-            }
-        }
-        Ok(())
-    };
-    for (i, (key, value, implicit, meta)) in entries.iter().enumerate() {
-        if i == splice.at {
-            replay(&mut emit)?;
-        }
-        if !splice.drop[i] {
-            emit(key, value, *implicit, meta)?;
-        }
-    }
-    if splice.at == entries.len() {
-        replay(&mut emit)?;
+    for (key, value, implicit, meta) in &entries {
+        emit(key, value, *implicit, meta)?;
     }
     Ok(())
 }
@@ -3651,7 +3591,7 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
 
     // The same merged read every other action goes through: `config_with_options()`
     // (builtin/config.c:888) walks the whole cascade, command-line entries included.
-    for_each_entry(file, d.command_line, |name, value, implicit, meta| {
+    for_each_entry(file, |name, value, implicit, meta| {
         // ```c
         // if (!skip_prefix(var, collect->section, &key) || *(key++) != '.')
         //         return 0; /* not interested */
@@ -4171,7 +4111,7 @@ fn param_metadata() -> gix::config::file::Metadata {
 /// * a `<default>` the parser rejects is a plain `error()` return, not a `die()`:
 ///   `unable to parse default color value` and `main()`'s `-1`, which the shell
 ///   sees as 255.
-fn get_color(file: &gix::config::File, command_line: bool, slot: &str, def_color: Option<&str>) -> Result<ExitCode> {
+fn get_color(file: &gix::config::File, slot: &str, def_color: Option<&str>) -> Result<ExitCode> {
     // ```c
     // static int git_get_color_config(const char *var, const char *value, …)
     // {
@@ -4189,7 +4129,7 @@ fn get_color(file: &gix::config::File, command_line: bool, slot: &str, def_color
 
     let mut parsed: Option<String> = None;
     let mut failure: Option<(Vec<u8>, Option<std::path::PathBuf>)> = None;
-    for_each_entry(file, command_line, |k, value, _implicit, meta| {
+    for_each_entry(file, |k, value, _implicit, meta| {
         if k != wanted || failure.is_some() {
             return Ok(());
         }
@@ -4287,7 +4227,7 @@ fn get_color(file: &gix::config::File, command_line: bool, slot: &str, def_color
 /// naturally: 0 when color is on, 1 when it is off. The value is *printed* only
 /// when the caller states whether stdout is a terminal, which is git's `print`
 /// argument (`argc == 2`).
-fn get_colorbool(file: &gix::config::File, command_line: bool, positional: &[&str]) -> Result<ExitCode> {
+fn get_colorbool(file: &gix::config::File, positional: &[&str]) -> Result<ExitCode> {
     let Some(name) = positional.first() else {
         return usage_error("wrong number of arguments, should be from 1 to 2");
     };
@@ -4316,7 +4256,7 @@ fn get_colorbool(file: &gix::config::File, command_line: bool, positional: &[&st
     // `color.diff = red`, say — is `git_config_bool()`'s `die()`, and it fires
     // while the config is being walked rather than at the end.
     let mut bad: Option<(String, String)> = None;
-    for_each_entry(file, command_line, |k, value, _implicit, _| {
+    for_each_entry(file, |k, value, _implicit, _| {
         if k != wanted && k != "diff.color" && k != "color.ui" {
             return Ok(());
         }

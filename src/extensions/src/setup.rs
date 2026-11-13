@@ -223,97 +223,22 @@ fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
     Some(realpath_forgiving(repo.workdir()?))
 }
 
-/// The command-line configuration overrides this process was started with, in
-/// the `key=value` / bare-`key` spelling `gix::open::Options::cli_overrides`
-/// takes. Captured once, after `handle_options` has parsed the command line.
-static CLI_OVERRIDES: std::sync::OnceLock<Vec<gix::bstr::BString>> = std::sync::OnceLock::new();
-
-/// The valued half of the recorded overrides, as `(key, value)` — the ones that
-/// reach the configuration through *both* channels. See [`double_delivered`].
-static DOUBLE_DELIVERED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-
-/// The same overrides as `(key, value)` pairs, kept apart from the rendered
-/// `key=value` strings above because the two are not interchangeable: a key may itself
-/// contain an `=`, and re-deriving the pair by splitting the rendered string at its first
-/// `=` then moves those bytes into the value. `--config-env` splits its spec at the LAST
+/// The command-line configuration overrides this process was started with, as
+/// `(key, value)` pairs with `None` for a bare `-c key`, captured once after
+/// `handle_options` has parsed the command line. They are kept as pairs because a key
+/// may itself contain an `=`. `--config-env` splits its spec at the LAST
 /// `=` (`git_config_push_env()`, config.c:492) and a new-style `GIT_CONFIG_PARAMETERS`
 /// entry does not split its quoted key at all (`parse_config_env_list()`, config.c:697),
 /// so both can hand over a key like `section.subsection=with=equals.key`.
 static CLI_OVERRIDE_PAIRS: std::sync::OnceLock<Vec<(String, Option<String>)>> =
     std::sync::OnceLock::new();
 
-/// Record the `-c` overrides for [`discover`]. Called once from the entry point;
-/// later calls are ignored, which is what makes the value stable for the whole
-/// process.
+/// Record the `-c` overrides for [`cli_override`]. Called once from the
+/// entry point; later calls are ignored, which is what makes the value stable for the
+/// whole process. The configuration itself reads them from `GIT_CONFIG_PARAMETERS`.
 pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
-    let rendered: Vec<gix::bstr::BString> = overrides
-        .iter()
-        // `gix`'s override parser splits each entry at its first `=`
-        // (`config::overrides::append()`), so an override whose KEY contains one cannot
-        // be spelled here at all — it would arrive as a shorter key with the rest of it
-        // moved into the value. Those reach the configuration through the
-        // `GIT_CONFIG_KEY_<n>` triple instead, which keeps the two apart.
-        .filter(|o| !o.key.contains('='))
-        .map(|o| match &o.value {
-            // `-c key=value`.
-            Some(v) => format!("{}={}", o.key, v).into(),
-            // `-c key` — git's implicit true, which gix spells as a bare key
-            // (`core.bool-implicit-true` in its own documentation). This is the
-            // form the `GIT_CONFIG_COUNT`/`_VALUE_N` channel cannot carry: an
-            // empty value there means false in git as well as here, and an
-            // absent one is an error in both.
-            None => o.key.clone().into(),
-        })
-        .collect();
-    let _ = CLI_OVERRIDES.set(rendered);
     let _ = CLI_OVERRIDE_PAIRS
         .set(overrides.iter().map(|o| (o.key.clone(), o.value.clone())).collect());
-    let valued: Vec<(String, String)> = overrides
-        .iter()
-        .filter_map(|o| o.value.as_ref().map(|v| (o.key.clone(), v.clone())))
-        .collect();
-    let _ = DOUBLE_DELIVERED.set(valued);
-}
-
-/// Every `-c` override on this command line, in argv order, as `(key, value)` with
-/// `None` for a bare `-c key` — the list `git_config_from_parameters()`
-/// (config.c:731-790) hands the config callback after the `GIT_CONFIG_COUNT`
-/// entries.
-///
-/// Spelled from what the user typed, not from the snapshot: gitoxide parses a
-/// `Source::Cli` override with its config-file parser, which drops unquoted
-/// trailing blanks and anything after `;` or `#`, while git keeps the value
-/// byte for byte. The pair is the one that was recorded, not one re-derived from the
-/// rendered `key=value` string — see [`CLI_OVERRIDE_PAIRS`] for why splitting that back
-/// apart moves an `=` out of the key and into the value.
-pub fn command_line_overrides() -> Vec<(String, Option<String>)> {
-    CLI_OVERRIDE_PAIRS.get().cloned().unwrap_or_default()
-}
-
-/// The `-c key=value` overrides this process hands to `gix` **twice**.
-///
-/// `push_config_override` writes every valued override into the
-/// `GIT_CONFIG_KEY_<n>` / `_VALUE_<n>` triple so that the repositories opened
-/// without [`discover`]'s options — and every child process — still see it, and
-/// [`set_cli_overrides`] hands the same list to [`discover`] as `Source::Cli`.
-/// Both copies survive into the merged snapshot as separate sections.
-///
-/// Resolution is unaffected, because `Source::Cli` outranks `Source::Env`. What
-/// *is* affected is anything that walks the snapshot counting occurrences: git
-/// runs its config callback once per configured value, and `git config --list`
-/// prints one line per configured value, so one `-c` must be counted once. This
-/// is the list such a walk discounts — an occurrence matching one of these
-/// pairs is this port's second delivery of a command-line override, not a
-/// second setting. `crate::config::CliEcho` is that walk's side of it, and says
-/// which of the two copies survives and why.
-///
-/// A bare `-c key` is absent by construction: it never reaches the environment
-/// channel, so it is delivered once and needs no discounting. An override an
-/// alias contributed is absent too — `set_cli_overrides` has already run by the
-/// time `alias::resolve` appends to the list, so those reach `gix` through the
-/// environment alone.
-pub fn double_delivered() -> &'static [(String, String)] {
-    DOUBLE_DELIVERED.get().map_or(&[], Vec::as_slice)
 }
 
 /// The last value a `git -c <key>=<value>` on *this* command line gave `key`, for
@@ -327,31 +252,18 @@ pub fn double_delivered() -> &'static [(String, String)] {
 /// subsection does not — and `clone.rejectShallow`, the only caller so far, has
 /// none.
 pub fn cli_override(key: &str) -> Option<&'static str> {
-    DOUBLE_DELIVERED
+    CLI_OVERRIDE_PAIRS
         .get()?
         .iter()
         .rev()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.as_str())
+        .find(|(k, v)| v.is_some() && k.eq_ignore_ascii_case(key))
+        .and_then(|(_, v)| v.as_deref())
 }
 
-/// `gix::discover(".")`, with this process's `-c` overrides applied to the
-/// repository's configuration.
-///
-/// Every command-line override reaches `gix` twice: valued ones through the
-/// `GIT_CONFIG_COUNT` / `_KEY_N` / `_VALUE_N` environment triple (which children
-/// inherit), and all of them through this open option. The second channel is
-/// what a valueless key needs, because the first has no spelling for "no
-/// value" — measured against stock 2.55.0, an empty `GIT_CONFIG_VALUE_N` reads
-/// as *false* there too, and omitting it is an error in both implementations.
-/// Without this, `git -c user.useConfigOnly …` set the key to the empty string:
-/// `config --list` printed `user.useconfigonly=` where git prints
-/// `user.useconfigonly`, and `--type=bool` answered false where git answers
-/// true.
-///
-/// Overrides are applied with `Source::Cli`, which outranks `Source::Env` in
-/// `gix_config`'s override order, so the two channels agree when both carry the
-/// same key.
+/// `gix::discover(".")`. This process's `-c` overrides reach the repository's
+/// configuration through `GIT_CONFIG_PARAMETERS`, which `gix-config`'s
+/// `File::from_env()` reads after the `GIT_CONFIG_COUNT` entries, once each, the way
+/// `git_config_from_parameters()` (config.c:731-790) does.
 pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
     discover_with_overrides().inspect(arm_ref_store_refusal)
 }
@@ -535,42 +447,17 @@ fn reftable_write_options_die(message: &str) -> ! {
     std::process::exit(i32::from(crate::fatal::EXIT_FATAL))
 }
 
+/// `gix::discover(".")` unless the repository was refused. Its upward search reads a
+/// `GIT_CEILING_DIRECTORIES` with no entry above the search directory as no ceiling at
+/// all (`ceil_offset = min_offset - 2` in `setup_git_directory_gently_1()`, setup.c),
+/// never a refusal.
 fn discover_with_overrides() -> Result<gix::Repository, gix::discover::Error> {
     if IGNORED_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
             path: PathBuf::from("."),
         }));
     }
-    let overrides = CLI_OVERRIDES.get();
-    if overrides.is_none_or(Vec::is_empty) {
-        return gix::discover(".");
-    }
-    let overrides = overrides.unwrap();
-    // Start from the default mapping and add the overrides to each side rather
-    // than building one option set and cloning it into both. The two levels are
-    // NOT the same options: `Trust::Reduced` caps the object-store slots and
-    // marks the git dir untrusted (`gix/src/open/options.rs`,
-    // `DefaultForLevel`), so a single cloned set would open a repository the
-    // security layer distrusts — one owned by another user — with full-trust
-    // settings.
-    let mut trust: gix::sec::trust::Mapping<gix::open::Options> = Default::default();
-    trust.full = trust.full.cli_overrides(overrides.iter().cloned());
-    trust.reduced = trust.reduced.cli_overrides(overrides.iter().cloned());
-    // The same upward-search options `gix::discover(".")` uses above: a
-    // `GIT_CEILING_DIRECTORIES` with no entry above the search directory is "no
-    // ceiling at all" (`ceil_offset = min_offset - 2` in
-    // `setup_git_directory_gently_1()`, setup.c), never a refusal. The default
-    // `upwards::Options` errors instead, so any `-c` on the command line turned
-    // `GIT_CEILING_DIRECTORIES=<repo>/src git -c a=b status` into a failure.
-    gix::ThreadSafeRepository::discover_with_environment_overrides_opts(
-        ".",
-        gix::discover::upwards::Options {
-            match_ceiling_dir_or_error: false,
-            ..Default::default()
-        },
-        trust,
-    )
-    .map(Into::into)
+    gix::discover(".")
 }
 
 /// `the_repository->ref_storage_format` by the name the repository recorded for
@@ -2694,23 +2581,19 @@ pub fn command_line_config_gate(
     let count = std::env::var("GIT_CONFIG_COUNT").ok();
     if count.as_deref().is_some_and(|v| v != "0" && strtoul_10(v) == Some(0)) {
         // Safety: this runs on the main thread, before the verb is
-        // dispatched — the same point at which `push_config_override()`
-        // publishes `-c` overrides through these variables.
+        // dispatched.
         std::env::set_var("GIT_CONFIG_COUNT", "0");
     }
     None
 }
 
 /// The `GIT_CONFIG_COUNT` this process inherited, captured by
-/// [`capture_inherited_config_count`] before `handle_options` appends this
-/// process's own `-c` to the same triple for its children.
+/// [`capture_inherited_config_count`] before `handle_options` runs.
 static INHERITED_CONFIG_COUNT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
-/// Record the inherited `GIT_CONFIG_COUNT`. The port publishes every valued `-c`
-/// through that triple as it parses it, so after `handle_options` the variable
-/// no longer says how many entries the *parent* declared — and the C reads the
-/// inherited entries first and the `-c` ones (through `GIT_CONFIG_PARAMETERS`)
-/// second, which decides whose error is reported when both are wrong.
+/// Record the inherited `GIT_CONFIG_COUNT`. The C reads those entries first and the
+/// `-c` ones (through `GIT_CONFIG_PARAMETERS`) second, which decides whose error is
+/// reported when both are wrong.
 pub(crate) fn capture_inherited_config_count() {
     if let Ok(mut slot) = INHERITED_CONFIG_COUNT.write() {
         *slot = std::env::var("GIT_CONFIG_COUNT").ok();

@@ -405,6 +405,49 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     })? {
         return death.die();
     }
+    // That refresh hashes each matching entry `refresh_cache_ent()` cannot vouch for by its stat
+    // (read-cache.c:1339-1437), and `index_fd()`'s `convert_attrs()` reads `.gitattributes` from
+    // the index where the worktree has none, which loads the index's sparse patterns with the
+    // warnings a cone file cone mode cannot read prints (attr.c:821, dir.c:798-936, :1557-1574).
+    {
+        let ctx = super::read_tree::StatCtx::new(&repo, &index)?;
+        for e in index.entries() {
+            let path = e.path(&index);
+            if e.stage_raw() == 0 && ps.is_included(path, Some(false)) && ctx.refresh_compares_data(e, path) {
+                crate::unpack_sparse::convert_attrs(
+                    &repo,
+                    path,
+                    crate::unpack_sparse::Istate::Current,
+                    crate::unpack_sparse::Direction::Checkin,
+                );
+            }
+        }
+    }
+    // Without `--sparse` the cache loop asks `path_in_sparse_checkout()` of every entry that is
+    // not `ce_skip_worktree()` (builtin/rm.c:316-319), and the first one loads the same patterns,
+    // warnings included, if the refresh has not.
+    if !opts.sparse && index.entries().iter().any(|e| !e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE)) {
+        crate::unpack_sparse::path_in_sparse_checkout(&repo);
+    }
+    // The refresh itself: every matching entry whose content still matches takes the file's stat
+    // data, and `write_locked_index()` (builtin/rm.c:442) persists it with the removals, so a
+    // stat-dirty entry the pathspec reached is clean in the index `rm` writes. Run on a copy:
+    // the matching and `ie_modified()` below read the index as it was read, as their port expects.
+    // Without a work tree every `lstat()` fails and `REFRESH_QUIET` reports nothing.
+    let mut refreshed = gix::index::File::clone(&index);
+    if workdir.is_some() {
+        super::update_index::refresh_index(
+            &repo,
+            &mut refreshed,
+            super::update_index::RefreshFlags {
+                quiet: true,
+                allow_unmerged: true,
+                ..Default::default()
+            },
+            None,
+            Some(&mut |p: &gix::bstr::BStr| ps.is_included(p, Some(false))),
+        )?;
+    }
 
     // `do_match_pathspec()` walks *every* item against a path, not just the first that matches, and
     // records the strongest match of each in `seen[]` — also for a path a later exclusion removes
@@ -861,7 +904,8 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // 12. For removed submodules, strip their `.gitmodules` sections and restage
     //     the edited file. Only for full removal — `--cached` leaves `.gitmodules`
     //     untouched (the worktree submodule survives, now untracked), matching git.
-    let mut index = index;
+    drop(index);
+    let mut index = refreshed;
     // A full removal passed `setup_work_tree()` in step 3, so the work tree is there.
     let gitmodules_update = if let (true, Some(workdir)) = (has_submodule && !opts.cached, &workdir) {
         let removed_paths: Vec<&BString> = selected

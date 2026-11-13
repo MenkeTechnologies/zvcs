@@ -1013,10 +1013,6 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         // dirty one, as `do_pick_commit` does. Carried forward across picks so
         // filesystem stats are reused and a later `status` stays cheap.
         index: repo.index_or_load_from_head()?.into_owned(),
-        // `-n`/`--no-commit` applies picks to the index and worktree without
-        // committing; `pending_tree` accumulates the applied tree so a run of
-        // picks squashes onto each other while HEAD stays put.
-        pending_tree: None,
         head_id,
         unborn,
     };
@@ -1167,7 +1163,6 @@ struct PickEnv<'a> {
 /// What one pick hands to the next.
 struct PickState {
     index: gix::index::File,
-    pending_tree: Option<ObjectId>,
     /// `head` in `do_pick_commit()`: the empty tree while `unborn`.
     head_id: ObjectId,
     /// `HEAD` names a branch with no commit yet; cleared by the first commit.
@@ -1266,9 +1261,19 @@ fn pick_one(
             eprintln!("error: your index file is unmerged.");
             return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
         }
-        match state.pending_tree {
-            Some(t) => t,
-            None => tree_from_index(&repo, &state.index)?,
+        // `write_index_as_tree(&head, r->index, r->index_file, 0, NULL)` (sequencer.c:2314) reads
+        // the index file again and, when its cache-tree is not fully valid, writes the trees
+        // `cache_tree_update()` builds and the index with them (cache-tree.c:810-844): an empty
+        // index leaves the empty tree in the odb and a TREE extension in the file even when
+        // the merge after it fails.
+        let mut on_disk = super::write_tree::open_index_for_update(&repo)?;
+        match super::write_tree::refresh_cache_tree(&repo, &mut on_disk, false)? {
+            Ok(id) => id,
+            Err(err) => {
+                super::write_tree::report_tree_build_failure(&err);
+                eprintln!("error: your index file is unmerged.");
+                return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+            }
         }
     } else {
         let head_tree = if state.unborn {
@@ -1751,10 +1756,9 @@ fn pick_one(
 
     // --- `--no-commit`: stage the applied tree, do not commit ---------
     // git leaves the result in the index and worktree and never moves HEAD;
-    // `pending_tree` carries it forward so a following pick squashes onto it.
+    // a following pick reads the index it wrote as its *ours* side.
     if opts.no_commit {
         state.index = update_clean_worktree(&repo, &state.index, tree_id, unpack.as_ref(), &[], &should_interrupt)?;
-        state.pending_tree = Some(tree_id);
         return Ok(PickOutcome::Done);
     }
 
@@ -2256,7 +2260,6 @@ fn resume_todo(
     drop(head);
     let mut state = PickState {
         index: repo.index_or_load_from_head()?.into_owned(),
-        pending_tree: None,
         head_id,
         unborn,
     };

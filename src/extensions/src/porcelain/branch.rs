@@ -1413,10 +1413,24 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
     /// `worktrees/<id>/HEAD`) as `add_head_info()` reads it from that worktree's ref store,
     /// or `None` when detached/unreadable.
     fn head_ref(repo: &gix::Repository, head: &str) -> Option<BString> {
-        match crate::refstore::state_ref_read(repo, head).ok()?? {
-            crate::refstore::StateRef::Symbolic(target) => Some(target),
-            crate::refstore::StateRef::Object(_) => None,
+        let mut name = match crate::refstore::state_ref_read(repo, head).ok()?? {
+            crate::refstore::StateRef::Symbolic(target) => target,
+            crate::refstore::StateRef::Object(_) => return None,
+        };
+        // `refs_resolve_ref_unsafe(…, "HEAD", 0, …)` (refs.c:2147-2197) follows a chain of
+        // symbolic references to its end, so `HEAD -> refs/heads/alias -> refs/heads/side`
+        // keys the tree by `refs/heads/side`. `SYMREF_MAXDEPTH` (refs/refs-internal.h:260)
+        // allows five reads, `HEAD`'s included; a chain still symbolic after them is NULL.
+        for _ in 1..5 {
+            match repo.try_find_reference(name.as_bstr()) {
+                Ok(Some(r)) => match r.target() {
+                    gix::refs::TargetRef::Symbolic(next) => name = next.as_bstr().to_owned(),
+                    gix::refs::TargetRef::Object(_) => return Some(name),
+                },
+                _ => return Some(name),
+            }
         }
+        None
     }
     /// Drop the `/.git` a worktree's git dir ends in, leaving the checkout path.
     fn checkout_of(git_dir: &std::path::Path) -> std::path::PathBuf {
@@ -2297,7 +2311,10 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             new: Target::Object(target),
         },
         name: full_name,
-        deref: false,
+        // `flags` carries no `REF_NO_DEREF`, so a branch that is a symbolic reference is
+        // updated through it: `split_symref_update()` (refs/files-backend.c:2555-2607) moves
+        // the referent and leaves the symref with a log-only entry.
+        deref: true,
     });
     // `die("%s", err.buf)` when the transaction fails (branch.c:665-673): a refusal
     // the store words as git does is that text, like a name conflict with another

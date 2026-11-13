@@ -6,6 +6,10 @@ use gix_ref::{
 
 use crate::{Reference, bstr::BString, ext::ReferenceExt, reference};
 
+/// `SYMREF_MAXDEPTH` (refs/refs-internal.h:260): how many references `refs_resolve_ref_unsafe()` reads
+/// before it gives up on a chain of symbolic references.
+const SYMREF_MAXDEPTH: usize = 5;
+
 /// Pick the edit for `name` out of `edits`.
 ///
 /// A single requested edit can come back as several: the file store adds log-only companions of
@@ -220,11 +224,34 @@ impl crate::Repository {
     pub fn head(&self) -> Result<crate::Head<'_>, reference::find::existing::Error> {
         let head = self.find_reference("HEAD")?;
         Ok(match head.inner.target {
-            Target::Symbolic(branch) => match self.find_reference(&branch) {
-                Ok(r) => crate::head::Kind::Symbolic(r.detach()),
-                Err(reference::find::existing::Error::NotFound { .. }) => crate::head::Kind::Unborn(branch),
-                Err(err) => return Err(err),
-            },
+            // `refs_resolve_ref_unsafe(refs, "HEAD", 0, &oid, &flags)` (refs.c:2147-2194) follows
+            // the whole chain: with `HEAD -> refs/heads/alias -> refs/heads/side` it returns
+            // `refs/heads/side`, which is what `add_head_info()` keeps as `head_ref`
+            // (worktree.c:40-56), what `branch_checked_out()` and `die_if_checked_out()` compare
+            // against (branch.c:881-895, worktree.c:500-525), and what `cmd_merge()` and
+            // `wt_status` name as the current branch. A referent the loop cannot read is the
+            // missing ref it forgives (:2159-2170), so the last name read is the unborn branch.
+            // `SYMREF_MAXDEPTH` (refs/refs-internal.h:260) bounds the loop at five reads,
+            // `HEAD`'s own included; past it git returns NULL, and this keeps the last
+            // symbolic reference read, which names no object.
+            Target::Symbolic(mut branch) => {
+                let mut depth = 1;
+                loop {
+                    match self.find_reference(&branch) {
+                        Ok(r) => match &r.inner.target {
+                            Target::Symbolic(next) if depth + 1 < SYMREF_MAXDEPTH => {
+                                branch = next.clone();
+                                depth += 1;
+                            }
+                            _ => break crate::head::Kind::Symbolic(r.detach()),
+                        },
+                        Err(reference::find::existing::Error::NotFound { .. }) => {
+                            break crate::head::Kind::Unborn(branch);
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
             Target::Object(target) => crate::head::Kind::Detached {
                 target,
                 peeled: head.inner.peeled,

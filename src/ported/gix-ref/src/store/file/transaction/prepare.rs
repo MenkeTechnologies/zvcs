@@ -154,6 +154,18 @@ impl Transaction<'_, '_> {
 
                 let existing_ref = Self::read_existing_ref(store, change.update.name.as_ref(), packed)?;
 
+                // `lock_ref_for_update()` reads the referent of a symbolic reference whatever the
+                // update is, a deletion included, so its lock holds the value the chain resolves
+                // to as `old_oid` (refs/files-backend.c:2764-2773): what the log-only `HEAD`
+                // update `split_head_update()` added for it copies (:2759-2763).
+                if let Some(Reference {
+                    target: Target::Symbolic(referent),
+                    ..
+                }) = &existing_ref
+                {
+                    symref_previous_oid = Self::resolve_symref_chain(store, referent, packed);
+                }
+
                 match (&expected, &existing_ref) {
                     (PreviousValue::MustNotExist, _) => {
                         panic!("BUG: MustNotExist constraint makes no sense if references are to be deleted")
@@ -740,12 +752,22 @@ impl Transaction<'_, '_> {
                 PreviousValue::MustNotExist => Some(kind.null()),
                 _ => match updates[branch_idx].update.change.previous_value() {
                     Some(crate::TargetRef::Object(oid)) => Some(oid.to_owned()),
+                    // A symbolic reference updated with `REF_NO_DEREF` holds what its referent
+                    // resolves to (:2764-2773). One that was dereferenced has its `old_oid` filled
+                    // only by the split-off update of its referent (:2826-2836), which is processed
+                    // after this `HEAD` update was, so `HEAD` logs the null id.
+                    Some(crate::TargetRef::Symbolic(_))
+                        if !updates.iter().any(|u| u.parent_index == Some(branch_idx)) =>
+                    {
+                        updates[branch_idx].leaf_referent_previous_oid
+                    }
                     _ => None,
                 },
             };
-            if let Some(old) = old {
-                updates[head_idx].leaf_referent_previous_oid = Some(old);
-            }
+            // Assigned even when there is none: the `HEAD` update is `REF_LOG_VIA_SPLIT`, which
+            // never reads `HEAD`'s own referent the way an update of a symref does (:2764-2773),
+            // so the value its lock found for the symbolic `HEAD` is not its old value.
+            updates[head_idx].leaf_referent_previous_oid = old;
         }
         self.rejections = rejections;
         self.prepare_packed_transaction(&updates, packed_refs_lock_fail_mode)?;

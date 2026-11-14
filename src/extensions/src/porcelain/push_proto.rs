@@ -1699,7 +1699,11 @@ pub fn send_pack(
     // pack.
     let need_pack = wire.iter().any(|w| w.new != null);
     let mut pack_failed = false;
-    let pack_bytes = if need_pack {
+    // What `pack-objects` is fed. The pack itself is generated once the commands are out:
+    // `send_pack()` writes them with `write_or_die()` before `pack_objects()` starts the child
+    // that writes it (send-pack.c:693-694, :712-713), so a receiving end on its way out takes the
+    // commands, and the `EPIPE` its going leaves behind falls on the pack.
+    let pack_input = if need_pack {
         let wants: Vec<ObjectId> = pack_tips.clone();
         // Haves are everything the remote advertised plus the old tips, restricted
         // to objects we actually hold locally (git's `feed_object(negative)` skips
@@ -1734,12 +1738,12 @@ pub fn send_pack(
             Some((_, bad)) => {
                 eprintln!("fatal: bad object {bad}");
                 pack_failed = true;
-                Vec::new()
+                None
             }
-            None => super::pack_objects::pack_for_push(repo, &wants, &haves, thin, caps.contains("ofs-delta"), opts.progress)?,
+            None => Some((wants, haves, thin)),
         }
     } else {
-        Vec::new()
+        None
     };
 
     // `git_transport_push()` closes both ends without the flush `disconnect_git()`
@@ -1798,12 +1802,18 @@ pub fn send_pack(
     if wrote.as_ref().is_err_and(|e| !is_http && broken_pipe(e)) {
         crate::sigpipe::exit_broken_pipe();
     }
+    let pack_bytes = match &pack_input {
+        Some((wants, haves, thin)) if wrote.is_ok() => {
+            super::pack_objects::pack_for_push(repo, wants, haves, *thin, caps.contains("ofs-delta"), opts.progress)?
+        }
+        _ => Vec::new(),
+    };
     // The pack is `pack-objects` writing to the same descriptor (send-pack.c:81-84, :712), and a
     // closed pipe kills that child by `SIGPIPE`, which `odb_pack_generator_files_finish()` passes
     // over in silence as the consumer hanging up (odb/source-files.c:777-790). `send_pack()` goes
     // on to read the status (send-pack.c:712-735), whose end of stream reports the hang-up.
     let wrote = wrote
-        .and_then(|()| if need_pack && !pack_failed { writer.write_all(&pack_bytes) } else { Ok(()) })
+        .and_then(|()| if pack_input.is_some() { writer.write_all(&pack_bytes) } else { Ok(()) })
         .and_then(|()| writer.flush())
         .or_else(|e| if !is_http && broken_pipe(&e) { Ok(()) } else { Err(e) });
     drop(writer);

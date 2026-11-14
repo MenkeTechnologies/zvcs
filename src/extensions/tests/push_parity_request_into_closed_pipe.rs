@@ -23,6 +23,12 @@
 //! `cmd` closes it ahead of the last of the advertisement, before the client has read what it
 //! needs to answer; `pack` closes it once the commands' flush has come in, under a pack too big
 //! for the pipe to have taken whole.
+//!
+//! The proxy is named `exec <proxy>`. Both sides run the option through `sh -c` (connect.c:1486-1495,
+//! run-command.c:293-305), and Debian's dash forks a lone `-c` command rather than exec it
+//! (debian/patches/0004 makes `evalstring(minusc, EV_EXIT)` `evalstring(minusc, 0)`), so the shell
+//! would hold the read end of the request pipe open until it had reaped the proxy: a window the
+//! commands of a fast enough client get through.
 #![cfg(unix)]
 
 #[path = "support/stock_git.rs"]
@@ -134,15 +140,15 @@ fn a_request_into_a_closed_pipe_ends_as_git_ends() {
     for side in [&s, &z] {
         fixture(stock, side);
     }
-    let push = |verb: &'static str| [verb, "--receive-pack=<proxy>", "../remote.git", "main:refs/heads/new"];
+    let push = |verb: &'static str| [verb, "--receive-pack=exec <proxy>", "../remote.git", "main:refs/heads/new"];
     let cases: [(&str, &str, Vec<&str>); 7] = [
         ("big", "cmd", push("push").to_vec()),
         ("big", "cmd", push("send-pack").to_vec()),
         ("big", "pack", push("push").to_vec()),
         ("big", "pack", push("send-pack").to_vec()),
-        ("empty", "cmd", vec!["-c", "protocol.version=2", "clone", "-q", "--upload-pack=<proxy>", "../remote.git", "c"]),
-        ("empty", "cmd", vec!["-c", "protocol.version=2", "fetch", "--upload-pack=<proxy>", "origin"]),
-        ("empty", "cmd", vec!["-c", "protocol.version=2", "ls-remote", "--upload-pack=<proxy>", "origin"]),
+        ("empty", "cmd", vec!["-c", "protocol.version=2", "clone", "-q", "--upload-pack=exec <proxy>", "../remote.git", "c"]),
+        ("empty", "cmd", vec!["-c", "protocol.version=2", "fetch", "--upload-pack=exec <proxy>", "origin"]),
+        ("empty", "cmd", vec!["-c", "protocol.version=2", "ls-remote", "--upload-pack=exec <proxy>", "origin"]),
     ];
     for (repo, mode, args) in &cases {
         let want = run(stock, &s, repo, mode, args);

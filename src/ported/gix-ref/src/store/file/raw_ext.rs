@@ -246,7 +246,9 @@ impl ReferenceExt for Reference {
     ) -> Option<Result<Reference, file::find::existing::Error>> {
         match &self.target {
             Target::Object(_) => None,
-            Target::Symbolic(full_name) => match store.try_find_packed(full_name.as_ref(), packed) {
+            // `refs_resolve_ref_unsafe()` reads the referent by its exact name
+            // (refs.c:2151-2152, :2185), never through `ref_rev_parse_rules`.
+            Target::Symbolic(full_name) => match store.try_find_exact_packed(full_name.as_ref(), packed) {
                 Ok(Some(next)) => Some(Ok(next)),
                 Ok(None) => Some(Err(file::find::existing::Error::NotFound {
                     name: full_name.to_path().to_owned(),

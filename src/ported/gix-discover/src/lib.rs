@@ -53,6 +53,8 @@ pub mod is_git {
         MissingHead,
         #[error("Expected HEAD at '.git/HEAD', got '.git/{}'", .name)]
         MisplacedHead { name: bstr::BString },
+        #[error("HEAD is neither a symbolic ref into refs/ nor an object id")]
+        InvalidHead,
         #[error("Expected an objects directory at '{}'", .missing.display())]
         MissingObjectsDirectory { missing: PathBuf },
         #[error("The worktree's private repo's commondir file at '{}' or it could not be read", .missing.display())]

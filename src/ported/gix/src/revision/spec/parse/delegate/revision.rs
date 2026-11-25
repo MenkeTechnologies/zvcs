@@ -35,6 +35,12 @@ impl delegate::Revision for Delegate<'_> {
                     name: gix_path::from_bstr(name).into_owned(),
                 }
             }),
+            // gix's DWIM never reads a lower-case or digit-bearing one-level name
+            // from the git directory, which `expand_ref()`'s first rule, `%.*s`,
+            // does (refs.c:620-621, :820-822): `.git/x` answers `rev-parse x`.
+            Err(err @ gix_ref::file::find::existing::Error::NotFound { .. }) => {
+                first_readable_rule(&self.repo.refs, name).ok_or(err)
+            }
             Err(err) => Err(err),
         };
         match found {
@@ -353,12 +359,9 @@ fn resolves_for_reading(refs: &gix_ref::file::Store, r: &gix_ref::Reference) -> 
         gix_ref::Target::Symbolic(name) => name.clone(),
     };
     for _ in 0..5 {
-        let Ok(Some(next)) = refs.try_find(target.as_ref()) else {
+        let Ok(Some(next)) = refs.try_find_exact(target.as_ref()) else {
             return false;
         };
-        if next.name != target {
-            return false;
-        }
         match next.target {
             gix_ref::Target::Object(_) => return true,
             gix_ref::Target::Symbolic(name) => target = name,
@@ -369,7 +372,10 @@ fn resolves_for_reading(refs: &gix_ref::file::Store, r: &gix_ref::Reference) -> 
 
 /// `expand_ref()`'s walk over `ref_rev_parse_rules` (refs.c:808-834) for the
 /// first rule whose exact refname resolves for reading. A rule that names a
-/// dangling symref or a broken loose ref is passed over, as the C's NULL is.
+/// dangling symref or a broken loose ref is passed over, as the C's NULL is, and
+/// so is one `check_refname_format(..., REFNAME_ALLOW_ONELEVEL)` refuses
+/// (refs.c:2131-2134). Each rule is read by its exact name, so the first, the
+/// operand itself, can be a one-level `$GIT_DIR/x` that no `refs/` prefix reaches.
 fn first_readable_rule(refs: &gix_ref::file::Store, name: &BStr) -> Option<gix_ref::Reference> {
     [
         name.to_owned(),
@@ -381,7 +387,8 @@ fn first_readable_rule(refs: &gix_ref::file::Store, name: &BStr) -> Option<gix_r
     ]
     .into_iter()
     .find_map(|rule: BString| {
-        let r = refs.try_find(rule.as_bstr()).ok()??;
-        (r.name.as_bstr() == rule && resolves_for_reading(refs, &r)).then_some(r)
+        let rule = gix_ref::FullName::try_from_onelevel(rule).ok()?;
+        let r = refs.try_find_exact(rule.as_ref()).ok()??;
+        resolves_for_reading(refs, &r).then_some(r)
     })
 }

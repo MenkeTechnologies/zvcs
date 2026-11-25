@@ -208,24 +208,46 @@ fn die(msg: &str) -> ! {
     std::process::exit(128)
 }
 
-/// `validate_headref()` (`setup.c:352-402`): a `refs/…` symlink, a file whose text
-/// is `ref: refs/…`, or a file holding a bare object name.
-fn validate_headref(path: &std::path::Path) -> bool {
-    if let Ok(target) = std::fs::read_link(path) {
-        return target.to_string_lossy().starts_with("refs/");
+/// `validate_headref()` (`setup.c:350-400`, v2.56.0): a symlink whose target starts
+/// with `refs/`, or a file whose first 255 bytes are `ref:`, any `isspace()` run and
+/// a name starting with `refs/`, or begin with a full object id of a known hash.
+/// Anything else — an empty file, `ref:` alone, `ref: x` — is not a repository's
+/// `HEAD`, so `is_git_directory()` refuses the directory.
+pub(crate) fn validate_headref(path: &std::path::Path) -> bool {
+    use std::io::Read;
+
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return std::fs::read_link(path).is_ok_and(|target| gix_path::into_bstr(target).starts_with(b"refs/"));
     }
-    let Ok(data) = std::fs::read(path) else { return false };
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
     // `read_in_full(fd, buffer, sizeof(buffer)-1)` with a 256-byte buffer.
-    let text = String::from_utf8_lossy(&data[..data.len().min(255)]).into_owned();
-    if let Some(refname) = text.strip_prefix("ref:") {
-        if refname.trim_start().starts_with("refs/") {
+    let mut buffer = Vec::with_capacity(255);
+    if file.take(255).read_to_end(&mut buffer).is_err() {
+        return false;
+    }
+    // `buffer[len] = '\0'` makes it a C string: a NUL inside ends it.
+    if let Some(nul) = buffer.iter().position(|&b| b == 0) {
+        buffer.truncate(nul);
+    }
+    if let Some(mut refname) = buffer.strip_prefix(b"ref:") {
+        // git's `isspace()`: space, `\t`, `\n` and `\r` (ctype.c:20-22).
+        while let Some((b' ' | b'\t' | b'\n' | b'\r', rest)) = refname.split_first() {
+            refname = rest;
+        }
+        if refname.starts_with(b"refs/") {
             return true;
         }
     }
-    // `get_oid_hex_any()`: any of the hash algorithms git knows, so SHA-1's 40 and
-    // SHA-256's 64 hex characters both answer.
-    let head = text.trim_end_matches(['\n', '\r']);
-    matches!(head.len(), 40 | 64) && head.bytes().all(|b| b.is_ascii_hexdigit())
+    // `get_oid_hex_any()` (hex.c): the leading hex digits of any hash git knows,
+    // SHA-1's 40 or SHA-256's 64; what follows them is not looked at.
+    [40, 64]
+        .into_iter()
+        .any(|len| buffer.len() >= len && buffer[..len].iter().all(u8::is_ascii_hexdigit))
 }
 
 /// `read_gitfile_gently()`'s error codes, in the wording

@@ -563,16 +563,12 @@ pub(super) fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option
                 continue;
             };
             let mut reference = repo.find_reference(name_str)?;
-            let symref = reference
-                .target()
-                .try_name()
-                .map(|nm| nm.as_bstr().to_vec())
-                .unwrap_or_default();
             // `do_for_each_ref()` drops a ref that does not resolve, so a dangling
             // symbolic ref is simply absent rather than an error.
             let Ok(id) = reference.follow_to_object().map(|i| i.detach()) else {
                 continue;
             };
+            let symref = symref_referent(repo, name_str)?;
             (symref, id, is_packed(repo, name_str))
         };
 
@@ -615,6 +611,22 @@ pub(super) fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option
         });
     }
     Ok((out, None))
+}
+
+/// The referent the ref iterator hands `ref-filter` for `name` (`item->symref`,
+/// ref-filter.c:3080): `loose_fill_ref_dir_regular_file()` takes it from
+/// `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING, ...)`
+/// (refs/files-backend.c:324-327, :351-352), so it is the *last* name of the
+/// chain, and empty for a ref that is not symbolic. A symref to a symref is
+/// therefore `-> topic`, never the name in between.
+pub(super) fn symref_referent(repo: &gix::Repository, name: &str) -> Result<Vec<u8>> {
+    let mut referent = Vec::new();
+    let mut link = repo.find_reference(name)?;
+    while let Some(Ok(next)) = link.follow() {
+        referent = next.name().as_bstr().to_vec();
+        link = next;
+    }
+    Ok(referent)
 }
 
 /// Read each surviving ref's object as far as the run's atoms require, producing

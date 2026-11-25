@@ -937,22 +937,16 @@ pub(super) fn leaf_object_id(repo: &gix::Repository, name: &BStr) -> Result<Opti
     Ok(None)
 }
 
-/// Look a reference up by its exact full name.
-///
-/// The store's `try_find` applies git's rev-parse search rules (so `main` would
-/// resolve to `refs/heads/main`); `symbolic-ref` addresses refs literally, so
-/// the name that came back is compared against the one asked for.
+/// Look a reference up by its exact full name, `refs_read_raw_ref()`
+/// (refs.c:2094-2105): the store's `try_find` applies git's rev-parse search
+/// rules (so `main` would resolve to `refs/heads/main`, and a one-level `y` would
+/// never be `$GIT_DIR/y`), while `symbolic-ref` addresses refs literally.
 fn find_exact(repo: &gix::Repository, name: &BStr) -> Result<Option<gix::refs::Reference>> {
-    let Ok(name) = name.to_str() else {
+    // An unusable name simply names nothing.
+    let Ok(name) = FullName::try_from_onelevel(name) else {
         return Ok(None);
     };
-    let found = match repo.refs.try_find(name) {
-        Ok(found) => found,
-        // An unusable name simply names nothing.
-        Err(gix::refs::file::find::Error::RefnameValidation(_)) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    Ok(found.filter(|reference| reference.name.as_bstr() == BStr::new(name)))
+    Ok(repo.refs.try_find_exact(name.as_ref())?)
 }
 
 /// Append one reflog line for `name`, following git's rules for which refs get a

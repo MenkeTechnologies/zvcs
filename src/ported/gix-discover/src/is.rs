@@ -72,29 +72,9 @@ pub(crate) fn git_with_metadata(
         if dot_git.join("HEAD").symlink_metadata().is_err() {
             return Err(crate::is_git::Error::MissingHead);
         }
-        // We expect to be able to parse any ref-hash, so we shouldn't have to know the repos hash here.
-        // With ref-table, the hash is probably stored as part of the ref-db itself, so we can handle it from there.
-        // In other words, it's important not to fail on detached heads here because we guessed the hash kind wrongly.
-        let refs = gix_ref::file::Store::at(dot_git.as_ref().into(), Default::default());
-        // `validate_headref()` (setup.c) reads the file and builds no ref store, so
-        // nothing a host hooks onto a store's first use belongs to this probe.
-        match gix_ref::file::without_hooks(|| refs.find_loose("HEAD")) {
-            Ok(head) => {
-                if head.name.as_bstr() != "HEAD" {
-                    return Err(crate::is_git::Error::MisplacedHead {
-                        name: head.name.into_inner(),
-                    });
-                }
-            }
-            Err(gix_ref::file::find::existing::Error::Find(gix_ref::file::find::Error::ReferenceCreation {
-                source: _,
-                relative_path,
-            })) if relative_path == Path::new("HEAD") => {
-                // It's fine as long as the reference is found is `HEAD`.
-            }
-            Err(err) => {
-                return Err(err.into());
-            }
+        // `is_git_directory()` (setup.c:413-424) asks `validate_headref()` first.
+        if !crate::setup::validate_headref(&dot_git.join("HEAD")) {
+            return Err(crate::is_git::Error::InvalidHead);
         }
     }
 

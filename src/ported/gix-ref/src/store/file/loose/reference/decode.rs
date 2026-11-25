@@ -28,7 +28,10 @@ impl TryFrom<MaybeUnsafeState> for Target {
         Ok(match v {
             MaybeUnsafeState::Id(id) => Target::Object(id),
             MaybeUnsafeState::UnvalidatedPath(name) => {
-                Target::Symbolic(match gix_validate::reference::name(name.as_ref()) {
+                // `refs_resolve_ref_unsafe()` (refs.c:2190-2195, v2.56.0) holds the target of a
+                // symbolic ref to `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so
+                // `ref: x` or `ref: A1` names `$GIT_DIR/x` or `$GIT_DIR/A1` and is followed.
+                Target::Symbolic(match gix_validate::reference::name_partial(name.as_ref()) {
                     Ok(_) => FullName(name),
                     Err(err) => {
                         return Err(Error::RefnameValidation {
@@ -84,7 +87,10 @@ fn parse(mut i: &[u8], object_hash: gix_hash::Kind) -> Result<MaybeUnsafeState, 
         Ok(MaybeUnsafeState::UnvalidatedPath(path))
     } else {
         let hex = hex_hash(&mut i, object_hash)?;
-        if i.first().is_some_and(u8::is_ascii_hexdigit) {
+        // `(*p != '\0' && !isspace(*p))` is `REF_ISBROKEN` (refs/files-backend.c:687-692):
+        // only the end, a NUL or whitespace may follow the object id, so
+        // `<oid>garbage` is broken and `<oid>\t...` (FETCH_HEAD) is not.
+        if i.first().is_some_and(|b| !matches!(b, b'\0' | b' ' | b'\t' | b'\n' | b'\r')) {
             return Err(());
         }
         Ok(MaybeUnsafeState::Id(ObjectId::from_hex(hex).expect("prior validation")))

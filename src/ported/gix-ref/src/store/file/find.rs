@@ -165,6 +165,36 @@ impl file::Store {
         let full_name = precomposed_partial_name
             .unwrap_or(partial_name)
             .construct_full_name_ref(inbetween, path_buf, consider_pseudo_ref);
+        self.read_raw_ref_packed(full_name, packed)
+    }
+
+    /// `refs_read_raw_ref()` (refs.c:2094-2105, v2.56.0), `files_read_raw_ref()`
+    /// (refs/files-backend.c:648-653) and its `read_ref_internal()` (:514) for the
+    /// files backend: the reference named exactly `full_name`, its loose file first
+    /// and then `packed-refs`, with none of the `ref_rev_parse_rules` expansion
+    /// [`Self::try_find()`] applies. This is how `refs_resolve_ref_unsafe()`
+    /// (refs.c:2113-2200) reads each link of a symref chain, so a target `x` is
+    /// `$GIT_DIR/x` and never `refs/heads/x`.
+    pub fn try_find_exact_packed(
+        &self,
+        full_name: &FullNameRef,
+        packed: Option<&packed::Buffer>,
+    ) -> Result<Option<Reference>, Error> {
+        file::first_use();
+        self.read_raw_ref_packed(full_name, packed)
+    }
+
+    /// [`Self::try_find_exact_packed()`] with the current `packed-refs`.
+    pub fn try_find_exact(&self, full_name: &FullNameRef) -> Result<Option<Reference>, Error> {
+        let packed = self.assure_packed_refs_uptodate()?;
+        self.try_find_exact_packed(full_name, packed.as_ref().map(|b| &***b))
+    }
+
+    fn read_raw_ref_packed(
+        &self,
+        full_name: &FullNameRef,
+        packed: Option<&packed::Buffer>,
+    ) -> Result<Option<Reference>, Error> {
         if let Some(backend) = self.reftable.as_deref() {
             if !crate::store_impl::reftable::is_pseudo_ref(full_name.as_bstr()) {
                 return self.find_in_reftable(backend, full_name);
@@ -249,9 +279,10 @@ impl file::Store {
             return Ok(None);
         };
         // A file store refuses a symbolic reference to an invalid name when
-        // decoding the file; the same error is reported here.
+        // decoding the file; the same error is reported here, under the same
+        // `REFNAME_ALLOW_ONELEVEL` rule (refs.c:2190-2195).
         if let crate::Target::Symbolic(target) = &target {
-            if let Err(err) = gix_validate::reference::name(target.as_bstr()) {
+            if let Err(err) = gix_validate::reference::name_partial(target.as_bstr()) {
                 return Err(Error::ReferenceCreation {
                     source: loose::reference::decode::Error::RefnameValidation {
                         source: err,

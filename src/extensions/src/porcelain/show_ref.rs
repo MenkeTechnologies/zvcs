@@ -729,6 +729,16 @@ fn broken_as_null<'r>(
                 return Err(Broken::Packed(crate::fatal::die(line.to_string())));
             }
             match e.downcast_ref::<IterError>() {
+                // A symref whose target `check_refname_format()` refuses (`ref:` with
+                // nothing after it) is `REF_ISSYMREF`, not unparsable: it resolves to
+                // NULL (refs.c:2190-2195) and is `REF_ISSYMREF | REF_ISBROKEN`
+                // (refs/files-backend.c:324-331), which `GIT_REF_PARANOIA`'s default
+                // `REFS_FOR_EACH_OMIT_DANGLING_SYMREFS` (refs.c:1859-1867) drops
+                // (refs/files-backend.c:1023-1026) like any dangling symref.
+                Some(IterError::ReferenceCreation {
+                    source: gix::refs::file::loose::reference::decode::Error::RefnameValidation { .. },
+                    ..
+                }) => Err(Broken::Skipped),
                 Some(IterError::ReferenceCreation { relative_path, .. }) => {
                     Err(Broken::Loose(relative_path.to_string_lossy().replace('\\', "/")))
                 }

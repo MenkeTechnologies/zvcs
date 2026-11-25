@@ -1095,7 +1095,18 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         format!("refs/remotes/{name}"),
         format!("refs/remotes/{name}/HEAD"),
     ] {
-        let r = match repo.try_find_reference(rule.as_str()) {
+        // git resolves each rule with `refs_resolve_ref_unsafe()`: a name that
+        // `check_refname_format(..., REFNAME_ALLOW_ONELEVEL)` refuses is a bare NULL
+        // (refs.c:2131-2134), and any other is read by its exact name
+        // (refs.c:2151-2152), so `x` is `$GIT_DIR/x` and `refs_found` counts
+        // distinct existing refnames. gitoxide's `try_find` applies a DWIM of its
+        // own over `refs/`, `refs/tags/`, `refs/heads/` and `refs/remotes/`, which
+        // never reads a lower-case one-level name and would let several rules
+        // report the same underlying ref.
+        let Ok(full) = gix::refs::FullName::try_from_onelevel(rule.as_str()) else {
+            continue;
+        };
+        let r = match repo.refs.try_find_exact(full.as_ref()) {
             Ok(Some(r)) => r,
             Ok(None) => continue,
             // ```c
@@ -1110,30 +1121,35 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
             // `RESOLVE_REF_READING`. Like the dangling-symref arm it is asked of the
             // expansion only, and nothing in `get_oid_basic()`'s flags gates it, so
             // stock `rev-parse --verify -q <broken>` prints it once.
-            Err(gix::reference::find::Error::Find(
-                gix::refs::file::find::Error::ReferenceCreation { relative_path, .. },
-            )) => {
+            //
+            // A file that *is* symbolic but names something
+            // `check_refname_format(..., REFNAME_ALLOW_ONELEVEL)` refuses — `ref:` with
+            // nothing after it — is not broken: `parse_loose_ref_contents()` set
+            // `REF_ISSYMREF` (refs/files-backend.c:674-683), `refs_resolve_ref_unsafe()`
+            // ORs it into the flags and only then refuses the target with a bare NULL
+            // (refs.c:2175, :2190-2195), so `expand_ref()`'s first arm calls it a
+            // dangling symref (refs.c:829-830), and says nothing at all for `HEAD`.
+            Err(gix::refs::file::find::Error::ReferenceCreation { relative_path, source }) => {
                 if gix::path::to_unix_separators_on_windows(gix::path::into_bstr(relative_path))
                     .as_ref()
                     == rule.as_bytes()
-                    && rule.contains('/')
                 {
-                    eprintln!("warning: ignoring broken ref {rule}");
+                    let symbolic = matches!(
+                        source,
+                        gix::refs::file::loose::reference::decode::Error::RefnameValidation { .. }
+                    );
+                    if symbolic {
+                        if rule != "HEAD" {
+                            eprintln!("warning: ignoring dangling symref {rule}");
+                        }
+                    } else if rule.contains('/') {
+                        eprintln!("warning: ignoring broken ref {rule}");
+                    }
                 }
                 continue;
             }
             Err(_) => continue,
         };
-        // git resolves each rule with `refs_resolve_ref_unsafe()`, an *exact*
-        // lookup, so `refs_found` counts distinct existing refnames. gitoxide's
-        // `try_find` instead applies a DWIM of its own over `refs/`,
-        // `refs/tags/`, `refs/heads/` and `refs/remotes/`, so several rules would
-        // otherwise report the same underlying ref and inflate the count — which
-        // would make a plain `git rev-parse main` look ambiguous. Keep only the
-        // candidates that named the very ref they found.
-        if r.name().as_bstr() != rule.as_bytes() {
-            continue;
-        }
         // `repo_dwim_ref` records what `resolve_ref_unsafe` resolved *to*, so a
         // symbolic `HEAD` contributes the branch it points at.
         //
@@ -1154,7 +1170,7 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         // `HEAD` is exempt because an unborn branch is the ordinary state of a fresh
         // repository. Recording the symref's target name without following it
         // counted a dangling symref as a found ref and printed nothing.
-        found.push(match r.target() {
+        found.push(match r.target.to_ref() {
             TargetRef::Symbolic(full) => match resolve_symref_chain(repo, full.as_bstr()) {
                 Some(resolved) => resolved,
                 None => {
@@ -1164,7 +1180,7 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
                     continue;
                 }
             },
-            TargetRef::Object(_) => r.name().as_bstr().to_string(),
+            TargetRef::Object(_) => r.name.as_bstr().to_string(),
         });
         // refs.c:828 — asked inside the `if (r)` arm, so only a rule that
         // matched reads the setting, and an unreadable value dies right here.
@@ -1184,11 +1200,13 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
 fn resolve_symref_chain(repo: &gix::Repository, target: &BStr) -> Option<String> {
     let mut current = target.to_owned();
     for _ in 0..5 {
-        let r = repo.try_find_reference(current.as_bstr()).ok()??;
-        if r.name().as_bstr() != current {
-            return None;
-        }
-        match r.target() {
+        // Each link must pass `check_refname_format(..., REFNAME_ALLOW_ONELEVEL)`
+        // (refs.c:2190-2195) and is read by its exact name (refs.c:2151-2152), so a
+        // one-level target such as `x` is `$GIT_DIR/x`, which `ref_rev_parse_rules`
+        // never names.
+        let name = gix::refs::FullName::try_from_onelevel(current.clone()).ok()?;
+        let r = repo.refs.try_find_exact(name.as_ref()).ok()??;
+        match r.target.to_ref() {
             TargetRef::Object(_) => return Some(current.to_string()),
             TargetRef::Symbolic(next) => current = next.as_bstr().to_owned(),
         }
@@ -2675,13 +2693,14 @@ fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
         format!("refs/remotes/{name}"),
         format!("refs/remotes/{name}/HEAD"),
     ] {
-        let Ok(Some(r)) = repo.try_find_reference(rule.as_str()) else {
+        // Each rule is read by its exact name, as in `dwim_ref_matches()`.
+        let Ok(full) = gix::refs::FullName::try_from_onelevel(rule.as_str()) else {
             continue;
         };
-        if r.name().as_bstr() != rule.as_bytes() {
+        let Ok(Some(r)) = repo.refs.try_find_exact(full.as_ref()) else {
             continue;
-        }
-        let resolved = match r.target() {
+        };
+        let resolved = match r.target.to_ref() {
             TargetRef::Object(_) => Some(rule),
             TargetRef::Symbolic(full) => resolve_symref_chain(repo, full.as_bstr()),
         };

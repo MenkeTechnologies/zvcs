@@ -100,6 +100,9 @@ pub(crate) struct Queue {
     pub prune: Vec<RefEdit>,
     /// The rank of each local ref's update, lowest first; see `Prepare::with_update_order()`.
     pub order: std::collections::HashMap<gix_ref::FullName, u32>,
+    /// The refs a non-atomic `--prune` deleted before the fetch, with the values they had; see
+    /// `Prepare::with_pruned()`.
+    pub pruned: std::collections::HashMap<gix_ref::FullName, gix_hash::ObjectId>,
 }
 
 /// [`update()`], with `queue`'s deletions and order applied to the transaction.
@@ -186,9 +189,27 @@ pub(crate) fn update_queued(
         }
         let (mode, edit_index, type_change) = match local {
             Some(name) => {
-                let (mode, reflog_message, name, previous_value) = match repo.try_find_reference(name)? {
+                // `get_ref_map()` reads every destination's `peer_ref->old_oid` before `prune_refs()`
+                // runs (builtin/fetch.c:630-652), so a ref the prune just deleted is updated from the
+                // value it had, and the transaction then fails to lock it. Automatic tag following
+                // is not: its second pass, `backfill_tags()`, looks the tag up after the prune and
+                // finds it missing (:2070-2090).
+                let existing = match repo.try_find_reference(name)? {
                     Some(existing) => {
-                        if let Some(wt_dirs) = checked_out_branches.get_mut(existing.name()) {
+                        let local_id = existing
+                            .try_id()
+                            .map_or_else(|| existing.clone().peel_to_id(), Ok)
+                            .map(crate::Id::detach);
+                        Some((existing.name().to_owned(), existing.target().into_owned(), local_id))
+                    }
+                    None if is_implicit_tag => None,
+                    None => gix_ref::FullName::try_from(name.clone())
+                        .ok()
+                        .and_then(|full| queue.pruned.get(&full).map(|id| (full, Target::Object(*id), Ok(*id)))),
+                };
+                let (mode, reflog_message, name, previous_value) = match existing {
+                    Some((existing_name, existing_target, local_id)) => {
+                        if let Some(wt_dirs) = checked_out_branches.get_mut(&existing_name) {
                             wt_dirs.sort();
                             wt_dirs.dedup();
                             let mode = Mode::RejectedCurrentlyCheckedOut {
@@ -198,11 +219,7 @@ pub(crate) fn update_queued(
                             continue;
                         }
 
-                        match existing
-                            .try_id()
-                            .map_or_else(|| existing.clone().peel_to_id(), Ok)
-                            .map(crate::Id::detach)
-                        {
+                        match local_id {
                             Ok(local_id) => {
                                 let remote_id = match remote_id {
                                     Some(id) => id,
@@ -215,7 +232,7 @@ pub(crate) fn update_queued(
                                 };
                                 let (mode, reflog_message) = if local_id == remote_id {
                                     (Mode::NoChangeNeeded, "no update will be performed")
-                                } else if let Some(gix_ref::Category::Tag) = existing.name().category() {
+                                } else if let Some(gix_ref::Category::Tag) = existing_name.category() {
                                     if spec.allow_non_fast_forward() {
                                         (Mode::Forced, "updating tag")
                                     } else if is_implicit_tag {
@@ -270,8 +287,8 @@ pub(crate) fn update_queued(
                                 (
                                     mode,
                                     reflog_message,
-                                    existing.name().to_owned(),
-                                    PreviousValue::MustExistAndMatch(existing.target().into_owned()),
+                                    existing_name,
+                                    PreviousValue::MustExistAndMatch(existing_target),
                                 )
                             }
                             Err(crate::reference::peel::Error::ToId(gix_ref::peel::to_id::Error::FollowToObject(
@@ -279,7 +296,7 @@ pub(crate) fn update_queued(
                             ))) => {
                                 // An unborn reference, always allow it to be changed to whatever the remote wants.
                                 (
-                                    if existing.target().try_name().map(gix_ref::FullNameRef::as_bstr)
+                                    if existing_target.try_name().map(gix_ref::FullNameRef::as_bstr)
                                         == remote.as_target()
                                     {
                                         Mode::NoChangeNeeded
@@ -287,8 +304,8 @@ pub(crate) fn update_queued(
                                         Mode::Forced
                                     },
                                     "change unborn ref",
-                                    existing.name().to_owned(),
-                                    PreviousValue::MustExistAndMatch(existing.target().into_owned()),
+                                    existing_name,
+                                    PreviousValue::MustExistAndMatch(existing_target),
                                 )
                             }
                             Err(err) => return Err(err.into()),

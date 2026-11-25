@@ -410,6 +410,17 @@ where
         self
     }
 
+    /// The refs `--prune` already deleted in a transaction of its own, with the values they had.
+    ///
+    /// `get_ref_map()` reads every destination's old value before `prune_refs()` runs
+    /// (builtin/fetch.c:630-652), so git updates such a ref from that value - and the update then
+    /// fails to lock a ref that is gone. Each is taken as still holding its value when the update
+    /// is worked out.
+    pub fn with_pruned(mut self, pruned: std::collections::HashMap<gix_ref::FullName, gix_hash::ObjectId>) -> Self {
+        self.inner.queue.pruned = pruned;
+        self
+    }
+
     /// The position of each local ref's update in the transaction, lowest first; a ref not named
     /// goes after every one that is, in ref-map order.
     ///

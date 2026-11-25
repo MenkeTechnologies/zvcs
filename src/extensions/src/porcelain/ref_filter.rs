@@ -482,7 +482,7 @@ fn atoms<'a>(items: &'a [Item], sorts: &'a [SortKey]) -> impl Iterator<Item = &'
 
 /// Every ref name the `:short` disambiguation tests candidates against. A ref whose file would not
 /// parse does not resolve (`refs_ref_exists()`), so it takes no part.
-fn existing_ref_names(repo: &gix::Repository) -> Result<HashSet<Vec<u8>>> {
+pub(super) fn existing_ref_names(repo: &gix::Repository) -> Result<HashSet<Vec<u8>>> {
     let mut set = HashSet::new();
     for r in repo.references()?.all()? {
         if let crate::fatal::RefWalkEntry::Ref(r) = crate::fatal::ref_walk_entry(r)? {

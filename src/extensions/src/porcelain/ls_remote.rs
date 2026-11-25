@@ -11,36 +11,28 @@
 //! 128 when the remote cannot be reached or a sort key is rejected, 129 for
 //! usage errors and for bare `-h`).
 //!
-//! `--sort` reproduces `ref-filter.c`: the *last* `--sort` on the command line
-//! is the primary key, earlier ones break its ties, and a final ascending
-//! `strcmp` on the refname breaks the rest (`compare_refs`). `-` reverses a
-//! single key without reversing that final tiebreak; `version:`/`v:` selects
-//! `versioncmp()` (`crate::refsort`, shared with `branch`, `tag` and
-//! `for-each-ref` exactly as git shares `versioncmp.c`, so
-//! `versionsort.suffix` / `versionsort.prereleaseSuffix` apply here too). Sort
-//! keys are validated only after
-//! the refs have been fetched, exactly where git validates them, so an
-//! unreachable remote still reports the transport failure rather than the key.
+//! `--sort` goes through the one ref-filter engine `for-each-ref`, `branch` and
+//! `tag` use, as `cmd_ls_remote()` does (builtin/ls-remote.c:150-164): every
+//! advertised ref becomes a `ref_array_item`, each `--sort` key is any
+//! `for-each-ref` atom, the *last* `--sort` is the primary key, and a final
+//! ascending `strcmp` on the refname breaks ties (`compare_refs`). An atom
+//! that reads the object names the first ref whose object is not local in
+//! `missing object <oid> for <ref>`, in `git_qsort_s()`'s comparison order.
+//! Sort keys are validated only after the refs have been fetched, exactly
+//! where git validates them, so an unreachable remote still reports the
+//! transport failure rather than the key.
 //!
 //! `--upload-pack=<exec>` (and its hidden synonym `--exec`) selects the program run in place of
 //! `git-upload-pack`, defaulting to `remote.<name>.uploadpack`; `-o`/`--server-option` is transmitted as
 //! protocol-v2 `server-option=<value>` capability lines on the `ls-refs` request, defaulting to
 //! `remote.<name>.serverOption`.
 //!
-//! Known gaps:
-//!
-//! * `--sort` keys beyond `refname`, `objectname`, `creatordate`,
-//!   `committerdate`, `authordate` and `taggerdate` are refused with git's
-//!   `unknown field name` fatal. git accepts more `for-each-ref` atoms than
-//!   those, but computing them needs object data `ls-remote` never fetches.
-//! * `version:` in front of a *date* key falls back to the plain numeric
-//!   compare instead of git's versioncmp over the formatted date string.
-//!
 //! Outside a repository the operand is the URL, rewritten by the system, global
 //! and command-line `url.<base>.insteadOf`, and the transport is opened on it
-//! directly (see [`outside_repository`]); a date `--sort` key dies there for
-//! want of object data, as in git.
+//! directly (see [`outside_repository`]); a `--sort` key whose atom needs object
+//! data dies there, as in git.
 
+use super::for_each_ref::{self, parse_atom, Atom, AtomCtx, ErrKind, Field, Key, NameMod, ObjInfo, QuoteStyle, RefInfo, RenderCtx, SortKey};
 use crate::refsort::{self, Prereleases};
 use anyhow::Result;
 use std::cmp::Ordering;
@@ -142,41 +134,6 @@ struct Row {
     symref: Option<String>,
     /// Whether this is the synthetic `^{}` row (git's "magic fake tag ref").
     peel: bool,
-    /// The seconds [`compare_rows`] uses for every date key. The listing never
-    /// sets it: its dates are read from the object during the sort, as
-    /// `get_ref_atom_value()` reads them (see [`sort_rows`]).
-    date: i64,
-}
-
-/// The `for-each-ref` atoms `ls-remote` can evaluate from what it has.
-#[derive(Clone, Copy, PartialEq)]
-enum Atom {
-    Refname,
-    Objectname,
-    /// `creatordate`, `committerdate`, `authordate` or `taggerdate`; which one is
-    /// [`SortKey::date`].
-    Date,
-}
-
-/// The date atoms, which `grab_values()` fills per object type (ref-filter.c):
-/// a commit has an author and a committer, a tag a tagger, and `creatordate`
-/// is whichever of committer and tagger the object has. An atom the object
-/// has no person for keeps the value 0.
-#[derive(Clone, Copy, PartialEq)]
-enum DateField {
-    Creator,
-    Committer,
-    Author,
-    Tagger,
-}
-
-/// One parsed `--sort` key: `[-][version:|v:]<atom>`.
-struct SortKey {
-    reverse: bool,
-    version: bool,
-    atom: Atom,
-    /// The date atom, when `atom` is [`Atom::Date`].
-    date: DateField,
 }
 
 /// `git ls-remote` — list references available in a remote repository.
@@ -407,7 +364,7 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     if repository.is_none() && !opts.quiet {
         eprintln!("From {url}");
     }
-    let code = list(&ref_map.remote_refs, patterns, &opts, Some(&repo));
+    let code = list(&ref_map.remote_refs, patterns, &opts, Some(&repo))?;
     // `transport_disconnect()` comes after the listing (builtin/ls-remote.c:166-177), and its
     // `disconnect_git()` writes the closing flush (transport.c:1020-1030).
     if gix::protocol::take_closing_flush_broken_pipe() {
@@ -427,52 +384,32 @@ fn disconnect_into_closed_pipe() -> ! {
 ///
 /// `repo` is `None` outside a repository, where a date key has no object data
 /// to read and `ref_sorting_options()` dies on it — after the refs are in.
-fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Repository>) -> ExitCode {
+fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Repository>) -> Result<ExitCode> {
     let mut rows: Vec<Row> = Vec::new();
     for r in refs {
         push_rows(r, &mut rows);
     }
+    // The items are pushed in advertisement order (builtin/ls-remote.c:152-161), each peeled
+    // `<tag>^{}` right behind its tag, so `refs/tags/v1.0^{}` precedes `refs/tags/v1.0.1`.
     rows.retain(|row| check_ref(row, opts) && tail_match(patterns, &row.name));
-    rows.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
-    // git only reorders when `--sort` was given; otherwise the advertisement
-    // order stands, and it is already refname order.
+    // `ref_sorting_options()` leaves `sorting` NULL when no `--sort` was given, and
+    // `ref_array_sort()` sorts only `if (sorting)` (ref-filter.c:3624-3628): the advertisement
+    // order stands. With `--sort` it is the order `git_qsort_s()` starts from, which decides
+    // the ref a `missing object` names.
     if !opts.sort.is_empty() {
-        let keys = match parse_sort_keys(&opts.sort) {
-            Ok(keys) => keys,
-            Err(msg) => {
-                eprintln!("fatal: {msg}");
-                return ExitCode::from(128);
-            }
-        };
-        let prereleases = match repo {
-            // git seeds `versioncmp`'s prerelease list from config once, lazily.
-            Some(repo) => Prereleases::new(repo),
-            None => {
-                // `parse_ref_filter_atom()`: "not a git repository, but the field
-                // '%.*s' requires access to object data" for the first such key
-                // on the command line.
-                if let Some(field) = opts.sort.iter().find_map(|spec| {
-                    let field = spec.trim_start_matches('-');
-                    let field = field
-                        .strip_prefix("version:")
-                        .or_else(|| field.strip_prefix("v:"))
-                        .unwrap_or(field);
-                    matches!(field, "creatordate" | "committerdate" | "authordate" | "taggerdate")
-                        .then_some(field)
-                }) {
-                    eprintln!(
-                        "fatal: not a git repository, but the field '{field}' requires access to object data"
-                    );
-                    return ExitCode::from(128);
+        let sorts = match parse_sort_keys(&opts.sort, repo) {
+            Ok(sorts) => sorts,
+            Err(SortFailure::OutsideRepositoryBug) => outside_repository_bug(),
+            Err(SortFailure::Atom(e)) => match e.kind {
+                ErrKind::Unported => anyhow::bail!("{}", e.msg),
+                ErrKind::Fatal | ErrKind::Usage => {
+                    eprintln!("fatal: {}", e.msg);
+                    return Ok(ExitCode::from(128));
                 }
-                Prereleases::none()
-            }
+            },
         };
-        if let Err(msg) = sort_rows(repo, &keys, &mut rows, &prereleases) {
-            eprintln!("fatal: {msg}");
-            return ExitCode::from(128);
-        }
+        sort_rows(repo, &sorts, &mut rows)?;
     }
 
     let mut out = String::new();
@@ -489,11 +426,11 @@ fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Reposit
     crate::cstdio::defer();
     crate::cstdio::write_bytes(out.as_bytes());
 
-    if rows.is_empty() && opts.exit_code {
+    Ok(if rows.is_empty() && opts.exit_code {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
-    }
+    })
 }
 
 /// Walk the command line the way `parse_options` does.
@@ -673,159 +610,258 @@ fn split_long(arg: &str) -> (&str, Option<&str>, bool) {
     }
 }
 
-/// Parse `--sort` arguments into git's ordering chain.
+/// `ref_sorting_options()` (ref-filter.c:3775-3791) over the `--sort` arguments:
+/// `parse_ref_sorting()` (:3757-3773) strips `-` and `version:`/`v:` and hands
+/// the rest to `parse_sorting_atom()` (:3741-3755), which runs
+/// `parse_ref_filter_atom()` against a dummy format and `die()`s on the first
+/// argument it rejects, in command-line order. Each key is prepended, so the
+/// returned chain is head-first: the last `--sort` sorts first.
 ///
-/// `ref_sorting_options` prepends each parsed key, so the last one on the
-/// command line ends up at the head and sorts first; the returned vector is in
-/// that head-first order.
-fn parse_sort_keys(specs: &[String]) -> Result<Vec<SortKey>, String> {
+/// Without a repository `parse_ref_filter_atom()` refuses every atom whose
+/// `valid_atom[]` source is not `SOURCE_NONE` (ref-filter.c:1074-1077) before
+/// its parser runs; `head_atom_parser()` then resolves `HEAD` through
+/// `get_main_ref_store()`, which is a `BUG()` there (refs.c:2367).
+fn parse_sort_keys(specs: &[String], repo: Option<&gix::Repository>) -> Result<Vec<SortKey>, SortFailure> {
+    let ctx = AtomCtx {
+        repo,
+        color_on: false,
+        quote_style: QuoteStyle::None,
+    };
     let mut keys = Vec::with_capacity(specs.len());
-    for spec in specs.iter().rev() {
-        let mut arg = spec.as_str();
-        let reverse = arg.starts_with('-');
-        if reverse {
-            arg = &arg[1..];
-        }
-        let version = match arg.strip_prefix("version:").or_else(|| arg.strip_prefix("v:")) {
-            Some(rest) => {
-                arg = rest;
-                true
+    for spec in specs {
+        let (rest, descending) = match spec.strip_prefix('-') {
+            Some(rest) => (rest, true),
+            None => (spec.as_str(), false),
+        };
+        let (rest, versioned) = match rest.strip_prefix("version:").or_else(|| rest.strip_prefix("v:")) {
+            Some(rest) => (rest, true),
+            None => (rest, false),
+        };
+        if repo.is_none() {
+            for_each_ref::check_atom_outside_repository(rest).map_err(SortFailure::Atom)?;
+            if rest.split_once(':').map_or(rest, |(name, _)| name) == "HEAD" {
+                return Err(SortFailure::OutsideRepositoryBug);
             }
-            None => false,
-        };
-        if arg.is_empty() {
-            return Err(format!("malformed field name: {arg}"));
         }
-        let (atom, date) = match arg {
-            "refname" => (Atom::Refname, DateField::Creator),
-            "objectname" => (Atom::Objectname, DateField::Creator),
-            "creatordate" => (Atom::Date, DateField::Creator),
-            "committerdate" => (Atom::Date, DateField::Committer),
-            "authordate" => (Atom::Date, DateField::Author),
-            "taggerdate" => (Atom::Date, DateField::Tagger),
-            other => return Err(format!("unknown field name: {other}")),
-        };
+        let atom = parse_atom(rest, &ctx).map_err(SortFailure::Atom)?;
         keys.push(SortKey {
-            reverse,
-            version,
-            atom,
-            date,
+            atom: ls_remote_atom(atom),
+            descending,
+            versioned,
         });
     }
+    keys.reverse();
     Ok(keys)
 }
 
-/// The dates of one object, indexed by [`DateField`].
-#[derive(Clone, Copy, Default)]
-struct Dates([i64; 4]);
+/// Why the sort chain could not be built.
+enum SortFailure {
+    /// `parse_ref_filter_atom()`'s message, `die()`d by `parse_sorting_atom()`.
+    Atom(for_each_ref::AtomError),
+    /// `BUG: refs.c:2367: attempting to get main_ref_store outside of repository`.
+    OutsideRepositoryBug,
+}
 
-impl Dates {
-    fn get(&self, field: DateField) -> i64 {
-        self.0[field as usize]
+/// The values `populate_value()` gives the atoms that read the array item's
+/// `kind`, `flag`, `counts` or `is_base`: `ref_array_push()` leaves all four
+/// zero for an advertised ref (builtin/ls-remote.c:159-160, ref-filter.c:2939-2951),
+/// and `cmd_ls_remote()` runs neither `filter_ahead_behind()` nor
+/// `filter_is_base()`. So `%(worktreepath)` is `""` (`ref->kind ==
+/// FILTER_REFS_BRANCHES` fails, ref-filter.c:2473-2477), `%(flag)` is `""`,
+/// and `%(ahead-behind:…)` and `%(is-base:…)` are `""` (:2574-2594).
+fn ls_remote_atom(atom: Atom) -> Atom {
+    match atom.field {
+        Field::WorktreePath | Field::Flag | Field::AheadBehind(_) | Field::IsBase(..) => Atom {
+            deref: atom.deref,
+            field: Field::Constant(Vec::new()),
+        },
+        _ => atom,
     }
 }
 
-/// `populate_value()` for the date atoms of `row`: its object read from the
-/// local odb, or git's `missing object <oid> for <ref>` (ref-filter.c
-/// `get_object()`), which for `ls-remote` is anything not fetched yet.
-fn row_dates(repo: &gix::Repository, row: &Row) -> Result<Dates, String> {
-    let object = repo
-        .find_object(row.id)
-        .map_err(|_| format!("missing object {} for {}", row.id.to_hex(), row.name))?;
-    let mut dates = Dates::default();
-    match object.kind {
-        gix::object::Kind::Commit => {
-            if let Ok(commit) = object.try_into_commit() {
-                if let Ok(committer) = commit.committer() {
-                    dates.0[DateField::Committer as usize] = committer.seconds();
-                    dates.0[DateField::Creator as usize] = committer.seconds();
-                }
-                if let Ok(author) = commit.author() {
-                    dates.0[DateField::Author as usize] = author.seconds();
-                }
-            }
-        }
-        gix::object::Kind::Tag => {
-            let tagged = object.try_into_tag().ok();
-            if let Some(seconds) = tagged.as_ref().and_then(|t| t.tagger().ok().flatten()).map(|s| s.seconds()) {
-                dates.0[DateField::Tagger as usize] = seconds;
-                dates.0[DateField::Creator as usize] = seconds;
-            }
-        }
-        // Trees and blobs have no date; git's atom value stays 0.
-        _ => {}
+/// `ref_array_sort()` (ref-filter.c:3624-3628): `QSORT_S` with `compare_refs()`,
+/// over the items `cmd_ls_remote()` pushed for the advertised refs.
+///
+/// `cmp_ref_sorting()` reads each side through `get_ref_atom_value()`
+/// (ref-filter.c:3548-3551), which fills every atom of an item the first time
+/// a comparison reaches it and `die()`s on what `populate_value()` rejects —
+/// `missing object <oid> for <ref>` for an object this repository does not
+/// have, which for `ls-remote` is anything not fetched yet. `git_qsort_s()`'s
+/// merge sort therefore decides which ref the error names, and a single row is
+/// never compared and never read.
+fn sort_rows(repo: Option<&gix::Repository>, sorts: &[SortKey], rows: &mut Vec<Row>) -> Result<()> {
+    if rows.len() < 2 {
+        return Ok(());
     }
-    Ok(dates)
-}
-
-/// `ref_array_sort()`: `QSORT_S` with `compare_refs()`. A date key reads each
-/// row's object the first time a comparison reaches the row and dies on the
-/// first one that is missing (`cmp_ref_sorting()`, ref-filter.c:3548-3551), so
-/// the merge sort's comparison order decides which ref the error names; with a
-/// single row nothing is compared and nothing is read.
-fn sort_rows(
-    repo: Option<&gix::Repository>,
-    keys: &[SortKey],
-    rows: &mut Vec<Row>,
-    pre: &Prereleases<'_>,
-) -> Result<(), String> {
-    let dated = keys.iter().any(|k| k.atom == Atom::Date);
-    let mut dates: Vec<Option<Dates>> = vec![None; rows.len()];
-    let mut order: Vec<usize> = (0..rows.len()).collect();
-    refsort::git_qsort_s(&mut order, &mut |&a: &usize, &b: &usize| -> Result<Ordering, String> {
-        if let (true, Some(repo)) = (dated, repo) {
-            for i in [a, b] {
-                if dates[i].is_none() {
-                    dates[i] = Some(row_dates(repo, &rows[i])?);
+    let mut infos: Vec<RefInfo> = match repo {
+        Some(repo) => ref_infos(repo, sorts, rows)?,
+        None => {
+            // Outside a repository every atom left is `SOURCE_NONE`. Of those, `%(upstream)`,
+            // `%(push)` and the `:short` names reach `get_main_ref_store()` while the first
+            // comparison populates (ref-filter.c:2484-2509, refs.c:2367), and a deref atom then
+            // sets `need_tagged`, whose `get_object()` stock git does not survive.
+            let reaches_refs = sorts.iter().any(|s| {
+                matches!(
+                    s.atom.field,
+                    Field::Upstream(_) | Field::Push(_) | Field::RefName(NameMod::Short) | Field::SymRef(NameMod::Short)
+                )
+            });
+            if reaches_refs {
+                outside_repository_bug();
+            }
+            if sorts.iter().any(|s| s.atom.deref) {
+                // `git ls-remote --sort='*refname' <url>` outside a repository is
+                // killed by SIGSEGV in stock git 2.56. The Rust runtime's own SIGSEGV
+                // handler would swallow a raised signal, so the default action is
+                // restored first, as receive_pack.rs does.
+                unsafe {
+                    libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                    libc::raise(libc::SIGSEGV);
                 }
+                unreachable!("SIGSEGV at its default action terminates the process");
+            }
+            rows.iter()
+                .map(|row| RefInfo {
+                    refname: row.name.clone().into_bytes(),
+                    short: Vec::new(),
+                    symref: row.symref.clone().unwrap_or_default().into_bytes(),
+                    symref_short: Vec::new(),
+                    obj: ObjInfo {
+                        id: row.id,
+                        kind: gix::objs::Kind::Commit,
+                        size: 0,
+                        data: None,
+                    },
+                    peeled: None,
+                    is_head: false,
+                    packed: false,
+                    is_base: Vec::new(),
+                    head_desc: None,
+                    missing: false,
+                    bad_tag: false,
+                })
+                .collect()
+        }
+    };
+
+    let used: Vec<&Atom> = sorts.iter().rev().map(|s| &s.atom).collect();
+    let prereleases = match repo {
+        // git seeds `versioncmp`'s prerelease list from config once, lazily.
+        Some(repo) => Prereleases::new(repo),
+        None => Prereleases::none(),
+    };
+    let ctx = repo.map(|repo| RenderCtx {
+        repo,
+        worktrees: std::cell::OnceCell::new(),
+    });
+    let mut values: Vec<Option<Vec<Key>>> = (0..infos.len()).map(|_| None).collect();
+    let mut order: Vec<usize> = (0..infos.len()).collect();
+    refsort::git_qsort_s(&mut order, &mut |&a: &usize, &b: &usize| -> Result<Ordering> {
+        for i in [a, b] {
+            if values[i].is_none() {
+                values[i] = Some(match &ctx {
+                    Some(ctx) => {
+                        for_each_ref::populate_value_errors(&used, &infos[i])?;
+                        for_each_ref::sort_key_values(ctx, sorts, &infos[i])?
+                    }
+                    None => sorts
+                        .iter()
+                        .map(|s| {
+                            Key::Str(for_each_ref::render_from_ref(&s.atom, &infos[i]).unwrap_or_default())
+                        })
+                        .collect(),
+                });
             }
         }
-        let (da, db) = (dates[a].unwrap_or_default(), dates[b].unwrap_or_default());
-        Ok(compare_rows_with(keys, &rows[a], &rows[b], pre, &|f| da.get(f), &|f| db.get(f)))
+        let (ka, kb) = (values[a].as_deref().unwrap_or_default(), values[b].as_deref().unwrap_or_default());
+        Ok(for_each_ref::compare_sort_keys(
+            sorts,
+            ka,
+            kb,
+            &infos[a].refname,
+            &infos[b].refname,
+            false,
+            &prereleases,
+        ))
     })?;
+    infos.clear();
     let mut taken: Vec<Option<Row>> = rows.drain(..).map(Some).collect();
     rows.extend(order.iter().map(|&i| taken[i].take().expect("each row once")));
     Ok(())
 }
 
-/// git's `compare_refs`: walk the keys, then fall back to an ascending refname
-/// `strcmp` that `-` never reverses. Every date key reads [`Row::date`].
-fn compare_rows(keys: &[SortKey], a: &Row, b: &Row, pre: &Prereleases<'_>) -> Ordering {
-    compare_rows_with(keys, a, b, pre, &|_| a.date, &|_| b.date)
+/// The `ref_array_item`s `cmd_ls_remote()` pushes, as far as `populate_value()`
+/// will read them: `refname` and `symref` from the advertisement, no peeled
+/// oid (`ref_array_push(..., NULL)`, so a `*`-atom peels the tag itself), and
+/// the object loaded only when an atom reads it ([`for_each_ref::atom_reads_object`]).
+/// A missing object is recorded, not reported: see [`sort_rows`].
+fn ref_infos(repo: &gix::Repository, sorts: &[SortKey], rows: &[Row]) -> Result<Vec<RefInfo>> {
+    let atoms = || sorts.iter().map(|s| &s.atom);
+    let needs_data = atoms().any(for_each_ref::atom_reads_contents);
+    let needs_peel = atoms().any(|a| a.deref);
+    let reads_object = atoms().any(for_each_ref::atom_reads_object);
+    let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
+    let needs_symref_short = atoms().any(|a| matches!(a.field, Field::SymRef(NameMod::Short)));
+    let all_names = if needs_short || needs_symref_short {
+        super::ref_filter::existing_ref_names(repo)?
+    } else {
+        Default::default()
+    };
+    // `head_atom_parser()` (ref-filter.c:928-938): `HEAD` resolved for reading, which is the
+    // name `HEAD` itself when it is detached, and no marker at all when it does not resolve.
+    let head_name: Option<Vec<u8>> = match repo.head_name() {
+        Ok(Some(name)) => Some(name.as_bstr().to_vec()),
+        Ok(None) => repo.head_id().is_ok().then(|| b"HEAD".to_vec()),
+        Err(_) => None,
+    };
+
+    let mut infos = Vec::with_capacity(rows.len());
+    for row in rows {
+        let refname = row.name.clone().into_bytes();
+        let symref = row.symref.clone().unwrap_or_default().into_bytes();
+        let loaded = match reads_object {
+            true => for_each_ref::load(repo, row.id, needs_data).ok(),
+            false => None,
+        };
+        let missing = reads_object && loaded.is_none();
+        let obj = loaded.unwrap_or(ObjInfo {
+            id: row.id,
+            kind: gix::objs::Kind::Commit,
+            size: 0,
+            data: None,
+        });
+        let (peeled, bad_tag) = match needs_peel && !missing {
+            true => for_each_ref::peel_for_deref(repo, &obj, needs_data),
+            false => (None, false),
+        };
+        infos.push(RefInfo {
+            is_head: head_name.as_deref() == Some(refname.as_slice()),
+            short: match needs_short {
+                true => for_each_ref::short_name(repo, &refname, &all_names),
+                false => Vec::new(),
+            },
+            symref_short: match needs_symref_short && !symref.is_empty() {
+                true => for_each_ref::short_name(repo, &symref, &all_names),
+                false => Vec::new(),
+            },
+            refname,
+            symref,
+            obj,
+            peeled,
+            packed: false,
+            is_base: Vec::new(),
+            head_desc: None,
+            missing,
+            bad_tag,
+        });
+    }
+    Ok(infos)
 }
 
-/// [`compare_rows`] with the date atoms of `a` and `b` read from `date_a` and
-/// `date_b`.
-fn compare_rows_with(
-    keys: &[SortKey],
-    a: &Row,
-    b: &Row,
-    pre: &Prereleases<'_>,
-    date_a: &dyn Fn(DateField) -> i64,
-    date_b: &dyn Fn(DateField) -> i64,
-) -> Ordering {
-    for key in keys {
-        let cmp = match (key.version, key.atom) {
-            (true, Atom::Refname) => refsort::versioncmp(a.name.as_bytes(), b.name.as_bytes(), pre),
-            (true, Atom::Objectname) => refsort::versioncmp(
-                a.id.to_hex().to_string().as_bytes(),
-                b.id.to_hex().to_string().as_bytes(),
-                pre,
-            ),
-            // `version:<date atom>` is accepted but treated as the plain
-            // numeric compare. git runs versioncmp over the atom's *formatted*
-            // date string there, which this port does not reproduce; the
-            // combination is undocumented and not exercised by the harness.
-            (_, Atom::Date) => date_a(key.date).cmp(&date_b(key.date)),
-            (false, Atom::Refname) => a.name.as_bytes().cmp(b.name.as_bytes()),
-            (false, Atom::Objectname) => a.id.as_bytes().cmp(b.id.as_bytes()),
-        };
-        let cmp = if key.reverse { cmp.reverse() } else { cmp };
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    a.name.as_bytes().cmp(b.name.as_bytes())
+/// `BUG()` (usage.c): the message, then `abort()`.
+fn outside_repository_bug() -> ! {
+    eprintln!("BUG: refs.c:2367: attempting to get main_ref_store outside of repository");
+    std::process::abort();
 }
 
 /// Turn one advertised ref into its output rows.
@@ -864,7 +900,6 @@ fn push_rows(r: &Ref, rows: &mut Vec<Row>) {
         id: oid,
         symref,
         peel: false,
-        date: 0,
         name: name.clone(),
     });
     if let Some(peeled) = peeled {
@@ -873,7 +908,6 @@ fn push_rows(r: &Ref, rows: &mut Vec<Row>) {
             id: peeled,
             symref: None,
             peel: true,
-            date: 0,
         });
     }
 }
@@ -932,41 +966,56 @@ mod tests {
     /// and `-` reverses that key without touching the refname tiebreak.
     #[test]
     fn last_sort_wins_and_reverse_keeps_refname_tiebreak() {
-        let keys = parse_sort_keys(&["refname".into(), "-creatordate".into()]).unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(keys[0].reverse && keys[0].atom == Atom::Date);
-        assert!(!keys[1].reverse && keys[1].atom == Atom::Refname);
-
-        let row = |name: &str, date: i64| Row {
-            name: name.into(),
-            id: gix::ObjectId::null(gix::hash::Kind::Sha1),
-            symref: None,
-            peel: false,
-            date,
+        let Ok(keys) = parse_sort_keys(&["refname".into(), "-symref".into()], None) else {
+            panic!("both keys are SOURCE_NONE atoms");
         };
-        // Equal dates fall through to an ascending refname compare, never a
-        // descending one, even though the date key is reversed.
-        assert_eq!(
-            compare_rows(&keys, &row("refs/heads/a", 7), &row("refs/heads/b", 7), &Prereleases::none()),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_rows(&keys, &row("refs/heads/a", 1), &row("refs/heads/b", 9), &Prereleases::none()),
-            Ordering::Greater
-        );
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].descending && matches!(keys[0].atom.field, Field::SymRef(NameMod::Full)));
+        assert!(!keys[1].descending && matches!(keys[1].atom.field, Field::RefName(NameMod::Full)));
+
+        let cmp = |a: &str, b: &str, sa: &str, sb: &str| {
+            let ka = [Key::Str(sa.into()), Key::Str(a.into())];
+            let kb = [Key::Str(sb.into()), Key::Str(b.into())];
+            for_each_ref::compare_sort_keys(&keys, &ka, &kb, a.as_bytes(), b.as_bytes(), false, &Prereleases::none())
+        };
+        // Equal symrefs fall through to an ascending refname compare, never a
+        // descending one, even though the symref key is reversed.
+        assert_eq!(cmp("refs/heads/a", "refs/heads/b", "x", "x"), Ordering::Less);
+        assert_eq!(cmp("refs/heads/a", "refs/heads/b", "w", "x"), Ordering::Greater);
     }
 
-    /// git validates sort keys after the transport, and rejects these two
-    /// shapes with `fatal:` (exit 128) rather than a usage error.
+    /// git validates sort keys after the transport and `die()`s (exit 128) on
+    /// the first it rejects. Outside a repository an atom that needs object
+    /// data is refused before its parser runs (ref-filter.c:1074-1077).
     #[test]
     fn sort_key_validation_mirrors_git() {
-        assert!(parse_sort_keys(&["bogus".into()]).is_err());
-        assert!(parse_sort_keys(&["".into()]).is_err());
-        assert!(parse_sort_keys(&["-".into()]).is_err());
-        assert!(parse_sort_keys(&["v:refname".into()]).unwrap()[0].version);
-        assert!(parse_sort_keys(&["-version:refname".into()]).unwrap()[0].reverse);
-        assert!(parse_sort_keys(&["objectname".into()]).is_ok());
-        assert!(parse_sort_keys(&["creatordate".into()]).is_ok());
+        let msg = |spec: &str| match parse_sort_keys(&[spec.to_string()], None) {
+            Err(SortFailure::Atom(e)) => e.msg,
+            _ => panic!("{spec} is refused"),
+        };
+        assert_eq!(msg("bogus"), "unknown field name: bogus");
+        assert_eq!(msg(""), "malformed field name: ");
+        assert_eq!(msg("-"), "malformed field name: ");
+        assert_eq!(msg("*"), "malformed field name: *");
+        assert_eq!(
+            msg("objectname"),
+            "not a git repository, but the field 'objectname' requires access to object data"
+        );
+        assert_eq!(
+            msg("-v:creatordate"),
+            "not a git repository, but the field 'creatordate' requires access to object data"
+        );
+        let first = |specs: &[&str]| match parse_sort_keys(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(), None) {
+            Ok(keys) => keys,
+            Err(_) => panic!("{specs:?} parse"),
+        };
+        assert!(first(&["v:refname"])[0].versioned);
+        assert!(first(&["-version:refname"])[0].descending);
+        // The first rejected key on the command line is the one reported.
+        match parse_sort_keys(&["nope1".into(), "nope2".into()], None) {
+            Err(SortFailure::Atom(e)) => assert_eq!(e.msg, "unknown field name: nope1"),
+            _ => panic!("refused"),
+        }
     }
 
     fn blank_opts() -> Opts {
@@ -1149,7 +1198,12 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
             return ExitCode::from(128);
         }
     };
-    let code = list(&refs, patterns, opts, None);
+    // Without a repository no sort key reaches a fallible step: every atom that would has
+    // already been refused by `parse_sort_keys()`.
+    let code = list(&refs, patterns, opts, None).unwrap_or_else(|e| {
+        eprintln!("fatal: {e}");
+        ExitCode::from(128)
+    });
     if closing_flush_broken_pipe {
         disconnect_into_closed_pipe();
     }

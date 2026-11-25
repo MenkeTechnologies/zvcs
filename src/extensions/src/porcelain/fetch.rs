@@ -3159,24 +3159,23 @@ fn fetch_one(
         remote.replace_refspecs(specs, gix::remote::Direction::Fetch)?;
     }
 
-    // Destination prefixes to prune (glob refspec destinations only), captured
-    // before the remote is consumed by `connect`.
-    let mut prune_prefixes: Vec<Vec<u8>> = Vec::new();
+    // The refspecs `prune_refs()` matches local refs against, captured before the remote is
+    // consumed by `connect`: the command line's when it has any, the remote's configured ones
+    // otherwise (builtin/fetch.c:2037-2042), with `-P`'s `refs/tags/*:refs/tags/*` appended to
+    // whichever of the two it joined (:2464-2469).
+    let mut prune_specs: Vec<gix::refspec::RefSpec> = Vec::new();
     if prune == Some(true) {
-        for s in remote.refspecs(gix::remote::Direction::Fetch) {
-            if let Some(dst) = s.to_ref().destination() {
-                let dst: &[u8] = dst.as_ref();
-                if let Some(star) = dst.iter().position(|&b| b == b'*') {
-                    prune_prefixes.push(dst[..star].to_vec());
-                }
-            }
-        }
-        // `-P` adds the tags refspec, so its destination joins the prune set.
+        prune_specs = remote
+            .refspecs(gix::remote::Direction::Fetch)
+            .iter()
+            .map(|s| s.to_ref().to_owned())
+            .collect();
         if prune_tags == Some(true) {
-            prune_prefixes.push(b"refs/tags/".to_vec());
+            prune_specs.push(
+                gix::refspec::parse("refs/tags/*:refs/tags/*".into(), gix::refspec::parse::Operation::Fetch)?
+                    .to_owned(),
+            );
         }
-        prune_prefixes.sort();
-        prune_prefixes.dedup();
     }
 
     // ```c
@@ -3661,7 +3660,17 @@ fn fetch_one(
     // (`do_fetch()`, builtin/fetch.c:2014-2028.) The stale refs go before a single object is
     // asked for: in one `refs_delete_refs()` transaction of their own, or under `--atomic` as
     // the first entries of the transaction the updates join (`prune_refs()`, :1478-1491).
-    let (prune_lines, atomic_prune, dangling_symrefs) = prune_refs(repo, &prune_prefixes, prepared.ref_map(), opts)?;
+    let (prune_lines, atomic_prune, dangling_symrefs) =
+        prune_refs(repo, prune.unwrap_or(false), &prune_specs, prepared.ref_map(), opts)?;
+    // What a committed prune deleted, as `get_ref_map()` had already read it into each
+    // `peer_ref->old_oid` (builtin/fetch.c:630-652): the update still starts from those values.
+    let pruned: std::collections::HashMap<FullName, gix::ObjectId> = match opts.dry_run || opts.atomic {
+        true => Default::default(),
+        false => prune_lines
+            .iter()
+            .filter_map(|l| FullName::try_from(l.full.as_str()).ok().map(|name| (name, l.old)))
+            .collect(),
+    };
     // `display_state_init()` sizes the `<from>` column from the ref map before anything is
     // pruned or fetched (builtin/fetch.c:2017-2018), and `prune_refs()` prints its rows there and
     // then, padded to `transport_summary_width(stale_refs)`, with the dangling symrefs after them
@@ -3806,6 +3815,7 @@ fn fetch_one(
         .with_filter(fetch_filter.clone())
         .with_atomic(opts.atomic)
         .with_atomic_prune(atomic_prune)
+        .with_pruned(pruned)
         .with_update_order(update_order)
         .with_show_forced_updates(opts.show_forced_updates)
         .with_reflog_message(RefLogMessage::Prefixed {
@@ -4963,10 +4973,10 @@ fn fetch_follow_remote_head(repo: &gix::Repository) -> Option<FollowRemoteHead> 
     follow
 }
 
-/// Port of git's `prune_refs()` (builtin/fetch.c:1465-1512): delete every local ref under a
-/// pruned refspec destination that `ref_map` no longer maps onto, and return the `[deleted]`
-/// rows, the deletions the update transaction is to begin with under `--atomic`, and the
-/// dangling-symref warnings that follow the rows.
+/// Port of git's `prune_refs()` (builtin/fetch.c:1465-1512): delete every local ref
+/// [`get_stale_heads`] finds, and return the `[deleted]` rows, the deletions the update
+/// transaction is to begin with under `--atomic`, and the dangling-symref warnings that follow
+/// the rows.
 ///
 /// ```c
 /// if (!dry_run) {
@@ -4987,31 +4997,15 @@ fn fetch_follow_remote_head(repo: &gix::Repository) -> Option<FollowRemoteHead> 
 /// Without `--atomic` the deletions are one transaction of their own, committed here.
 fn prune_refs(
     repo: &gix::Repository,
-    prune_prefixes: &[Vec<u8>],
+    prune: bool,
+    rs: &[gix::refspec::RefSpec],
     ref_map: &gix::remote::fetch::RefMap,
     opts: &FetchOpts,
 ) -> Result<(Vec<Line>, Vec<RefEdit>, Vec<String>)> {
-    if prune_prefixes.is_empty() {
+    if !prune {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
-    // Every local ref the remote still advertises is kept; the rest under a
-    // pruned prefix are stale (`get_stale_heads()`, remote.c).
-    let kept: HashSet<BString> = ref_map.mappings.iter().filter_map(|m| m.local.clone()).collect();
-    let mut stale: Vec<(FullName, String, gix::ObjectId)> = Vec::new();
-    for prefix in prune_prefixes {
-        for r in repo.references()?.prefixed(&prefix[..])? {
-            let r = r.map_err(anyhow::Error::msg)?;
-            // Never prune symbolic tracking refs like `refs/remotes/*/HEAD`.
-            let TargetRef::Object(id) = r.target() else { continue };
-            let name = r.name().to_owned();
-            if kept.contains(name.as_bstr()) || stale.iter().any(|(known, _, _)| *known == name) {
-                continue;
-            }
-            stale.push((name, r.name().shorten().to_string(), id.to_owned()));
-        }
-    }
-    // `get_stale_heads()` collects them in `refs_for_each_ref()` order, by name.
-    stale.sort_by(|a, b| a.0.cmp(&b.0));
+    let stale = get_stale_heads(repo, rs, ref_map)?;
 
     let deletions: Vec<RefEdit> = stale
         .iter()
@@ -5067,6 +5061,136 @@ fn prune_refs(
         })
         .collect();
     Ok((lines, atomic, dangling))
+}
+
+/// `get_stale_heads()` (remote.c:2675-2692): every local ref that a refspec of `rs` maps a remote
+/// name onto, when none of the names it maps back to is in the ref map. The ref map's names are
+/// the *remote* names it was built from, so an exact refspec with an unqualified source,
+/// `feat:refs/remotes/origin/feat`, maps its destination back to the literal `feat`, which no
+/// ref-map entry (`refs/heads/feat`) is called, and the destination is stale.
+fn get_stale_heads(
+    repo: &gix::Repository,
+    rs: &[gix::refspec::RefSpec],
+    ref_map: &gix::remote::fetch::RefMap,
+) -> Result<Vec<(FullName, String, gix::ObjectId)>> {
+    let ref_names: HashSet<&BStr> = ref_map.mappings.iter().filter_map(|m| m.remote.as_name()).collect();
+    let mut names: Vec<FullName> = Vec::new();
+    for r in repo.references()?.prefixed(b"refs/".as_slice())? {
+        names.push(r.map_err(anyhow::Error::msg)?.name().to_owned());
+    }
+    // `refs_for_each_ref()` walks in name order.
+    names.sort();
+    let mut stale = Vec::new();
+    for name in names {
+        // `get_stale_heads_cb()` (remote.c:2644-2673).
+        let matches = refspec_find_all_matches(rs, name.as_bstr());
+        if matches.is_empty() {
+            continue;
+        }
+        // A symref is never stale.
+        let Ok(r) = repo.find_reference(name.as_ref()) else { continue };
+        let TargetRef::Object(id) = r.target() else { continue };
+        if matches.iter().any(|m| ref_names.contains(m.as_bstr())) {
+            continue;
+        }
+        stale.push((name.clone(), name.shorten().to_string(), id.to_owned()));
+    }
+    Ok(stale)
+}
+
+/// `refspec_find_all_matches()` (refspec.c:406-435) for a query that names a destination: the
+/// source each refspec with a destination maps `dst` back to, unless the source `dst` comes from
+/// is excluded by a negative refspec ([`refspec_find_negative_match`]).
+fn refspec_find_all_matches(rs: &[gix::refspec::RefSpec], dst: &BStr) -> Vec<BString> {
+    if refspec_find_negative_match(rs, dst) {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for spec in rs {
+        let spec = spec.to_ref();
+        let (Some(key), Some(value)) = (spec.destination(), spec.source()) else { continue };
+        if refspec_is_negative(&spec) {
+            continue;
+        }
+        if refspec_is_pattern(value) {
+            if let Some(expansion) = match_refname_with_pattern(key, dst, Some(value)) {
+                results.push(expansion);
+            }
+        } else if dst == key {
+            results.push(value.to_owned());
+        }
+    }
+    results
+}
+
+/// `refspec_find_negative_match()` (refspec.c:349-404): map `needle` back through every positive
+/// refspec — a pattern through its destination (its source when it has none), a literal by
+/// comparing `needle` with its *source* — and report whether any name that yields is excluded by
+/// a negative refspec (`refname_matches_negative_refspec_item()`, :338-347). The `matching`
+/// branch is for `:`, which only a push refspec can be (:47-50).
+fn refspec_find_negative_match(rs: &[gix::refspec::RefSpec], needle: &BStr) -> bool {
+    let negative = refspec_is_negative;
+    if !rs.iter().any(|s| negative(&s.to_ref())) {
+        return false;
+    }
+    let mut reversed: Vec<BString> = Vec::new();
+    for spec in rs {
+        let spec = spec.to_ref();
+        if negative(&spec) {
+            continue;
+        }
+        let src = spec.source().unwrap_or_default();
+        if refspec_is_pattern(src) {
+            let key = spec.destination().unwrap_or(src);
+            if let Some(expansion) = match_refname_with_pattern(key, needle, Some(src)) {
+                reversed.push(expansion);
+            }
+        } else if needle == src {
+            reversed.push(src.to_owned());
+        }
+    }
+    reversed.iter().any(|name| {
+        rs.iter().map(|s| s.to_ref()).filter(negative).any(|spec| {
+            let src = spec.source().unwrap_or_default();
+            // `refspec_match()` (refspec.c:329-336).
+            match refspec_is_pattern(src) {
+                true => match_refname_with_pattern(src, name.as_bstr(), None).is_some(),
+                false => src == name.as_bstr(),
+            }
+        })
+    })
+}
+
+/// `item->negative` (refspec.c:32-35): a `^<src>` exclusion.
+fn refspec_is_negative(spec: &gix::refspec::RefSpecRef<'_>) -> bool {
+    matches!(
+        spec.instruction(),
+        gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::Exclude { .. })
+    )
+}
+
+/// `item->pattern` (refspec.c:52-69): for a fetch refspec that parsed, the source holds a `*`
+/// exactly when the destination (if any) does.
+fn refspec_is_pattern(src: &BStr) -> bool {
+    src.contains(&b'*')
+}
+
+/// `match_refname_with_pattern()` (refspec.c:301-327): whether `refname` matches the one-`*`
+/// `pattern`, and with a `replacement`, the replacement with its `*` swapped for what the
+/// pattern's `*` matched. Without a replacement a match yields an empty name.
+fn match_refname_with_pattern(pattern: &BStr, refname: &BStr, replacement: Option<&BStr>) -> Option<BString> {
+    let star = pattern.find_byte(b'*')?;
+    let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
+    if !refname.starts_with(prefix) || refname.len() < prefix.len() + suffix.len() || !refname.ends_with(suffix) {
+        return None;
+    }
+    let matched = &refname[prefix.len()..refname.len() - suffix.len()];
+    let Some(replacement) = replacement else { return Some(BString::default()) };
+    let vstar = replacement.find_byte(b'*')?;
+    let mut out = BString::from(&replacement[..vstar]);
+    out.extend_from_slice(matched);
+    out.extend_from_slice(&replacement[vstar + 1..]);
+    Some(out)
 }
 
 /// `refcol_width()` (builtin/fetch.c:687-728): the width of the summary's `<from>` column,

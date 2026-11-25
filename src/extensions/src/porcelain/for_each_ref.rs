@@ -1345,47 +1345,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             })
             .chain(sorts.iter().map(|s| &s.atom))
     };
-    let needs_data = atoms().any(|a| {
-        matches!(
-            a.field,
-            Field::Person(..)
-                | Field::Contents(_)
-                | Field::Tree(_)
-                | Field::Parent(_)
-                | Field::NumParent
-                | Field::TargetName
-                | Field::TargetType
-                | Field::TagName
-                | Field::Raw(_)
-                | Field::Signature(_)
-        )
-    });
+    let needs_data = atoms().any(atom_reads_contents);
     let needs_peel = atoms().any(|a| a.deref);
-    // `populate_value()` (ref-filter.c) fills every atom that reads nothing
-    // first, and only asks the odb when one is still empty afterwards — so a
-    // reference whose object is gone still renders `%(refname)`,
-    // `%(objectname)`, `%(HEAD)` and the rest of that set, and only a format
-    // that wants something *out of* the object turns the absence into
-    // `missing object <oid> for <refname>`. This is the complement of that set,
-    // spelled as a negation so a newly added atom is assumed to read.
-    let reads_object = atoms().any(|a| {
-        a.deref
-            || !matches!(
-                a.field,
-                Field::RefName(_)
-                    | Field::SymRef(_)
-                    | Field::ObjectName(_)
-                    | Field::Head
-                    | Field::Flag
-                    | Field::Color(_)
-                    | Field::Upstream(_)
-                    | Field::Push(_)
-                    | Field::WorktreePath
-                    | Field::IsBase(_, _)
-                    | Field::AheadBehind(_)
-                    | Field::Constant(_)
-            )
-    });
+    let reads_object = atoms().any(atom_reads_object);
     let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
     let needs_symref_short = atoms().any(|a| matches!(a.field, Field::SymRef(NameMod::Short)));
 
@@ -2325,6 +2287,95 @@ const KNOWN_ATOMS: &[&str] = &[
     "is-base",
 ];
 
+/// The half of `parse_ref_filter_atom()` that runs before an atom's parser
+/// (ref-filter.c:1041-1077), for a caller that may have no repository: the
+/// `malformed field name` and `unknown field name` checks, then
+/// `valid_atom[i].source != SOURCE_NONE && !have_git_dir()` — "not a git
+/// repository, but the field '%.*s' requires access to object data". `spec` is
+/// the whole atom, deref `*` included, which is what every message quotes.
+pub(super) fn check_atom_outside_repository(spec: &str) -> std::result::Result<(), AtomError> {
+    let body = spec.strip_prefix('*').unwrap_or(spec);
+    if body.is_empty() {
+        return Err(fatal_atom(format!("malformed field name: {spec}")));
+    }
+    let name = body.split_once(':').map_or(body, |(name, _)| name);
+    if !KNOWN_ATOMS.contains(&name) {
+        return Err(fatal_atom(format!("unknown field name: {spec}")));
+    }
+    // The `SOURCE_NONE` rows of `valid_atom[]` (ref-filter.c:947-993).
+    let source_none = matches!(
+        name,
+        "refname"
+            | "upstream"
+            | "push"
+            | "symref"
+            | "flag"
+            | "HEAD"
+            | "color"
+            | "worktreepath"
+            | "align"
+            | "end"
+            | "if"
+            | "then"
+            | "else"
+            | "rest"
+    );
+    if !source_none {
+        return Err(fatal_atom(format!(
+            "not a git repository, but the field '{spec}' requires access to object data"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `atom` needs the object's contents rather than only its type and
+/// size: the `SOURCE_OBJ` rows of `valid_atom[]`, which set
+/// `oi.info.contentp` (ref-filter.c:1087-1092).
+pub(super) fn atom_reads_contents(a: &Atom) -> bool {
+    matches!(
+        a.field,
+        Field::Person(..)
+            | Field::Contents(_)
+            | Field::Tree(_)
+            | Field::Parent(_)
+            | Field::NumParent
+            | Field::TargetName
+            | Field::TargetType
+            | Field::TagName
+            | Field::Raw(_)
+            | Field::Signature(_)
+    )
+}
+
+/// Whether `populate_value()` opens the ref's object for `atom` (ref-filter.c:2605-2627).
+///
+/// It fills every atom that reads nothing first, and only asks the odb when one
+/// is still empty afterwards — so a reference whose object is gone still
+/// renders `%(refname)`, `%(objectname)`, `%(HEAD)` and the rest of that set,
+/// and only an atom that wants something *out of* the object turns the absence
+/// into `missing object <oid> for <refname>`. A deref atom sets `need_tagged`,
+/// which reads the ref's own object to learn whether it is a tag. This is the
+/// complement of that set, spelled as a negation so a newly added atom is
+/// assumed to read.
+pub(super) fn atom_reads_object(a: &Atom) -> bool {
+    a.deref
+        || !matches!(
+            a.field,
+            Field::RefName(_)
+                | Field::SymRef(_)
+                | Field::ObjectName(_)
+                | Field::Head
+                | Field::Flag
+                | Field::Color(_)
+                | Field::Upstream(_)
+                | Field::Push(_)
+                | Field::WorktreePath
+                | Field::IsBase(_, _)
+                | Field::AheadBehind(_)
+                | Field::Constant(_)
+        )
+}
+
 /// Parse one atom body (the text between `%(` and `)`), also used for sort keys.
 ///
 /// Every entry of `valid_atom[]` (ref-filter.c:947-993) is understood, with the
@@ -3056,35 +3107,53 @@ pub(super) fn sort_refs(
     // cannot propagate errors.
     let mut rows: Vec<(Vec<Key>, RefInfo)> = Vec::with_capacity(refs.len());
     for info in refs {
-        let mut keys = Vec::with_capacity(sorts.len());
-        for s in sorts {
-            keys.push(key_of(ctx, s, &info)?);
-        }
-        rows.push((keys, info));
+        rows.push((sort_key_values(ctx, sorts, &info)?, info));
     }
 
     rows.sort_by(|(ka, a), (kb, b)| {
-        for (n, s) in sorts.iter().enumerate() {
-            // The `version:`/`v:` prefix compares the string value with
-            // git's `versioncmp`, regardless of the atom's natural type.
-            let ord = if s.versioned {
-                versioncmp_key(&ka[n], &kb[n], prereleases)
-            } else {
-                compare(&ka[n], &kb[n], ignore_case)
-            };
-            let ord = if s.descending { ord.reverse() } else { ord };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        compare_bytes(&a.refname, &b.refname, ignore_case)
+        compare_sort_keys(sorts, ka, kb, &a.refname, &b.refname, ignore_case, prereleases)
     });
 
     Ok(rows.into_iter().map(|(_, info)| info).collect())
 }
 
+/// The value of every key of the sort chain for `info`, in chain order — what
+/// `get_ref_atom_value()` hands `cmp_ref_sorting()` (ref-filter.c:3540-3552).
+pub(super) fn sort_key_values(ctx: &RenderCtx<'_>, sorts: &[SortKey], info: &RefInfo) -> Result<Vec<Key>> {
+    sorts.iter().map(|s| key_of(ctx, s, info)).collect()
+}
+
+/// `compare_refs()` (ref-filter.c:3596-3611) over values [`sort_key_values`]
+/// produced: each key's `cmp_ref_sorting()` in chain order, `-` reversing only
+/// that key, then a refname `strcmp` (`strcasecmp` under `--ignore-case`) that
+/// nothing reverses.
+pub(super) fn compare_sort_keys(
+    sorts: &[SortKey],
+    ka: &[Key],
+    kb: &[Key],
+    a_refname: &[u8],
+    b_refname: &[u8],
+    ignore_case: bool,
+    prereleases: &Prereleases<'_>,
+) -> std::cmp::Ordering {
+    for (n, s) in sorts.iter().enumerate() {
+        // The `version:`/`v:` prefix compares the string value with
+        // git's `versioncmp`, regardless of the atom's natural type.
+        let ord = if s.versioned {
+            versioncmp_key(&ka[n], &kb[n], prereleases)
+        } else {
+            compare(&ka[n], &kb[n], ignore_case)
+        };
+        let ord = if s.descending { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    compare_bytes(a_refname, b_refname, ignore_case)
+}
+
 /// A comparable sort value: numeric for sizes and bare timestamps, bytes else.
-enum Key {
+pub(super) enum Key {
     Num(i64),
     Str(Vec<u8>),
 }
@@ -3201,19 +3270,8 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
     match &atom.field {
         // git's "fill in specials first" pass: these atoms are answered from the
         // ref itself, so a leading `*` has no effect on them.
-        Field::Constant(text) => return Ok(text.clone()),
         Field::Upstream(rr) => return render_upstream(ctx, &info.refname, rr, false),
         Field::Push(rr) => return render_upstream(ctx, &info.refname, rr, true),
-        Field::Flag => {
-            let mut parts: Vec<&str> = Vec::new();
-            if !info.symref.is_empty() {
-                parts.push("symref");
-            }
-            if info.packed {
-                parts.push("packed");
-            }
-            return Ok(parts.join(",").into_bytes());
-        }
         Field::WorktreePath => {
             // `FILTER_REFS_BRANCHES` only: a tag never names a working tree.
             if !info.refname.starts_with(b"refs/heads/") {
@@ -3226,16 +3284,6 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
                 .map(|p| p.as_bytes().to_vec())
                 .unwrap_or_default());
         }
-        // `populate_value`'s `ATOM_ISBASE` arm (ref-filter.c:2586-2594): the ref
-        // [`filter_is_base`] chose renders `(<committish>)`, every other ref
-        // renders empty.
-        Field::IsBase(name, _) => {
-            return Ok(if info.is_base.iter().any(|n| n == name) {
-                format!("({name})").into_bytes()
-            } else {
-                Vec::new()
-            })
-        }
         Field::AheadBehind(base) => {
             let Some(tip) = commit_tip(repo, info.obj.id)? else {
                 // Not a commit: git leaves the atom empty.
@@ -3244,44 +3292,10 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
             let (ahead, behind) = ahead_behind(repo, tip, *base)?;
             return Ok(format!("{ahead} {behind}").into_bytes());
         }
-        Field::RefName(m) => {
-            // `get_refname()` (ref-filter.c:2337-2342) short-circuits ahead of
-            // `show_ref()`, so the description is not lstripped or shortened.
-            let name = match &info.head_desc {
-                Some(desc) => desc.clone(),
-                None => match m {
-                    NameMod::Full => info.refname.clone(),
-                    NameMod::Short => info.short.clone(),
-                    NameMod::LStrip(n) => refsort::strip_components(&info.refname, *n, true),
-                    NameMod::RStrip(n) => refsort::strip_components(&info.refname, *n, false),
-                },
-            };
-            return Ok(deref_refname(atom, name));
-        }
-        Field::SymRef(m) => {
-            // `get_symref()` (ref-filter.c:2329-2335): no symref is `""`, which
-            // a deref still suffixes.
-            let name = if info.symref.is_empty() {
-                Vec::new()
-            } else {
-                match m {
-                    NameMod::Full => info.symref.clone(),
-                    NameMod::Short => info.symref_short.clone(),
-                    NameMod::LStrip(n) => refsort::strip_components(&info.symref, *n, true),
-                    NameMod::RStrip(n) => refsort::strip_components(&info.symref, *n, false),
-                }
-            };
-            return Ok(deref_refname(atom, name));
-        }
-        Field::Color(escape) => return Ok(escape.clone()),
-        Field::Head => {
-            return Ok(if info.is_head {
-                b"*".to_vec()
-            } else {
-                b" ".to_vec()
-            })
-        }
         _ => {}
+    }
+    if let Some(value) = render_from_ref(atom, info) {
+        return Ok(value);
     }
 
     let Some(obj) = object_of(atom, info) else {
@@ -3373,6 +3387,73 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         | Field::AheadBehind(_)
         | Field::Constant(_) => unreachable!("handled above"),
     }
+}
+
+/// The specials of `populate_value()`'s first pass (ref-filter.c:2456-2603) that
+/// are answered from the ref array item alone, with neither the repository nor
+/// the object: `None` for every other atom.
+pub(super) fn render_from_ref(atom: &Atom, info: &RefInfo) -> Option<Vec<u8>> {
+    Some(match &atom.field {
+        Field::Constant(text) => text.clone(),
+        Field::Flag => {
+            let mut parts: Vec<&str> = Vec::new();
+            if !info.symref.is_empty() {
+                parts.push("symref");
+            }
+            if info.packed {
+                parts.push("packed");
+            }
+            parts.join(",").into_bytes()
+        }
+        // `populate_value`'s `ATOM_ISBASE` arm (ref-filter.c:2586-2594): the ref
+        // [`filter_is_base`] chose renders `(<committish>)`, every other ref
+        // renders empty.
+        Field::IsBase(name, _) => {
+            if info.is_base.iter().any(|n| n == name) {
+                format!("({name})").into_bytes()
+            } else {
+                Vec::new()
+            }
+        }
+        Field::RefName(m) => {
+            // `get_refname()` (ref-filter.c:2337-2342) short-circuits ahead of
+            // `show_ref()`, so the description is not lstripped or shortened.
+            let name = match &info.head_desc {
+                Some(desc) => desc.clone(),
+                None => match m {
+                    NameMod::Full => info.refname.clone(),
+                    NameMod::Short => info.short.clone(),
+                    NameMod::LStrip(n) => refsort::strip_components(&info.refname, *n, true),
+                    NameMod::RStrip(n) => refsort::strip_components(&info.refname, *n, false),
+                },
+            };
+            deref_refname(atom, name)
+        }
+        Field::SymRef(m) => {
+            // `get_symref()` (ref-filter.c:2329-2335): no symref is `""`, which
+            // a deref still suffixes.
+            let name = if info.symref.is_empty() {
+                Vec::new()
+            } else {
+                match m {
+                    NameMod::Full => info.symref.clone(),
+                    NameMod::Short => info.symref_short.clone(),
+                    NameMod::LStrip(n) => refsort::strip_components(&info.symref, *n, true),
+                    NameMod::RStrip(n) => refsort::strip_components(&info.symref, *n, false),
+                }
+            };
+            deref_refname(atom, name)
+        }
+        Field::Color(escape) => escape.clone(),
+        Field::Head => {
+            if info.is_head {
+                b"*".to_vec()
+            } else {
+                b" ".to_vec()
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// The tail of `populate_value()`'s specials loop for `%(refname)` and

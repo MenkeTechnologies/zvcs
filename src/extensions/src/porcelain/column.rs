@@ -17,15 +17,11 @@
 //! splitting; and the exit codes 129 (usage/parse error) and 128 (`--padding`
 //! negative, `--command` misplaced, bad config value).
 //!
-//! Two deliberate, documented divergences from stock git:
+//! Cell width is `utf8_strnwidth()` through [`crate::utf8`], git's own
+//! `git_wcwidth()` tables included.
 //!
-//!   * Cell width counts Unicode scalar values, after stripping SGR escape
-//!     sequences exactly as git's `display_mode_esc_sequence_len` does, and
-//!     after dropping the glyphs `git_wcwidth()` scores at or below zero by its
-//!     own first test — NUL and the control ranges. git additionally applies the
-//!     `unicode-width.h` tables, so lines containing combining marks or wide
-//!     (CJK) characters lay out differently. This matches the convention already
-//!     used by `shortlog` and `request-pull` in this crate.
+//! One deliberate, documented divergence from stock git:
+//!
 //!   * [`crate::pager::term_columns`] (used only when `--width` is absent or
 //!     zero) reads `COLUMNS` with C's `atoi` and otherwise falls back to 80; the
 //!     `TIOCGWINSZ` probe is not performed, so an unset `COLUMNS` on a terminal
@@ -802,78 +798,13 @@ fn div_round_up(a: i64, b: i64) -> i64 {
     (a + b - 1) / b
 }
 
-/// git's `item_length`, i.e. `utf8_strnwidth(s, strlen(s), 1)`: display width
-/// with SGR escape sequences skipped.
-///
-/// ```c
-/// glyph_width = utf8_width(&string, NULL);
-/// if (glyph_width > 0)
-///         width += glyph_width;
-/// ```
-///
-/// (utf8.c:224-227.) A glyph `git_wcwidth()` scores at or below zero adds
-/// nothing — which covers NUL (0) and every control character, `if (ch < 32 ||
-/// (ch >= 0x7f && ch < 0xa0)) return -1` (utf8.c:96-97). A tab in a cell
-/// therefore costs no columns at all.
-///
-/// Everything else counts as one column rather than `git_wcwidth()`'s answer —
-/// see the module header. Bytes that are not valid UTF-8 count as one column
-/// each, matching git's fallback for undecodable input.
+/// `item_length()` (column.c:27-30): `utf8_strnwidth(s, strlen(s), 1)`, the
+/// display width with SGR escape sequences skipped, through the shared port of
+/// `utf8.c` — so a wide (CJK) glyph takes two columns and a combining mark or a
+/// control character none, as `git_wcwidth()` scores them, and a cell that is not
+/// valid UTF-8 counts its bytes.
 fn item_length(s: &[u8]) -> i64 {
-    let mut width = 0i64;
-    let mut i = 0;
-    while i < s.len() {
-        let skip = esc_sequence_len(&s[i..]);
-        if skip != 0 {
-            i += skip;
-            continue;
-        }
-        // Decode one UTF-8 scalar, or consume a single invalid byte.
-        let take = utf8_len(s[i]).min(s.len() - i).max(1);
-        let scalar = std::str::from_utf8(&s[i..i + take])
-            .ok()
-            .and_then(|text| text.chars().next());
-        i += match scalar {
-            Some(_) => take,
-            None => 1,
-        };
-        let zero_or_less = scalar.is_some_and(|c| {
-            let ch = c as u32;
-            ch < 32 || (0x7f..0xa0).contains(&ch)
-        });
-        if !zero_or_less {
-            width += 1;
-        }
-    }
-    width
-}
-
-/// Port of `display_mode_esc_sequence_len`: the length of a leading
-/// `ESC [ [0-9;]* m` sequence, or 0 when `s` does not start with one.
-fn esc_sequence_len(s: &[u8]) -> usize {
-    if s.first() != Some(&0x1b) || s.get(1) != Some(&b'[') {
-        return 0;
-    }
-    let mut i = 2;
-    while matches!(s.get(i), Some(b) if b.is_ascii_digit() || *b == b';') {
-        i += 1;
-    }
-    if s.get(i) == Some(&b'm') {
-        i + 1
-    } else {
-        0
-    }
-}
-
-/// Byte length of the UTF-8 sequence a leading byte introduces.
-fn utf8_len(b: u8) -> usize {
-    match b {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
-        _ => 1,
-    }
+    crate::utf8::utf8_strnwidth(s, true).into()
 }
 
 // ---------------------------------------------------------------------------

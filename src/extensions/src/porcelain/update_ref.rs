@@ -756,7 +756,7 @@ fn ref_file_path(repo: &gix::Repository, name: &str) -> std::path::PathBuf {
 ///
 /// See [`super::pack_refs::packed_refs_lock_fatal`] for why `PermanentlyLocked` is exactly
 /// `EEXIST`, and [`super::pack_refs::eexist`] for why the raw code is needed.
-fn packed_lock_errno(err: &gix::lock::acquire::Error) -> std::io::Error {
+pub(super) fn packed_lock_errno(err: &gix::lock::acquire::Error) -> std::io::Error {
     match err {
         gix::lock::acquire::Error::Io(err) => err
             .raw_os_error()

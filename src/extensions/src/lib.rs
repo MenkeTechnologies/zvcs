@@ -1490,12 +1490,23 @@ pub(crate) fn ident_default_name(user_name: String, name_given: bool) -> String 
 /// non-empty `EMAIL`, else the address built from the login and host name,
 /// trimmed.
 pub(crate) fn ident_default_email(user_email: String, mail_given: bool) -> String {
+    ident_default_email_bogus(user_email, mail_given).0
+}
+
+/// [`ident_default_email`] with `default_email_is_bogus` beside it: set only when
+/// the address was built from the account and a host name without a domain
+/// (`copy_email()` → `add_domainname()`, ident.c:129-160), which `fmt_ident()`
+/// refuses under `IDENT_STRICT` (ident.c:481-484).
+pub(crate) fn ident_default_email_bogus(user_email: String, mail_given: bool) -> (String, bool) {
     if mail_given || !user_email.is_empty() {
-        return user_email;
+        return (user_email, false);
     }
     match std::env::var("EMAIL").ok().filter(|e| !e.is_empty()) {
-        Some(email) => email.trim().to_string(),
-        None => auto_email(&auto_name().login).0.trim().to_string(),
+        Some(email) => (email.trim().to_string(), false),
+        None => {
+            let (addr, bogus) = auto_email(&auto_name().login);
+            (addr.trim().to_string(), bogus)
+        }
     }
 }
 
@@ -1518,6 +1529,12 @@ pub(crate) fn passwd_self() -> (String, String) {
 /// what makes a `commit` on a domain-less machine refuse while its reflogs are
 /// written with that same address.
 fn auto_email(login: &str) -> (String, bool) {
+    // `copy_email()` (ident.c:147-160) takes the host from `/etc/mailname`
+    // (Debian) when `add_mailname_host()` reads a line from it, ahead of
+    // `add_domainname()`.
+    if let Some(host) = mailname_host() {
+        return (format!("{login}@{host}"), false);
+    }
     let host = hostname().unwrap_or_else(|| "(none)".to_string());
     if host.contains('.') {
         return (format!("{login}@{host}"), false);
@@ -1525,6 +1542,42 @@ fn auto_email(login: &str) -> (String, bool) {
     match canonical_hostname(&host) {
         Some(fqdn) if fqdn.contains('.') => (format!("{login}@{fqdn}"), false),
         _ => (format!("{login}@{host}.(none)"), true),
+    }
+}
+
+/// `add_mailname_host()` (ident.c:80-101): the first line of `/etc/mailname`, or
+/// `None` when it cannot be opened or holds no line. `fopen_or_warn()` is
+/// silent for a missing file and warns for any other failure to open it
+/// (wrapper.c:479-498); a read error after a successful open warns as
+/// `warning_errno()` does.
+fn mailname_host() -> Option<String> {
+    use std::io::BufRead;
+    const PATH: &str = "/etc/mailname";
+    let file = match std::fs::File::open(PATH) {
+        Ok(file) => file,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => return None,
+        Err(e) => {
+            eprintln!("warning: unable to access '{PATH}': {}", crate::external::strerror(&e));
+            return None;
+        }
+    };
+    let mut line = Vec::new();
+    match std::io::BufReader::new(file).read_until(b'\n', &mut line) {
+        Ok(0) => None,
+        Ok(_) => {
+            // `strbuf_getline()`: the LF and a CR before it are dropped.
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            Some(String::from_utf8_lossy(&line).into_owned())
+        }
+        Err(e) => {
+            eprintln!("warning: cannot read {PATH}: {}", crate::external::strerror(&e));
+            None
+        }
     }
 }
 
@@ -1897,7 +1950,7 @@ impl IdentRefusal {
 }
 
 /// The block `fmt_ident()` prints before it gives up, verbatim.
-fn identity_advice(role: &str) {
+pub(crate) fn identity_advice(role: &str) {
     eprintln!(
         "{role} identity unknown\n\n\
          *** Please tell me who you are.\n\n\

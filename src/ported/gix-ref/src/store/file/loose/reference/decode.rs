@@ -59,9 +59,8 @@ impl Reference {
 
 /// Parse the contents of a loose reference file.
 ///
-/// A *symbolic* reference starts with `ref: `, may have additional spaces before
-/// the path, and returns [`MaybeUnsafeState::UnvalidatedPath`] with the path
-/// bytes up to the next NUL byte (just like Git), line ending, or the end of input. The path
+/// A *symbolic* reference starts with `ref:`, may have whitespace before the
+/// path, and returns [`MaybeUnsafeState::UnvalidatedPath`] with the path bytes up to the next NUL byte (just like Git), line ending, or the end of input. The path
 /// is validated later when it is converted into a [`Target`].
 ///
 /// A *direct* reference starts with a hexadecimal object id and returns
@@ -69,9 +68,12 @@ impl Reference {
 ///
 /// If neither reference form can be parsed, an error is returned.
 fn parse(mut i: &[u8], object_hash: gix_hash::Kind) -> Result<MaybeUnsafeState, ()> {
-    if let Some(rest) = i.strip_prefix(b"ref: ") {
+    // `parse_loose_ref_contents()` (refs/files-backend.c:674-676): `ref:`, then
+    // whatever git's `isspace()` skips (space, `\t`, `\n`, `\r`, ctype.c:20-22),
+    // so `ref:refs/heads/main` and `ref:\trefs/heads/main` are symbolic too.
+    if let Some(rest) = i.strip_prefix(b"ref:") {
         i = rest;
-        while i.first() == Some(&b' ') {
+        while i.first().is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
             i = &i[1..];
         }
         let path_end = i

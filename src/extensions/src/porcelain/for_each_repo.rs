@@ -56,14 +56,12 @@
 //! `fatal: cannot change to '<path>': <reason>` with exit 128. stdin, stdout and
 //! stderr are inherited.
 //!
-//! Two deliberate deviations, both forced by this being the git shadow binary and
-//! not git:
-//!   * git spawns `git -C <path> <args>` (`child.git_cmd = 1`). zvcs has no
-//!     global `-C`, so the child is `hosted::git_exe()` with its working directory set
-//!     to `<path>` — the same semantics, and it keeps the promise that zvcs never
-//!     forks upstream git (see `credential_cache.rs`, `upload_archive.rs`).
-//!   * Because the child is zvcs, an empty `<arguments>` list produces zvcs's own
-//!     "no subcommand given" error rather than git's usage dump. Both exit 1.
+//! One deliberate deviation, forced by this being the git shadow binary and not
+//! git: the child is `hosted::git_exe()` run as `-C <path> <args>`, as git runs
+//! `git -C <path> <args>` (`child.git_cmd = 1`), which keeps the promise that zvcs
+//! never forks upstream git (see `credential_cache.rs`, `upload_archive.rs`).
+//! Because the child is zvcs, an empty `<arguments>` list produces zvcs's own
+//! "no subcommand given" error rather than git's usage dump. Both exit 1.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -125,7 +123,7 @@ pub fn for_each_repo(args: &[String]) -> Result<ExitCode> {
 
     let mut result = ExitCode::SUCCESS;
     for path in paths {
-        let code = run_command_on_repo(&path, &rest)?;
+        let code = run_command_on_repo(path.as_deref(), &rest)?;
         if code != 0 {
             if !keep_going {
                 return Ok(ExitCode::from(code));
@@ -236,8 +234,9 @@ enum Lookup {
     Bad,
     /// `err > 0` — the key is simply not set.
     Missing,
-    /// The values, in config order, already path-interpolated.
-    Values(Vec<PathBuf>),
+    /// The values, in config order, already path-interpolated; `None` where
+    /// `interpolate_path()` answered NULL.
+    Values(Vec<Option<PathBuf>>),
 }
 
 /// Read `key` as a multi-valued list of repository paths from the merged config.
@@ -309,11 +308,12 @@ fn lookup_paths(key: &str) -> Result<Lookup> {
         // an empty path outright (gix-config-value/src/path.rs:170-172), so that
         // one value is carried past it rather than through it.
         if value.is_empty() {
-            paths.push(std::path::PathBuf::new());
+            paths.push(Some(std::path::PathBuf::new()));
             continue;
         }
-        let path = gix::config::Path::from(value).interpolate(context)?;
-        paths.push(path);
+        // `interpolate_path()` answers NULL, without a word, for a `~user` with no
+        // passwd entry and a `~/` with no `HOME` (path.c:709-728).
+        paths.push(gix::config::Path::from(value).interpolate(context).ok());
     }
     Ok(Lookup::Values(paths))
 }
@@ -377,31 +377,28 @@ fn bad_config(key: &str) -> ExitCode {
     ExitCode::from(129)
 }
 
-/// `run_command_on_repo()` — run the argument vector inside `path`.
+/// `run_command_on_repo()` (builtin/for-each-repo.c:17-32) — run the argument
+/// vector as `git -C <path> <args>`, with `sanitize_repo_env()`'s
+/// repository-local variables cleared. A path the child cannot enter is its own
+/// `die_errno("cannot change to '%s'")` (git.c:321-323) at 128, for a missing
+/// directory and a regular file alike, and `-C ''` is the child's no-op.
 ///
-/// git builds `git -C <path> <args>`; zvcs has no global `-C`, so the child is
-/// this same binary with its working directory set to `path`.
-fn run_command_on_repo(path: &std::path::Path, args: &[String]) -> Result<u8> {
+/// A `path` of `None` is `interpolate_path()`'s NULL, which ends
+/// `strvec_pushl(&child.args, "-C", abspath, NULL)` after the `-C`, so the
+/// first argument is taken as the directory.
+fn run_command_on_repo(path: Option<&std::path::Path>, args: &[String]) -> Result<u8> {
     let exe = crate::hosted::git_exe()?;
     let mut child = Command::new(exe);
-    child.args(args);
-    // `git -C ''` is a documented no-op, so an empty value stays in the cwd.
-    if !path.as_os_str().is_empty() {
-        child.current_dir(path);
+    child.arg("-C").args(path).args(args);
+    // `sanitize_repo_env()` (run-command.c:1995-2004): every `local_repo_env`
+    // variable but the two that carry `-c` configuration.
+    for name in crate::alternate_refs::LOCAL_REPO_ENV {
+        if *name != "GIT_CONFIG_PARAMETERS" && *name != "GIT_CONFIG_COUNT" {
+            child.env_remove(name);
+        }
     }
 
-    let status = match child.status() {
-        Ok(status) => status,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "fatal: cannot change to '{}': {}",
-                path.display(),
-                errno_text(&e)
-            );
-            return Ok(128);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let status = child.status()?;
 
     if let Some(code) = status.code() {
         return Ok(code as u8);
@@ -414,13 +411,4 @@ fn run_command_on_repo(path: &std::path::Path, args: &[String]) -> Result<u8> {
         }
     }
     Ok(1)
-}
-
-/// The bare strerror text, without Rust's ` (os error N)` suffix.
-fn errno_text(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match text.find(" (os error ") {
-        Some(at) => text[..at].to_string(),
-        None => text,
-    }
 }

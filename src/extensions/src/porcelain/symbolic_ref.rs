@@ -173,22 +173,10 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
-    // `core.preferSymlinkRefs` is read when the files ref store is created
-    // (refs/files-backend.c:129), which every form of this command does — so an
-    // unreadable value refuses the read form as much as the write form, and
-    // refuses before any update is applied. The reftable backend never reads it.
-    let prefer_symlink = match crate::refstore::is_reftable(&repo) {
-        true => false,
-        false => match crate::repo_settings::config_bool_strict(&repo, "core.prefersymlinkrefs") {
-            Ok(v) => v.unwrap_or(false),
-            Err(msg) => return fatal(&msg),
-        },
-    };
-
     if opts.delete {
         delete_symref(&repo, positional[0])
     } else if positional.len() == 2 {
-        set_symref(&repo, positional[0], positional[1], opts.message.as_deref(), prefer_symlink)
+        set_symref(&repo, positional[0], positional[1], opts.message.as_deref())
     } else {
         read_symref(&repo, positional[0], &opts)
     }
@@ -234,7 +222,6 @@ fn set_symref(
     name: &str,
     target: &str,
     message: Option<&str>,
-    prefer_symlink: bool,
 ) -> Result<ExitCode> {
     if name == "HEAD" && !target.starts_with("refs/") {
         return fatal("Refusing to point HEAD outside of refs/");
@@ -277,7 +264,7 @@ fn set_symref(
     // `-d` answers `No such ref`). `FullName` cannot spell any of them, so the
     // write goes straight to the loose ref file, like an unspellable target does.
     let Ok(name_full) = FullName::try_from(name) else {
-        return set_symref_raw(repo, BStr::new(name), target, message, prefer_symlink);
+        return set_symref_raw(repo, BStr::new(name), target, message);
     };
     // `check_refname_format(argv[1], REFNAME_ALLOW_ONELEVEL)` (builtin/symbolic-ref.c:120)
     // is git's only constraint on the target, and the `name_partial` check above
@@ -287,7 +274,7 @@ fn set_symref(
     // case, like `HEAD`), so a target gitoxide cannot spell is written straight
     // into the loose ref file instead of through the transaction.
     let Ok(target_full) = FullName::try_from(target) else {
-        return set_symref_raw(repo, name_full.as_ref().as_bstr(), target, message, prefer_symlink);
+        return set_symref_raw(repo, name_full.as_ref().as_bstr(), target, message);
     };
 
     // Capture the pre-edit resolution so the reflog line carries the same
@@ -298,7 +285,7 @@ fn set_symref(
     let new = leaf_object_id(repo, BStr::new(target)).unwrap_or(None);
     let via_head = head_refers_to(repo, name_full.as_ref())?;
 
-    repo.edit_reference(RefEdit {
+    let edit = RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
@@ -310,7 +297,11 @@ fn set_symref(
         },
         name: name_full.clone(),
         deref: false,
-    })?;
+    };
+    let prefer_symlink = match files_edit(repo, edit)? {
+        Ok(prefer_symlink) => prefer_symlink,
+        Err(code) => return Ok(code),
+    };
 
     if prefer_symlink {
         write_ref_symlink(repo, name_full.as_ref().as_bstr(), target);
@@ -403,7 +394,6 @@ fn set_symref_raw(
     name: &BStr,
     target: &str,
     message: Option<&str>,
-    prefer_symlink: bool,
 ) -> Result<ExitCode> {
     let previous = leaf_object_id(repo, name)?;
     let spelled = FullName::try_from(name).ok();
@@ -414,23 +404,19 @@ fn set_symref_raw(
         None => false,
     };
 
-    // `files_ref_path()`: `HEAD` and the other per-worktree names live in the
-    // worktree's git dir, `refs/…` in the common one.
-    let base = match spelled.as_ref().and_then(|full| full.as_ref().category()) {
-        Some(
-            Category::PseudoRef
-            | Category::Bisect
-            | Category::Rewritten
-            | Category::WorktreePrivate,
-        ) => repo.git_dir(),
-        _ => repo.common_dir(),
-    };
+    let base = files_ref_base(repo, name);
     let path = base.join(gix::path::from_bstr(name));
-    let mut lock = gix::lock::File::acquire_to_update_resource(
-        &path,
-        gix::lock::acquire::Fail::Immediately,
-        Some(base.to_path_buf()),
-    )?;
+    let (file_lock, _) = repo.ref_lock_modes()?;
+    let mut lock = match gix::lock::File::acquire_to_update_resource(&path, file_lock, Some(base.to_path_buf())) {
+        Ok(lock) => lock,
+        Err(e) => return Ok(lock_failure(name, &path, &e)),
+    };
+    // Read with the lock held, as `files_transaction_finish()` reads it; failing
+    // here drops the lock and leaves the reference as it was.
+    let prefer_symlink = match prefer_symlink_refs(repo) {
+        Ok(prefer_symlink) => prefer_symlink,
+        Err(code) => return Ok(code),
+    };
     lock.with_mut(|file| writeln!(file, "ref: {target}"))?;
     lock.commit()?;
 
@@ -444,6 +430,60 @@ fn set_symref_raw(
     if via_head {
         log_head_split(repo, previous, message)?;
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `files_ref_path()`'s directory for `name`: `HEAD` and the other per-worktree
+/// names live in the worktree's git dir, `refs/…` in the common one.
+fn files_ref_base<'r>(repo: &'r gix::Repository, name: &BStr) -> &'r std::path::Path {
+    let per_worktree = FullName::try_from(name).is_ok_and(|full| {
+        matches!(
+            full.as_ref().category(),
+            Some(Category::PseudoRef | Category::Bisect | Category::Rewritten | Category::WorktreePrivate)
+        )
+    });
+    match per_worktree {
+        true => repo.git_dir(),
+        false => repo.common_dir(),
+    }
+}
+
+/// A loose ref this command locks by hand could not be locked: `lock_raw_ref()`'s
+/// `unable_to_lock_message()` (refs/files-backend.c:859), wrapped as
+/// `cannot lock ref '<ref>': ` by its caller (:2724) and returned as the
+/// transaction's `error:`, exit 1.
+fn lock_failure(name: &BStr, path: &std::path::Path, err: &gix::lock::acquire::Error) -> ExitCode {
+    let errno = super::update_ref::packed_lock_errno(err);
+    eprintln!(
+        "error: cannot lock ref '{name}': {}",
+        gix::lock::pid::unable_to_lock_message(path, &errno)
+    );
+    ExitCode::from(1)
+}
+
+/// `refs_delete_ref(…, REF_NO_DEREF)` (refs.c:1007-1028) of a symref whose target
+/// gitoxide cannot spell — `ref: x` names a valid one-level ref that `FullName`
+/// refuses — so the transaction, which reads the ref back, cannot carry it.
+/// `files_transaction_finish()` takes the lock, reads `core.preferSymlinkRefs`,
+/// unlinks the reflog and then the loose file (refs/files-backend.c:3327,
+/// :3391-3450).
+fn delete_symref_raw(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
+    let base = files_ref_base(repo, BStr::new(name));
+    let path = base.join(name);
+    let (file_lock, _) = repo.ref_lock_modes()?;
+    let lock = match gix::lock::Marker::acquire_to_hold_resource(&path, file_lock, Some(base.to_path_buf())) {
+        Ok(lock) => lock,
+        Err(e) => return Ok(lock_failure(BStr::new(name), &path, &e)),
+    };
+    if let Err(code) = prefer_symlink_refs(repo) {
+        return Ok(code);
+    }
+    match std::fs::remove_file(base.join("logs").join(name)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    std::fs::remove_file(&path)?;
+    drop(lock);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -516,12 +556,13 @@ fn write_ref_symlink(repo: &gix::Repository, name: &BStr, target: &str) {
     eprintln!("{SYMLINK_REFS_DEPRECATION}");
 }
 
-/// `--delete` form. Refuses `HEAD`, and anything that is not a symbolic ref —
-/// both with git's exact wording and exit code, `-q` notwithstanding.
+/// `--delete` form. Refuses anything that is not a symbolic ref, and then
+/// `HEAD` — both with git's exact wording and exit code, `-q` notwithstanding.
+/// The order is `cmd_symbolic_ref()`'s (builtin/symbolic-ref.c:70-77):
+/// `check_symref()` first, so a detached `HEAD` is `Cannot delete HEAD, not a
+/// symbolic ref`, and only a symbolic one reaches `deleting 'HEAD' is not
+/// allowed`.
 fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
-    if name == "HEAD" {
-        return fatal("deleting 'HEAD' is not allowed");
-    }
     // `refs_read_symbolic_ref()` reaches the ref store through
     // `refs_resolve_ref_unsafe()`, which refuses a name `check_refname_format()`
     // will not spell at all — so `-d refs/heads/x.lock` is `No such ref`, where
@@ -529,14 +570,28 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
     if !valid_refname(name) {
         return fatal(&format!("No such ref: {name}"));
     }
-    let Some(target) = symbolic_target(repo, BStr::new(name))? else {
-        return fatal(&format!("Cannot delete {name}, not a symbolic ref"));
+    // `check_symref(argv[0], 1, 0, 0, 0)` resolves with `RESOLVE_REF_NO_RECURSE`,
+    // which hands back a target `check_refname_format()` would refuse — `ref: x`
+    // is a symref to delete — and a file that does not parse is `REF_ISBROKEN`,
+    // which is `No such ref` (refs.c:2150-2187).
+    let target = match symbolic_target(repo, BStr::new(name)) {
+        Ok(Some(target)) => Some(target),
+        Ok(None) => return fatal(&format!("Cannot delete {name}, not a symbolic ref")),
+        Err(e) if bad_symref_target(&e).is_some() => None,
+        Err(e) if is_unparsable_ref(&e) => return fatal(&format!("No such ref: {name}")),
+        Err(e) => return Err(e),
     };
+    if name == "HEAD" {
+        return fatal("deleting 'HEAD' is not allowed");
+    }
     if crate::refstore::is_reftable(repo) {
         return reftable_symref_write(repo, name, None, None);
     }
+    let Some(target) = target else {
+        return delete_symref_raw(repo, name);
+    };
 
-    repo.edit_reference(RefEdit {
+    let edit = RefEdit {
         change: Change::Delete {
             expected: PreviousValue::MustExistAndMatch(Target::Symbolic(target)),
             log: RefLog::AndReference,
@@ -544,8 +599,50 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
         },
         name: full_name(name)?,
         deref: false,
-    })?;
-    Ok(ExitCode::SUCCESS)
+    };
+    Ok(match files_edit(repo, edit)? {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(code) => code,
+    })
+}
+
+/// `core.preferSymlinkRefs` the way the files backend loads it: lazily, in
+/// `files_ref_store_write_options()`, which `files_transaction_finish()` calls
+/// once the transaction's locks are held (refs/files-backend.c:136-157, :3327).
+/// A read never asks, and a lock failure is reported ahead of a value
+/// `git_config_bool()` refuses, which dies at 128.
+fn prefer_symlink_refs(repo: &gix::Repository) -> std::result::Result<bool, ExitCode> {
+    match crate::repo_settings::config_bool_strict(repo, "core.prefersymlinkrefs") {
+        Ok(value) => Ok(value.unwrap_or(false)),
+        Err(msg) => {
+            eprintln!("fatal: {msg}");
+            Err(ExitCode::from(128))
+        }
+    }
+}
+
+/// One edit through the files backend as `ref_transaction_commit()` runs it:
+/// prepared (locked) first, then `core.preferSymlinkRefs` read, then committed.
+/// A refused prepare is the `error: <reason>` of the transaction and exit 1, as
+/// `ret = !!refs_update_symref(...)` and `refs_delete_ref()`'s `error()` return
+/// make it (builtin/symbolic-ref.c:76-77, :91-93). `Ok(Ok(prefer_symlink))`
+/// means the edit is on disk.
+fn files_edit(repo: &gix::Repository, edit: RefEdit) -> Result<std::result::Result<bool, ExitCode>> {
+    let committer = repo.committer().transpose()?;
+    let (file_lock, packed_lock) = repo.ref_lock_modes()?;
+    let prepared = match repo.refs.transaction().prepare([edit], file_lock, packed_lock) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            eprintln!("error: {}", super::update_ref::lock_error(repo, &e.into()));
+            return Ok(Err(ExitCode::from(1)));
+        }
+    };
+    let prefer_symlink = match prefer_symlink_refs(repo) {
+        Ok(prefer_symlink) => prefer_symlink,
+        Err(code) => return Ok(Err(code)),
+    };
+    prepared.commit(committer)?;
+    Ok(Ok(prefer_symlink))
 }
 
 /// The write `refs_update_symref()` (refs.c:2512-2566) makes in a reftable
@@ -663,6 +760,19 @@ fn resolve_ref(repo: &gix::Repository, name: &str, recurse: bool) -> Result<Reso
             Err(e) if !recurse && bad_symref_target(&e).is_some() => {
                 let target = bad_symref_target(&e).expect("just checked");
                 return Ok(Resolution::Symbolic(target));
+            }
+            // Recursing, the target only has to pass `check_refname_format(…,
+            // REFNAME_ALLOW_ONELEVEL)` (refs.c:2188-2194), which a lower-case
+            // one-level name such as `ref: x` does but gitoxide's `FullName` does
+            // not; the walk goes on to read it, and an absent `x` ends it there.
+            Err(e) if bad_symref_target(&e).is_some() => {
+                let target = bad_symref_target(&e).expect("just checked");
+                saw_symref = true;
+                if !target.to_str().is_ok_and(valid_refname) {
+                    return Ok(Resolution::NoSuchRef);
+                }
+                current = target;
+                continue;
             }
             Err(e) if is_unparsable_ref(&e) => return Ok(Resolution::NoSuchRef),
             Err(e) => return Err(e),

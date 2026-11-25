@@ -38,12 +38,9 @@
 //!
 //! ### Honest limitations
 //!
-//! * The ident variables require `user.name`/`user.email` (or the
-//!   `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL}` environment variables). Git falls back
-//!   to the gecos field and `user@hostname`; the vendored crates deliberately have
-//!   no such fallback (see `gix/src/repository/identity.rs`, "Deviation"), and
-//!   there is no passwd/gethostname substrate to port it onto. Rather than invent
-//!   a different ident, this errors out (exit 128) with a precise message.
+//! * The ident variables are `fmt_ident()`'s, auto-detection from the passwd
+//!   entry and the host name included (see [`ident`]); only a uid with no passwd
+//!   entry, which git reports as a bogus name, is not modelled.
 //! * `GIT_ATTR_SYSTEM` and `GIT_CONFIG_SYSTEM` hang off git's *installation
 //!   prefix*, which git resolves in `exec-cmd.c`'s `system_prefix()` — the
 //!   compiled-in `prefix` for an ordinary build, or, under `RUNTIME_PREFIX`, the
@@ -94,8 +91,8 @@ const VARS: &[&str] = &[
 
 /// `git var` — show a Git logical variable.
 ///
-/// See the module docs for the covered surface and the two honest deviations
-/// (ident auto-detection and the system prefix).
+/// See the module docs for the covered surface and the remaining limitations
+/// (an absent passwd entry and the system prefix).
 pub fn var(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the argument list without the subcommand; tolerate a
     // leading `var` so the function is correct under either calling convention.
@@ -140,7 +137,7 @@ pub fn var(args: &[String]) -> Result<ExitCode> {
         }
         list_config(&cfg, &mut out, None)?;
         for name in VARS {
-            let Some(values) = resolve(name, &cfg)? else {
+            let Some(values) = resolve(name, &cfg, false)? else {
                 continue;
             };
             for value in values {
@@ -156,7 +153,7 @@ pub fn var(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error());
     }
 
-    match resolve(request, &cfg)? {
+    match resolve(request, &cfg, true)? {
         // A variable with no value prints nothing and exits 1.
         None => Ok(ExitCode::from(1)),
         Some(values) => {
@@ -196,14 +193,14 @@ fn load_config() -> Result<ConfigFile> {
 ///
 /// The return is a list because `GIT_CONFIG_GLOBAL` legitimately has two values
 /// (XDG then `$HOME/.gitconfig`), which git prints highest-priority first.
-fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
+fn resolve(name: &str, cfg: &ConfigFile, strict: bool) -> Result<Option<Vec<BString>>> {
     let single = |s: Option<String>| -> Result<Option<Vec<BString>>> {
         Ok(s.map(|s| vec![BString::from(s)]))
     };
 
     match name {
-        "GIT_AUTHOR_IDENT" => single(Some(ident(cfg, "AUTHOR")?)),
-        "GIT_COMMITTER_IDENT" => single(Some(ident(cfg, "COMMITTER")?)),
+        "GIT_AUTHOR_IDENT" => single(Some(ident(cfg, "Author", strict)?)),
+        "GIT_COMMITTER_IDENT" => single(Some(ident(cfg, "Committer", strict)?)),
         "GIT_EDITOR" => single(crate::editor::select_editor(cfg_str(cfg, "core.editor"))),
         "GIT_SEQUENCE_EDITOR" => single(crate::editor::select_sequence_editor(
             cfg_str(cfg, "sequence.editor"),
@@ -239,38 +236,87 @@ fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
 
 /// `GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` — `Name <email> <seconds> <tz>`.
 ///
-/// Precedence follows git's `ident.c`: the role's environment variables, then
-/// `user.name`/`user.email`, with `EMAIL` as a last resort for the address. The
-/// timestamp comes from `GIT_<ROLE>_DATE` when set (parsed with git's date
-/// grammar via `gix_date`), otherwise from the current local time.
+/// Port of `git_author_info()`/`git_committer_info()` (ident.c:565-589) over
+/// `fmt_ident()` (ident.c:456-542). `role` is `Author` or `Committer`; `strict`
+/// is `IDENT_STRICT`, which `cmd_var()` passes for a single variable and
+/// `list_vars()` does not (builtin/var.c:240, :181).
 ///
-/// Name and email are trimmed of git's "crud" characters exactly as
-/// `strbuf_addstr_without_crud` does before they are formatted.
-fn ident(cfg: &ConfigFile, role: &str) -> Result<String> {
-    let name = env(&format!("GIT_{role}_NAME")).or_else(|| cfg_str(cfg, "user.name"));
-    let email = env(&format!("GIT_{role}_EMAIL"))
-        .or_else(|| cfg_str(cfg, "user.email"))
-        .or_else(|| env("EMAIL"));
-
-    let (Some(name), Some(email)) = (name, email) else {
-        anyhow::bail!(
-            "unable to determine the {} identity: set user.name and user.email \
-             (git's gecos/hostname auto-detection has no substrate in the vendored crates)",
-            role.to_lowercase()
-        );
+/// * The email: `GIT_<ROLE>_EMAIL` when set at all, even empty; else a non-empty
+///   `<role>.email`; else, unless a strict `user.useConfigOnly` refuses an
+///   identity no `*.email` key gave, `ident_default_email()` — `user.email`, a
+///   non-empty `EMAIL`, or the address built from the account and the host,
+///   which a strict caller refuses when the host has no domain.
+/// * The name the same way through `GIT_<ROLE>_NAME`, `<role>.name` and
+///   `ident_default_name()`; an empty one is refused when strict and replaced by
+///   the login name otherwise, and a strict name made only of `crud()` characters
+///   is refused.
+/// * Both are copied through `strbuf_addstr_without_crud()`, and the date is
+///   `parse_date()` of a non-empty `GIT_<ROLE>_DATE`, else the current time.
+///
+/// `default_name_is_bogus` — a uid with no passwd entry — is not modelled:
+/// [`crate::passwd_self`] substitutes `unknown`/`Unknown` without saying it did.
+fn ident(cfg: &ConfigFile, role: &str, strict: bool) -> Result<String> {
+    let upper = role.to_uppercase();
+    let lower = role.to_lowercase();
+    // `set_ident()` (ident.c:610-675): any of the three `*.email`, or of the three
+    // `*.name`, keys marks `ident_config_given`, even with an empty value.
+    let given = |field: &str| {
+        ["user", "author", "committer"]
+            .iter()
+            .any(|section| cfg.string(&format!("{section}.{field}")).is_some())
+    };
+    let use_config_only = cfg.boolean("user.useConfigOnly").ok().flatten().unwrap_or(false);
+    let refuse = |msg: String| -> Result<String> {
+        crate::identity_advice(role);
+        crate::git_fatal!("{msg}")
     };
 
-    let name = without_crud(&name);
-    let email = without_crud(&email);
+    let email = match env(&format!("GIT_{upper}_EMAIL")).or_else(|| cfg_str(cfg, &format!("{lower}.email")).filter(|e| !e.is_empty())) {
+        Some(email) => email,
+        None => {
+            if strict && use_config_only && !given("email") {
+                return refuse("no email was given and auto-detection is disabled".into());
+            }
+            let (email, bogus) =
+                crate::ident_default_email_bogus(cfg_str(cfg, "user.email").unwrap_or_default(), given("email"));
+            if strict && bogus {
+                return refuse(format!("unable to auto-detect email address (got '{email}')"));
+            }
+            email
+        }
+    };
+
+    let (mut name, using_default) =
+        match env(&format!("GIT_{upper}_NAME")).or_else(|| cfg_str(cfg, &format!("{lower}.name")).filter(|n| !n.is_empty())) {
+            Some(name) => (name, false),
+            None => {
+                if strict && use_config_only && !given("name") {
+                    return refuse("no name was given and auto-detection is disabled".into());
+                }
+                (crate::ident_default_name(cfg_str(cfg, "user.name").unwrap_or_default(), given("name")), true)
+            }
+        };
     if name.is_empty() {
-        crate::git_fatal!("empty ident name (for <{email}>) not allowed");
+        if strict {
+            let msg = format!("empty ident name (for <{email}>) not allowed");
+            return match using_default {
+                true => refuse(msg),
+                false => crate::git_fatal!("{msg}"),
+            };
+        }
+        name = crate::passwd_self().0;
+    }
+    // `has_non_crud()` (ident.c:216-223) over `crud()` (ident.c:203-214).
+    let crud = |c: u8| c <= 32 || b",:;<>\"\\'".contains(&c);
+    if strict && name.bytes().all(crud) {
+        crate::git_fatal!("name consists only of disallowed characters: {name}");
     }
 
-    let date_var = format!("GIT_{role}_DATE");
-    let time = match env(&date_var) {
-        // `ident.c:534` parses `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` with `parse_date()`, which
-        // is `parse_date_basic()` — approxidate is not in this path, so a relative date is an
-        // error here even though `commit --date=` would accept it.
+    // `if (date_str && date_str[0])` (ident.c:533-538): an empty
+    // `GIT_<ROLE>_DATE` is the current time, like an unset one. `parse_date()`
+    // is `parse_date_basic()` — approxidate is not in this path, so a relative
+    // date is an error here even though `commit --date=` would accept it.
+    let time = match env(&format!("GIT_{upper}_DATE")).filter(|d| !d.is_empty()) {
         Some(raw) => match crate::date::parse_date_basic(&raw) {
             Some(time) => time,
             None => crate::git_fatal!("invalid date format: {raw}"),
@@ -278,7 +324,7 @@ fn ident(cfg: &ConfigFile, role: &str) -> Result<String> {
         None => gix::date::Time::now_local_or_utc(),
     };
 
-    Ok(format!("{name} <{email}> {time}"))
+    Ok(format!("{} <{}> {time}", without_crud(&name), without_crud(&email)))
 }
 
 /// `GIT_PAGER` — git's `git_pager(1)` chain, with `builtin/var.c`'s `cat` fallback.
@@ -611,15 +657,12 @@ fn os_bytes(s: &std::ffi::OsStr) -> BString {
         .unwrap_or_else(|_| BString::from(s.to_string_lossy().into_owned()))
 }
 
-/// git's `strbuf_addstr_without_crud`: strip leading and trailing whitespace and
-/// the punctuation git refuses to carry into an ident (`.,:;<>"` and backslash/
-/// apostrophe), then drop any remaining control characters.
+/// `strbuf_addstr_without_crud()` (ident.c:229-266) for a `str`: `crud()` trimmed
+/// from both ends — bytes up to the space, and `,:;<>"\'` — and `\n`, `<` and `>`
+/// dropped from what is left. A `.` is not crud. Only ASCII bytes are removed, so
+/// the result is still UTF-8.
 pub(super) fn without_crud(s: &str) -> String {
-    const CRUD: &[char] = &['.', ',', ':', ';', '<', '>', '"', '\\', '\''];
-    s.trim_matches(|c: char| c.is_whitespace() || CRUD.contains(&c))
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
+    String::from_utf8(super::refs_migrate::without_crud(s.as_bytes())).expect("only ASCII bytes were removed")
 }
 
 #[cfg(test)]

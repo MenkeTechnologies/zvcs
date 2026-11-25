@@ -100,7 +100,10 @@ pub fn show_ref(args: &[String]) -> Result<ExitCode> {
             patterns.push(a.to_string());
             continue;
         }
-        if a == "--" {
+        // parse_options_step() ends option parsing at `--` and, by an exact
+        // `strcmp()` ahead of parse_long_opt(), at `--end-of-options`; both are
+        // consumed (parse-options.c:1113-1125).
+        if a == "--" || a == "--end-of-options" {
             no_more_opts = true;
             continue;
         }

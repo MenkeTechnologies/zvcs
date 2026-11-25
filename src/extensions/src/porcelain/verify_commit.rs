@@ -169,11 +169,10 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
 /// only one a verification then consults.
 ///
 /// Both rejections are an `error()` inside the config reader followed by its own
-/// `die()`, so what leaves here is a [`crate::fatal::Silent`] carrying nothing but
-/// the exit code: the message is already on stderr, and this port's own voice
-/// after it would double it. The `die()`'s second line, which names the file and
-/// line the value came from, is not reproduced — gix's config parser does not
-/// carry per-entry line numbers.
+/// `die()` (configset_iter(), config.c:1654-1673), whose line names the file and
+/// line the value came from (or `command-line config`). Both lines are printed
+/// here, so what leaves is a [`crate::fatal::Silent`] carrying nothing but the
+/// exit code.
 ///
 /// Calling this where a signature is about to be checked, rather than up front, is
 /// not an optimization but the observable behaviour: `git status` and `git log` in
@@ -181,6 +180,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
 pub(crate) fn min_trust_level(repo: &gix::Repository) -> Result<crate::gitsig::Trust> {
     let reported = |key: &str, value: &str| {
         eprintln!("error: invalid value for '{key}': '{value}'");
+        eprintln!("fatal: {}", crate::config::die_config_linenr(Some(repo), key));
         anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL))
     };
     crate::gitsig::validate_format(repo).map_err(|v| reported("gpg.format", &v))?;

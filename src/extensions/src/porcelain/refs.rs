@@ -33,11 +33,6 @@
 //! In a reftable repository every verb here goes through the reftable backend:
 //! `exists` reads the record ([`read_raw_ref`]), `create`/`delete`/`update`
 //! run its transaction, `optimize` compacts the stack, `list` reads the stack.
-//!
-//! Known divergence: usage *errors* raised inside `optimize` are reported by the
-//! `pack-refs` module, so their usage block reads `usage: git pack-refs ...`
-//! where git would print `usage: git refs optimize ...`. `refs optimize -h` is
-//! handled here and does print the `git refs optimize` form.
 
 use anyhow::{bail, Result};
 use std::process::ExitCode;
@@ -742,20 +737,11 @@ fn list(args: &[String]) -> Result<ExitCode> {
 /// `git refs optimize` — the documented alias for `git pack-refs`.
 ///
 /// `args[0]` is the literal `optimize`, which the `pack-refs` module skips just
-/// as it skips its own subcommand name. Only `-h` is intercepted, so that the
-/// usage block names `git refs optimize` rather than `git pack-refs`.
+/// as it skips its own subcommand name. `cmd_refs_optimize()` is
+/// `pack_refs_core()` with `refs_optimize_usage` (builtin/refs.c:178-188), so
+/// `-h`, `--help-all` and every usage error print the `git refs optimize` block.
 fn optimize(args: &[String]) -> Result<ExitCode> {
-    // `--help-all` is `parse_options_step()`'s own `strcmp()`, placed after the
-    // `--` break and before `parse_long_opt()`: the exact name only (no prefix,
-    // no `=<value>`) and never past a `--`, which is why this scan stops there.
-    // `USAGE_FULL` is the same block, pack-refs' table having no hidden entry.
-    if args[1..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--help-all") {
-        return Ok(super::show_usage(USAGE_OPTIMIZE));
-    }
-    if args[1..].iter().any(|a| a == "-h") {
-        return Ok(super::show_usage(USAGE_OPTIMIZE));
-    }
-    super::pack_refs::pack_refs(args)
+    super::pack_refs::pack_refs_core(args, USAGE_OPTIMIZE)
 }
 
 /// `git refs create -h`, byte-for-byte.

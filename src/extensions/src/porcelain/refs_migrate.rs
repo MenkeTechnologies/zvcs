@@ -293,7 +293,17 @@ fn collect_refs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Ref>> {
         }
     }
     for r in repo.references()?.all()? {
-        let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let r = match crate::fatal::ref_walk_entry(r)? {
+            crate::fatal::RefWalkEntry::Ref(r) => r,
+            // `REFS_FOR_EACH_INCLUDE_BROKEN` hands migrate_one_ref() a loose ref that
+            // would not parse with a null object id, and ref_transaction_create() answers
+            // that with a positive 1, not an error (refs.c:1508-1511). The callback's
+            // nonzero return ends the iteration, and `if (ret < 0)` lets it through
+            // (refs.c:3442-3444): the refs collected so far are committed and the
+            // migration succeeds without the rest.
+            crate::fatal::RefWalkEntry::Broken(_) => break,
+            crate::fatal::RefWalkEntry::Omitted => continue,
+        };
         let name = r.name().as_bstr().to_owned();
         if !name.starts_with(b"refs/") {
             continue;

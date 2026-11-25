@@ -102,6 +102,13 @@ struct Opts {
 
 /// `git pack-refs` — see the module docs for the covered surface.
 pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
+    pack_refs_core(args, USAGE)
+}
+
+/// `pack_refs_core()` (pack-refs.c:9-55), shared by `git pack-refs` and `git refs optimize`.
+/// Each caller hands it its own usage block (builtin/pack-refs.c:15, builtin/refs.c:187), so
+/// `-h` and every usage error name the command that was run.
+pub(super) fn pack_refs_core(args: &[String], usage: &str) -> Result<ExitCode> {
     let mut opts = Opts {
         all: false,
         prune: true,
@@ -120,15 +127,15 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         args.first().map(String::as_str),
         Some("pack-refs" | "optimize")
     ));
-    // Everything after a literal `--` is a positional, and `pack-refs` accepts
-    // none, so it is a usage error rather than a flag.
-    let mut positional_only = false;
+    // parse_options() keeps going past a non-option, collecting it, and stops at
+    // `--` or `--end-of-options` (parse-options.c:1011-1018, :1113-1125); only
+    // then does pack_refs_core() answer any collected argument with
+    // usage_with_options() (pack-refs.c:38-39). So an option after a positional is
+    // still parsed (`pack-refs extra -h` prints help, `extra --bogus` is an unknown
+    // option), and everything after the end marker is a positional.
+    let mut has_positional = false;
     while i < args.len() {
         let a = args[i].as_str();
-        if positional_only {
-            eprint!("{USAGE}");
-            return Ok(ExitCode::from(129));
-        }
         // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
         // ahead of parse_long_opt(): the name never abbreviates and never takes
         // an `=<value>`, so it is matched before the abbreviation resolution
@@ -136,18 +143,18 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            return Ok(super::show_usage(USAGE));
+            return Ok(super::show_usage(usage));
         }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+                return Ok(super::ambiguous_option(a, &first, &second, usage))
             }
         };
         let a = resolved.as_ref();
         match a {
             "-h" => {
-                return Ok(super::show_usage(USAGE));
+                return Ok(super::show_usage(usage));
             }
             "--all" => opts.all = true,
             "--no-all" => opts.all = false,
@@ -155,7 +162,10 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
             "--no-prune" => opts.prune = false,
             "--auto" => opts.auto = true,
             "--no-auto" => opts.auto = false,
-            "--" => positional_only = true,
+            "--" | "--end-of-options" => {
+                has_positional |= i + 1 < args.len();
+                break;
+            }
             "--no-include" => opts.includes.clear(),
             "--no-exclude" => opts.excludes.clear(),
             "--include" | "--exclude" => {
@@ -175,17 +185,17 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
             }
             _ if a.starts_with("--include=") => opts.includes.push(a["--include=".len()..].to_string()),
             _ if a.starts_with("--exclude=") => opts.excludes.push(a["--exclude=".len()..].to_string()),
-            _ if a.starts_with("--") => return usage_error(&format!("unknown option `{}'", &a[2..])),
+            _ if a.starts_with("--") => return usage_error(&format!("unknown option `{}'", &a[2..]), usage),
             _ if a.starts_with('-') && a.len() > 1 => {
-                return usage_error(&format!("unknown switch `{}'", &a[1..2]))
+                return usage_error(&format!("unknown switch `{}'", &a[1..2]), usage)
             }
-            // `pack-refs` takes no positional arguments; git prints usage and exits 129.
-            _ => {
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
+            _ => has_positional = true,
         }
         i += 1;
+    }
+    if has_positional {
+        eprint!("{usage}");
+        return Ok(ExitCode::from(129));
     }
 
     // git appends `*` for --all, then falls back to `refs/tags/*` when the
@@ -295,13 +305,14 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         // (refs/packed-backend.c:1222-1228); the transaction below reaches the
         // same read through the ref store's packed-refs lock hook.
         crate::sequencer::packed_refs_lock_timeout(&repo)?;
-        if let Err(e) = gix::lock::File::acquire_to_update_resource(
+        let mut lock = match gix::lock::File::acquire_to_update_resource(
             &packed_refs,
             gix::lock::acquire::Fail::Immediately,
             None,
         ) {
-            return Ok(packed_refs_lock_fatal(&packed_refs, &e));
-        }
+            Ok(lock) => lock,
+            Err(e) => return Ok(packed_refs_lock_fatal(&packed_refs, &e)),
+        };
         // The `packed-refs` transaction is committed with no update in it, and runs the
         // `reference-transaction` hook with nothing on stdin (refs/files-backend.c:1555-1557,
         // refs.c:2700-2786).
@@ -310,6 +321,35 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
                 gix::refs::file::transaction_hook_refused(store, state, &[&b""[..]]);
             }
         }
+        // ```c
+        // /*
+        //  * Note that we *don't* skip transactions with zero updates,
+        //  * because such a transaction might be executed for the side
+        //  * effect of ensuring that all of the references are peeled or
+        //  * ensuring that the `packed-refs` file is sorted.
+        // ```
+        //
+        // (`packed_transaction_prepare()`, refs/packed-backend.c:1724-1730.) So
+        // `write_with_updates()` rewrites the file even with nothing to add: the current
+        // header, then every packed record in sorted order with the `^` line it already
+        // carried and no other (refs/packed-backend.c:1416-1418, :1532-1535). A file whose
+        // header lacked `fully-peeled` or `sorted` comes out with both.
+        {
+            use std::io::Write;
+            lock.write_all(HEADER_LINE)?;
+            if let Some(buffer) = store.open_packed_buffer()? {
+                for reference in buffer.iter()? {
+                    let reference = reference?;
+                    write!(lock, "{} ", reference.target)?;
+                    lock.write_all(reference.name.as_bstr())?;
+                    lock.write_all(b"\n")?;
+                    if let Some(peeled) = reference.object {
+                        writeln!(lock, "^{peeled}")?;
+                    }
+                }
+            }
+        }
+        lock.commit().map_err(|e| e.error)?;
         gix::refs::file::run_transaction_hook(store, "committed", b"");
     } else {
         let objects: Box<dyn gix::objs::Find + '_> = Box::new(&repo.objects);
@@ -412,9 +452,9 @@ fn log2u(n: usize) -> usize {
 }
 
 /// Report a usage error the way git's option parser does, then exit 129.
-fn usage_error(message: &str) -> Result<ExitCode> {
+fn usage_error(message: &str, usage: &str) -> Result<ExitCode> {
     eprintln!("error: {message}");
-    eprint!("{USAGE}");
+    eprint!("{usage}");
     Ok(ExitCode::from(129))
 }
 

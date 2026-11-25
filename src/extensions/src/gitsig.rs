@@ -829,11 +829,21 @@ fn run_with_stdin(
     {
         Ok(child) => child,
         Err(e) => {
-            // `child_err_spew()`'s `CHILD_ERR_ERRNO` arm (run-command.c:403):
-            // `error_errno("cannot exec '%s'")` with the error routine swapped
-            // for the die routine, so it prints `fatal:` and yet does not die —
-            // the caller carries on and reports its own failure.
-            eprintln!("fatal: cannot exec '{program}': {}", crate::external::strerror(&e));
+            // A name without a dir separator that prepare_cmd()'s PATH lookup
+            // does not find fails start_command() in the parent, as
+            // `error_errno("cannot run %s", cmd->args.v[0])` (run-command.c:432-441,
+            // :757-763). A path with one is exec'd as given, and the child's
+            // failed execve() is `child_err_spew()`'s `CHILD_ERR_ERRNO` arm
+            // (run-command.c:403): `error_errno("cannot exec '%s'")` with the
+            // error routine swapped for the die routine, so it prints `fatal:`
+            // and yet does not die. Either way the caller carries on and reports
+            // its own failure.
+            let reason = crate::external::strerror(&e);
+            if program.contains('/') {
+                eprintln!("fatal: cannot exec '{program}': {reason}");
+            } else {
+                eprintln!("error: cannot run {program}: {reason}");
+            }
             return None;
         }
     };

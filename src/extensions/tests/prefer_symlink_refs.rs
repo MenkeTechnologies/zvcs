@@ -153,16 +153,17 @@ fn a_symlinked_head_resolves_like_a_textual_one() {
 }
 
 #[test]
-fn a_symlink_that_does_not_name_a_reference_is_followed_as_a_file() {
+fn a_head_symlink_outside_refs_is_not_a_repository() {
     let (repo, home) = fixture("not-a-ref");
     if !symlinks_work(&repo) {
         return;
     }
 
-    // git only treats a link as a symref when the target starts with `refs/` and
-    // is a valid refname (refs/files-backend.c:527-533); anything else falls
-    // through to "read whatever it points to". Here `.git/HEAD` points at a plain
-    // file holding a textual symref, which must still resolve.
+    // Before any ref is read, repository discovery runs `validate_headref()`, which
+    // accepts a symlinked `HEAD` only when the link's target starts with `refs/`
+    // (setup.c:362-367), whatever the file it points at holds. Here `.git/HEAD`
+    // points at a plain file holding a textual symref, so `.git` is not a git
+    // directory and the walk ends in `die()` (git 2.56.1 on this fixture).
     std::fs::write(repo.join(".git/real-head"), "ref: refs/heads/main\n").unwrap();
     let head = repo.join(".git/HEAD");
     std::fs::remove_file(&head).unwrap();
@@ -171,7 +172,9 @@ fn a_symlink_that_does_not_name_a_reference_is_followed_as_a_file() {
     #[cfg(windows)]
     std::os::windows::fs::symlink_file("real-head", &head).unwrap();
 
-    assert_eq!(stdout(&ok(&repo, &home, &["symbolic-ref", "HEAD"])), "refs/heads/main\n");
+    let out = run(&repo, &home, &["symbolic-ref", "HEAD"]);
+    assert_eq!(stderr(&out), "fatal: not a git repository (or any of the parent directories): .git\n");
+    assert_eq!(out.status.code().unwrap_or(-1), FATAL);
 }
 
 #[test]

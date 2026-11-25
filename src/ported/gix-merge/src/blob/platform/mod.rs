@@ -100,6 +100,7 @@ impl Platform {
                 out
             },
             options,
+            renormalize_attr_stack: None,
         }
     }
 }

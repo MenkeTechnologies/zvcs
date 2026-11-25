@@ -193,9 +193,9 @@
 //! `--filter=<spec>` and the rest of `handle_revision_opt()`'s walk options are
 //! not, so those reach stage 5 as unknown options where stock walks them.
 //!
-//! The `-X` values `gix-merge` cannot express — the whitespace family,
-//! `subtree` and `renormalize` — are refused by the shared
+//! The `-X` values `gix-merge` cannot express are refused by the shared
 //! `merge_tree::StrategyOptions`, at the point the merge would have used them.
+//! `-Xrenormalize` is applied as `merge.renormalize` on a private copy of the repository.
 //!
 //! Repository state for a successful pick matches git: the author signature
 //! (name, email and time) is preserved from the picked commit, the committer
@@ -1464,6 +1464,9 @@ fn pick_one(
     // list it loaded before looking at any entry (unpack-trees.c:1931-1936); a `merge-<strategy>`
     // child moves the worktree itself.
     let mut unpack: Option<crate::unpack_sparse::SparseCheckout> = None;
+    // `-Xrenormalize` overrides `merge.renormalize` on a private copy of the repository, which
+    // has to outlive the merge outcome borrowing it.
+    let renormalized: Option<gix::Repository>;
     let (tree_id, mut merge) = match opts.strategy {
         None | Some("recursive") | Some("ort") => {
             // git hands every `-X` to `parse_merge_opt()` here and *discards*
@@ -1473,6 +1476,8 @@ fn pick_one(
             for x in &opts.xopts {
                 strategy.absorb(x);
             }
+            renormalized = crate::merge_apply::with_renormalize(repo, strategy.renormalize())?;
+            let repo = renormalized.as_ref().unwrap_or(repo);
             // `do_recursive_merge()` calls `init_ui_merge_options()`
             // (sequencer.c) before merging, and its `merge_recursive_config()`
             // dies on an unreadable `merge.renameLimit` & co.

@@ -178,6 +178,16 @@ impl Stack {
         self.case = case;
         self
     }
+
+    /// Replace the path-to-blob mappings attribute and ignore files are read from, which must be
+    /// sorted by path as [`State::id_mappings_from_index()`] sorts them.
+    ///
+    /// The root directory's files are read once, on first use, so this only has an effect on a
+    /// stack that was not queried yet.
+    pub fn set_id_mappings(&mut self, id_mappings: Vec<PathIdMapping>) -> &mut Self {
+        self.id_mappings = id_mappings;
+        self
+    }
 }
 
 /// Access

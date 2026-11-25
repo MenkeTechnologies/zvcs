@@ -1248,7 +1248,13 @@ pub(crate) fn renormalized_repo(
     repo: &gix::Repository,
     xopts: &StrategyOptions,
 ) -> Result<Option<gix::Repository>> {
-    let Some(on) = xopts.renormalize else {
+    with_renormalize(repo, xopts.renormalize)
+}
+
+/// [`renormalized_repo`] for a verb with its own `-X` parser: `renormalize` is `-Xrenormalize`
+/// (`Some(true)`) or `-Xno-renormalize` (`Some(false)`), the later one winning (merge-ort.c:5585-5588).
+pub(crate) fn with_renormalize(repo: &gix::Repository, renormalize: Option<bool>) -> Result<Option<gix::Repository>> {
+    let Some(on) = renormalize else {
         return Ok(None);
     };
     let mut with_override = repo.clone();

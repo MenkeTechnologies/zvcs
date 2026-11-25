@@ -79,6 +79,9 @@ where
     let tree_conflicts = options.tree_conflicts;
 
     let side_tree_ids = [base_tree, our_tree, their_tree];
+    // `clear_or_reinit_internal_opts()` discards the attribute index at the start of every merge,
+    // virtual merge bases included (merge-ort.c:708), so each one reads its own `.gitattributes`.
+    crate::tree::renormalize::install_attr_index(blob_merge, objects, side_tree_ids)?;
     let mut our_changes = Vec::new();
     if ours_needs_diff {
         let our_tree = objects.find_tree_iter(our_tree, &mut side_buf)?;
@@ -1096,6 +1099,19 @@ where
                                             should_break
                                         }
                                     }
+                                } else if blob_merge.filter_mode == crate::blob::pipeline::Mode::Renormalize
+                                    && blob_merge.blob_unchanged(
+                                        (previous_entry_mode.kind(), previous_id),
+                                        (entry_mode.kind(), id),
+                                        location.as_bstr(),
+                                        objects,
+                                    )?
+                                {
+                                    // "Blob unchanged after renormalization, so there's no
+                                    // modify/delete conflict after all; we can just remove the file"
+                                    // (merge-ort.c:4387-4402), at every recursion level.
+                                    editor.remove(toc(location))?;
+                                    false
                                 } else {
                                     let entries = [
                                         index_entry(previous_entry_mode, previous_id),

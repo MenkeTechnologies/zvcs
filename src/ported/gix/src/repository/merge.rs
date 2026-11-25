@@ -56,7 +56,20 @@ impl Repository {
             default_driver: self.config.resolved.string(tree::Merge::DEFAULT),
         };
         let drivers = self.config.merge_drivers()?;
-        Ok(gix_merge::blob::Platform::new(filter, mode, attrs, drivers, options))
+        let mut platform = gix_merge::blob::Platform::new(filter, mode, attrs, drivers, options);
+        if mode == gix_merge::blob::pipeline::Mode::Renormalize {
+            // A tree merge fills in the `.gitattributes` of merge-ort's fake attribute index
+            // (merge-ort.c:2049-2108), read with `GIT_ATTR_CHECKOUT` (merge-ort.c:5084-5085): from
+            // that index first and then the worktree (attr.c:852-855), and from the index alone in a
+            // bare repository (attr.c:851).
+            let source = gix_worktree::stack::state::attributes::Source::IdMappingThenWorktree
+                .adjust_for_bare(self.workdir().is_none());
+            platform.renormalize_attr_stack = Some(
+                self.attributes_only(&gix_index::State::new(self.object_hash()), source)?
+                    .inner,
+            );
+        }
+        Ok(platform)
     }
 
     /// Return options for use with [`gix_merge::blob::PlatformRef::merge()`], accessible through

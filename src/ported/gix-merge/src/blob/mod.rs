@@ -161,6 +161,14 @@ pub struct Platform {
     attrs: gix_filter::attributes::search::Outcome,
     /// The way we convert resources into mergeable states.
     pub filter_mode: pipeline::Mode,
+    /// The attribute stack a tree merge installs as [`attr_stack`](Self::attr_stack) when `filter_mode` is
+    /// [`Renormalize`](pipeline::Mode::Renormalize), not yet queried and without id mappings.
+    ///
+    /// merge-ort reads attributes from a fake index holding only the merged `.gitattributes`
+    /// (`initialize_attr_index()`, merge-ort.c:2049-2108) with the attribute direction at
+    /// `GIT_ATTR_CHECKOUT` (merge-ort.c:5084-5085), so an in-tree file the fake index lacks is
+    /// read from the worktree (attr.c:852-855), or not at all in a bare repository (attr.c:851).
+    pub renormalize_attr_stack: Option<gix_worktree::Stack>,
 }
 
 /// The product of a [`prepare_merge()`](Platform::prepare_merge()) call to finally

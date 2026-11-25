@@ -100,3 +100,53 @@ impl Platform {
         Ok(())
     }
 }
+
+/// Renormalization
+impl Platform {
+    /// `blob_unchanged()` (merge-ort.c:3748-3783): `true` if `side` holds what `base` holds once both
+    /// went through `renormalize_buffer()` (convert.c:1542-1556), which is a conversion to the worktree
+    /// form and back, with the attributes at `rela_path`.
+    ///
+    /// A mode change is a change (merge-ort.c:3761-3762), and so is a blob too large to be converted.
+    pub fn blob_unchanged(
+        &mut self,
+        base: (gix_object::tree::EntryKind, &gix_hash::oid),
+        side: (gix_object::tree::EntryKind, &gix_hash::oid),
+        rela_path: &BStr,
+        objects: &impl gix_object::FindObjectOrHeader,
+    ) -> Result<bool, Error> {
+        if base.0 != side.0 {
+            return Ok(false);
+        }
+        if base.1 == side.1 {
+            return Ok(true);
+        }
+        let entry = self
+            .attr_stack
+            .at_entry(rela_path, None, objects)
+            .map_err(|err| Error::Attributes {
+                source: err,
+                kind: ResourceKind::CommonAncestorOrBase,
+                rela_path: rela_path.to_owned(),
+            })?;
+        let mut bufs = [Vec::new(), Vec::new()];
+        for ((mode, id), buf) in [base, side].into_iter().zip(bufs.iter_mut()) {
+            let data = self.filter.convert_to_mergeable(
+                id,
+                mode,
+                rela_path,
+                ResourceKind::CommonAncestorOrBase,
+                &mut |_, out| {
+                    let _ = entry.matching_attributes(out);
+                },
+                objects,
+                pipeline::Mode::Renormalize,
+                buf,
+            )?;
+            if !matches!(data, Some(pipeline::Data::Buffer)) {
+                return Ok(false);
+            }
+        }
+        Ok(bufs[0] == bufs[1])
+    }
+}

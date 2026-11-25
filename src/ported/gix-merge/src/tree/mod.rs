@@ -523,6 +523,7 @@ pub enum ResolveWith {
 }
 
 mod dir_renames;
+mod renormalize;
 pub(super) mod function;
 mod utils;
 ///

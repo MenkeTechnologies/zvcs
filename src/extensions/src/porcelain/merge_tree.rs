@@ -23,7 +23,9 @@
 //!     `find-renames=<n>`, `rename-threshold=<n>`, `histogram`,
 //!     `diff-algorithm=myers|default|minimal|histogram`, `subtree[=<path>]`,
 //!     `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`,
-//!     `ignore-cr-at-eol`, and the no-op `no-renormalize`
+//!     `ignore-cr-at-eol`, `renormalize` and `no-renormalize`, the last two
+//!     overriding `merge.renormalize` on a private copy of the repository
+//!     ([`crate::merge_apply::with_renormalize`]) before anything is merged
 //!
 //! Also covered:
 //!   * `--stdin` — the multi-merge batch protocol: each input line is one merge
@@ -66,9 +68,6 @@
 //! still writing the original bytes.
 //!
 //! Not covered, and refused rather than approximated:
-//!   * the strategy option `renormalize` — `gix-merge`'s blob pipeline is not
-//!     driven in renormalizing mode here. It parses and validates exactly as git
-//!     does; only performing such a merge is refused.
 //!   * message rendering for the two conflict classes [`crate::merge_msg`]
 //!     still cannot name: a gitlink content merge, whose git text comes from
 //!     `merge_submodule()` plus the `advice.submoduleMergeConflict` hint block,
@@ -394,6 +393,7 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     // NUL and the message block uses the `-z` shape, so `-z` is a no-op here.
     if use_stdin {
         let repo = crate::setup::discover()?;
+        let repo = crate::merge_apply::with_renormalize(&repo, strategy.renormalize)?.unwrap_or(repo);
         // `if (merge_base) die(...)` (builtin/merge-tree.c:620-622), ahead of
         // the first read from stdin.
         if merge_base.is_some() {
@@ -491,6 +491,9 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+    // `parse_merge_opt()` sets `opt->renormalize` before either mode runs
+    // (builtin/merge-tree.c:610-612); only a real merge reads it.
+    let repo = crate::merge_apply::with_renormalize(&repo, strategy.renormalize)?.unwrap_or(repo);
 
     if mode == Mode::Trivial {
         // git's trivial merge peels each of the three operands to a tree before
@@ -1081,16 +1084,17 @@ impl StrategyOptions {
         true
     }
 
+    /// `-Xrenormalize` (`Some(true)`) or `-Xno-renormalize` (`Some(false)`), whichever came last.
+    pub(super) fn renormalize(&self) -> Option<bool> {
+        self.renormalize
+    }
+
     /// Fold the strategy options into the merge options, refusing the ones
     /// `gix-merge` has no way to express rather than silently ignoring them.
     pub(super) fn apply(
         &self,
         options: gix::merge::tree::Options,
     ) -> Result<gix::merge::tree::Options> {
-        if self.renormalize == Some(true) {
-            anyhow::bail!("unsupported strategy option \"renormalize\" (gix-merge's blob pipeline is not driven in renormalizing mode here)");
-        }
-
         let algorithm = match self.diff_algorithm.as_deref() {
             // `init_merge_options()` (merge-ort.c) opens with
             // `opt->xdl_opts = DIFF_WITH_ALG(opt, HISTOGRAM_DIFF)`, so an

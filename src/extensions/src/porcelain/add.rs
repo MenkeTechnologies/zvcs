@@ -815,6 +815,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         });
         let mut notes = notes.into_iter().peekable();
         let mut advised = false;
+        // `core.bigFileThreshold` is read the first time `index_fd()` hashes a
+        // regular file (object-file.c:955-957, repo-settings.c:167-172), so its
+        // refusal is a `die()` at that path's place in the two passes: whatever
+        // `add_files_to_cache()` and `add_files()` printed before it — the
+        // gitignore block, an embedded repository's warning, an earlier path's
+        // errors — is already out. See [`crate::config::big_file_threshold_refusal`].
+        let mut big_file_checked = false;
         for i in order {
             let s = &mut staged[i];
             let here = (!s.was_tracked, s.path.clone());
@@ -842,6 +849,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 let bytes = target.to_string_lossy().into_owned().into_bytes();
                 bytes
             } else {
+                // A symlink's target never reaches the blob hasher that consults
+                // the threshold, so only this branch asks — git adds a lone
+                // symlink under `-c core.bigFileThreshold=warn` and dies on a file.
+                if !big_file_checked {
+                    big_file_checked = true;
+                    if let Some(message) = crate::config::big_file_threshold_refusal(repo) {
+                        eprintln!("fatal: {message}");
+                        return Ok(Some((ExitCode::from(128), here)));
+                    }
+                }
                 let raw = std::fs::read(&abs)?;
                 let rela = gix::path::from_bstr(s.path.as_bstr()).into_owned();
                 match filters.convert(repo, &rela, &raw) {
@@ -1033,7 +1050,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     };
     // `core.bigFileThreshold` is read the first time a work-tree file is hashed,
     // not when the configuration is parsed; see
-    // [`crate::config::big_file_threshold_refusal`].
+    // [`crate::config::big_file_threshold_refusal`]. Only `--resolved` asks here:
+    // the two passes ask in [`index_staged_blobs`].
     let mut big_file_checked = false;
 
     // The paths git counts toward "did this pathspec match anything":
@@ -1233,16 +1251,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         } else {
-            // A symlink's target never reaches the blob hasher that consults the
-            // threshold, so only this branch asks — git 2.55.0 adds a lone
-            // symlink under `-c core.bigFileThreshold=warn` and dies on a file.
-            if !big_file_checked {
-                big_file_checked = true;
-                if let Some(message) = crate::config::big_file_threshold_refusal(&repo) {
-                    eprintln!("fatal: {message}");
-                    return Ok(ExitCode::from(128));
-                }
-            }
+            // `core.bigFileThreshold` is not consulted here: [`index_staged_blobs`]
+            // asks when it reaches the first regular file, in pass order.
             if let Err(e) = std::fs::File::open(&abs) {
                 read_errors.push((path, os_err_message(&e), already_tracked));
                 continue;
@@ -2443,6 +2453,7 @@ pub(super) fn renormalize_tracked_files(
     // The paths already handed to `add_file_to_index()`, in index order.
     let mut handled: Vec<BString> = Vec::new();
     let mut failed = false;
+    let mut big_file_checked = false;
     let backing = index.path_backing();
     for e in index.entries() {
         let path = e.path_in(backing);
@@ -2478,6 +2489,25 @@ pub(super) fn renormalize_tracked_files(
         if opts.intent_to_add {
             handled.push(path.to_owned());
             continue;
+        }
+        // `index_fd()` reads `core.bigFileThreshold` the first time it hashes an
+        // opened regular file, ahead of any conversion (object-file.c:955-957,
+        // repo-settings.c:167-172); a refusal dies there, with the `-v`/`-n` lines
+        // of the entries before it already out (read-cache.c:818-819).
+        if !big_file_checked
+            && std::fs::symlink_metadata(&abs).is_ok_and(|md| md.is_file())
+            && std::fs::File::open(&abs).is_ok()
+        {
+            big_file_checked = true;
+            if let Some(message) = crate::config::big_file_threshold_refusal(repo) {
+                if opts.dry_run || opts.verbose {
+                    for done in &handled {
+                        println!("add '{done}'");
+                    }
+                }
+                eprintln!("fatal: {message}");
+                return Ok(RenormalizeOutcome { aborted: Some(ExitCode::from(128)), failed });
+            }
         }
         // `index_path()` runs for `--dry-run` as well; `hash_flags` only drops
         // `INDEX_WRITE_OBJECT`. So the read happens either way and only the *write*

@@ -2436,7 +2436,21 @@ pub enum GitDirNaming {
 /// that reader covers, the command line included unless it is the very early one
 /// (`opts.ignore_cmdline`, config.c:1724).
 pub fn first_unparsable_config_file(scopes: ConfigScopes, naming: GitDirNaming) -> Option<ConfigReadStop> {
-    let files = config_file_sequence(scopes, naming);
+    // `read_early_config()` and `repo_read_config()` (config.c:1687-1711,
+    // :2299-2315) hand `config_with_options()` the whole sequence, so the system,
+    // XDG and user files are read again under this reader's `git_config_include()`
+    // (config.c:419-447): a condition the very early read could not take — a
+    // `gitdir:`, an `onbranch:`, a `hasconfig:remote.*.url:` whose URL is in the
+    // repository's config — holds now, and its include is followed or refused
+    // where it sits in the global file. A line those files cannot parse already
+    // ended the run in the very early read.
+    let mut files = match scopes {
+        ConfigScopes::EarlyGlobal => Vec::new(),
+        ConfigScopes::Repository | ConfigScopes::EarlyRepository => {
+            config_file_sequence(ConfigScopes::EarlyGlobal, naming)
+        }
+    };
+    files.extend(config_file_sequence(scopes, naming));
     first_unparsable_of(scopes, naming, &files, None)
 }
 

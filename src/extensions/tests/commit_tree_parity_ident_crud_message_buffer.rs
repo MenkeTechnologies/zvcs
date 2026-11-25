@@ -54,7 +54,12 @@ fn run(side: &twin_repo::Side, env: &[(&str, &str)], args: &[&str], input: &str)
         cmd.env(k, v);
     }
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    // A `-m` case never reads stdin, so this write races the child's exit and
+    // can lose with `EPIPE`; the assertions are on its status and output, so a
+    // broken pipe here is not a test failure. Any other write error still panics.
+    if let Err(e) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "feeding {args:?} stdin: {e}");
+    }
     let out = child.wait_with_output().unwrap();
     let root = side.root.to_string_lossy().into_owned();
     let text = |b: &[u8]| String::from_utf8_lossy(b).replace(&root, "<root>");

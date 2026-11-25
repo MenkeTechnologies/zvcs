@@ -3460,7 +3460,7 @@ fn log_unchanged_rename(
     })?;
     rewrite_last_reflog_old_id(
         &repo
-            .git_dir()
+            .common_dir()
             .join("logs")
             .join(name.as_bstr().to_str_lossy().as_ref()),
         target,
@@ -3637,6 +3637,10 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
                 return Ok(code);
             }
+            // `reject_rebase_or_bisect_branch(worktrees, oldref.buf)` (builtin/branch.c:661).
+            if let Some(msg) = super::worktree::rebase_or_bisect_refusal(repo, &old_full)? {
+                return fatal(msg);
+            }
             return rename_orphan_branch(repo, &old, &new, &old_full, &new_full);
         }
     };
@@ -3645,6 +3649,10 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // RESOLVE_REF_NO_RECURSE.
     if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
         return Ok(code);
+    }
+    // `reject_rebase_or_bisect_branch(worktrees, oldref.buf)` (builtin/branch.c:661).
+    if let Some(msg) = super::worktree::rebase_or_bisect_refusal(repo, &old_full)? {
+        return fatal(msg);
     }
     if crate::refstore::is_reftable(repo) {
         drop(old_ref);
@@ -3705,7 +3713,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // deleting `refs/heads/n/n` is pruned so the file `refs/heads/n` can be
     // created. Writing the new ref first, as this did, is `File exists` in the
     // first case and `Is a directory` in the second.
-    let logs = repo.git_dir().join("logs");
+    let logs = repo.common_dir().join("logs");
     let tmp_log = logs.join(TMP_RENAMED_LOG);
     let mut moved_log = false;
     if old_full != new_full {
@@ -3800,7 +3808,7 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // The ref is new to the ref store, so gitoxide logs it as a creation; git renamed a
     // *ref that already pointed there*, and its entry reads `<tip> <tip>`.
     if old_full != new_full {
-        rewrite_last_reflog_old_id(&repo.git_dir().join("logs").join(&new_full), target);
+        rewrite_last_reflog_old_id(&repo.common_dir().join("logs").join(&new_full), target);
     } else {
         log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
     }
@@ -4065,7 +4073,7 @@ fn worktree_repos(repo: &gix::Repository) -> Vec<(std::path::PathBuf, gix::Repos
 }
 
 /// Port of `replace_each_worktree_head_symref()` (`worktree.c`): repoint every
-/// *linked* worktree whose `HEAD` is symbolic to `old_full` at `new_name`,
+/// *other* worktree, the main one included, whose `HEAD` is symbolic to `old_full` at `new_name`,
 /// writing the rename's own message into that worktree's `logs/HEAD`. The
 /// current worktree's `HEAD` is the caller's business — it has the head-log
 /// pairing to get right — and a detached `HEAD` names no branch, so it is left
@@ -4080,14 +4088,27 @@ fn repoint_linked_worktree_heads(
     target: ObjectId,
     message: &str,
 ) {
+    // `get_worktrees()` lists the main worktree first (worktree.c:186-197), and
+    // from a linked worktree it is one of the others whose `HEAD` may follow.
+    let mut others: Vec<gix::Repository> = Vec::new();
+    let current = gix::path::realpath(repo.git_dir()).ok();
+    if current != gix::path::realpath(repo.common_dir()).ok() {
+        if let Ok(main) = repo.main_repo() {
+            others.push(main);
+        }
+    }
     for proxy in repo.worktrees().unwrap_or_default() {
-        // `wt->is_current`: the worktree this process is standing in.
-        if proxy.git_dir() == repo.git_dir() {
+        // `wt->is_current`: the worktree this process is standing in. The
+        // registration and the open repository can spell that directory
+        // differently, so both are resolved before comparing.
+        if gix::path::realpath(proxy.git_dir()).ok() == current {
             continue;
         }
-        let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
-            continue;
-        };
+        if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree() {
+            others.push(linked);
+        }
+    }
+    for linked in others {
         // `!worktrees[i]->is_detached && !strcmp(oldref, worktrees[i]->head_ref)`.
         let follows = linked
             .head_name()
@@ -4168,12 +4189,21 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
         return Ok(code);
     }
+    // `reject_rebase_or_bisect_branch(worktrees, oldref.buf)` (builtin/branch.c:661).
+    if let Some(msg) = super::worktree::rebase_or_bisect_refusal(repo, &old_full)? {
+        return fatal(msg);
+    }
     if crate::refstore::is_reftable(repo) {
         drop(old_ref);
         return reftable_copy_or_rename_branch(repo, &old, &new, &old_full, &new_full, recovery, false, true);
     }
     let target = old_ref.peel_to_id()?.detach();
 
+    // A `-C` onto a branch that already holds the source's tip changes no value.
+    let dest_holds_target = repo
+        .try_find_reference(new_full.as_str())?
+        .and_then(|mut r| r.peel_to_id().ok())
+        .is_some_and(|id| id.detach() == target);
     let new_name: FullName = new_full
         .as_str()
         .try_into()
@@ -4182,7 +4212,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // Copy the reflog file first so the update below appends its "copied" entry to
     // the carried-over history rather than starting a fresh log.
     if old_full != new_full {
-        let logs = repo.git_dir().join("logs");
+        let logs = repo.common_dir().join("logs");
         let from = logs.join(&old_full);
         let to = logs.join(&new_full);
         if from.exists() {
@@ -4215,10 +4245,11 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             deref: false,
         })
     })?;
-    // Copying a branch onto its own name changes no value, so the update above logged
-    // nothing; git's copy ends in the same unconditional `commit_ref_update()` a rename
-    // does and records the entry regardless.
-    if old_full == new_full {
+    // Copying a branch onto its own name, or with `-C` onto one already at the same
+    // commit, changes no value, so the update above logged nothing; git's copy ends in
+    // the same unconditional `commit_ref_update()` a rename does and records the entry
+    // regardless (refs/files-backend.c:1788-1804).
+    if old_full == new_full || dest_holds_target {
         log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
     } else {
         // ```c
@@ -4234,7 +4265,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // `-C` overwrote at the destination.
         rewrite_last_reflog_old_id(
             &repo
-                .git_dir()
+                .common_dir()
                 .join("logs")
                 .join(new_name.as_bstr().to_str_lossy().as_ref()),
             target,

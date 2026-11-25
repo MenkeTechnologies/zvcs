@@ -116,9 +116,10 @@ pub(super) enum SpecVerdict {
     /// *after* `add_files_to_cache()` has hashed and deposited the blob of every
     /// path it did match. The index is never written; those objects stay.
     Unknown(ExitCode),
-    /// The gitignore block was printed and `exit_status` became 1. Staging carries
+    /// `dir->ignored` holds these paths, so `add_files()` prints the gitignore
+    /// block ([`report_ignored`]) and `exit_status` becomes 1. Staging carries
     /// on; the 1 surfaces at `finish:` — see [`super::add::finish_code`].
-    Ignored,
+    Ignored(Vec<BString>),
 }
 
 /// The pathspec state both verbs feed to [`unmatched_pathspec_check`].
@@ -314,19 +315,25 @@ pub(super) fn unmatched_pathspec_check(
         return Ok(SpecVerdict::Unknown(ExitCode::from(FATAL)));
     }
     if !ignored.is_empty() {
-        eprintln!("The following paths are ignored by one of your .gitignore files:");
-        for p in &ignored {
-            eprintln!("{p}");
-        }
-        // `advise_if_enabled(ADVICE_ADD_IGNORED_FILE, …)` (builtin/add.c:351-352):
-        // the preamble and the path list are plain stderr writes, only the
-        // closing line is the hint — and its `Disable this message with …`
-        // trailer is `vadvise()`'s, printed only while the slot is unconfigured.
-        crate::advice::Advice::AddIgnoredFile
-            .advise_in(repo, "Use -f if you really want to add them.");
-        return Ok(SpecVerdict::Ignored);
+        // `add_files()` prints the block (builtin/add.c:355-362), and it runs only
+        // after `add_files_to_cache()` has reported every tracked path; the caller
+        // emits it at that point through [`report_ignored`].
+        return Ok(SpecVerdict::Ignored(ignored));
     }
     Ok(SpecVerdict::Ok)
+}
+
+/// The gitignore block `add_files()` opens with (builtin/add.c:355-362).
+pub(super) fn report_ignored(repo: &gix::Repository, ignored: &[BString]) {
+    eprintln!("The following paths are ignored by one of your .gitignore files:");
+    for p in ignored {
+        eprintln!("{p}");
+    }
+    // `advise_if_enabled(ADVICE_ADD_IGNORED_FILE, …)` (builtin/add.c:359-360):
+    // the preamble and the path list are plain stderr writes, only the
+    // closing line is the hint — and its `Disable this message with …`
+    // trailer is `vadvise()`'s, printed only while the slot is unconfigured.
+    crate::advice::Advice::AddIgnoredFile.advise_in(repo, "Use -f if you really want to add them.");
 }
 
 /// `dir->ignored` as `fill_directory()` leaves it for `cmd_add()`

@@ -711,6 +711,67 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         deferred: bool,
     }
     let mut staged: Vec<Staged> = Vec::new();
+    /// Something `add_files_to_cache()` or `add_files()` prints to stderr as it
+    /// reaches a path, besides what converting the path's content prints.
+    struct Note {
+        /// Reached by `add_files()` over the untracked `dir->entries`, which runs
+        /// after `add_files_to_cache()` is done with the tracked paths
+        /// (builtin/add.c:671-684).
+        untracked: bool,
+        /// The name the pass reaches it under: an embedded repository is a
+        /// directory entry and keeps its trailing `/`. Empty for the gitignore
+        /// block, which `add_files()` prints before its loop (builtin/add.c:355-362).
+        name: BString,
+        what: NoteKind,
+    }
+    enum NoteKind {
+        /// `check_embedded_repo()` (builtin/add.c:326-348), for a directory entry
+        /// `add_file_to_index()` took (builtin/add.c:371-377).
+        Embedded,
+        /// `add_file_to_index()` failed and printed this first `error:` line,
+        /// which `add_to_index()` follows with `unable to index file`
+        /// (read-cache.c:796-797).
+        Unindexable(String),
+        /// A `die()` inside a pass, whatever `--ignore-errors` says.
+        Die(String),
+        /// `add_files()`'s gitignore block.
+        Ignored(Vec<BString>),
+    }
+    impl Note {
+        fn key(&self) -> (bool, BString) {
+            (self.untracked, self.name.clone())
+        }
+        /// Print the note; `Some(128)` is the `die()` an unindexable path is
+        /// without `--ignore-errors`: `updating files failed` from
+        /// `update_callback()` (read-cache.c:4012-4014) for a tracked path,
+        /// `adding files failed` from `add_files()` (builtin/add.c:371-373) for
+        /// an untracked one.
+        fn print(&self, repo: &gix::Repository, ignore_errors: bool, advised: &mut bool) -> Option<ExitCode> {
+            match &self.what {
+                NoteKind::Embedded => {
+                    // "Drop trailing slash for aesthetics" (builtin/add.c:336-338).
+                    let name: BString = self.name.strip_suffix(b"/").unwrap_or(&self.name).into();
+                    warn_embedded_repo(&name, true, repo, advised);
+                }
+                NoteKind::Unindexable(first) => {
+                    eprintln!("error: {first}");
+                    eprintln!("error: unable to index file '{}'", self.name);
+                    if !ignore_errors {
+                        let verb = if self.untracked { "adding" } else { "updating" };
+                        eprintln!("fatal: {verb} files failed");
+                        return Some(ExitCode::from(128));
+                    }
+                }
+                NoteKind::Die(message) => {
+                    eprintln!("fatal: {message}");
+                    return Some(ExitCode::from(128));
+                }
+                NoteKind::Ignored(paths) => super::add_support::report_ignored(repo, paths),
+            }
+            None
+        }
+    }
+    let mut notes: Vec<Note> = Vec::new();
     /// `index_path()` for every path the walk kept — git's `add_files_to_cache()`
     /// and `add_files()` (builtin/add.c:588-599), which run only once the pathspec
     /// checks have passed (`:568`). The `convert_to_git()` pipeline runs here and
@@ -723,13 +784,45 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     /// over a large worktree holds one file in memory at a time. A conversion
     /// `core.safecrlf` or a `required` driver refuses is `die()`: the fatal is
     /// printed and `Some(128)` returned before the index is touched.
+    ///
+    /// `notes` are the other things the two passes print as they reach a path;
+    /// each is printed between the conversions of the paths around it, in the
+    /// order [`Note::key`] gives, so a `core.autocrlf` warning, an embedded
+    /// repository's warning and an unindexable path's errors come out as git
+    /// interleaves them. The first unindexable path is fatal unless
+    /// `ignore_errors`; that `die()` leaves the odb transaction unfinished
+    /// (builtin/add.c:667, :688), so when one is coming nothing is written.
+    /// A `die()` comes back as its exit code and the position it happened at.
     fn index_staged_blobs(
         repo: &gix::Repository,
         staged: &mut [Staged],
         filters: &mut super::convert_to_git::WorktreeFilter,
         write: bool,
-    ) -> Result<Option<ExitCode>> {
-        for s in staged.iter_mut().filter(|s| s.deferred) {
+        mut notes: Vec<Note>,
+        ignore_errors: bool,
+    ) -> Result<Option<(ExitCode, (bool, BString))>> {
+        notes.sort_by(|a, b| a.key().cmp(&b.key()));
+        let write = write
+            && !notes.iter().any(|n| match n.what {
+                NoteKind::Unindexable(_) => !ignore_errors,
+                NoteKind::Die(_) => true,
+                _ => false,
+            });
+        let mut order: Vec<usize> = (0..staged.len()).filter(|&i| staged[i].deferred).collect();
+        order.sort_by(|&a, &b| {
+            let key = |s: &Staged| (!s.was_tracked, s.path.clone());
+            key(&staged[a]).cmp(&key(&staged[b]))
+        });
+        let mut notes = notes.into_iter().peekable();
+        let mut advised = false;
+        for i in order {
+            let s = &mut staged[i];
+            let here = (!s.was_tracked, s.path.clone());
+            while let Some(note) = notes.next_if(|n| n.key() < here) {
+                if let Some(code) = note.print(repo, ignore_errors, &mut advised) {
+                    return Ok(Some((code, note.key())));
+                }
+            }
             let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
             // Only the id is taken from this read. The mode was settled by
             // `add_to_index()`'s own block before a byte was read
@@ -755,7 +848,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     Ok(converted) => converted,
                     Err(err) => {
                         eprintln!("fatal: {err}");
-                        return Ok(Some(ExitCode::from(128)));
+                        return Ok(Some((ExitCode::from(128), here)));
                     }
                 }
             };
@@ -766,30 +859,60 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             };
             s.deferred = false;
         }
+        for note in notes {
+            if let Some(code) = note.print(repo, ignore_errors, &mut advised) {
+                return Ok(Some((code, note.key())));
+            }
+        }
         Ok(None)
     }
     /// The `-n`/`-v` report, in the order git emits it: first the matched tracked
     /// entries in index order (a removed file → `remove`, a changed file — or any
     /// matched file under `-N` — → `add`, an unchanged file omitted), then the
     /// brand-new untracked files in walk order → `add`.
+    ///
+    /// Each line carries the `(untracked, name)` position [`Note::key`] uses, so a
+    /// run that dies part-way can print only the lines git printed before it.
     fn report_lines(
         index: &gix::index::File,
         staged: &[Staged],
         deletions: &[BString],
         renormalize: bool,
-    ) -> Vec<String> {
+    ) -> Vec<((bool, BString), String)> {
         let mut lines = Vec::new();
         let staged_tracked: std::collections::HashMap<&BString, &Staged> =
             staged.iter().filter(|s| s.was_tracked).map(|s| (&s.path, s)).collect();
         let deletion_lookup: HashSet<&BString> = deletions.iter().collect();
         let backing = index.path_backing();
+        let mut last_unmerged: Option<&[u8]> = None;
         for e in index.entries() {
-            if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
+            if e.stage() != Stage::Unconflicted {
+                // `run_diff_files()` hands an unmerged path to `update_callback()`
+                // once, as `DIFF_STATUS_UNMERGED`, and `fix_unmerged_status()` turns
+                // it into a removal when the file is gone and a modification
+                // otherwise (read-cache.c:3905-3924). The `alias` `add_to_index()`
+                // finds is a stage > 0 entry, so `was_same` is false and the
+                // `add '<path>'` line is unconditional (read-cache.c:807-819).
+                // `renormalize_tracked_files()` skips unmerged entries outright.
+                let path = e.path_in(backing);
+                if renormalize || last_unmerged == Some(path.as_ref()) {
+                    continue;
+                }
+                last_unmerged = Some(path.as_ref());
+                let path = path.to_owned();
+                if deletion_lookup.contains(&path) {
+                    lines.push(((false, path.clone()), format!("remove '{path}'")));
+                } else if staged_tracked.contains_key(&path) {
+                    lines.push(((false, path.clone()), format!("add '{path}'")));
+                }
+                continue;
+            }
+            if e.mode == Mode::COMMIT {
                 continue;
             }
             let path = e.path_in(backing).to_owned();
             if deletion_lookup.contains(&path) {
-                lines.push(format!("remove '{path}'"));
+                lines.push(((false, path.clone()), format!("remove '{path}'")));
             } else if let Some(s) = staged_tracked.get(&path) {
                 // A tracked path is reported only when the worktree really differs
                 // from its index entry: `add_files_to_cache()` drives the report from
@@ -804,7 +927,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 // `ADD_CACHE_RENORMALIZE` — so `was_same` is never true and the
                 // `add '<path>'` line is unconditional.
                 if renormalize || s.id != e.id || s.mode != e.mode {
-                    lines.push(format!("add '{path}'"));
+                    lines.push(((false, path.clone()), format!("add '{path}'")));
                 }
             }
         }
@@ -824,7 +947,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             .collect();
         fresh.sort();
         for path in fresh {
-            lines.push(format!("add '{path}'"));
+            lines.push(((true, BString::from(path.as_str())), format!("add '{path}'")));
         }
         lines
     }
@@ -898,9 +1021,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // Embedded repositories whose HEAD is unborn: git cannot record a gitlink for
     // them and reports each one before failing the whole add.
     let mut headless_repos: Vec<BString> = Vec::new();
-    // `check_embedded_repo`'s `adviced_on_embedded_repo`: the warning is printed
-    // per repository, the advice at most once per invocation.
-    let mut embedded_advised = false;
+    // `check_embedded_repo()` (builtin/add.c:326-348) for an embedded repository
+    // `add_file_to_index()` took, printed in `add_files()` order by
+    // [`index_staged_blobs`]; `--no-warn-embedded-repo` silences it.
+    let note_embedded = |notes: &mut Vec<Note>, path: &BString| {
+        if warn_embedded {
+            let mut name = path.clone();
+            name.push(b'/');
+            notes.push(Note { untracked: true, name, what: NoteKind::Embedded });
+        }
+    };
     // `core.bigFileThreshold` is read the first time a work-tree file is hashed,
     // not when the configuration is parsed; see
     // [`crate::config::big_file_threshold_refusal`].
@@ -956,7 +1086,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 // gives every intent-to-add entry. `check_embedded_repo()` still
                 // warns first (builtin/add.c:336-340).
                 if intent_to_add {
-                    warn_embedded_repo(&path, warn_embedded, &repo, &mut embedded_advised);
+                    note_embedded(&mut notes, &path);
                     indexed_any = true;
                     staged.push(Staged {
                         path,
@@ -978,7 +1108,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     headless_repos.push(path);
                     continue;
                 };
-                warn_embedded_repo(&path, warn_embedded, &repo, &mut embedded_advised);
+                note_embedded(&mut notes, &path);
                 let stat = gix::index::fs::Metadata::from_path_no_follow(&abs)
                     .ok()
                     .and_then(|md| Stat::from_fs(&md).ok())
@@ -1027,6 +1157,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             if !already_tracked {
                 sparse_skipped.insert(path);
             }
+            continue;
+        }
+        // `renormalize_tracked_files()` leaves unmerged paths alone: "do not touch
+        // unmerged paths" (builtin/add.c:87-88).
+        if renormalize && already_tracked && !tracked.contains_key(&path) {
             continue;
         }
         let Some(abs) = repo.workdir_path(&path) else {
@@ -1286,18 +1421,47 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // Suppressed by `--no-all`/`--ignore-removal`, which `-u` overrides: `update_callback()` only
     // honours `ADD_CACHE_IGNORE_REMOVAL` for the paths `-u` is not after.
     let mut deletions: Vec<BString> = Vec::new();
-    if (!no_removal || update_only) && !add_resolved {
+    let removal = !no_removal || update_only;
+    if !add_resolved {
         let backing = index.path_backing();
+        let mut last_unmerged: Option<BString> = None;
         for e in index.entries() {
-            if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
-                continue; // leave conflicted stages and submodule gitlinks alone
+            let path = e.path_in(backing);
+            if e.stage() != Stage::Unconflicted {
+                // An unmerged path reaches `update_callback()` once, through the
+                // same sparse guard, and `fix_unmerged_status()` (read-cache.c:3905-3924)
+                // makes a missing file a removal of every stage, or, under
+                // `ADD_CACHE_IGNORE_REMOVAL`, a modification whose
+                // `add_file_to_index()` dies on the `lstat()` (read-cache.c:823-829).
+                // `--refresh` and `--renormalize` never call `add_files_to_cache()`.
+                if refresh || renormalize || last_unmerged.as_ref().is_some_and(|p| p == path) {
+                    continue;
+                }
+                let owned = path.to_owned();
+                last_unmerged = Some(owned.clone());
+                if staged_set.contains(&owned) || outside_sparse(&owned) || !pathspec.is_included(path, Some(false)) {
+                    continue;
+                }
+                let gone = match repo.workdir_path(path) {
+                    Some(p) => std::fs::symlink_metadata(p).is_err(),
+                    None => true,
+                };
+                if gone && removal {
+                    deletions.push(owned);
+                } else if gone {
+                    let what = NoteKind::Die(format!("unable to stat '{owned}': No such file or directory"));
+                    notes.push(Note { untracked: false, name: owned, what });
+                }
+                continue;
+            }
+            if !removal || e.mode == Mode::COMMIT {
+                continue; // leave submodule gitlinks alone
             }
             // `PS_IGNORE_SKIP_WORKTREE`: an entry the sparse-checkout definition keeps
             // out of the worktree is absent by design, never a deletion.
             if e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
                 continue;
             }
-            let path = e.path_in(backing);
             let owned = path.to_owned();
             if staged_set.contains(&owned) {
                 continue;
@@ -1397,6 +1561,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // *inside* the odb transaction, so everything else the run matched is still
     // staged and the 1 only surfaces at `finish:`. Only a fatal stops the run.
     let mut gitignored = false;
+    let mut gitignored_paths: Option<Vec<BString>> = None;
     match super::add_support::unmatched_pathspec_check(&repo, &index, &check, &hidden_seen)? {
         super::add_support::SpecVerdict::Fatal(code) => return Ok(code),
         // `report_path_error()` exits from inside the odb transaction, so everything
@@ -1404,11 +1569,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // and the blobs it hashed are in the store. Only the index write, which
         // `finish:` owns, is skipped.
         super::add_support::SpecVerdict::Unknown(code) => {
-            if let Some(code) = index_staged_blobs(&repo, &mut staged, &mut filters, write_content)? {
+            let none = Vec::new();
+            if let Some((code, _)) =
+                index_staged_blobs(&repo, &mut staged, &mut filters, write_content, none, ignore_errors)?
+            {
                 return Ok(code);
             }
             if dry_run || verbose {
-                for line in report_lines(&index, &staged, &deletions, renormalize) {
+                for (_, line) in report_lines(&index, &staged, &deletions, renormalize) {
                     println!("{line}");
                 }
             }
@@ -1417,7 +1585,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             }
             return Ok(code);
         }
-        super::add_support::SpecVerdict::Ignored => gitignored = true,
+        super::add_support::SpecVerdict::Ignored(paths) => {
+            gitignored = true;
+            gitignored_paths = Some(paths);
+        }
         super::add_support::SpecVerdict::Ok => {}
     }
 
@@ -1550,9 +1721,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     // `--ignore-errors`: a real add reports the paths it could not index and, if
-    // any occurred without `--ignore-errors`, aborts before touching the index.
-    // An embedded repository with an unborn HEAD is one of those paths; git names
-    // it with the trailing slash the directory walk carries.
+    // any occurred without `--ignore-errors`, dies at the first of them before
+    // touching the index. An embedded repository with an unborn HEAD is one of
+    // those paths; git names it with the trailing slash the directory walk carries.
+    // The reports go out with the conversions in [`index_staged_blobs`]: a tracked
+    // path from `add_files_to_cache()`, ahead of `add_files()` and its gitignore
+    // block, and an untracked one in `dir->entries` order.
     //
     // `--renormalize` never gets here: `cmd_add()` runs `renormalize_tracked_files()`
     // *instead of* `add_files_to_cache()` and skips `add_files()` entirely
@@ -1565,26 +1739,20 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // reports the same two `error:` lines and dies the same way. Verified against git
     // 2.55.0: `git add -n --ignore-errors -A` over an unreadable tracked file prints
     // both lines and exits 1.
-    if had_errors {
-        for p in &headless_repos {
-            eprintln!("error: '{p}/' does not have a commit checked out");
-            eprintln!("error: unable to index file '{p}/'");
+    if !renormalize {
+        for p in headless_repos.iter() {
+            let mut name = p.clone();
+            name.push(b'/');
+            let first = format!("'{name}' does not have a commit checked out");
+            notes.push(Note { untracked: true, name, what: NoteKind::Unindexable(first) });
         }
-        for (p, msg, _) in &read_errors {
-            eprintln!("error: open(\"{p}\"): {msg}");
-            eprintln!("error: unable to index file '{p}'");
+        for (p, msg, tracked) in read_errors.iter() {
+            let first = format!("open(\"{p}\"): {msg}");
+            notes.push(Note { untracked: !tracked, name: p.clone(), what: NoteKind::Unindexable(first) });
         }
-        if !ignore_errors {
-            // `add_files_to_cache()` runs first and dies on the first tracked path it
-            // could not index, so a tracked failure always outranks an untracked one.
-            let verb = if read_errors.iter().any(|(_, _, tracked)| *tracked) {
-                "updating"
-            } else {
-                "adding"
-            };
-            eprintln!("fatal: {verb} files failed");
-            return Ok(ExitCode::from(128));
-        }
+    }
+    if let Some(paths) = gitignored_paths {
+        notes.push(Note { untracked: true, name: BString::default(), what: NoteKind::Ignored(paths) });
     }
 
     // --- object writes: everything git does inside its odb transaction ------
@@ -1597,7 +1765,19 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     //
     // `report_path_error()` is the one exit that is *not* a die and does leave them
     // behind — it has its own call above, on the `Unknown` verdict.
-    if let Some(code) = index_staged_blobs(&repo, &mut staged, &mut filters, write_content)? {
+    if let Some((code, at)) =
+        index_staged_blobs(&repo, &mut staged, &mut filters, write_content, notes, ignore_errors)?
+    {
+        // `add_to_index()` prints each `-v`/`-n` line as it goes (read-cache.c:818-819),
+        // so the paths the passes finished before the `die()` are already reported.
+        if (dry_run || verbose) && !add_resolved {
+            for (_, line) in report_lines(&index, &staged, &deletions, renormalize)
+                .into_iter()
+                .filter(|(key, _)| *key < at)
+            {
+                println!("{line}");
+            }
+        }
         return Ok(code);
     }
 
@@ -1619,7 +1799,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let report: Vec<String> = match dry_run || verbose {
         false => Vec::new(),
         true if add_resolved => resolved_report,
-        true => report_lines(&index, &staged, &deletions, renormalize),
+        true => report_lines(&index, &staged, &deletions, renormalize).into_iter().map(|(_, line)| line).collect(),
     };
 
     // `if (chmod_arg && pathspec.nr)` (builtin/add.c:601): the mode override runs
@@ -1703,7 +1883,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // Record intent-to-add: an empty-blob, zero-stat entry with the ITA flag,
         // for untracked matched files only. Tracked paths are left untouched.
         // Deletions are still applied (git stages them for `-N <pathspec>`).
-        let ita: Vec<&Staged> = staged.iter().filter(|s| !s.was_tracked).collect();
+        // An unmerged path has no stage-0 entry for `ADD_CACHE_NEW_ONLY` to keep, so
+        // its stages give way to the intent-to-add entry (read-cache.c:1277-1297).
+        let ita: Vec<&Staged> = staged.iter().filter(|s| !s.was_tracked || !tracked.contains_key(&s.path)).collect();
         let empty_id = if ita.is_empty() {
             repo.object_hash().null()
         } else {

@@ -3730,6 +3730,59 @@ pub(super) struct SharedHead {
     pub(super) head_unborn: bool,
 }
 
+/// The branch a worktree's git dir records as being rebased and the one it
+/// records a bisect as started from: `state.branch` after
+/// `wt_status_check_rebase()` (wt-status.c:1847-1875) and `state.bisecting_from`
+/// after `wt_status_check_bisect()` (:1877-1891). `rebase-apply` with `applying`
+/// is an `am`, which records no branch; `rebase-merge` is a rebase either way.
+/// `BISECT_LOG` marks a bisect and `BISECT_START` names what it started from.
+fn rebased_and_bisected(wt_gitdir: &Path) -> (Option<String>, Option<String>) {
+    let rebase_head_name = if wt_gitdir.join("rebase-apply").is_dir() {
+        (!wt_gitdir.join("rebase-apply/applying").exists()).then(|| wt_gitdir.join("rebase-apply/head-name"))
+    } else if wt_gitdir.join("rebase-merge").is_dir() {
+        Some(wt_gitdir.join("rebase-merge/head-name"))
+    } else {
+        None
+    };
+    let rebased = rebase_head_name.and_then(|p| state_branch(&p));
+    let bisected = wt_gitdir
+        .join("BISECT_LOG")
+        .exists()
+        .then(|| state_branch(&wt_gitdir.join("BISECT_START")))
+        .flatten();
+    (rebased, bisected)
+}
+
+/// `reject_rebase_or_bisect_branch()` (builtin/branch.c:555-573), which
+/// `copy_or_rename_branch()` runs once both names are validated (:661): the
+/// `die()` message for the first detached worktree in which `target` is being
+/// rebased (`is_worktree_being_rebased()`, worktree.c:462-477) or bisected
+/// (`is_worktree_being_bisected()`, :479-492).
+pub(super) fn rebase_or_bisect_refusal(repo: &gix::Repository, target: &str) -> Result<Option<String>> {
+    let Some(branch) = target.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    let common = gix::path::realpath(repo.common_dir())?;
+    for wt in collect(repo, u64::MAX)? {
+        if !matches!(wt.head, HeadInfo::Detached(_)) {
+            continue;
+        }
+        let wt_gitdir = match &wt.id {
+            Some(id) => common.join("worktrees").join(id),
+            None => common.clone(),
+        };
+        let (rebased, bisected) = rebased_and_bisected(&wt_gitdir);
+        let path = wt.path.display();
+        if rebased.as_deref() == Some(branch) {
+            return Ok(Some(format!("branch {target} is being rebased at {path}")));
+        }
+        if bisected.as_deref() == Some(branch) {
+            return Ok(Some(format!("branch {target} is being bisected at {path}")));
+        }
+    }
+    Ok(None)
+}
+
 /// `find_shared_symref(get_worktrees(), "HEAD", target)` (worktree.c:500-537):
 /// the first non-bare worktree whose `HEAD` is a symref to `target`, or whose
 /// detached `HEAD` is a rebase of `target` (`is_worktree_being_rebased()`,
@@ -3749,24 +3802,7 @@ pub(super) fn find_shared_head(repo: &gix::Repository, target: &str) -> Option<S
         let shared = match &wt.head {
             HeadInfo::Branch { name, .. } => name.as_bstr() == target.as_bytes(),
             HeadInfo::Detached(_) => {
-                // `wt_status_check_rebase()`: `rebase-apply` with `applying` is an
-                // `am`, which records no branch; `rebase-merge` is a rebase either
-                // way. `wt_status_check_bisect()`: `BISECT_LOG` marks a bisect and
-                // `BISECT_START` names what it started from.
-                let rebase_head_name = if wt_gitdir.join("rebase-apply").is_dir() {
-                    (!wt_gitdir.join("rebase-apply/applying").exists())
-                        .then(|| wt_gitdir.join("rebase-apply/head-name"))
-                } else if wt_gitdir.join("rebase-merge").is_dir() {
-                    Some(wt_gitdir.join("rebase-merge/head-name"))
-                } else {
-                    None
-                };
-                let rebased = rebase_head_name.and_then(|p| state_branch(&p));
-                let bisected = wt_gitdir
-                    .join("BISECT_LOG")
-                    .exists()
-                    .then(|| state_branch(&wt_gitdir.join("BISECT_START")))
-                    .flatten();
+                let (rebased, bisected) = rebased_and_bisected(&wt_gitdir);
                 branch.is_some() && (rebased.as_deref() == branch || bisected.as_deref() == branch)
             }
             HeadInfo::Unknown(_) => false,

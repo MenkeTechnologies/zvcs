@@ -142,8 +142,9 @@ struct Row {
     symref: Option<String>,
     /// Whether this is the synthetic `^{}` row (git's "magic fake tag ref").
     peel: bool,
-    /// Creator/committer/author/tagger seconds, filled in only when a date key
-    /// is being sorted on. Mirrors `get_ref_atom_value`'s lazy population.
+    /// The seconds [`compare_rows`] uses for every date key. The listing never
+    /// sets it: its dates are read from the object during the sort, as
+    /// `get_ref_atom_value()` reads them (see [`sort_rows`]).
     date: i64,
 }
 
@@ -152,9 +153,21 @@ struct Row {
 enum Atom {
     Refname,
     Objectname,
-    /// `creatordate`, plus the type-specific dates that resolve identically for
-    /// the commit/tag objects a ref can point at.
+    /// `creatordate`, `committerdate`, `authordate` or `taggerdate`; which one is
+    /// [`SortKey::date`].
     Date,
+}
+
+/// The date atoms, which `grab_values()` fills per object type (ref-filter.c):
+/// a commit has an author and a committer, a tag a tagger, and `creatordate`
+/// is whichever of committer and tagger the object has. An atom the object
+/// has no person for keeps the value 0.
+#[derive(Clone, Copy, PartialEq)]
+enum DateField {
+    Creator,
+    Committer,
+    Author,
+    Tagger,
 }
 
 /// One parsed `--sort` key: `[-][version:|v:]<atom>`.
@@ -162,6 +175,8 @@ struct SortKey {
     reverse: bool,
     version: bool,
     atom: Atom,
+    /// The date atom, when `atom` is [`Atom::Date`].
+    date: DateField,
 }
 
 /// `git ls-remote` — list references available in a remote repository.
@@ -431,14 +446,8 @@ fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Reposit
             }
         };
         let prereleases = match repo {
-            Some(repo) => {
-                if let Err(msg) = resolve_dates(repo, &keys, &mut rows) {
-                    eprintln!("fatal: {msg}");
-                    return ExitCode::from(128);
-                }
-                // git seeds `versioncmp`'s prerelease list from config once, lazily.
-                Prereleases::new(repo)
-            }
+            // git seeds `versioncmp`'s prerelease list from config once, lazily.
+            Some(repo) => Prereleases::new(repo),
             None => {
                 // `parse_ref_filter_atom()`: "not a git repository, but the field
                 // '%.*s' requires access to object data" for the first such key
@@ -460,7 +469,10 @@ fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Reposit
                 Prereleases::none()
             }
         };
-        rows.sort_by(|a, b| compare_rows(&keys, a, b, &prereleases));
+        if let Err(msg) = sort_rows(repo, &keys, &mut rows, &prereleases) {
+            eprintln!("fatal: {msg}");
+            return ExitCode::from(128);
+        }
     }
 
     let mut out = String::new();
@@ -684,58 +696,114 @@ fn parse_sort_keys(specs: &[String]) -> Result<Vec<SortKey>, String> {
         if arg.is_empty() {
             return Err(format!("malformed field name: {arg}"));
         }
-        let atom = match arg {
-            "refname" => Atom::Refname,
-            "objectname" => Atom::Objectname,
-            "creatordate" | "committerdate" | "authordate" | "taggerdate" => Atom::Date,
+        let (atom, date) = match arg {
+            "refname" => (Atom::Refname, DateField::Creator),
+            "objectname" => (Atom::Objectname, DateField::Creator),
+            "creatordate" => (Atom::Date, DateField::Creator),
+            "committerdate" => (Atom::Date, DateField::Committer),
+            "authordate" => (Atom::Date, DateField::Author),
+            "taggerdate" => (Atom::Date, DateField::Tagger),
             other => return Err(format!("unknown field name: {other}")),
         };
         keys.push(SortKey {
             reverse,
             version,
             atom,
+            date,
         });
     }
     Ok(keys)
 }
 
-/// Fill in `Row::date` for every row when a date key is in play.
-///
-/// git populates the atom lazily inside the comparison and dies with
-/// `missing object <oid> for <ref>` when the object is not in the local odb —
-/// which for `ls-remote` is anything the local repository has not fetched. With
-/// a single row no comparison ever runs, so no lookup happens and no such
-/// failure is possible; that case is skipped here for the same reason.
-fn resolve_dates(repo: &gix::Repository, keys: &[SortKey], rows: &mut [Row]) -> Result<(), String> {
-    if rows.len() < 2 || !keys.iter().any(|k| k.atom == Atom::Date) {
-        return Ok(());
+/// The dates of one object, indexed by [`DateField`].
+#[derive(Clone, Copy, Default)]
+struct Dates([i64; 4]);
+
+impl Dates {
+    fn get(&self, field: DateField) -> i64 {
+        self.0[field as usize]
     }
-    for row in rows.iter_mut() {
-        let object = repo
-            .find_object(row.id)
-            .map_err(|_| format!("missing object {} for {}", row.id.to_hex(), row.name))?;
-        let kind = object.kind;
-        row.date = match kind {
-            gix::object::Kind::Commit => object
-                .try_into_commit()
-                .ok()
-                .and_then(|c| c.committer().ok().map(|s| s.seconds()))
-                .unwrap_or_default(),
-            gix::object::Kind::Tag => object
-                .try_into_tag()
-                .ok()
-                .and_then(|t| t.tagger().ok().flatten().map(|s| s.seconds()))
-                .unwrap_or_default(),
-            // Trees and blobs have no date; git's atom value stays 0.
-            _ => 0,
-        };
+}
+
+/// `populate_value()` for the date atoms of `row`: its object read from the
+/// local odb, or git's `missing object <oid> for <ref>` (ref-filter.c
+/// `get_object()`), which for `ls-remote` is anything not fetched yet.
+fn row_dates(repo: &gix::Repository, row: &Row) -> Result<Dates, String> {
+    let object = repo
+        .find_object(row.id)
+        .map_err(|_| format!("missing object {} for {}", row.id.to_hex(), row.name))?;
+    let mut dates = Dates::default();
+    match object.kind {
+        gix::object::Kind::Commit => {
+            if let Ok(commit) = object.try_into_commit() {
+                if let Ok(committer) = commit.committer() {
+                    dates.0[DateField::Committer as usize] = committer.seconds();
+                    dates.0[DateField::Creator as usize] = committer.seconds();
+                }
+                if let Ok(author) = commit.author() {
+                    dates.0[DateField::Author as usize] = author.seconds();
+                }
+            }
+        }
+        gix::object::Kind::Tag => {
+            let tagged = object.try_into_tag().ok();
+            if let Some(seconds) = tagged.as_ref().and_then(|t| t.tagger().ok().flatten()).map(|s| s.seconds()) {
+                dates.0[DateField::Tagger as usize] = seconds;
+                dates.0[DateField::Creator as usize] = seconds;
+            }
+        }
+        // Trees and blobs have no date; git's atom value stays 0.
+        _ => {}
     }
+    Ok(dates)
+}
+
+/// `ref_array_sort()`: `QSORT_S` with `compare_refs()`. A date key reads each
+/// row's object the first time a comparison reaches the row and dies on the
+/// first one that is missing (`cmp_ref_sorting()`, ref-filter.c:3548-3551), so
+/// the merge sort's comparison order decides which ref the error names; with a
+/// single row nothing is compared and nothing is read.
+fn sort_rows(
+    repo: Option<&gix::Repository>,
+    keys: &[SortKey],
+    rows: &mut Vec<Row>,
+    pre: &Prereleases<'_>,
+) -> Result<(), String> {
+    let dated = keys.iter().any(|k| k.atom == Atom::Date);
+    let mut dates: Vec<Option<Dates>> = vec![None; rows.len()];
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    refsort::git_qsort_s(&mut order, &mut |&a: &usize, &b: &usize| -> Result<Ordering, String> {
+        if let (true, Some(repo)) = (dated, repo) {
+            for i in [a, b] {
+                if dates[i].is_none() {
+                    dates[i] = Some(row_dates(repo, &rows[i])?);
+                }
+            }
+        }
+        let (da, db) = (dates[a].unwrap_or_default(), dates[b].unwrap_or_default());
+        Ok(compare_rows_with(keys, &rows[a], &rows[b], pre, &|f| da.get(f), &|f| db.get(f)))
+    })?;
+    let mut taken: Vec<Option<Row>> = rows.drain(..).map(Some).collect();
+    rows.extend(order.iter().map(|&i| taken[i].take().expect("each row once")));
     Ok(())
 }
 
 /// git's `compare_refs`: walk the keys, then fall back to an ascending refname
-/// `strcmp` that `-` never reverses.
+/// `strcmp` that `-` never reverses. Every date key reads [`Row::date`].
 fn compare_rows(keys: &[SortKey], a: &Row, b: &Row, pre: &Prereleases<'_>) -> Ordering {
+    compare_rows_with(keys, a, b, pre, &|_| a.date, &|_| b.date)
+}
+
+/// [`compare_rows`] with the date atoms of `a` and `b` read from `date_a` and
+/// `date_b`.
+fn compare_rows_with(
+    keys: &[SortKey],
+    a: &Row,
+    b: &Row,
+    pre: &Prereleases<'_>,
+    date_a: &dyn Fn(DateField) -> i64,
+    date_b: &dyn Fn(DateField) -> i64,
+) -> Ordering {
     for key in keys {
         let cmp = match (key.version, key.atom) {
             (true, Atom::Refname) => refsort::versioncmp(a.name.as_bytes(), b.name.as_bytes(), pre),
@@ -748,7 +816,7 @@ fn compare_rows(keys: &[SortKey], a: &Row, b: &Row, pre: &Prereleases<'_>) -> Or
             // numeric compare. git runs versioncmp over the atom's *formatted*
             // date string there, which this port does not reproduce; the
             // combination is undocumented and not exercised by the harness.
-            (_, Atom::Date) => a.date.cmp(&b.date),
+            (_, Atom::Date) => date_a(key.date).cmp(&date_b(key.date)),
             (false, Atom::Refname) => a.name.as_bytes().cmp(b.name.as_bytes()),
             (false, Atom::Objectname) => a.id.as_bytes().cmp(b.id.as_bytes()),
         };

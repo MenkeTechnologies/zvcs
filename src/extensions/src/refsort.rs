@@ -406,9 +406,61 @@ pub fn versioncmp(s1: &[u8], s2: &[u8], prereleases: &Prereleases<'_>) -> Orderi
     }
 }
 
+/// `git_qsort_s()` (compat/qsort_s.c), the sort behind `ref_array_sort()`'s
+/// `QSORT_S`: neither `config.mak.uname` nor the Makefile defines
+/// `HAVE_ISO_QSORT_S`, so every supported platform gets this merge sort. It is
+/// ported rather than replaced by `slice::sort_by` because `cmp_ref_sorting()`
+/// fills a ref's atoms the first time a comparison reaches it and dies on a
+/// failure (ref-filter.c:3548-3551), so *which* ref fails first is decided by
+/// the order `msort_with_tmp()` compares in. The first `Err` stops the sort.
+pub fn git_qsort_s<T: Clone, E>(
+    items: &mut [T],
+    cmp: &mut impl FnMut(&T, &T) -> Result<Ordering, E>,
+) -> Result<(), E> {
+    let n = items.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    let n1 = n / 2;
+    git_qsort_s(&mut items[..n1], cmp)?;
+    git_qsort_s(&mut items[n1..], cmp)?;
+    // The merge: the left element wins ties (`cmp(b1, b2) <= 0`), which keeps
+    // the sort stable.
+    let mut merged: Vec<T> = Vec::with_capacity(n);
+    let (mut i1, mut i2) = (0, n1);
+    while i1 < n1 && i2 < n {
+        if cmp(&items[i1], &items[i2])? != Ordering::Greater {
+            merged.push(items[i1].clone());
+            i1 += 1;
+        } else {
+            merged.push(items[i2].clone());
+            i2 += 1;
+        }
+    }
+    merged.extend_from_slice(&items[i1..n1]);
+    let done = merged.len();
+    items[..done].clone_from_slice(&merged);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `msort_with_tmp()` recurses left, then right, then merges, so on three
+    /// elements the first comparison is `b[1]` against `b[2]`.
+    #[test]
+    fn git_qsort_s_compares_in_msort_order() {
+        let mut items = vec![3, 1, 2];
+        let mut seen = Vec::new();
+        git_qsort_s(&mut items, &mut |a: &i32, b: &i32| -> Result<Ordering, ()> {
+            seen.push((*a, *b));
+            Ok(a.cmp(b))
+        })
+        .unwrap();
+        assert_eq!(items, vec![1, 2, 3]);
+        assert_eq!(seen[0], (1, 2));
+    }
 
     /// Ordering of the names stock git 2.55 produced for
     /// `git tag --sort=version:refname` over this exact set, which is the

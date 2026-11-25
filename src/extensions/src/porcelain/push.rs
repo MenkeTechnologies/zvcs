@@ -774,7 +774,7 @@ git push <groupname>\n"
     // `--delete <ref>` is `:<ref>` in git's refspec list — an empty source,
     // which `match_explicit_lhs()` accepts — so there is nothing to check.
     if !f.delete && !check_push_refs(&repo, &specs) {
-        eprintln!("error: failed to push some refs to '{transport_url}'");
+        PushFailure::without_rejections().report(&transport_url);
         return Ok(ExitCode::from(1));
     }
 
@@ -810,7 +810,7 @@ git push <groupname>\n"
                         .map(|u| u.to_bstring().to_string())
                         .unwrap_or_else(|| remote_name.to_string());
                     eprintln!("error: {line}");
-                    eprintln!("error: failed to push some refs to '{url}'");
+                    PushFailure::without_rejections().report(&url);
                     return Ok(ExitCode::from(1));
                 }
                 None => return Err(e),
@@ -1006,7 +1006,7 @@ git push <groupname>\n"
                 // `transport_push()` returns -1, and `push_with_options()` closes
                 // with the same summary line every other push failure ends on:
                 // `error(_("failed to push some refs to '%s'"), transport->url)`.
-                eprintln!("error: failed to push some refs to '{transport_url}'");
+                PushFailure::without_rejections().report(&transport_url);
                 return Ok(Some(ExitCode::from(1)));
             }
         }
@@ -1088,7 +1088,7 @@ git push <groupname>\n"
                 }
             }
         }
-        eprintln!("error: failed to push some refs to '{transport_url}'");
+        PushFailure::without_rejections().report(&transport_url);
         return Ok(ExitCode::from(1));
     }
     // `git_transport_push()` ORs in `finish_connect()` (transport.c:957), and the receive-pack
@@ -1096,7 +1096,7 @@ git push <groupname>\n"
     // the failure (builtin/push.c:393-394). With no refs there is no status block, no
     // upstream and no tracking ref.
     if outcome.no_refs {
-        eprintln!("error: failed to push some refs to '{transport_url}'");
+        PushFailure::without_rejections().report(&transport_url);
         return Ok(ExitCode::from(1));
     }
 
@@ -1123,7 +1123,7 @@ git push <groupname>\n"
         Some(true) => (
             ExitCode::from(1),
             false,
-            Some(failure.unwrap_or_else(|| PushFailure::without_rejections(f.porcelain))),
+            Some(failure.unwrap_or_else(PushFailure::without_rejections)),
         ),
         Some(false) => (ExitCode::from(1), trailer, failure),
         None => (code, trailer, failure),
@@ -2787,12 +2787,10 @@ struct PushFailure<'a> {
 }
 
 impl PushFailure<'_> {
-    /// The failure of a push no ref was rejected in, colored as [`report`]'s and [`report_porcelain`]'s are.
-    fn without_rejections(porcelain: bool) -> Self {
-        let color = match porcelain {
-            true => String::new(),
-            false => super::color::PushColors::resolve(crate::setup::discover().ok().as_ref()).error,
-        };
+    /// The failure of a push no ref was rejected in. `push_with_options()` colors the line with
+    /// `push_get_color(PUSH_COLOR_ERROR)` whatever the output format (builtin/push.c:395-398).
+    fn without_rejections() -> Self {
+        let color = super::color::PushColors::resolve(crate::setup::discover().ok().as_ref()).error;
         PushFailure { rejected: Vec::new(), color }
     }
 
@@ -2992,8 +2990,10 @@ fn report_porcelain<'a>(
         // `push_with_options()` reports the failure whatever the output format is: the
         // machine-readable block is on stdout, and the failure line stays on stderr
         // next to the advice (builtin/push.c:392-409). `Done` still follows the
-        // tracking refs (transport.c:1560-1561).
-        let failure = PushFailure { rejected, color: String::new() };
+        // tracking refs (transport.c:1560-1561). The line takes `color.push`'s error color
+        // there as well (builtin/push.c:395-398).
+        let color = super::color::PushColors::resolve(Some(repo)).error;
+        let failure = PushFailure { rejected, color };
         return Ok((ExitCode::from(1), done, Some(failure)));
     }
     Ok((ExitCode::SUCCESS, done, None))

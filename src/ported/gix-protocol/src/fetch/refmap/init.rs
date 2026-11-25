@@ -136,18 +136,20 @@ impl RefMap {
                     }))
                     .validated()?;
                 for m in res.mappings {
-                    // Without a destination there is nothing to update, and git suppresses the duplicate
-                    // `FETCH_HEAD` row such a mapping would otherwise produce.
-                    let (Some(local), Some(item_index)) = (m.rhs.map(std::borrow::Cow::into_owned), m.item_index)
-                    else {
+                    let Some(item_index) = m.item_index else {
                         continue;
                     };
-                    if taken.contains(&local) {
+                    // A mapping without a destination is kept: git's entry has no `peer_ref`, so
+                    // `ref_remove_duplicates()` never drops it, and `store_updated_refs()` leaves it out of
+                    // `FETCH_HEAD` as `FETCH_HEAD_IGNORE` but still reports it as a `* branch <name> ->
+                    // FETCH_HEAD` row (builtin/fetch.c:1353-1366), next to the command-line entry's own.
+                    let local = m.rhs.map(std::borrow::Cow::into_owned);
+                    if local.as_ref().is_some_and(|local| taken.contains(local)) {
                         continue;
                     }
                     opportunistic.push(Mapping {
                         remote: Source::Ref(remote_refs[selected[item_index]].clone()),
-                        local: Some(local),
+                        local,
                         spec_index: SpecIndex::Implicit(offset + m.spec_index),
                     });
                 }

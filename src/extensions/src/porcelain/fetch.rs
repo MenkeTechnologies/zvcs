@@ -1167,11 +1167,13 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         opts.refmap = Some(
             refmap
                 .iter()
-                // git's documented `--refmap=''`: it appends a refspec that matches nothing, which is how the
-                // fetch is told to store nowhere while still counting as a refmap.
-                .filter(|s| !s.is_empty())
+                // git's documented `--refmap=''` stores nowhere: its refspec has an empty source, which
+                // `get_fetch_map()` reads as `HEAD` (`refspec->src[0] ? refspec->src : "HEAD"`,
+                // remote.c:2146), and no destination. It maps nothing unless the command line selected
+                // `HEAD`, and then only into an ignored entry that is reported a second time.
+                .map(|s| if s.is_empty() { "HEAD" } else { s.as_str() })
                 .map(|s| {
-                    gix::refspec::parse(s.as_str().into(), gix::refspec::parse::Operation::Fetch)
+                    gix::refspec::parse(s.into(), gix::refspec::parse::Operation::Fetch)
                         .map(|s| s.to_owned())
                 })
                 .collect::<Result<_, _>>()?,
@@ -1252,10 +1254,14 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             let name = name.as_deref().map(BStr::new);
             let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
             refspecs.extend(stdin_specs.iter().map(String::as_str));
+            // `prune_tags_ok = (argc == 1);` (builtin/fetch.c:2778): a refspec
+            // named after the remote on the command line turns `--prune-tags` off.
+            let prune_tags_ok = positional_specs.is_empty();
             match disconnect(fetch_one(
                 &repo,
                 name,
                 &refspecs,
+                prune_tags_ok,
                 &opts,
                 upstream.as_ref(),
                 &mut fetch_head,
@@ -1463,10 +1469,15 @@ fn backfilled_tags(repo: &gix::Repository, map: &gix::remote::fetch::RefMap) -> 
     let Some(tag_spec) = Tags::Included.to_refspec() else {
         return passes;
     };
+    // Only the tag-following spec gitoxide supplies itself: a command-line or
+    // configured `refs/tags/*:refs/tags/*` spells the same refspec, but its
+    // matches are ref-map entries, so their oids are in `fetch_oids` and they are
+    // not proposed again (`create_fetch_oidset()`, builtin/fetch.c:250-257).
     let is_implicit_tag = |m: &gix::protocol::fetch::refmap::Mapping| {
-        m.spec_index
-            .get(&map.refspecs, &map.extra_refspecs)
-            .is_some_and(|spec| spec.to_ref() == tag_spec)
+        m.spec_index.implicit_index().is_some()
+            && m.spec_index
+                .get(&map.refspecs, &map.extra_refspecs)
+                .is_some_and(|spec| spec.to_ref() == tag_spec)
     };
 
     let fetch_oids: std::collections::HashSet<gix::ObjectId> = map
@@ -2425,16 +2436,41 @@ fn abbrev_len(repo: &gix::Repository) -> usize {
         .unwrap_or(FALLBACK)
 }
 
-/// git's compact `fetch.output`: when one of `<from>`/`<to>` contains the other
-/// as a substring, the containing side shows `*` in place of it.
+/// git's compact `fetch.output` (`print_compact()`, builtin/fetch.c:807-827):
+/// identical names show the local side as `*`; otherwise the local name is
+/// replaced by `*` inside the remote one, or failing that the remote name inside
+/// the local one, once and only on whole `/`-separated components.
 fn compact(from: &str, to: &str) -> (String, String) {
-    if !from.is_empty() && to.contains(from) {
-        (from.to_string(), to.replace(from, "*"))
-    } else if !to.is_empty() && from.contains(to) {
-        (from.replace(to, "*"), to.to_string())
+    if from == to {
+        return (from.to_string(), "*".to_string());
+    }
+    if let Some(r) = find_and_replace(from, to) {
+        (r, to.to_string())
+    } else if let Some(l) = find_and_replace(to, from) {
+        (from.to_string(), l)
     } else {
         (from.to_string(), to.to_string())
     }
+}
+
+/// `find_and_replace()` (builtin/fetch.c:780-805): the needle at the end of the
+/// haystack, else its first occurrence, becomes `*` when it starts the haystack
+/// or follows a `/` and ends it or precedes a `/`, so `HEAD` is not found in
+/// `FETCH_HEAD`.
+fn find_and_replace(haystack: &str, needle: &str) -> Option<String> {
+    let at = if haystack.ends_with(needle) {
+        haystack.len() - needle.len()
+    } else {
+        haystack.find(needle)?
+    };
+    if at > 0 && haystack.as_bytes()[at - 1] != b'/' {
+        return None;
+    }
+    let end = at + needle.len();
+    if end < haystack.len() && haystack.as_bytes()[end] != b'/' {
+        return None;
+    }
+    Some(format!("{}*{}", &haystack[..at], &haystack[end..]))
 }
 
 /// The `<kind> '<what>' of <url>` tail of a FETCH_HEAD row, from the full remote
@@ -2913,6 +2949,7 @@ fn fetch_one(
     repo: &gix::Repository,
     name_or_url: Option<&BStr>,
     refspecs: &[&str],
+    prune_tags_ok: bool,
     opts: &FetchOpts,
     upstream: Option<&(String, Vec<String>)>,
     fetch_head: &mut FetchHead,
@@ -2980,6 +3017,27 @@ fn fetch_one(
             .and_then(|name| repo.config_snapshot().boolean(&format!("remote.{name}.pruneTags")))
             .or(opts.prune_tags)
     };
+    // ```c
+    // maybe_prune_tags = prune_tags_ok && prune_tags;
+    // if (maybe_prune_tags && remote_via_config)
+    //         refspec_append(&remote->fetch, TAG_REFSPEC);
+    //
+    // if (maybe_prune_tags && (argc || !remote_via_config))
+    //         refspec_append(&rs, TAG_REFSPEC);
+    // ```
+    //
+    // (`fetch_one()`, builtin/fetch.c:2464-2469.) `argc` there counts the
+    // refspecs after the remote, which `prune_tags_ok` has already ruled out, so
+    // the second append is the one a URL or an unconfigured name takes: the tag
+    // refspec becomes a command-line refspec, and with it there is no `HEAD`
+    // fallback and every `FETCH_HEAD` row is a merge candidate.
+    let prune_tags = if prune_tags_ok { prune_tags } else { Some(false) };
+    let tag_refspec_on_command_line = prune_tags == Some(true) && remote_name.is_none();
+    let mut cli_refspecs: Vec<&str> = refspecs.to_vec();
+    if tag_refspec_on_command_line {
+        cli_refspecs.push("refs/tags/*:refs/tags/*");
+    }
+    let refspecs: &[&str] = &cli_refspecs;
 
     // `transfer.credentialsInUrl` is checked before any connection is opened,
     // where git checks it.
@@ -3189,7 +3247,8 @@ fn fetch_one(
     // Nothing is lost by that: auto-following proposes no tag this spec has not
     // already claimed.
     let supply_tag_refspec =
-        prune_tags == Some(true) || (opts.force && matches!(remote.fetch_tags(), Tags::All));
+        (prune_tags == Some(true) && !tag_refspec_on_command_line)
+            || (opts.force && matches!(remote.fetch_tags(), Tags::All));
     if supply_tag_refspec {
         let spec = match opts.force {
             true => "+refs/tags/*:refs/tags/*",
@@ -4023,6 +4082,10 @@ fn fetch_one(
     // --- build the git-style per-ref summary ------------------------------
     let mut update_lines: Vec<Line> = Vec::new();
     let mut fetch_head_rows: Vec<(String, bool)> = Vec::new();
+    // The `branch.<name>.merge` rows an earlier entry already named: git never adds them to the
+    // ref map (builtin/fetch.c:229-230), so `--set-upstream` must not see them either.
+    let mut not_in_ref_map: std::collections::HashSet<*const gix::protocol::fetch::refmap::Mapping> =
+        std::collections::HashSet::new();
     let mut rejected = false;
     // The refs the `REF_TRANSACTION_ALLOW_FAILURE` transaction refused (builtin/fetch.c:1832-1872).
     let store_refused: std::collections::HashSet<&gix::bstr::BStr> =
@@ -4078,7 +4141,13 @@ fn fetch_one(
     // it sorted by refname, so the backfilled rows are ordered among themselves
     // regardless of the order the remote advertised them in.
     second_pass.sort_by_key(|(_, m, _, _)| m.remote.as_name().map(ToOwned::to_owned));
-    let backfill_rows = second_pass.len();
+    // `if (tags_ref_map) backfill_tags(...)` (builtin/fetch.c:2079-2090): the second
+    // `find_non_local_tags()` keeps only tags whose objects are now local, so a
+    // deferred tag the pack did not bring leaves no second pass behind it.
+    let backfill_rows = second_pass
+        .iter()
+        .filter(|(update, _, _, _)| update.mode != Mode::ImplicitTagNotSentByRemote)
+        .count();
 
     for (update, mapping, spec, edit, backfill) in first_pass
         .into_iter()
@@ -4090,6 +4159,7 @@ fn fetch_one(
         let remote_id = mapping.remote.as_id().map(ToOwned::to_owned);
         let opportunistic = ref_map.is_opportunistic(mapping);
         let Some(status) = head_status.next(ref_map, mapping, backfill) else {
+            not_in_ref_map.insert(std::ptr::from_ref(mapping));
             continue;
         };
         let for_merge = status == 0;
@@ -4127,10 +4197,15 @@ fn fetch_one(
                     continue;
                 }
                 if let Some(id) = remote_id {
-                    fetch_head_rows.push((
-                        fetch_head_note(id, for_merge, &remote_full, &url),
-                        for_merge,
-                    ));
+                    // `append_fetch_head()` writes nothing for `FETCH_HEAD_IGNORE`
+                    // (builtin/fetch.c:1176-1178), the status of an opportunistic
+                    // entry, which is still reported below.
+                    if !opportunistic {
+                        fetch_head_rows.push((
+                            fetch_head_note(id, for_merge, &remote_full, &url),
+                            for_merge,
+                        ));
+                    }
                     let kind = match remote_full.as_str() {
                         r if r.starts_with("refs/heads/") => "branch",
                         r if r.starts_with("refs/tags/") => "tag",
@@ -4356,6 +4431,14 @@ fn fetch_one(
                             opts,
                             spec.is_some_and(|s| s.allow_non_fast_forward()),
                         )? {
+                            // The `[rejected] (non-fast-forward)` branch of
+                            // `update_local_ref()` returns 1 (builtin/fetch.c:1119-1127),
+                            // so the fetch fails and the summary loses its width (:2093-2100)
+                            // as for any other rejection.
+                            Some(('!', s, r)) => {
+                                rejected = true;
+                                ('!', s, r)
+                            }
                             Some((f, s, r)) => (f, s, r),
                             None => continue,
                         }
@@ -4621,6 +4704,9 @@ fn fetch_one(
         let mut source: Option<String> = None;
         let mut ambiguous = false;
         for mapping in &ref_map.mappings {
+            if not_in_ref_map.contains(&std::ptr::from_ref(mapping)) {
+                continue;
+            }
             if mapping.local.is_none() {
                 if source.is_some() {
                     ambiguous = true;
@@ -4647,7 +4733,7 @@ fn fetch_one(
             let short = name.strip_prefix("refs/heads/").unwrap_or(&name).to_string();
             match repo.head_name()? {
                 None => eprintln!(
-                    "warning: could not set upstream of HEAD to '{short}' from '{remote_display}'                      when it does not point to any branch."
+                    "warning: could not set upstream of HEAD to '{short}' from '{remote_display}' when it does not point to any branch."
                 ),
                 Some(head) => {
                     let branch = head.shorten().to_string();
@@ -4671,7 +4757,7 @@ fn fetch_one(
             }
         } else {
             eprintln!(
-                "warning: no source branch found;\n                 you need to specify exactly one branch with the --set-upstream option"
+                "warning: no source branch found;\nyou need to specify exactly one branch with the --set-upstream option"
             );
         }
     }

@@ -1154,6 +1154,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
                 eprintln!("fatal: {msg}");
                 return Ok(ExitCode::FAILURE);
             }
+            // A closed pipe that kills the child (`check_pipe()`, run-command.c:1150-1161) is one
+            // more non-zero status for `run_fetch()`.
+            if crate::sigpipe::is_broken_pipe(e.as_ref()) {
+                return Ok(ExitCode::FAILURE);
+            }
             return Err(e);
         }
     };

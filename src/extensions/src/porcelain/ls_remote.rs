@@ -392,7 +392,20 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     if repository.is_none() && !opts.quiet {
         eprintln!("From {url}");
     }
-    Ok(list(&ref_map.remote_refs, patterns, &opts, Some(&repo)))
+    let code = list(&ref_map.remote_refs, patterns, &opts, Some(&repo));
+    // `transport_disconnect()` comes after the listing (builtin/ls-remote.c:166-177), and its
+    // `disconnect_git()` writes the closing flush (transport.c:1020-1030).
+    if gix::protocol::take_closing_flush_broken_pipe() {
+        disconnect_into_closed_pipe();
+    }
+    Ok(code)
+}
+
+/// `disconnect_git()`'s `packet_flush()` met a closed pipe (pkt-line.c:93-98): ls-remote runs with
+/// `SIGPIPE` at its default (common-init.c:27-35), so the `write()` kills it, and what `printf()` put
+/// in a fully buffered stdout is never written out.
+fn disconnect_into_closed_pipe() -> ! {
+    crate::sigpipe::exit_broken_pipe()
 }
 
 /// The listing itself, from the advertised refs on: filter, sort, print.
@@ -459,7 +472,10 @@ fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Reposit
         }
         out.push_str(&format!("{}\t{}\n", row.id.to_hex(), row.name));
     }
-    print!("{out}");
+    // `printf()` into stdio's stdout, fully buffered off a terminal: the listing is written out
+    // at `exit()`, after `transport_disconnect()` (builtin/ls-remote.c:166-177).
+    crate::cstdio::defer();
+    crate::cstdio::write_bytes(out.as_bytes());
 
     if rows.is_empty() && opts.exit_code {
         ExitCode::from(2)
@@ -1041,8 +1057,8 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
         opts.upload_pack.as_deref().map(Into::into),
         "upload-pack",
     );
-    let refs = match advertised_refs(url.clone(), version, upload_pack, &opts.server_options, config) {
-        Ok(refs) => refs,
+    let (refs, closing_flush_broken_pipe) = match advertised_refs(url.clone(), version, upload_pack, &opts.server_options, config) {
+        Ok(listed) => listed,
         Err(err) => {
             // A 401 to the retry that carried credentials: `discover_refs()` dies.
             if let Some(e) = err.downcast_ref::<gix::protocol::handshake::Error>() {
@@ -1065,18 +1081,23 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
             return ExitCode::from(128);
         }
     };
-    list(&refs, patterns, opts, None)
+    let code = list(&refs, patterns, opts, None);
+    if closing_flush_broken_pipe {
+        disconnect_into_closed_pipe();
+    }
+    code
 }
 
 /// Connect, shake hands and list: the advertisement a v0/v1 server sends
-/// unasked, or the answer to a v2 `ls-refs`.
+/// unasked, or the answer to a v2 `ls-refs`, and whether the closing flush met a closed pipe:
+/// `disconnect_git()` writes it after the caller has listed them (transport.c:1020-1030).
 fn advertised_refs(
     url: gix::Url,
     version: gix::protocol::transport::Protocol,
     upload_pack: Option<gix::bstr::BString>,
     server_options: &[gix::bstr::BString],
     config: gix::config::File,
-) -> anyhow::Result<Vec<Ref>> {
+) -> anyhow::Result<(Vec<Ref>, bool)> {
     use gix::protocol::transport::client::blocking_io::connect;
     let is_http = matches!(url.scheme, gix::url::Scheme::Http | gix::url::Scheme::Https);
     let url_string = url.to_bstring();
@@ -1116,6 +1137,9 @@ fn advertised_refs(
         )
         .invoke_blocking(&mut transport, &mut gix::progress::Discard, false)?,
     };
-    gix::protocol::indicate_end_of_interaction(&mut transport, false)?;
-    Ok(refs)
+    match gix::protocol::indicate_end_of_interaction(&mut transport, false) {
+        Ok(()) => Ok((refs, false)),
+        Err(err) if crate::sigpipe::is_broken_pipe(&err) => Ok((refs, true)),
+        Err(err) => Err(err.into()),
+    }
 }

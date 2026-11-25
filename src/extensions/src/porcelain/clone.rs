@@ -2298,6 +2298,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
+                    disconnect(&junk);
                     junk.leave();
                     prepare.persist();
                     return Ok(());
@@ -2325,6 +2326,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             write_refs(&mut repo, &outcome)?;
             // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
             // before touching the worktree, but `junk_mode` has already moved on.
+            disconnect(&junk);
             junk.leave();
         } else {
             // `git clone 'url'...`
@@ -2345,6 +2347,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     say_done();
                     // An empty clone is a *successful* clone in git — `checkout()` runs and
                     // returns, `junk_mode` moves on, and the repository stays.
+                    disconnect(&junk);
                     junk.leave();
                     prepare.persist();
                     return Ok(());
@@ -2370,6 +2373,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             say_done();
             note_filter_support(&outcome.handshake);
             write_refs(checkout.repo_mut(), &outcome)?;
+            disconnect(&junk);
             // `--sparse` is set up before anything is checked out:
             //
             // ```c
@@ -2495,6 +2499,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // A transport that never connected is git's own `die()`, not a wrapped error:
     // the ssh child's stderr, then the fixed block, exit 128.
     if let Err(e) = &result {
+        // A request written into a closed pipe, over ssh as over any other pipe: clone runs with
+        // `SIGPIPE` at its default (common-init.c:27-35), so `send_request()`'s `write()` raises it
+        // (fetch-pack.c:254-264) and `remove_junk_on_signal()` takes the clone down before the
+        // signal kills it (builtin/clone.c:416-421).
+        if crate::sigpipe::is_broken_pipe(e.as_ref()) {
+            junk.remove_now();
+            crate::sigpipe::exit_broken_pipe();
+        }
         if let Some(code) = crate::transport_err::ssh_fatal(url_str, e) {
             return Ok(code);
         }
@@ -2827,6 +2839,17 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+
+/// `transport_disconnect()` ahead of `junk_mode = JUNK_LEAVE_REPO` (builtin/clone.c:1618-1629). A
+/// closing flush that met a closed pipe is `disconnect_git()`'s `packet_flush()` raising `SIGPIPE`
+/// (transport.c:1020-1030): `remove_junk_on_signal()` takes the clone down and re-raises it
+/// (builtin/clone.c:416-421), so the clone dies by the signal with nothing left on disk.
+fn disconnect(junk: &JunkDir) {
+    if gix::protocol::take_closing_flush_broken_pipe() {
+        junk.remove_now();
+        crate::sigpipe::exit_broken_pipe();
+    }
+}
 
 /// builtin/clone.c's `remove_junk()`, as a guard rather than an `atexit()` hook.
 ///

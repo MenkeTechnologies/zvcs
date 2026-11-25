@@ -479,6 +479,11 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
         if let Some(refusal) = e.downcast_ref::<Refusal>() {
             crate::git_fatal!("{}", refusal.0);
         }
+        // `send_request()` writes the wants into a closed pipe (fetch-pack.c:254-264), and
+        // `fetch-pack` runs with `SIGPIPE` at its default (common-init.c:27-35): the `write()` kills it.
+        if crate::sigpipe::is_broken_pipe(e.as_ref()) {
+            crate::sigpipe::exit_broken_pipe();
+        }
         // `get_packet_data()` (pkt-line.c): a pkt-line read that meets end-of-file
         // where a line was expected is
         // `die(_("the remote end hung up unexpectedly"))`, not a complaint about

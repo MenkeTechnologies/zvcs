@@ -34,6 +34,27 @@ mod with_transport {
         Ok(())
     }
 
+    /// Set when the flush-packet a [`SendFlushOnDrop`] writes as it goes met a closed pipe.
+    static CLOSING_FLUSH_BROKEN_PIPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Whether the flush-packet a dropped connection wrote met a closed pipe since the last call, which clears it.
+    ///
+    /// That flush is `disconnect_git()`'s `packet_flush()` (transport.c:1020-1030, pkt-line.c:93-98), and git
+    /// writes it where its caller disconnects: a `write()` into a closed pipe there raises `SIGPIPE`, or under an
+    /// ignored `SIGPIPE` dies `unable to write flush packet: Broken pipe`. A drop has no error to return, so the
+    /// caller asks here at the point git would have disconnected.
+    pub fn take_closing_flush_broken_pipe() -> bool {
+        CLOSING_FLUSH_BROKEN_PIPE.swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_closing_flush(result: Result<(), gix_transport::client::Error>) {
+        if let Err(gix_transport::client::Error::Io(err)) = result {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                CLOSING_FLUSH_BROKEN_PIPE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// A utility to automatically send a flush packet when the instance is dropped, assuring a graceful termination of any
     /// interaction with the server.
     pub struct SendFlushOnDrop<T>
@@ -101,11 +122,11 @@ mod with_transport {
                 //       Right now we block the executor by forcing this communication, but that only
                 //       happens if the user didn't actually try to receive a pack, which consumes the
                 //       connection in an async context.
-                crate::futures_lite::future::block_on(self.indicate_end_of_interaction()).ok();
+                note_closing_flush(crate::futures_lite::future::block_on(self.indicate_end_of_interaction()));
             }
             #[cfg(not(feature = "async-client"))]
             {
-                self.indicate_end_of_interaction().ok();
+                note_closing_flush(self.indicate_end_of_interaction());
             }
         }
     }

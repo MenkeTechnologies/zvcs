@@ -230,7 +230,10 @@ where
                     // A deepening fetch sends its wants and deepen lines on their own and reads the shallow
                     // list they are answered with before the first `have` goes out (fetch-pack.c:452-481).
                     if !matches!(shallow, Shallow::NoChange) {
-                        let mut rd = arguments.send_v1_deepen_request(transport).await?;
+                        let mut rd = arguments
+                            .send_v1_deepen_request(transport)
+                            .await
+                            .map_err(|e| Error::from_request_write(e, is_stateless))?;
                         let updates = crate::fetch::Response::shallow_list_from_line_reader(&mut rd).await?;
                         negotiate.update_shallow(&updates);
                         first_shallows = Some(updates);
@@ -257,7 +260,10 @@ where
                                         rounds: rounds.len(),
                                     }));
                                 }
-                                let mut rd = arguments.send(transport, false).await?;
+                                let mut rd = arguments
+                                    .send(transport, false)
+                                    .await
+                                    .map_err(|e| Error::from_request_write(e, is_stateless))?;
                                 let window = count - window_start;
                                 window_start = count;
                                 flush_at = gix_negotiate::window_size(is_stateless, Some(count));
@@ -346,7 +352,10 @@ where
                                 haves_to_send: count - window_start,
                                 previous_response_had_at_least_one_in_common: false,
                             });
-                            let mut rd = arguments.send(transport, true).await?;
+                            let mut rd = arguments
+                                .send(transport, true)
+                                .await
+                                .map_err(|e| Error::from_request_write(e, is_stateless))?;
                             let mut response = crate::fetch::Response::from_line_reader_on_connection(
                                 protocol_version,
                                 &mut rd,

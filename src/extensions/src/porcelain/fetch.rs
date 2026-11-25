@@ -1252,7 +1252,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             let name = name.as_deref().map(BStr::new);
             let mut refspecs: Vec<&str> = positional_specs.iter().map(String::as_str).collect();
             refspecs.extend(stdin_specs.iter().map(String::as_str));
-            match fetch_one(
+            match disconnect(fetch_one(
                 &repo,
                 name,
                 &refspecs,
@@ -1261,7 +1261,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 &mut fetch_head,
                 &mut op,
                 &mut tips,
-            )? {
+            )?)? {
                 Verdict::Ok => {}
                 Verdict::Rejected => failure = true,
                 Verdict::Fatal => fatal = true,
@@ -2873,6 +2873,40 @@ fn default_fetch_remote_missing(repo: &gix::Repository) -> bool {
     )
 }
 
+/// Whether `do_fetch()` took a ref lock, which is the first `activate_tempfile()` of the process.
+///
+/// That first call runs `sigchain_push_common(remove_tempfiles_on_signal)` (tempfile.c:112-120),
+/// which saves the `SIGPIPE` handler in force at that moment on the signal's stack
+/// (sigchain.c:45-52). Inside `do_fetch()` that handler is the `SIG_IGN` `fetch_one()` pushed
+/// (builtin/fetch.c:2494-2498), so its `sigchain_pop(SIGPIPE)` restores `SIG_IGN` rather than
+/// `unlock_pack_on_signal()`, and `SIGPIPE` stays ignored for `transport_disconnect()`.
+static REF_LOCK_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// A ref transaction of `do_fetch()` was prepared, locking its refs.
+fn note_ref_lock() {
+    REF_LOCK_TAKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `transport_disconnect(gtransport)` after `do_fetch()` returned (builtin/fetch.c:2496-2500).
+///
+/// Unless nothing was fetched, `fetch_refs_via_pack()` has already closed the connection
+/// (transport.c:455-465); otherwise `disconnect_git()` writes the closing flush
+/// (transport.c:1020-1030). Into a closed pipe, its `packet_flush()` dies
+/// `unable to write flush packet: Broken pipe` (pkt-line.c:93-98) where `SIGPIPE` is still
+/// ignored (see [`REF_LOCK_TAKEN`]), and otherwise `unlock_pack_on_signal()` re-raises the
+/// signal, which kills the process (builtin/fetch.c:222-227): the `EPIPE` returned for that
+/// reaches [`crate::sigpipe`] at the top, or `pull`, whose `run_fetch()` sees a failed child.
+fn disconnect(verdict: Verdict) -> Result<Verdict> {
+    if verdict == Verdict::Fatal || !gix::protocol::take_closing_flush_broken_pipe() {
+        return Ok(verdict);
+    }
+    if REF_LOCK_TAKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("fatal: unable to write flush packet: Broken pipe");
+        return Ok(Verdict::Fatal);
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+}
+
 /// Run the fetch pipeline for a single remote and print its summary.
 #[allow(clippy::too_many_arguments)]
 fn fetch_one(
@@ -3783,6 +3817,13 @@ fn fetch_one(
                 "mismatched algorithms: client {local}; server {remote}"
             )));
         }
+        // `send_request()`'s `die_errno(_("unable to write to remote"))` (fetch-pack.c:254-264):
+        // `fetch_one()` runs `do_fetch()` with `SIGPIPE` ignored (builtin/fetch.c:2494-2498), so a
+        // server gone before it read the wants is the `write()`'s `EPIPE`, not a death by the signal.
+        Err(gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::WriteRequest(io))) => {
+            eprintln!("fatal: unable to write to remote: {}", crate::external::strerror(&io));
+            return Ok(Verdict::Fatal);
+        }
         Err(e) => {
             // `ERR <message>` mid-response: the server's own refusal (an
             // unreachable want, a hidden ref), which git reports verbatim.
@@ -3966,6 +4007,16 @@ fn fetch_one(
         Status::NoPackReceived { update_refs, .. } => update_refs,
         Status::Change { update_refs, .. } => update_refs,
     };
+    // `commit_ref_transaction()` takes a lock on every ref it updates (builtin/fetch.c:2102-2103),
+    // and `update_local_ref()` queues none for a ref already up to date (builtin/fetch.c:972-979).
+    if !opts.dry_run
+        && update_refs
+            .updates
+            .iter()
+            .any(|u| u.edit_index.is_some() && !matches!(u.mode, Mode::NoChangeNeeded))
+    {
+        note_ref_lock();
+    }
 
     let null = gix::ObjectId::null(repo.object_hash());
 
@@ -4888,6 +4939,11 @@ fn prune_refs(
             deref: false,
         })
         .collect();
+    // `prune_refs()` deletes the stale refs in a transaction of its own or the `--atomic` one
+    // (builtin/fetch.c:1475-1490), locking each.
+    if !opts.dry_run && !deletions.is_empty() {
+        note_ref_lock();
+    }
     let atomic = match (opts.dry_run, opts.atomic) {
         (true, _) => Vec::new(),
         (false, true) => deletions,
@@ -5232,6 +5288,9 @@ fn set_head_from_remote(
         return Ok(());
     }
 
+    // `refs_update_symref_extended()` prepares a transaction on the `HEAD` ref, which locks it
+    // whether or not the ref already exists (refs.c:2532-2538).
+    note_ref_lock();
     // `create_only` is what makes `create` and `warn` leave an existing `HEAD` where it is; only
     // `always` (and a bare mirror) rewrites it.
     let create_only = follow != FollowRemoteHead::Always && !bare_mirror;

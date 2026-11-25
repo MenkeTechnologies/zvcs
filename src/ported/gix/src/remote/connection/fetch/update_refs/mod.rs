@@ -453,6 +453,23 @@ pub(crate) fn update_queued(
             }
             gix_ref::file::run_transaction_hook(&repo.refs, "aborted", &lines);
         }
+        // ```c
+        // string_list_sort(&transaction->refnames);
+        // if (ref_update_reject_duplicates(&transaction->refnames, err))
+        //         return REF_TRANSACTION_ERROR_GENERIC;
+        // ```
+        //
+        // (`ref_transaction_prepare()`, refs.c:2708-2710, ahead of the `preparing` hook.)
+        // `--atomic --prune` queues a stale ref's deletion and the update of the same ref
+        // in one transaction (builtin/fetch.c:2020-2040), which the commit refuses as a
+        // whole; `commit_ref_transaction()` frees it without the `aborted` hook (:1883-1903).
+        fetch::DryRun::No if atomic && duplicate_refname(&transaction).is_some() => {
+            let name = duplicate_refname(&transaction).expect("checked by the guard");
+            transaction_error = Some((
+                gix_ref::file::transaction::ErrorKind::Generic,
+                format!("multiple updates for ref '{name}' not allowed").into(),
+            ));
+        }
         fetch::DryRun::No => {
             let _span = gix_trace::detail!("apply", edits = transaction.len());
             let (file_lock_fail, packed_refs_lock_fail) = repo
@@ -511,6 +528,14 @@ pub(crate) fn update_queued(
         rejections,
         transaction_error,
     })
+}
+
+/// `ref_update_reject_duplicates()` (refs.c:2574-2596): the first name that the sorted list of
+/// the transaction's refnames holds twice.
+fn duplicate_refname(transaction: &[RefEdit]) -> Option<gix_ref::FullName> {
+    let mut names: Vec<&gix_ref::FullName> = transaction.iter().map(|edit| &edit.name).collect();
+    names.sort();
+    names.windows(2).find(|pair| pair[0] == pair[1]).map(|pair| pair[1].clone())
 }
 
 /// Figure out if target of `edit` points to a reference that doesn't exist in `repo` and won't exist as it's not in any of `edits`.

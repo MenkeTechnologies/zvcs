@@ -1525,6 +1525,82 @@ fn backfilled_tags(repo: &gix::Repository, map: &gix::remote::fetch::RefMap) -> 
     passes
 }
 
+/// The tags a non-atomic `--prune` deleted that `backfill_tags()` brings back, as tag-following
+/// entries of their own.
+///
+/// `prune_refs()` runs between the two `find_non_local_tags()` calls (builtin/fetch.c:2020-2040,
+/// :2078). The first, inside `get_ref_map()`, skipped such a tag because it was still here; the
+/// second looks again after the prune:
+///
+/// ```c
+/// refs_for_each_ref(get_main_ref_store(the_repository), add_one_refname,
+///                   &existing_refs);
+/// if (transaction)
+///         ref_transaction_for_each_queued_update(transaction,
+///                                                add_already_queued_tags,
+///                                                &existing_refs);
+/// ```
+///
+/// (builtin/fetch.c:361-371.) So a tag the remote still advertises under its full name — the
+/// prune went by a refspec whose source named it some other way, like `t1:refs/tags/t1` — is
+/// proposed again unless the first pass queued an update of it, and kept if its object, or the
+/// one its peel line names, is now local (:373-411). An explicit mapping of the same tag that
+/// found it up to date queued nothing (:906-911), which is why one fetch prints both the
+/// `[deleted]` row and `* [new tag]`, and `FETCH_HEAD` holds the tag twice. gitoxide's single
+/// ref map merged the tag-following entry into the explicit one, so it is rebuilt here.
+fn pruned_tags_refollowed(
+    repo: &gix::Repository,
+    ref_map: &gix::remote::fetch::RefMap,
+    update_refs: &gix::remote::fetch::refs::update::Outcome,
+    pruned_tags: &[FullName],
+) -> Vec<gix::protocol::fetch::refmap::Mapping> {
+    use gix::objs::Exists;
+    use gix::protocol::fetch::refmap::{Mapping, Source, SpecIndex};
+
+    if pruned_tags.is_empty() {
+        return Vec::new();
+    }
+    let Some(tag_spec) = Tags::Included.to_refspec() else {
+        return Vec::new();
+    };
+    let Some(tag_index) = ref_map.extra_refspecs.iter().position(|spec| spec.to_ref() == tag_spec) else {
+        return Vec::new();
+    };
+    // `add_already_queued_tags()`: the refs `update_local_ref()` queued, which are the ones it
+    // creates or moves.
+    let queued: HashSet<&BStr> = update_refs
+        .iter_mapping_updates(&ref_map.mappings, &ref_map.refspecs, &ref_map.extra_refspecs)
+        .filter(|(update, ..)| matches!(update.mode, Mode::New | Mode::FastForward | Mode::Forced))
+        .filter_map(|(.., edit)| edit.map(|edit| edit.name.as_bstr()))
+        .collect();
+    let in_odb = |id: Option<&gix::hash::oid>| id.is_some_and(|id| repo.objects.exists(id));
+
+    let mut seen: HashSet<BString> = HashSet::new();
+    let mut refollowed = Vec::new();
+    for r in &ref_map.remote_refs {
+        let (name, target, peeled) = r.unpack();
+        // `skip duplicates and refs that we already have` (:388-391).
+        if !name.starts_with(b"refs/tags/") || !seen.insert(name.to_owned()) {
+            continue;
+        }
+        if !pruned_tags.iter().any(|tag| tag.as_bstr() == name)
+            || queued.contains(name)
+            || repo.try_find_reference(name).ok().flatten().is_some()
+        {
+            continue;
+        }
+        if !(in_odb(target) || in_odb(peeled)) {
+            continue;
+        }
+        refollowed.push(Mapping {
+            remote: Source::Ref(r.clone()),
+            local: Some(name.to_owned()),
+            spec_index: SpecIndex::Implicit(tag_index),
+        });
+    }
+    refollowed
+}
+
 /// How automatic tag following split the remote's tags across git's two
 /// `find_non_local_tags()` calls — see [`backfilled_tags`].
 #[derive(Default)]
@@ -3671,6 +3747,9 @@ fn fetch_one(
             .filter_map(|l| FullName::try_from(l.full.as_str()).ok().map(|name| (name, l.old)))
             .collect(),
     };
+    // The tags among them, which `backfill_tags()` may bring back; see [`pruned_tags_refollowed`].
+    let pruned_tags: Vec<FullName> =
+        pruned.keys().filter(|name| name.category() == Some(Category::Tag)).cloned().collect();
     // `display_state_init()` sizes the `<from>` column from the ref map before anything is
     // pruned or fetched (builtin/fetch.c:2017-2018), and `prune_refs()` prints its rows there and
     // then, padded to `transport_summary_width(stale_refs)`, with the dangling symrefs after them
@@ -4121,6 +4200,22 @@ fn fetch_one(
     };
     let (first_pass, mut second_pass): (Vec<_>, Vec<_>) =
         rows.into_iter().partition(|(_, m, _, _)| !named(m, &tag_passes.deferred));
+    // The tags a non-atomic prune deleted that the second `find_non_local_tags()` call finds
+    // missing and proposes again (builtin/fetch.c:2070-2090); they are written once the first
+    // pass is known not to have failed, below.
+    let refollowed = match follows_tags {
+        true => pruned_tags_refollowed(repo, ref_map, update_refs, &pruned_tags),
+        false => Vec::new(),
+    };
+    let refollowed_update: gix::remote::fetch::refs::Update = Mode::New.into();
+    second_pass.extend(refollowed.iter().map(|mapping| {
+        (
+            &refollowed_update,
+            mapping,
+            mapping.spec_index.get(&ref_map.refspecs, &ref_map.extra_refspecs),
+            None,
+        )
+    }));
     // ```c
     // if (dry_run)
     //         return 0;
@@ -4608,6 +4703,31 @@ fn fetch_one(
             worktree.display()
         );
         return Ok(Verdict::Fatal);
+    }
+
+    // `backfill_tags()` queues the re-proposed tags in the same `REF_TRANSACTION_ALLOW_FAILURE`
+    // transaction, as new refs named after the remote's `refs/tags/` ("storing tag",
+    // `update_local_ref()`, builtin/fetch.c:1023-1031); a first pass that failed never gets
+    // there (:2066-2070).
+    if !rejected {
+        for mapping in &refollowed {
+            let (Some(name), Some(id)) = (mapping.local.as_ref(), mapping.remote.as_id()) else {
+                continue;
+            };
+            repo.edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!("{}: storing tag", opts.reflog_action).into(),
+                    },
+                    expected: PreviousValue::MustNotExist,
+                    new: Target::Object(id.to_owned()),
+                },
+                name: FullName::try_from(name.clone())?,
+                deref: false,
+            })?;
+        }
     }
 
     // `--atomic` aborted the transaction: no ref moved, the pruned ones included, so no FETCH_HEAD

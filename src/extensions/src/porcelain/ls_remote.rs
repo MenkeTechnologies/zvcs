@@ -309,14 +309,14 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             ));
         }
     }
-    let ref_map = match connection.ref_map(
+    let (ref_map, mut transport) = match connection.ref_map_keep_transport(
         gix::progress::Discard,
         gix::remote::ref_map::Options {
             prefix_from_spec_as_filter_on_remote: false,
             ..Default::default()
         },
     ) {
-        Ok((map, _handshake)) => map,
+        Ok((map, _handshake, transport)) => (map, transport),
         // `die_if_server_options()` (transport.c) prints the advice line ahead of
         // its refusal, and the transport the caller then tears down reports the
         // half-open connection — three lines, in this order, exit 128.
@@ -364,9 +364,21 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     if repository.is_none() && !opts.quiet {
         eprintln!("From {url}");
     }
-    let code = list(&ref_map.remote_refs, patterns, &opts, Some(&repo))?;
+    // The connection stays open through the listing: a sort that `die()`s (a missing object,
+    // a rejected key) exits before `transport_disconnect()` (builtin/ls-remote.c:163-177), so no
+    // closing flush is written and the pipe closes only at exit, after the `fatal:` line; a
+    // v0/v1 `upload-pack` waiting for its wants then reports `the remote end hung up
+    // unexpectedly` on the EOF. Leaking the transport leaves it to the exit as well.
+    let code = list(&ref_map.remote_refs, patterns, &opts, Some(&repo));
+    if !matches!(&code, Ok(c) if *c != ExitCode::from(128)) {
+        transport.skip_end_of_interaction();
+        std::mem::forget(transport);
+        return code;
+    }
     // `transport_disconnect()` comes after the listing (builtin/ls-remote.c:166-177), and its
     // `disconnect_git()` writes the closing flush (transport.c:1020-1030).
+    drop(transport);
+    let code = code?;
     if gix::protocol::take_closing_flush_broken_pipe() {
         disconnect_into_closed_pipe();
     }

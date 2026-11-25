@@ -111,6 +111,30 @@ where
         let repo = self.remote.repo;
         self.into_detached().ref_map(repo, progress, options).await
     }
+
+    /// Like [`ref_map()`](Self::ref_map()), but hand the transport back rather than ending the
+    /// interaction, so the caller decides when the end-of-interaction flush-packet is written.
+    ///
+    /// git's `transport_get_remote_refs()` leaves the connection open, and only
+    /// `transport_disconnect()` writes the closing flush (transport.c:1020-1030); a command that
+    /// `die()`s in between never sends it, and a v0/v1 `upload-pack` then reports the EOF.
+    /// Dropping the returned transport writes the flush, unless
+    /// [`skip_end_of_interaction()`](gix_protocol::SendFlushOnDrop::skip_end_of_interaction()) was called.
+    #[gix_protocol::maybe_async::maybe_async]
+    pub async fn ref_map_keep_transport(
+        self,
+        progress: impl Progress,
+        options: Options,
+    ) -> Result<(fetch::RefMap, gix_protocol::Handshake, gix_protocol::SendFlushOnDrop<T>), Error> {
+        let repo = self.remote.repo;
+        let mut detached = self.into_detached();
+        let refmap = detached.ref_map_by_ref(repo, progress, options).await?;
+        let handshake = detached
+            .handshake
+            .take()
+            .expect("refmap always performs handshake and stores it if it succeeds");
+        Ok((refmap, handshake, detached.transport))
+    }
 }
 
 impl<T> ConnectionDetached<'_, T>

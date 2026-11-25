@@ -28,19 +28,99 @@ impl File {
     ///   technically 'splitting' the section. This can only make a difference if the `include` section also has values
     ///   which later overwrite portions of the included file, which seems unusual as these would be related to `includes`.
     ///   We can fix this by 'splitting' the include section if needed so the included sections are put into the right place.
-    /// - `hasconfig:remote.*.url` will not prevent itself to include files with `[remote "name"]\nurl = x` values, but it also
-    ///   won't match them, i.e. one cannot include something that will cause the condition to match or to always be true.
+    /// - `hasconfig:remote.*.url` matches the URLs of the whole configuration, includes followed and every
+    ///   `hasconfig:remote.*.url` include taken as true, as `populate_remote_urls()` gathers them (config.c:338-350).
+    ///   Where git dies on a `[remote "name"]\nurl = x` in a file such an include brings in (`forbid_remote_url()`,
+    ///   config.c:352-366), its URL is gathered here like any other.
     pub fn resolve_includes(&mut self, options: init::Options<'_>) -> Result<(), Error> {
+        self.resolve_includes_with_remote_urls(options, &[])
+    }
+
+    /// Like [`resolve_includes()`](Self::resolve_includes), with `extra_remote_urls`
+    /// standing for the remote URLs of configuration git reads after this one in
+    /// its sequence, the command line's, which a `hasconfig:remote.*.url:`
+    /// condition matches against as well.
+    pub fn resolve_includes_with_remote_urls(
+        &mut self,
+        options: init::Options<'_>,
+        extra_remote_urls: &[BString],
+    ) -> Result<(), Error> {
         if options.includes.max_depth == 0 {
             return Ok(());
         }
         let mut buf = Vec::new();
-        resolve(self, &mut buf, options)
+        resolve_with_remote_urls(self, &mut buf, options, extra_remote_urls)
     }
 }
 
 pub(crate) fn resolve(config: &mut File, buf: &mut Vec<u8>, options: init::Options<'_>) -> Result<(), Error> {
-    resolve_includes_recursive(None, config, 0, buf, options)
+    resolve_with_remote_urls(config, buf, options, &[])
+}
+
+/// How `hasconfig:remote.*.url:` conditions are answered during one resolution.
+#[derive(Clone, Copy)]
+enum RemoteUrls<'a> {
+    /// `opts->unconditional_remote_url` (config.c:385-388): every such condition holds.
+    Unconditional,
+    /// `inc->remote_urls`, gathered by the first condition that asks.
+    Gather(&'a GatherRemoteUrls<'a>),
+}
+
+/// `populate_remote_urls()` (config.c:338-350), run at most once per resolution:
+/// the configuration as it was before any include was followed, read again with
+/// every `hasconfig:remote.*.url:` include followed (`opts.unconditional_remote_url`),
+/// so a URL configured in a file that `include.path` or another condition brings
+/// in counts as well.
+struct GatherRemoteUrls<'a> {
+    unresolved: File,
+    extra: &'a [BString],
+    options: init::Options<'a>,
+    urls: std::cell::RefCell<Option<Vec<BString>>>,
+}
+
+impl GatherRemoteUrls<'_> {
+    /// `at_least_one_url_matches_glob()` (config.c:368-383): `wildmatch()` with
+    /// `WM_PATHNAME` against each URL.
+    fn any_matches(&self, glob: &BStr) -> Result<bool, Error> {
+        if self.urls.borrow().is_none() {
+            let mut everything = self.unresolved.clone();
+            let mut buf = Vec::new();
+            resolve_includes_recursive(None, &mut everything, 0, &mut buf, self.options, RemoteUrls::Unconditional)?;
+            let mut urls = remote_urls(&everything);
+            urls.extend_from_slice(self.extra);
+            *self.urls.borrow_mut() = Some(urls);
+        }
+        let urls = self.urls.borrow();
+        Ok(urls.iter().flatten().any(|url| {
+            gix_glob::wildmatch(glob, url.as_bstr(), gix_glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL)
+        }))
+    }
+}
+
+fn resolve_with_remote_urls<'a>(
+    config: &mut File,
+    buf: &mut Vec<u8>,
+    options: init::Options<'a>,
+    extra_remote_urls: &'a [BString],
+) -> Result<(), Error> {
+    let gather = GatherRemoteUrls {
+        unresolved: config.clone(),
+        extra: extra_remote_urls,
+        options,
+        urls: Default::default(),
+    };
+    resolve_includes_recursive(None, config, 0, buf, options, RemoteUrls::Gather(&gather))
+}
+
+/// `add_remote_url()` (config.c:322-336): the `url` of every named remote, in order.
+fn remote_urls(config: &File) -> Vec<BString> {
+    config
+        .sections_by_name("remote")
+        .into_iter()
+        .flatten()
+        .filter(|section| section.header().subsection_name().is_some())
+        .flat_map(|section| section.values("url"))
+        .collect()
 }
 
 fn resolve_includes_recursive(
@@ -49,6 +129,7 @@ fn resolve_includes_recursive(
     depth: u8,
     buf: &mut Vec<u8>,
     options: init::Options<'_>,
+    remote_urls: RemoteUrls<'_>,
 ) -> Result<(), Error> {
     if depth == options.includes.max_depth {
         return if options.includes.err_on_max_depth_exceeded {
@@ -76,13 +157,14 @@ fn resolve_includes_recursive(
                     target_config_path,
                     search_config.unwrap_or(target_config),
                     options.includes,
+                    remote_urls,
                 )? {
                     paths = Some(gather_paths(section, id, backing));
                 }
             }
         }
         if let Some(paths) = paths {
-            insert_includes_recursively(paths, target_config, depth, options, buf)?;
+            insert_includes_recursively(paths, target_config, depth, options, buf, remote_urls)?;
         }
     }
     Ok(())
@@ -94,6 +176,7 @@ fn insert_includes_recursively(
     depth: u8,
     options: init::Options<'_>,
     buf: &mut Vec<u8>,
+    remote_urls: RemoteUrls<'_>,
 ) -> Result<(), Error> {
     for (section_id, config_path) in section_ids_and_include_paths {
         let meta = OwnShared::clone(&target_config.sections[&section_id].meta);
@@ -133,7 +216,7 @@ fn insert_includes_recursively(
                 init::Error::Span(err) => Error::Span(err),
                 init::Error::Includes(_) => unreachable!("BUG: {:?} not possible due to no-follow options", err),
             })?;
-        resolve_includes_recursive(Some(target_config), &mut include_config, depth + 1, buf, options)?;
+        resolve_includes_recursive(Some(target_config), &mut include_config, depth + 1, buf, options, remote_urls)?;
 
         target_config.append_or_insert(include_config, Some(section_id))?;
     }
@@ -154,6 +237,7 @@ fn include_condition_match(
     target_config_path: Option<&Path>,
     search_config: &File,
     options: Options<'_>,
+    remote_urls: RemoteUrls<'_>,
 ) -> Result<bool, Error> {
     let mut tokens = condition.splitn(2, |b| *b == b':');
     let (prefix, condition) = match (tokens.next(), tokens.next()) {
@@ -206,22 +290,21 @@ fn include_condition_match(
             if key_glob.as_bstr() != "remote.*.url" {
                 return Ok(false);
             }
-            let Some(sections) = search_config.sections_by_name("remote") else {
-                return Ok(false);
-            };
-            for remote in sections {
-                for url in remote.values("url") {
-                    let glob_matches = gix_glob::wildmatch(
-                        value_glob.as_bstr(),
-                        url.as_ref(),
-                        gix_glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
-                    );
-                    if glob_matches {
-                        return Ok(true);
-                    }
-                }
+            // ```c
+            // if (inc->opts->unconditional_remote_url)
+            //         return 1;
+            // if (!inc->remote_urls)
+            //         populate_remote_urls(inc);
+            // return at_least_one_url_matches_glob(cond, cond_len, inc->remote_urls);
+            // ```
+            //
+            // (`include_by_remote_url()`, config.c:385-394.) The URLs are those of the
+            // whole configuration, not of `search_config`, the file being resolved.
+            let _ = search_config;
+            match remote_urls {
+                RemoteUrls::Unconditional => Ok(true),
+                RemoteUrls::Gather(gather) => gather.any_matches(value_glob.as_bstr()),
             }
-            Ok(false)
         }
         _ => Ok(false),
     }

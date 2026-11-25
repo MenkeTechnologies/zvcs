@@ -1863,6 +1863,10 @@ pub enum ConfigReadStop {
     /// :177-182): `path` is the include it refused to open, `from` the
     /// `kvi->filename` of the file that named it.
     IncludeDepth { path: String, from: String },
+    /// `forbid_remote_url()`'s `die()` (config.c:352-366): a named remote's `url`
+    /// in a file `populate_remote_urls()` reached through a
+    /// `hasconfig:remote.*.url:` include.
+    RemoteUrlInHasconfig,
 }
 
 impl ConfigReadStop {
@@ -1871,6 +1875,14 @@ impl ConfigReadStop {
     /// refused or a circular chain.
     pub fn is_include_refusal(&self) -> bool {
         matches!(self, ConfigReadStop::BadLine { preface: Some(_), .. })
+    }
+
+    /// Whether `git_config_include()` stopped the read rather than the parser: an
+    /// include [`is_include_refusal`](Self::is_include_refusal) covers, a circular
+    /// chain, or `forbid_remote_url()`.
+    pub fn is_include_stop(&self) -> bool {
+        self.is_include_refusal()
+            || matches!(self, ConfigReadStop::IncludeDepth { .. } | ConfigReadStop::RemoteUrlInHasconfig)
     }
 
     /// Put the callback's own diagnostic on stderr, ahead of the `fatal:` that
@@ -1888,6 +1900,7 @@ impl ConfigReadStop {
             ConfigReadStop::IncludeDepth { path, from } => format!(
                 "exceeded maximum include depth ({MAX_INCLUDE_DEPTH}) while including\n\t{path}\nfrom\n\t{from}\nThis might be due to circular includes."
             ),
+            ConfigReadStop::RemoteUrlInHasconfig => "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url".to_owned(),
         }
     }
 }
@@ -1902,30 +1915,139 @@ impl ConfigReadStop {
 /// section after an include starts with that section's header again.
 pub struct ConfigSegment {
     pub shown: String,
+    /// `kvi->scope`: the scope of the file of the sequence the entries came from,
+    /// which an included file inherits (config.c:183-184).
+    pub scope: gix::config::Source,
     pub text: Vec<u8>,
 }
 
 /// git's `git_config_from_file()` over `path` under `git_config_include()`
 /// (config.c:419-460): every entry `git_parse_source()` reads before it stops is
-/// passed along, and an `include.path` is followed at the point it is read,
-/// through `handle_path_include()` (config.c:142-191). `shown` is the
-/// `kvi->filename` the file is read under, which the diagnostics quote and a
-/// relative include is resolved against.
+/// passed along, and an `include.path`, or an `includeIf.<condition>.path` whose
+/// condition holds, is followed at the point it is read, through
+/// `handle_path_include()` (config.c:142-191). `shown` is the `kvi->filename` the
+/// file is read under, which the diagnostics quote and a relative include is
+/// resolved against.
 ///
 /// `includes` is `opts->respect_includes`. `depth` is `inc->depth` as this file is
 /// entered. When `segments` is given, the stretches read are appended to it in
 /// callback order, which is what `config --list` prints ahead of the `fatal:`.
 ///
-/// Only `include.path` is followed; an `includeIf.<condition>.path` needs
-/// `include_condition_is_true()` (config.c:393-417), which this walk does not
-/// port, so a chain that is only circular or malformed through a condition is not
-/// reported here.
+/// The file is its own `config_source`, as `git config --file` hands it to
+/// `config_with_options()` (builtin/config.c:604-606), so a
+/// `hasconfig:remote.*.url:` condition looks for its URLs in this file and what
+/// it includes alone (config.c:338-350).
 pub fn read_config_file_like_git(
     path: &std::path::Path,
     shown: &str,
     includes: bool,
     depth: usize,
+    segments: Option<&mut Vec<ConfigSegment>>,
+) -> Result<(), ConfigReadStop> {
+    let source = UrlSource::File(ConfigCandidate {
+        path: path.to_owned(),
+        shown: shown.to_owned(),
+        scope: gix::config::Source::Cli,
+    });
+    let mut inc = IncludeData::new(includes, IncludeRepo::current(true), source);
+    read_config_file_with(path, shown, depth, segments, &mut inc)
+}
+
+/// `inc->fn` of git's `struct config_include_data` (config.c:120-128): the
+/// callback each entry is handed to ahead of the include handling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IncludeCallback {
+    /// The caller's own callback, whose output is the `segments` text.
+    Caller,
+    /// `add_remote_url()` (config.c:322-336), for `populate_remote_urls()`.
+    AddRemoteUrl,
+    /// `forbid_remote_url()` (config.c:352-366), swapped in for a file a
+    /// `hasconfig:remote.*.url:` condition includes while the URLs are gathered.
+    ForbidRemoteUrl,
+}
+
+/// `inc->config_source`: what `populate_remote_urls()` hands back to
+/// `config_with_options()` (config.c:338-350) to gather the remote URLs from.
+#[derive(Clone)]
+enum UrlSource {
+    /// `do_git_config_sequence()` (config.c:1547-1613): these files in order, then
+    /// the command line unless `opts->ignore_cmdline`.
+    Sequence { files: Vec<ConfigCandidate>, cmdline: bool },
+    /// `config_source->file` (config.c:1648-1651).
+    File(ConfigCandidate),
+}
+
+/// What `include_condition_is_true()` (config.c:393-417) knows about the
+/// repository: `opts->git_dir` for `gitdir:`, and whether `inc->repo` is set,
+/// which `worktree:` and `onbranch:` need.
+#[derive(Clone)]
+struct IncludeRepo {
+    /// Whether `opts->git_dir` is the repository setup found, which is located on
+    /// first need: most configuration has no condition to ask.
+    has_git_dir: bool,
+    git_dir: std::cell::OnceCell<Option<PathBuf>>,
+    /// `inc->repo`, which `read_early_config()` and `read_very_early_config()`
+    /// leave `NULL` (config.c:1711, :1727).
+    repo: bool,
+}
+
+impl IncludeRepo {
+    /// The repository setup found, with `inc->repo` set when `repo` says so.
+    fn current(repo: bool) -> Self {
+        IncludeRepo { has_git_dir: true, git_dir: Default::default(), repo }
+    }
+
+    /// `read_very_early_config()` (config.c:1717-1728): no `git_dir`, no `repo`.
+    fn none() -> Self {
+        IncludeRepo { has_git_dir: false, git_dir: Default::default(), repo: false }
+    }
+
+    /// `opts->git_dir`.
+    fn git_dir(&self) -> Option<PathBuf> {
+        if !self.has_git_dir {
+            return None;
+        }
+        self.git_dir.get_or_init(|| repository_directories().map(|dirs| dirs.git_dir)).clone()
+    }
+}
+
+/// git's `struct config_include_data` (config.c:120-128) together with the
+/// `config_options` fields the include handling reads.
+struct IncludeData {
+    /// `opts->respect_includes`.
+    respect: bool,
+    /// `opts->unconditional_remote_url`.
+    unconditional_remote_url: bool,
+    fn_: IncludeCallback,
+    repo: IncludeRepo,
+    source: UrlSource,
+    /// `inc->remote_urls`, gathered on first need.
+    remote_urls: Option<Vec<String>>,
+    /// `kvi->scope` of the file of the sequence being read.
+    scope: gix::config::Source,
+}
+
+impl IncludeData {
+    fn new(respect: bool, repo: IncludeRepo, source: UrlSource) -> Self {
+        IncludeData {
+            respect,
+            unconditional_remote_url: false,
+            fn_: IncludeCallback::Caller,
+            repo,
+            source,
+            remote_urls: None,
+            scope: gix::config::Source::Cli,
+        }
+    }
+}
+
+/// [`read_config_file_like_git`] under an include context already set up.
+fn read_config_file_with(
+    path: &std::path::Path,
+    shown: &str,
+    depth: usize,
     mut segments: Option<&mut Vec<ConfigSegment>>,
+    inc: &mut IncludeData,
 ) -> Result<(), ConfigReadStop> {
     use gix::bstr::ByteSlice as _;
     use gix::config::parse::EventRef;
@@ -1970,10 +2092,12 @@ pub fn read_config_file_like_git(
 
     let mut text = Vec::new();
     let mut header: Vec<u8> = Vec::new();
-    let mut in_include = false;
-    let mut at_path = false;
-    // Whether the `include.path` being read has its `=`: one without is git's NULL
-    // value, which `handle_path_include()` refuses.
+    // The `<section>` (lowercased, as `git_parse_source()` hands it on) and the
+    // `<subsection>` of the entries being read, and the entry's own key.
+    let mut section = String::new();
+    let mut subsection: Option<String> = None;
+    let mut key = String::new();
+    // Whether the entry being read has its `=`: one without is git's NULL value.
     let mut separated = false;
     let mut pending: Option<Vec<u8>> = None;
     // `cs->linenr` of the entry being read: one past the line ends written so far.
@@ -1983,17 +2107,17 @@ pub fn read_config_file_like_git(
         event.write_to(&mut text).expect("writing to a Vec cannot fail");
         let entry_line = line;
         line += text[start..].iter().filter(|b| **b == b'\n').count();
-        // `Some(None)` is a valueless `include.path`.
-        let value = match event {
+        // The entry this event completes: `Some(None)` is a valueless one.
+        let value: Option<Option<Vec<u8>>> = match event {
             EventRef::SectionHeader { name, subsection_name, .. } => {
                 header.clear();
                 event.write_to(&mut header).expect("writing to a Vec cannot fail");
-                in_include = subsection_name.is_none() && name.to_str_lossy().eq_ignore_ascii_case("include");
-                at_path = false;
+                section = name.to_str_lossy().to_ascii_lowercase();
+                subsection = subsection_name.as_ref().map(|s| s.to_str_lossy().into_owned());
                 None
             }
             EventRef::SectionValueName(name) => {
-                at_path = in_include && name.to_str_lossy().eq_ignore_ascii_case("path");
+                key = name.to_str_lossy().to_ascii_lowercase();
                 separated = false;
                 None
             }
@@ -2002,44 +2126,92 @@ pub fn read_config_file_like_git(
                 None
             }
             // gitoxide reports a name with no `=` as an empty value, so only the
-            // missing separator tells it from `path =`.
-            EventRef::Value(raw) if at_path => Some(separated.then(|| raw.to_vec())),
-            EventRef::ValueNotDone(raw) if at_path => {
+            // missing separator tells it from `key =`.
+            EventRef::Value(raw) => Some(separated.then(|| raw.to_vec())),
+            EventRef::ValueNotDone(raw) => {
                 pending.get_or_insert_with(Vec::new).extend_from_slice(raw);
                 None
             }
-            EventRef::ValueDone(raw) if at_path => {
+            EventRef::ValueDone(raw) => {
                 let mut whole = pending.take().unwrap_or_default();
                 whole.extend_from_slice(raw);
                 Some(Some(whole))
             }
             _ => None,
         };
-        let Some(raw) = value.filter(|_| includes) else { continue };
-        at_path = false;
-        if let Some(out) = segments.as_deref_mut() {
-            out.push(ConfigSegment { shown: shown.to_owned(), text: std::mem::take(&mut text) });
+        let Some(value) = value else { continue };
+        let value = value.map(|raw| gix::config::value::normalize(raw.as_bstr()).to_str_lossy().into_owned());
+
+        // `ret = inc->fn(var, value, ctx, inc->data)` (config.c:428-430).
+        // `add_remote_url()` and `forbid_remote_url()` both ask
+        // `parse_config_key(var, "remote", …)` for a named remote's `url`.
+        if section == "remote" && subsection.is_some() && key == "url" {
+            match inc.fn_ {
+                IncludeCallback::Caller => {}
+                IncludeCallback::AddRemoteUrl => {
+                    if let (Some(urls), Some(url)) = (inc.remote_urls.as_mut(), value.as_ref()) {
+                        urls.push(url.clone());
+                    }
+                }
+                IncludeCallback::ForbidRemoteUrl => return Err(ConfigReadStop::RemoteUrlInHasconfig),
+            }
         }
-        text = header.clone();
+        // `git_config_include()` is only installed under `opts->respect_includes`
+        // (config.c:1630-1640).
+        if !inc.respect {
+            continue;
+        }
+
         // ```c
-        // if (!path)
-        //         return config_error_nonbool("include.path");
+        // if (!strcmp(var, "include.path"))
+        //         ret = handle_path_include(ctx->kvi, value, inc);
+        //
+        // if (!parse_config_key(var, "includeif", &cond, &cond_len, &key) &&
+        //     cond && include_condition_is_true(ctx->kvi, inc, cond, cond_len) &&
+        //     !strcmp(key, "path")) {
+        //         config_fn_t old_fn = inc->fn;
+        //
+        //         if (inc->opts->unconditional_remote_url)
+        //                 inc->fn = forbid_remote_url;
+        //         ret = handle_path_include(ctx->kvi, value, inc);
+        //         inc->fn = old_fn;
+        // }
         // ```
         //
-        // (config.c:150-151.) The entry has been passed along already; the callback's
-        // failure then ends the parse on the entry's own line.
-        let Some(raw) = raw else {
-            return Err(ConfigReadStop::BadLine {
-                shown: shown.to_owned(),
-                line: entry_line,
-                preface: Some("error: missing value for 'include.path'".to_owned()),
-            });
+        // (config.c:435-447.) The condition is evaluated before the key is looked
+        // at, so `includeIf.hasconfig:remote.*.url:<glob>.<anything>` gathers the
+        // URLs, and dies on one it may not hold, whatever `<key>` is.
+        let follow = match (section.as_str(), subsection.as_deref()) {
+            ("include", None) => key == "path",
+            ("includeif", Some(cond)) => match include_condition_is_true(path, cond, inc) {
+                Ok(holds) => holds && key == "path",
+                // The entry was handed on before its condition died gathering URLs.
+                Err(stop) => {
+                    if let Some(out) = segments.as_deref_mut() {
+                        out.push(ConfigSegment { shown: shown.to_owned(), scope: inc.scope, text });
+                    }
+                    return Err(stop);
+                }
+            },
+            _ => false,
         };
-        let value = gix::config::value::normalize(raw.as_bstr()).to_str_lossy().into_owned();
-        handle_path_include(path, shown, &value, entry_line, depth, segments.as_deref_mut())?;
+        if !follow {
+            continue;
+        }
+        if let Some(out) = segments.as_deref_mut() {
+            out.push(ConfigSegment { shown: shown.to_owned(), scope: inc.scope, text: std::mem::take(&mut text) });
+        }
+        text = header.clone();
+        let old_fn = inc.fn_;
+        if section == "includeif" && inc.unconditional_remote_url {
+            inc.fn_ = IncludeCallback::ForbidRemoteUrl;
+        }
+        let followed = handle_path_include(path, shown, value.as_deref(), entry_line, depth, segments.as_deref_mut(), inc);
+        inc.fn_ = old_fn;
+        followed?;
     }
     if let Some(out) = segments {
-        out.push(ConfigSegment { shown: shown.to_owned(), text });
+        out.push(ConfigSegment { shown: shown.to_owned(), scope: inc.scope, text });
     }
     match bad {
         Some(line) => Err(ConfigReadStop::BadLine { shown: shown.to_owned(), line, preface: None }),
@@ -2047,18 +2219,129 @@ pub fn read_config_file_like_git(
     }
 }
 
-/// `handle_path_include()` (config.c:142-191) for the `include.path` value
-/// `value` read from `from` (spelled `from_shown`) on line `line` at include depth
-/// `depth`.
+/// `include_condition_is_true()` (config.c:393-417) for the condition `cond` of
+/// an `includeIf.<cond>.<key>` read from the file at `from`.
+fn include_condition_is_true(
+    from: &std::path::Path,
+    cond: &str,
+    inc: &mut IncludeData,
+) -> Result<bool, ConfigReadStop> {
+    if let Some(holds) = include_condition_by_repo(cond, Some(from), &inc.repo) {
+        // `prepare_include_condition_pattern()`'s `error()` (config.c:214-219) is
+        // only for a value with no file behind it, which this is not.
+        return Ok(holds.unwrap_or(true));
+    }
+    let Some(glob) = cond.strip_prefix("hasconfig:remote.*.url:") else {
+        // Unknown conditionals are always false.
+        return Ok(false);
+    };
+    // ```c
+    // if (inc->opts->unconditional_remote_url)
+    //         return 1;
+    // if (!inc->remote_urls)
+    //         populate_remote_urls(inc);
+    // return at_least_one_url_matches_glob(cond, cond_len, inc->remote_urls);
+    // ```
+    //
+    // (`include_by_remote_url()`, config.c:385-394.)
+    if inc.unconditional_remote_url {
+        return Ok(true);
+    }
+    if inc.remote_urls.is_none() {
+        inc.remote_urls = Some(populate_remote_urls(inc)?);
+    }
+    // `at_least_one_url_matches_glob()` (config.c:368-383): `wildmatch()` with
+    // `WM_PATHNAME`.
+    let urls = inc.remote_urls.as_deref().unwrap_or_default();
+    Ok(urls.iter().any(|url| {
+        gix::glob::wildmatch(glob.into(), url.as_str().into(), gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL)
+    }))
+}
+
+/// `populate_remote_urls()` (config.c:338-350): the whole of `inc->config_source`
+/// read again with `add_remote_url()` as the callback and
+/// `opts.unconditional_remote_url` set, so every `hasconfig:remote.*.url:`
+/// include is followed under `forbid_remote_url()`. A refusal on the way is the
+/// refusal of the read that asked.
+fn populate_remote_urls(inc: &IncludeData) -> Result<Vec<String>, ConfigReadStop> {
+    use gix::bstr::ByteSlice as _;
+
+    let mut gather = IncludeData {
+        respect: inc.respect,
+        unconditional_remote_url: true,
+        fn_: IncludeCallback::AddRemoteUrl,
+        repo: inc.repo.clone(),
+        source: inc.source.clone(),
+        remote_urls: Some(Vec::new()),
+        scope: inc.scope,
+    };
+    match &inc.source {
+        UrlSource::File(file) => {
+            gather.scope = file.scope;
+            read_config_file_with(&file.path, &file.shown, 0, None, &mut gather)?;
+        }
+        UrlSource::Sequence { files, cmdline } => {
+            for file in files {
+                gather.scope = file.scope;
+                read_config_file_with(&file.path, &file.shown, 0, None, &mut gather)?;
+            }
+            // `git_config_from_parameters()` (config.c:731-790) ends the sequence;
+            // gitoxide's environment layer is built from the same two variables in
+            // the same order.
+            if *cmdline {
+                let params = gix::config::File::from_env(Default::default()).ok().flatten();
+                if let (Some(params), Some(urls)) = (params, gather.remote_urls.as_mut()) {
+                    for remote in params.sections_by_name("remote").into_iter().flatten() {
+                        if remote.header().subsection_name().is_some() {
+                            urls.extend(remote.values("url").iter().map(|url| url.to_str_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(gather.remote_urls.unwrap_or_default())
+}
+
+/// `handle_path_include()` (config.c:142-191) for the include value `value` read
+/// from `from` (spelled `from_shown`) on line `line` at include depth `depth`.
 fn handle_path_include(
     from: &std::path::Path,
     from_shown: &str,
-    value: &str,
+    value: Option<&str>,
     line: usize,
     depth: usize,
     segments: Option<&mut Vec<ConfigSegment>>,
+    inc: &mut IncludeData,
 ) -> Result<(), ConfigReadStop> {
-    let expanded = expand_tilde(value);
+    // ```c
+    // if (!path)
+    //         return config_error_nonbool("include.path");
+    // ```
+    //
+    // (config.c:150-151.) The entry has been passed along already; the callback's
+    // failure then ends the parse on the entry's own line.
+    let Some(value) = value else {
+        return Err(ConfigReadStop::BadLine {
+            shown: from_shown.to_owned(),
+            line,
+            preface: Some("error: missing value for 'include.path'".to_owned()),
+        });
+    };
+    // ```c
+    // expanded = interpolate_path(path, 0);
+    // if (!expanded)
+    //         return error(_("could not expand include path '%s'"), path);
+    // ```
+    //
+    // (config.c:153-155.)
+    let Some(expanded) = crate::setup::interpolate_path(value) else {
+        return Err(ConfigReadStop::BadLine {
+            shown: from_shown.to_owned(),
+            line,
+            preface: Some(format!("error: could not expand include path '{value}'")),
+        });
+    };
     // ```c
     // if (!is_absolute_path(path)) {
     //         slash = find_last_dir_sep(kvi->filename);
@@ -2099,7 +2382,7 @@ fn handle_path_include(
             preface: Some(format!("warning: unable to access '{shown}': Is a directory")),
         });
     }
-    read_config_file_like_git(&path, &shown, true, depth + 1, segments)
+    read_config_file_with(&path, &shown, depth + 1, segments, inc)
 }
 
 /// How the message spells `$GIT_DIR`, which is not a constant: git prints what
@@ -2144,17 +2427,58 @@ pub enum GitDirNaming {
 ///
 /// `include.path` is followed where it is read, as [`read_config_file_like_git`]
 /// does — an included file that will not parse is named by its own path, not the
-/// includer's, and a circular chain dies at `MAX_INCLUDE_DEPTH`. Conditional
-/// `includeIf` sections are not followed; naming no file at all is better than
-/// naming the wrong one, and the caller falls back to its own voice when this
-/// returns `None`.
+/// includer's, and a circular chain dies at `MAX_INCLUDE_DEPTH` — and so is an
+/// `includeIf.<condition>.path` whose condition holds for the reader `scopes`
+/// stands for: `read_very_early_config()` and `read_early_config()` pass no
+/// repository (config.c:1711, :1727), so `onbranch:` and `worktree:` never hold
+/// there, and the former has no `git_dir` for `gitdir:` either. A
+/// `hasconfig:remote.*.url:` condition gathers its URLs from the whole sequence
+/// that reader covers, the command line included unless it is the very early one
+/// (`opts.ignore_cmdline`, config.c:1724).
 pub fn first_unparsable_config_file(scopes: ConfigScopes, naming: GitDirNaming) -> Option<ConfigReadStop> {
-    config_file_sequence(scopes, naming)
-        .iter()
-        .find_map(|candidate| read_config_file_like_git(&candidate.path, &candidate.shown, true, 0, None).err())
+    let files = config_file_sequence(scopes, naming);
+    first_unparsable_of(scopes, naming, &files, None)
+}
+
+/// The read `git config --list` makes of the whole sequence under
+/// `show_all_config()` (builtin/config.c:1055-1063): system, XDG and user
+/// configuration, then the repository's, with includes. On a refusal, the stop
+/// and every stretch the callback was handed ahead of it, which `--list` has
+/// printed by the time git dies.
+pub fn listing_stop(naming: GitDirNaming) -> Option<(ConfigReadStop, Vec<ConfigSegment>)> {
+    let mut files = config_file_sequence(ConfigScopes::EarlyGlobal, naming);
+    files.extend(config_file_sequence(ConfigScopes::Repository, naming));
+    let mut segments = Vec::new();
+    let stop = first_unparsable_of(ConfigScopes::Repository, naming, &files, Some(&mut segments))?;
+    Some((stop, segments))
+}
+
+/// [`first_unparsable_config_file`] over `files`, read as the reader `scopes`
+/// stands for reads them.
+fn first_unparsable_of(
+    scopes: ConfigScopes,
+    naming: GitDirNaming,
+    files: &[ConfigCandidate],
+    mut segments: Option<&mut Vec<ConfigSegment>>,
+) -> Option<ConfigReadStop> {
+    let (repo, urls_from) = match scopes {
+        ConfigScopes::EarlyGlobal => (IncludeRepo::none(), files.to_vec()),
+        ConfigScopes::EarlyRepository | ConfigScopes::Repository => {
+            let mut all = config_file_sequence(ConfigScopes::EarlyGlobal, naming);
+            all.extend(config_file_sequence(scopes, naming));
+            (IncludeRepo::current(scopes == ConfigScopes::Repository), all)
+        }
+    };
+    let cmdline = scopes != ConfigScopes::EarlyGlobal;
+    let mut inc = IncludeData::new(true, repo, UrlSource::Sequence { files: urls_from, cmdline });
+    files.iter().find_map(|candidate| {
+        inc.scope = candidate.scope;
+        read_config_file_with(&candidate.path, &candidate.shown, 0, segments.as_deref_mut(), &mut inc).err()
+    })
 }
 
 /// One file of the config sequence: where it lives, and how git names it.
+#[derive(Clone)]
 struct ConfigCandidate {
     /// The path to open.
     path: PathBuf,
@@ -2162,6 +2486,8 @@ struct ConfigCandidate {
     /// `git_config_from_file()`, which is absolute for the global scopes and
     /// `$GIT_DIR`-relative for a discovered repository.
     shown: String,
+    /// The scope git reads it under.
+    scope: gix::config::Source,
 }
 
 /// The 1-based line `git_parse_source()` would refuse in `bytes`, or `None` when
@@ -2498,14 +2824,14 @@ fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<Confi
         let mut env = |name: &str| std::env::var_os(name);
         if let Some(path) = system_config_path(&mut env) {
             let shown = path.to_string_lossy().into_owned();
-            out.push(ConfigCandidate { path, shown });
+            out.push(ConfigCandidate { path, shown, scope: Source::System });
         }
         // The two global scopes, in `do_git_config_sequence()` order — XDG
         // before user. Neither reads anything but the environment.
         for source in [Source::Git, Source::User] {
             if let Some(path) = source.storage_location(&mut env) {
                 let shown = path.to_string_lossy().into_owned();
-                out.push(ConfigCandidate { path, shown });
+                out.push(ConfigCandidate { path, shown, scope: source });
             }
         }
         return out;
@@ -2517,9 +2843,9 @@ fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<Confi
     // `opts.commondir` is what the repository config is read from, so a linked
     // worktree reads the main repository's `config` and only `config.worktree`
     // is its own (config.c:1590-1600).
-    out.push(dirs.candidate(&dirs.common_dir, "config", naming));
+    out.push(dirs.candidate(&dirs.common_dir, "config", Source::Local, naming));
     if scopes == ConfigScopes::Repository && worktree_config_enabled(&dirs.common_dir.join("config")) {
-        out.push(dirs.candidate(&dirs.git_dir, "config.worktree", naming));
+        out.push(dirs.candidate(&dirs.git_dir, "config.worktree", Source::Worktree, naming));
     }
     out
 }
@@ -2657,7 +2983,7 @@ impl RepositoryDirs {
     /// `.git/config` from anywhere inside the work tree and an absolute path for
     /// an explicit `$GIT_DIR` or a `--separate-git-dir` repository. Both were
     /// measured against git 2.55.0.
-    fn candidate(&self, dir: &std::path::Path, file: &str, naming: GitDirNaming) -> ConfigCandidate {
+    fn candidate(&self, dir: &std::path::Path, file: &str, scope: gix::config::Source, naming: GitDirNaming) -> ConfigCandidate {
         let shown_dir = match &self.work_tree {
             _ if naming == GitDirNaming::Absolute => crate::setup::realpath(dir),
             _ if self.explicit => dir.to_path_buf(),
@@ -2676,6 +3002,7 @@ impl RepositoryDirs {
         ConfigCandidate {
             path: dir.join(file),
             shown,
+            scope,
         }
     }
 }
@@ -2702,41 +3029,85 @@ impl RepositoryDirs {
 ///
 /// Anything else is an unknown condition, which is false.
 pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String> {
+    match include_condition_by_repo(cond, None, &IncludeRepo::current(true)) {
+        Some(Some(holds)) => Ok(holds),
+        Some(None) => Err("relative config include conditionals must come from files".to_owned()),
+        None => Ok(cond.starts_with("hasconfig:remote.*.url:")),
+    }
+}
+
+/// The repository conditions of `include_condition_is_true()` (config.c:393-417):
+/// `gitdir:`, `gitdir/i:`, `worktree:`, `worktree/i:` and `onbranch:`, for an
+/// `includeIf` read from the file at `from`, or from no file at all (the command
+/// line). `None` when `cond` is none of them; `Some(None)` for
+/// `prepare_include_condition_pattern()`'s `error()` (config.c:214-219), a `./`
+/// pattern with no file behind it.
+fn include_condition_by_repo(cond: &str, from: Option<&std::path::Path>, repo: &IncludeRepo) -> Option<Option<bool>> {
     let complete = |mut pattern: String| {
-        // `add_trailing_starstar_for_dir()`.
+        // `add_trailing_starstar_for_dir()` (config.c:193-197).
         if pattern.ends_with('/') {
             pattern.push_str("**");
         }
         pattern
     };
-    let matches = |pattern: &str, text: &std::path::Path, icase: bool| {
+    let matches = |pattern: &str, text: &str, icase: bool| {
         let mut mode = gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL;
         if icase {
             mode |= gix::glob::wildmatch::Mode::IGNORE_CASE;
         }
-        gix::glob::wildmatch(pattern.into(), text.to_string_lossy().as_ref().into(), mode)
+        gix::glob::wildmatch(pattern.into(), text.into(), mode)
     };
-    // `include_by_path()` (:238-292) against the git directory or, for `worktree:`
-    // (git 2.56, :403-408), `repo_get_work_tree()`.
+    // `include_by_path()` (config.c:238-292) against the git directory or, for
+    // `worktree:`, `repo_get_work_tree()`.
     let by_path = |path: Option<PathBuf>, pattern: &str, icase: bool| {
-        let Some(path) = path else { return Ok(false) };
+        // `if (!path) goto done;`
+        let Some(path) = path else { return Some(false) };
+        // `prepare_include_condition_pattern()` (config.c:199-236): `~` expanded
+        // (a failure leaves the pattern as written), a `./` pattern made relative
+        // to the realpath of the including file's directory with that directory
+        // as a literal prefix, anything else not absolute put under `**/`.
         let expanded = crate::setup::interpolate_path(pattern)
             .map_or_else(|| pattern.to_owned(), |p| p.to_string_lossy().into_owned());
-        if expanded.starts_with("./") {
-            return Err("relative config include conditionals must come from files".to_owned());
-        }
-        let pattern = match std::path::Path::new(&expanded).is_absolute() {
-            true => complete(expanded),
-            false => complete(format!("**/{expanded}")),
+        let (pattern, prefix) = if let Some(rest) = expanded.strip_prefix("./") {
+            let from = from?;
+            let real = crate::setup::realpath(from);
+            let dir = real.parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default();
+            let prefix = dir.len() + 1;
+            (complete(format!("{dir}/{rest}")), prefix)
+        } else if std::path::Path::new(&expanded).is_absolute() {
+            (complete(expanded), 0)
+        } else {
+            (complete(format!("**/{expanded}")), 0)
         };
+        // `strbuf_realpath(&text, path, 1)`, then on a miss
+        // `strbuf_add_absolute_path(&text, path)` once more (config.c:257-289).
         let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-        Ok(matches(&pattern, &crate::setup::realpath(&path), icase) || matches(&pattern, &absolute, icase))
+        for text in [crate::setup::realpath(&path), absolute] {
+            let text = text.to_string_lossy().into_owned();
+            if prefix > 0 {
+                // Literal matching on the prefix; a mismatch is `goto done`,
+                // with no second try.
+                let (Some(want), Some(have)) = (pattern.get(..prefix), text.get(..prefix)) else {
+                    return Some(false);
+                };
+                let same = if icase { want.eq_ignore_ascii_case(have) } else { want == have };
+                if !same {
+                    return Some(false);
+                }
+            }
+            if matches(&pattern[prefix..], &text[prefix..], icase) {
+                return Some(true);
+            }
+        }
+        Some(false)
     };
-    let git_dir = || repository_directories().map(|dirs| dirs.git_dir);
     // Setup gives a repository named by `$GIT_DIR` alone the current directory as
     // its work tree (`setup_explicit_git_dir()`), unless `core.bare` or
     // `core.worktree` say otherwise — which is not read here.
     let work_tree = || {
+        if !repo.repo {
+            return None;
+        }
         repository_directories().and_then(|dirs| match (dirs.work_tree, dirs.explicit) {
             (Some(top), _) => Some(top),
             (None, true) => std::env::current_dir().ok(),
@@ -2745,27 +3116,29 @@ pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String>
     };
     for (prefix, icase) in [("gitdir:", false), ("gitdir/i:", true)] {
         if let Some(pattern) = cond.strip_prefix(prefix) {
-            return by_path(git_dir(), pattern, icase);
+            return Some(by_path(repo.git_dir(), pattern, icase));
         }
     }
     for (prefix, icase) in [("worktree:", false), ("worktree/i:", true)] {
         if let Some(pattern) = cond.strip_prefix(prefix) {
-            return by_path(work_tree(), pattern, icase);
+            return Some(by_path(work_tree(), pattern, icase));
         }
     }
-    if let Some(pattern) = cond.strip_prefix("onbranch:") {
-        let Some(dirs) = repository_directories() else { return Ok(false) };
-        let branch = match reftable_head_branch(&dirs) {
-            Some(branch) => branch,
-            None => {
-                let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
-                head.trim_end().strip_prefix("ref: refs/heads/").map(str::to_owned)
-            }
-        };
-        let Some(short) = branch else { return Ok(false) };
-        return Ok(matches(&complete(pattern.to_owned()), std::path::Path::new(&short), false));
+    let pattern = cond.strip_prefix("onbranch:")?;
+    // `include_by_branch()` (config.c:297-320): no `data->repo` is false.
+    if !repo.repo {
+        return Some(Some(false));
     }
-    Ok(cond.starts_with("hasconfig:remote.*.url:"))
+    let Some(dirs) = repository_directories() else { return Some(Some(false)) };
+    let branch = match reftable_head_branch(&dirs) {
+        Some(branch) => branch,
+        None => {
+            let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
+            head.trim_end().strip_prefix("ref: refs/heads/").map(str::to_owned)
+        }
+    };
+    let Some(short) = branch else { return Some(Some(false)) };
+    Some(Some(matches(&complete(pattern.to_owned()), &short, false)))
 }
 
 /// `include_by_branch()`'s read of `HEAD` (config.c:305-310, git 2.56) in a
@@ -3229,7 +3602,7 @@ pub fn repository_version_refusal() -> Option<String> {
     let dirs = repository_directories()?;
     let format = read_repository_format(&dirs.common_dir.join("config"));
     let (text, reason) = format.bad_version?;
-    let shown = dirs.candidate(&dirs.common_dir, "config", GitDirNaming::AsDiscovered).shown;
+    let shown = dirs.candidate(&dirs.common_dir, "config", gix::config::Source::Local, GitDirNaming::AsDiscovered).shown;
     Some(format!(
         "bad numeric config value '{text}' for 'core.repositoryformatversion' in file {shown}: {reason}"
     ))

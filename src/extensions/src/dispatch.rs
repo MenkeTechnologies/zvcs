@@ -1549,13 +1549,15 @@ fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     // `include.path` (setup.c). Whether it reads them again with its includes is
     // its own options' business — the pager check, `respect_includes`, the
     // `core.configLockTimeout` read of a write — so it meets an include it
-    // refuses at that point ([`crate::porcelain::config`]). Only the refusals
-    // gix reads past (an `include.path` with no value or naming a directory) are
-    // left to those points: a circular chain or an included file that will not
-    // parse keeps gix from opening the repository at all, so those still die here.
+    // refuses at that point ([`crate::porcelain::config`]). Every refusal of an
+    // include is left to those points — no value, a directory, a circular chain,
+    // a remote URL in a `hasconfig:remote.*.url:` include — since `config` opens
+    // the repository without includes when it does not follow them. Only an
+    // included file that will not parse still dies here, as gix cannot open the
+    // repository past it.
     let msg = match sub {
         "config" => match crate::config::first_unparsable_config_file(scopes, naming) {
-            Some(stop) if !stop.is_include_refusal() => {
+            Some(stop) if !stop.is_include_stop() => {
                 stop.print_preface();
                 stop.message()
             }

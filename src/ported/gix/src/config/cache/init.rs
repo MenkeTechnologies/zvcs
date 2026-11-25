@@ -122,9 +122,22 @@ impl Cache {
 
             let local_meta = git_dir_config.meta_owned();
             globals.append(git_dir_config)?;
-            globals.resolve_includes(options)?;
-            if use_env {
-                globals.append(gix_config::File::from_env(options)?.unwrap_or_default())?;
+            // `populate_remote_urls()` reads the whole sequence, which ends with the
+            // command line (config.c:1599-1602), so its remote URLs answer a
+            // `hasconfig:remote.*.url:` condition in the files as well.
+            let env_config = match use_env {
+                true => Some(gix_config::File::from_env(options)?.unwrap_or_default()),
+                false => None,
+            };
+            let env_remote_urls: Vec<crate::bstr::BString> = env_config
+                .iter()
+                .flat_map(|env| env.sections_by_name("remote").into_iter().flatten())
+                .filter(|section| section.header().subsection_name().is_some())
+                .flat_map(|section| section.values("url"))
+                .collect();
+            globals.resolve_includes_with_remote_urls(options, &env_remote_urls)?;
+            if let Some(env_config) = env_config {
+                globals.append(env_config)?;
             }
             if !cli_config_overrides.is_empty() {
                 config::overrides::append_resolving_includes(&mut globals, cli_config_overrides, gix_config::Source::Cli, options)

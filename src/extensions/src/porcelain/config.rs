@@ -2051,7 +2051,16 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                     eprintln!("warning: {message}");
                 }
             }
-            None
+            // `read_repository_format()` follows no include (setup.c), so a
+            // configuration whose includes gix will not resolve — a circular chain —
+            // still leaves `startup_info->have_repository` set, and `config` meets
+            // the refusal only where it reads those includes itself.
+            match &err {
+                gix::discover::Error::Open(gix::open::Error::Config(gix::config::Error::ResolveIncludes(_))) => {
+                    discover_without_includes()
+                }
+                _ => None,
+            }
         }
     };
     // ```c
@@ -2235,6 +2244,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             // gate for `config` left them alone, since setup's own read follows no
             // include. The files are located without `repo`, which a circular
             // include leaves `None`.
+            // A listing hands every entry of the sequence to `show_all_config()`
+            // as it is read, so what precedes the refusal has been printed.
+            Scope::Default if includes && mode == Mode::List => {
+                crate::config::listing_stop(crate::config::GitDirNaming::AsDiscovered)
+            }
             Scope::Default if includes => repository_include_stop(),
             Scope::Local | Scope::Worktree => repository_include_stop(),
             _ => None,
@@ -4638,7 +4652,7 @@ fn read_segments(segments: &[crate::config::ConfigSegment], d: &Display) -> Resu
             }
             _ => segment.shown.as_str(),
         };
-        let file = parse_config(&segment.text, std::path::Path::new(shown), Source::Cli)?;
+        let file = parse_config(&segment.text, std::path::Path::new(shown), segment.scope)?;
         let _ = all.append(file);
     }
     Ok(all)

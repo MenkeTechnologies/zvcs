@@ -215,6 +215,19 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     // already stripped), so every slot in `args` is a real operand.
     let original_argc = args.len();
 
+    // `init_basic_merge_options()` runs before parse_options()
+    // (builtin/merge-tree.c:592-593), and its merge_recursive_config()
+    // (merge-ort.c:5453-5492) dies on an unreadable `merge.verbosity`,
+    // rename limit, `merge.renormalize`, rename setting or, through
+    // git_xmerge_config(), `merge.conflictStyle` before any option, operand or
+    // mode is looked at: `-h`, a usage error and `--trivial-merge` all die there.
+    if let Ok(repo) = crate::setup::discover() {
+        if let Some(code) = super::merge::merge_recursive_config_check(&repo) {
+            return Ok(code);
+        }
+        crate::merge_apply::validate_conflict_style(&repo).map_err(|r| r.into_error())?;
+    }
+
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -381,6 +394,12 @@ pub fn merge_tree(args: &[String]) -> Result<ExitCode> {
     // NUL and the message block uses the `-z` shape, so `-z` is a no-op here.
     if use_stdin {
         let repo = crate::setup::discover()?;
+        // `if (merge_base) die(...)` (builtin/merge-tree.c:620-622), ahead of
+        // the first read from stdin.
+        if merge_base.is_some() {
+            eprintln!("fatal: options '--merge-base' and '--stdin' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
         let sep = b'\0';
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
@@ -629,13 +648,6 @@ fn resolve_outcome<'repo>(
         // the user asked for rather than the tree it peeled to. Leaving it unset
         // printed a bare `|||||||`.
         labels.ancestor = Some(BStr::new(base_spec.as_bytes()));
-        // `init_merge_options()` runs after the operands are peeled and can die
-        // on a bad `merge.renameLimit` — see
-        // [`super::merge::merge_recursive_config_check`].
-        if let Some(code) = super::merge::merge_recursive_config_check(repo) {
-            return Ok(Err(code));
-        }
-        crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
         let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         (
             crate::merge_apply::merge_trees(repo, base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?,
@@ -650,13 +662,6 @@ fn resolve_outcome<'repo>(
             eprintln!("merge-tree: {spec2} - not something we can merge");
             return Ok(Err(ExitCode::FAILURE));
         };
-        // `init_merge_options()` runs once both operands have peeled, and its
-        // `merge_recursive_config()` can die — see
-        // [`super::merge::merge_recursive_config_check`].
-        if let Some(code) = super::merge::merge_recursive_config_check(repo) {
-            return Ok(Err(code));
-        }
-        crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
         let bases = repo.merge_bases_many(ours, &[theirs])?;
         if !allow_unrelated && bases.is_empty() {
             eprintln!("fatal: refusing to merge unrelated histories");
@@ -1626,6 +1631,7 @@ fn merge_result(repo: &gix::Repository, item: &[MergeEntry]) -> Option<Vec<u8>> 
     let stage = |s: u8| item.iter().find(|e| e.stage == s);
     merge_blobs(
         repo,
+        item[0].path.as_ref(),
         stage(1).map(|e| e.id),
         stage(2).map(|e| e.id),
         stage(3).map(|e| e.id),
@@ -1648,6 +1654,7 @@ fn merge_result(repo: &gix::Repository, item: &[MergeEntry]) -> Option<Vec<u8>> 
 /// section even though the mode names no ancestor label to put after it.
 fn merge_blobs(
     repo: &gix::Repository,
+    path: &BStr,
     base: Option<ObjectId>,
     ours: Option<ObjectId>,
     theirs: Option<ObjectId>,
@@ -1663,8 +1670,11 @@ fn merge_blobs(
     let ancestor = base.and_then(|id| read_blob(repo, id)).unwrap_or_default();
 
     // `ll_merge()` hands a binary buffer to `ll_binary_merge()`, whose default
-    // variant keeps our side verbatim and reports a conflict.
+    // variant keeps our side verbatim and reports LL_MERGE_BINARY_CONFLICT
+    // (merge-ll.c:80-84), which three_way_filemerge() turns into a warning
+    // (merge-blobs.c:54-56).
     if buffer_is_binary(&our) || buffer_is_binary(&their) || buffer_is_binary(&ancestor) {
+        eprintln!("warning: Cannot merge binary files: {path} (.our vs. .their)");
         return Some(our);
     }
 
@@ -1763,12 +1773,17 @@ impl ConsumeHunk for TrivialSink<'_> {
                     (b'+', c)
                 }
             };
+            // xdl_emit_diffrec() hands show_outf() the marker, the record and,
+            // for a record without its newline, a third buffer
+            // (xdiff/xutils.c:39-52); show_outf() prints each with `%.*s`
+            // (builtin/merge-tree.c:112-118), so a record stops at its first NUL
+            // and a binary line loses everything after it, newline included.
             self.buf.push(marker);
-            self.buf.extend_from_slice(content);
-            if content.last() != Some(&b'\n') {
-                self.buf.push(b'\n');
+            let shown = content.iter().position(|&b| b == 0).map_or(content, |nul| &content[..nul]);
+            self.buf.extend_from_slice(shown);
+            if !content.is_empty() && content.last() != Some(&b'\n') {
                 self.buf
-                    .extend_from_slice(b"\\ No newline at end of file\n");
+                    .extend_from_slice(b"\n\\ No newline at end of file\n");
             }
         }
         Ok(())

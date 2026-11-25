@@ -801,13 +801,21 @@ where
                                     id: their_id,
                                     ..
                                 },
-                            ) if !involves_submodule(our_mode, their_mode) && our_id != their_id => {
-                                let conflict = if let Some(merged_mode) = merge_modes(*our_mode, *their_mode) {
-                                    let side = if our_mode == their_mode || matches!(our_mode.kind(), EntryKind::Blob) {
-                                        outer_side
-                                    } else {
-                                        outer_side.swapped()
+                            ) if !involves_submodule(our_mode, their_mode) && (our_id != their_id || our_mode != their_mode) => {
+                                let conflict = if merge_modes(*our_mode, *their_mode).is_some() {
+                                    // handle_content_merge() with `a` the first side and `b` the
+                                    // second, never swapped, and `o` null: modes that agree give
+                                    // `b->mode`; otherwise `a->mode` wins and the merge is unclean,
+                                    // as `b->mode` cannot equal the absent base's
+                                    // (merge-ort.c:2212-2218). Identical content takes the trivial
+                                    // oid merge (merge-ort.c:2243-2246), so an add/add that differs
+                                    // only in the executable bit is still a conflict.
+                                    let side = outer_side;
+                                    let (a_mode, b_mode) = match outer_side {
+                                        Original => (*our_mode, *their_mode),
+                                        Swapped => (*their_mode, *our_mode),
                                     };
+                                    let merged_mode = if a_mode == b_mode { b_mode } else { a_mode };
                                     // Each side is labelled with the path it gave the file,
                                     // before a directory rename moved it (`pathnames[side]`,
                                     // merge-ort.c:2137-2144): `A:y/wham` against `B:z/wham`.
@@ -823,6 +831,11 @@ where
                                         (0, side),
                                         &options,
                                     )?;
+                                    let resolution = if a_mode == b_mode {
+                                        resolution
+                                    } else {
+                                        crate::blob::Resolution::Conflict
+                                    };
                                     editor.upsert(toc(location), merged_mode.kind(), merged_blob_id)?;
                                     Conflict::with_resolution(
                                         Resolution::OursModifiedTheirsModifiedThenBlobContentMerge {

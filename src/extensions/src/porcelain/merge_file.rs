@@ -280,7 +280,14 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                 Err(code) => return Ok(code),
             }
         } else {
-            match read_file(operand, quiet) {
+            // read_mmfile() is handed prefix_filename(prefix, argv[i])
+            // (builtin/merge-file.c:123, :133), so its `Could not stat`/`open`
+            // errors name the operand from the top of the work tree.
+            let shown = crate::setup::prefix_filename(
+                repo.as_ref().and_then(crate::setup::startup_prefix).as_deref(),
+                operand,
+            );
+            match read_file(operand, &shown, quiet) {
                 Ok(content) => content,
                 Err(code) => return Ok(code),
             }
@@ -326,7 +333,22 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         let id = repo.as_ref().expect("checked above").write_blob(&merged)?;
         println!("{}", id.detach().to_hex());
     } else {
-        std::fs::write(operands[0], &merged)?;
+        // fopen(fpath, "wb") then fwrite() (builtin/merge-file.c:166-178): a
+        // failure is error_errno() naming argv[0] as typed, and its -1 replaces
+        // the conflict count, so the exit status is 255.
+        let failed = match std::fs::File::create(operands[0]) {
+            Err(err) => Some(format!("Could not open {} for writing: {}", operands[0], errno_text(&err))),
+            Ok(mut file) => (!merged.is_empty())
+                .then(|| file.write_all(&merged).err())
+                .flatten()
+                .map(|err| format!("Could not write to {}: {}", operands[0], errno_text(&err))),
+        };
+        if let Some(msg) = failed {
+            if !quiet {
+                eprintln!("error: {msg}");
+            }
+            return Ok(ExitCode::from(255));
+        }
     }
 
     Ok(ExitCode::from(conflicts.min(127) as u8))
@@ -490,18 +512,19 @@ fn style_fatal(value: &str, meta: &gix::config::file::Metadata) -> ExitCode {
     ExitCode::from(128)
 }
 
-/// Read one operand from the worktree, mirroring git's `stat` then `open`
-/// error messages. Returns the exit code to use on failure.
-fn read_file(path: &str, quiet: bool) -> std::result::Result<Vec<u8>, ExitCode> {
+/// Read one operand from the worktree, mirroring `read_mmfile()`'s `stat` then
+/// `open` error messages (xdiff-interface.c:164-167), which name `shown`.
+/// Returns the exit code to use on failure.
+fn read_file(path: &str, shown: &str, quiet: bool) -> std::result::Result<Vec<u8>, ExitCode> {
     if let Err(err) = std::fs::metadata(path) {
         if !quiet {
-            eprintln!("error: Could not stat {path}: {}", errno_text(&err));
+            eprintln!("error: Could not stat {shown}: {}", errno_text(&err));
         }
         return Err(ExitCode::from(255));
     }
     std::fs::read(path).map_err(|err| {
         if !quiet {
-            eprintln!("error: Could not open {path}: {}", errno_text(&err));
+            eprintln!("error: Could not open {shown}: {}", errno_text(&err));
         }
         ExitCode::from(255)
     })

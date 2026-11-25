@@ -25,8 +25,13 @@ mod stock_git;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
+
+/// Both tests build `fetch-v1` and `clone-v1` fixtures and run in parallel; without a
+/// per-fixture number they share one root, and each deletes the other's `src`.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
     root: PathBuf,
@@ -92,7 +97,11 @@ fn by_identity(trace: &str) -> BTreeMap<String, Vec<String>> {
 }
 
 fn fixture(tag: &str) -> Fixture {
-    let root = std::env::temp_dir().join(format!("zvcs-trace-packet-v1-{tag}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "zvcs-trace-packet-v1-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     let f = Fixture { root };
